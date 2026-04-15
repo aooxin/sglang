@@ -1,0 +1,136 @@
+# =============================================================================
+# GitLab CI Configuration for SGLang (Lint + CPU Tests)
+# =============================================================================
+#
+# Pipeline structure:  lint -> stage-a (CPU tests) -> finish
+#
+# This is a minimal CI configuration that runs:
+#   1. Pre-commit linting (isort, ruff, black, codespell)
+#   2. Clang-format for sgl-kernel C++/CUDA files
+#   3. CPU-only test suite (no GPU required)
+#
+# GPU test stages will be added in a follow-up MR.
+# =============================================================================
+
+stages:
+  - lint
+  - stage-a
+  - finish
+
+variables:
+  SGLANG_IS_IN_CI: "true"
+  GIT_DEPTH: 50
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  PIP_INDEX_URL: "https://pkgs.d.xiaomi.net/artifactory/api/pypi/pypi-virtual/simple"
+  PIP_TRUSTED_HOST: "pkgs.d.xiaomi.net"
+  HF_ENDPOINT: "https://hf-mirror.com"
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "api"
+    # Only run push pipelines for branches WITHOUT an open MR
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS == null
+      when: always
+
+# =============================================================================
+# Path patterns (used by rules:changes)
+# =============================================================================
+
+.main-package-paths: &main-package-paths
+  - python/sglang/**/*
+  - python/pyproject.toml
+  - scripts/ci/cuda/*
+  - scripts/ci/utils/*
+  - test/**/*
+  - .gitlab-ci.yml
+
+.sgl-kernel-paths: &sgl-kernel-paths
+  - sgl-kernel/**/*
+
+# =============================================================================
+# Stage: lint
+# =============================================================================
+
+lint:
+  stage: lint
+  image: micr.cloud.mioffice.cn/llm-infra/sglang-ci:latest
+  interruptible: true
+  timeout: 30m
+  script:
+    - SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH
+      when: on_success
+
+lint-clang-format:
+  stage: lint
+  image: micr.cloud.mioffice.cn/llm-infra/sglang-ci:latest
+  interruptible: true
+  timeout: 10m
+  script:
+    - |
+      FAILED=0
+      find sgl-kernel/ -name '*.h' -o -name '*.c' -o -name '*.cpp' -o -name '*.hpp' \
+        -o -name '*.cu' -o -name '*.cuh' -o -name '*.cc' | while read f; do
+        if ! clang-format-20 --style=file --dry-run --Werror "$f" 2>/dev/null; then
+          echo "Format error: $f"
+          FAILED=1
+        fi
+      done
+      exit $FAILED
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: *sgl-kernel-paths
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+# =============================================================================
+# Stage: stage-a (CPU Preflight Tests)
+# =============================================================================
+
+stage-a-test-cpu:
+  stage: stage-a
+  image: micr.cloud.mioffice.cn/llm-infra/python:3.12
+  interruptible: true
+  timeout: 30m
+  variables:
+    KUBERNETES_CPU_REQUEST: "8"
+    KUBERNETES_CPU_LIMIT: "16"
+    KUBERNETES_MEMORY_REQUEST: "16Gi"
+    KUBERNETES_MEMORY_LIMIT: "32Gi"
+  needs:
+    - job: lint
+      optional: true
+  script:
+    - pip install --no-cache-dir -e "python/[test]"
+    - cd test/
+    - python3 run_suite.py --hw cpu --suite stage-a-test-cpu --enable-retry --max-attempts 2
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api"
+      when: on_success
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: *main-package-paths
+      when: on_success
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH
+      when: on_success
+    - when: never
+
+# =============================================================================
+# Stage: finish
+# =============================================================================
+
+pr-test-finish:
+  stage: finish
+  image: micr.cloud.mioffice.cn/llm-infra/alpine:latest
+  interruptible: true
+  timeout: 5m
+  when: always
+  script:
+    - echo "Pipeline complete."
+    - echo "All upstream jobs have finished."

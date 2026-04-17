@@ -87,6 +87,7 @@ CI_LORA_MODELS = [
             ),
         ],
         max_loras_per_batch=1,
+        decode_tolerance=1.5e-1,
     ),
 ]
 

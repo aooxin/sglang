@@ -26,6 +26,7 @@ class TestEagle3Basic(EagleServerBase):
     spec_steps = 2
     spec_topk = 1
     spec_tokens = 3
+    server_env = {"SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"}
     extra_args = (
         [
             "--dtype=float16",

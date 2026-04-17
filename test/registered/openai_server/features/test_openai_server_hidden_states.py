@@ -8,8 +8,10 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
+    DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TARGET_MODEL_EAGLE,
+    DEFAULT_TARGET_MODEL_EAGLE3,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -312,15 +314,16 @@ class TestOpenAIServerWithEAGLE3AndHiddenStatesEnabled(
 ):
     @classmethod
     def setUpClass(cls):
-        cls.model = "meta-llama/Llama-3.1-8B-Instruct"
+        cls.model = DEFAULT_TARGET_MODEL_EAGLE3
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.speculative_algorithm = "EAGLE3"
-        cls.speculative_draft_model = "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B"
+        cls.speculative_draft_model = DEFAULT_DRAFT_MODEL_EAGLE3
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env={"SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1"},
             other_args=[
                 "--speculative-algorithm",
                 cls.speculative_algorithm,

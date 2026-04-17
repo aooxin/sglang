@@ -1,0 +1,30 @@
+FROM micr.cloud.mioffice.cn/llm-infra/cuda:12.9.1-cudnn-devel-ubuntu22.04
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv python3-dev \
+        git curl wget ca-certificates \
+    && ln -sf /usr/bin/python3 /usr/bin/python \
+    && pip3 install --no-cache-dir --upgrade pip setuptools wheel \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY . /sgl-workspace/sglang
+RUN cd /sgl-workspace/sglang && bash scripts/ci/cuda/ci_install_dependency.sh
+# RUN rm -fr /sgl-workspace/sglang
+
+# Install GitLab Runner
+RUN curl -L "https://packages.gitlab.com/install/repositories/runner/gitlab-runner/script.deb.sh" | bash \
+    && apt-get install -y gitlab-runner vim \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code (requires Node.js)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && npm install -g @anthropic-ai/claude-code \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /

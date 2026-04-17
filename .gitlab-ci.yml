@@ -1,20 +1,16 @@
 # =============================================================================
-# GitLab CI Configuration for SGLang (Lint + CPU Tests)
+# GitLab CI Configuration for SGLang
 # =============================================================================
 #
-# Pipeline structure:  lint -> stage-a (CPU tests) -> finish
+# Pipeline structure:  lint -> stage-a -> stage-c (8-gpu-h200) -> finish
 #
-# This is a minimal CI configuration that runs:
-#   1. Pre-commit linting (isort, ruff, black, codespell)
-#   2. Clang-format for sgl-kernel C++/CUDA files
-#   3. CPU-only test suite (no GPU required)
-#
-# GPU test stages will be added in a follow-up MR.
 # =============================================================================
 
 stages:
   - lint
   - stage-a
+  - stage-b
+  - stage-c
   - finish
 
 variables:
@@ -23,7 +19,6 @@ variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
   PIP_INDEX_URL: "https://pkgs.d.xiaomi.net/artifactory/api/pypi/pypi-virtual/simple"
   PIP_TRUSTED_HOST: "pkgs.d.xiaomi.net"
-  HF_ENDPOINT: "https://hf-mirror.com"
 
 workflow:
   rules:
@@ -104,6 +99,7 @@ stage-a-test-cpu:
     KUBERNETES_CPU_LIMIT: "16"
     KUBERNETES_MEMORY_REQUEST: "16Gi"
     KUBERNETES_MEMORY_LIMIT: "32Gi"
+    # HF_ENDPOINT: K8s pods cannot reach hf-mirror.com; use default huggingface.co
   needs:
     - job: lint
       optional: true
@@ -121,6 +117,167 @@ stage-a-test-cpu:
       when: on_success
     - when: never
 
+stage-a-test-1-gpu-small:
+  extends:
+    - .gpu-test-template
+    - .rules-main-package
+  stage: stage-a
+  tags: [1-gpu-h200]
+  needs:
+    - job: lint
+      optional: true
+  script:
+    - pip install --no-cache-dir -e "python/[test]"
+    - cd test/
+    - python3 run_suite.py --hw cuda --suite stage-a-test-1-gpu-small --enable-retry --max-attempts 2
+
+# =============================================================================
+# Templates
+# =============================================================================
+
+.gpu-test-template:
+  image: micr.cloud.mioffice.cn/llm-infra/sglang-ci-gpu:latest
+  interruptible: true
+  variables:
+    SGLANG_CUDA_COREDUMP: "1"
+    SGLANG_JIT_DEEPGEMM_FAST_WARMUP: "true"
+    SGLANG_CUDA_COREDUMP_DIR: "/tmp/sglang_cuda_coredumps"
+  before_script:
+    - mkdir -p "$SGLANG_CUDA_COREDUMP_DIR"
+  after_script:
+    - |
+      if [ -d "$SGLANG_CUDA_COREDUMP_DIR" ] && [ "$(ls -A $SGLANG_CUDA_COREDUMP_DIR 2>/dev/null)" ]; then
+        echo "CUDA coredumps found:"
+        ls -la "$SGLANG_CUDA_COREDUMP_DIR"
+      fi
+  timeout: 4h
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
+.rules-main-package:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" || $CI_PIPELINE_SOURCE == "web" || $CI_PIPELINE_SOURCE == "api"
+      when: on_success
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: *main-package-paths
+      when: on_success
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH
+      when: on_success
+    - when: never
+
+# =============================================================================
+# Stage: stage-b (1-GPU Tests)
+# =============================================================================
+
+stage-b-test-1-gpu-small:
+  extends:
+    - .gpu-test-template
+    - .rules-main-package
+  stage: stage-b
+  tags: [1-gpu-h200]
+  parallel: 8
+  needs:
+    - job: stage-a-test-1-gpu-small
+      optional: true
+  script:
+    - pip install --no-cache-dir -e "python/[test]"
+    - pip install "setuptools==70.0.0"
+    - pip install "peft==0.18.1"  # peft 0.19+ requires torchao>=0.16 which conflicts with torch 2.9.x bundled torchao 0.9
+    - git clone https://github.com/merrymercy/human-eval.git /tmp/human-eval
+        && cd /tmp/human-eval && pip install -e . --no-build-isolation && cd -
+    - cd test/
+    - python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-small
+        --auto-partition-id $((CI_NODE_INDEX - 1))
+        --auto-partition-size $CI_NODE_TOTAL
+        --enable-retry --max-attempts 2
+
+stage-b-test-1-gpu-large:
+  extends:
+    - .gpu-test-template
+  stage: stage-b
+  tags: [1-gpu-h200]
+  rules:
+    - when: manual
+  allow_failure: true  # manual jobs must allow_failure to not block pipeline
+  parallel: 14
+  needs:
+    - job: stage-a-test-1-gpu-small
+      optional: true
+  script:
+    - pip install --no-cache-dir -e "python/[test]"
+    - pip install "setuptools==70.0.0"
+    - pip install "peft==0.18.1"  # peft 0.19+ requires torchao>=0.16 which conflicts with torch 2.9.x bundled torchao 0.9
+    - git clone https://github.com/merrymercy/human-eval.git /tmp/human-eval
+        && cd /tmp/human-eval && pip install -e . --no-build-isolation && cd -
+    - cd test/
+    - python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-large
+        --auto-partition-id $((CI_NODE_INDEX - 1))
+        --auto-partition-size $CI_NODE_TOTAL
+        --timeout-per-file 1800
+        --enable-retry --max-attempts 2
+
+# =============================================================================
+# Stage: stage-c (8-GPU H200 Tests)
+# =============================================================================
+
+# --- stage-c-test-8-gpu-h200 (4 partitions) ---
+# From: .github/workflows/pr-test.yml stage-c-test-8-gpu-h200
+# Runs: run_suite.py --hw cuda --suite stage-c-test-8-gpu-h200
+
+stage-c-test-8-gpu-h200:
+  extends:
+    - .gpu-test-template
+  stage: stage-c
+  tags: [8-gpu-h200]
+  rules:
+    - when: manual
+  allow_failure: true
+  parallel: 4
+  needs:
+    - job: stage-a-test-cpu
+      optional: true
+  script:
+    - pip install --no-cache-dir -e "python/[test]"
+    # - bash scripts/ci/cuda/ci_install_dependency.sh  # pre-installed in sglang-ci-gpu image
+    - python3 scripts/ci/cuda/warmup_deep_gemm.py
+        deepseek-ai/DeepSeek-V3-0324:8
+        deepseek-ai/DeepSeek-V3.2-Exp:8
+    - python3 scripts/ci/cuda/warmup_server.py
+        deepseek-ai/DeepSeek-V3-0324:8
+        inclusionAI/Ring-2.5-1T:8
+    - cd test/
+    - python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h200
+        --auto-partition-id $((CI_NODE_INDEX - 1))
+        --auto-partition-size $CI_NODE_TOTAL
+
+# --- stage-c-test-deepep-8-gpu-h200 ---
+# From: .github/workflows/pr-test.yml stage-c-test-deepep-8-gpu-h200
+# Runs: run_suite.py --hw cuda --suite stage-c-test-deepep-8-gpu-h200
+
+stage-c-test-deepep-8-gpu-h200:
+  extends:
+    - .gpu-test-template
+  stage: stage-c
+  tags: [8-gpu-h200]
+  rules:
+    - when: manual
+  allow_failure: true
+  needs:
+    - job: stage-a-test-cpu
+      optional: true
+  script:
+    - bash scripts/ci/cuda/ci_install_deepep.sh
+    - python3 scripts/ci/cuda/warmup_deep_gemm.py
+        deepseek-ai/DeepSeek-V3-0324:8
+        deepseek-ai/DeepSeek-V3.2-Exp:8
+    - python3 scripts/ci/cuda/warmup_server.py
+        deepseek-ai/DeepSeek-V3-0324:8
+    - cd test/
+    - python3 run_suite.py --hw cuda --suite stage-c-test-deepep-8-gpu-h200
+
 # =============================================================================
 # Stage: finish
 # =============================================================================
@@ -130,6 +287,16 @@ pr-test-finish:
   image: micr.cloud.mioffice.cn/llm-infra/alpine:latest
   interruptible: true
   timeout: 5m
+  needs:
+    - job: stage-a-test-cpu
+    - job: stage-a-test-1-gpu-small
+    - job: stage-b-test-1-gpu-small
+    - job: stage-b-test-1-gpu-large
+      optional: true
+    - job: stage-c-test-8-gpu-h200
+      optional: true
+    - job: stage-c-test-deepep-8-gpu-h200
+      optional: true
   when: always
   script:
     - echo "Pipeline complete."

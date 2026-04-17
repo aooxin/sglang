@@ -123,7 +123,12 @@ def _get_sentence_transformer_embedding_model(
     else:  # if no pre-trained sentence-transformers model
         from sentence_transformers import models
 
-        word_embedding_model = models.Transformer(model_path).to(dtype=torch_dtype)
+        word_embedding_model = models.Transformer(
+            model_path,
+            # Force causal attention to match SGLang's RadixAttention behavior,
+            # same as the is_sentence_transformer_model branch above.
+            config_kwargs={"is_causal": True},
+        ).to(dtype=torch_dtype)
         # In transformers v5, composite configs (e.g. Qwen2VLConfig) may not
         # expose hidden_size at the top level.  Patch it from the text sub-config
         # so sentence_transformers' get_word_embedding_dimension() works.

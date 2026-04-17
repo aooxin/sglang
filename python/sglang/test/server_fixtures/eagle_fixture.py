@@ -33,6 +33,7 @@ class EagleServerBase(CustomTestCase):
     spec_tokens = 64
     mem_fraction_static = 0.7
     extra_args = []
+    server_env = None
 
     @classmethod
     def setUpClass(cls):
@@ -44,6 +45,7 @@ class EagleServerBase(CustomTestCase):
                 cls.target_model,
                 cls.base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                env=cls.server_env,
                 other_args=[
                     f"--speculative-algorithm={cls.spec_algo}",
                     f"--speculative-draft-model-path={cls.draft_model}",

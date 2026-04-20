@@ -12,6 +12,7 @@ stages:
   - stage-b
   - stage-c
   - finish
+  - release
 
 variables:
   SGLANG_IS_IN_CI: "true"
@@ -301,3 +302,44 @@ pr-test-finish:
   script:
     - echo "Pipeline complete."
     - echo "All upstream jobs have finished."
+
+# =============================================================================
+# Stage: release (Docker image build)
+# =============================================================================
+#
+# Mirrors .github/workflows/release-docker.yml publish-x86 (cu129 variant).
+# Builds the `framework` target for linux/amd64 and pushes to the internal registry.
+# Requires CI_REGISTRY, CI_REGISTRY_USER_IAM, CI_REGISTRY_PASSWORD_IAM CI variables.
+
+.release-docker-template:
+  stage: release
+  tags: [docker-build]
+  rules:
+    - when: manual
+  allow_failure: true
+  timeout: 4h
+  needs:
+    - job: stage-a-test-cpu
+      optional: true
+    - job: stage-a-test-1-gpu-small
+      optional: true
+  variables:
+    IMAGE: "micr.cloud.mioffice.cn/llm-infra/sglang"
+    GIT_DEPTH: 0
+  script:
+    - TAG="${BASE_IMAGE_VERSION}-xm-${CI_COMMIT_SHORT_SHA}-$(date +%Y%m%d-%H%M)"
+    - echo "Building ${IMAGE}:${TAG}"
+    - echo "$CI_REGISTRY_PASSWORD_IAM" | docker login -u "$CI_REGISTRY_USER_IAM" --password-stdin "$CI_REGISTRY"
+    - docker build -f docker/Dockerfile.xiaomi --build-arg BASE_IMAGE_VERSION="${BASE_IMAGE_VERSION}" -t "${IMAGE}:${TAG}" .
+    - docker push "${IMAGE}:${TAG}"
+    - echo "Pushed ${IMAGE}:${TAG}"
+
+release-docker-cu129:
+  extends: .release-docker-template
+  variables:
+    BASE_IMAGE_VERSION: "v0.5.10"
+
+release-docker-cu130:
+  extends: .release-docker-template
+  variables:
+    BASE_IMAGE_VERSION: "v0.5.10-cu130"

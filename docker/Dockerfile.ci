@@ -1,19 +1,18 @@
-FROM micr.cloud.mioffice.cn/llm-infra/python:3.12
+ARG BASE_IMAGE_VERSION=v0.5.10
+FROM micr.cloud.mioffice.cn/llm-infra/sglang:${BASE_IMAGE_VERSION}
+ENV PIP_INDEX_URL "https://pkgs.d.xiaomi.net/artifactory/api/pypi/pypi-virtual/simple"
+ENV PIP_TRUSTED_HOST "pkgs.d.xiaomi.net"
 
 # System deps: git (required by pre-commit), clang-format-20 (C++/CUDA lint)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git wget gnupg \
-    && wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg \
-    && echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/unstable/ llvm-toolchain-20 main" \
-        > /etc/apt/sources.list.d/llvm.list \
-    && apt-get update \
+    && apt-get install -y --no-install-recommends git wget vim \
     && apt-get install -y --no-install-recommends clang-format-20 \
-    && apt-get purge -y wget gnupg \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-commit
-RUN pip install --no-cache-dir pre-commit
+RUN pip install --no-cache-dir pre-commit && pre-commit install-hooks -c .pre-commit-config.yaml
+RUN rm -fr /sgl-workspace/sglang
 
 # Install Claude Code (requires Node.js).
 RUN apt-get update \
@@ -23,12 +22,5 @@ RUN apt-get update \
     && npm install -g @anthropic-ai/claude-code \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/*
-
-# Pre-warm all pre-commit hook environments (baked into image layer)
-COPY .pre-commit-config.yaml /tmp/.pre-commit-config.yaml
-WORKDIR /tmp
-RUN git init \
-    && pre-commit install-hooks -c .pre-commit-config.yaml \
-    && rm -rf /tmp/.git /tmp/.pre-commit-config.yaml
 
 WORKDIR /

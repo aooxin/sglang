@@ -149,7 +149,7 @@ claudecode-codereview:
 
 stage-a-test-cpu:
   stage: stage-a
-  image: micr.cloud.mioffice.cn/llm-infra/python:3.12
+  image: micr.cloud.mioffice.cn/llm-infra/sglang-ci:latest
   interruptible: true
   timeout: 30m
   variables:

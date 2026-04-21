@@ -15,6 +15,15 @@ RUN apt-get update \
 # Pre-commit
 RUN pip install --no-cache-dir pre-commit
 
+# Install Claude Code (requires Node.js).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y nodejs \
+    && npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force \
+    && rm -rf /var/lib/apt/lists/*
+
 # Pre-warm all pre-commit hook environments (baked into image layer)
 COPY .pre-commit-config.yaml /tmp/.pre-commit-config.yaml
 WORKDIR /tmp

@@ -86,6 +86,63 @@ lint-clang-format:
       changes: *sgl-kernel-paths
     - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
+# Requires CI/CD variables ANTHROPIC_API_KEY and GITLAB_API_TOKEN
+# (PAT with 'api' scope, used to post the MR note).
+
+claudecode-codereview:
+  stage: lint
+  image: micr.cloud.mioffice.cn/llm-infra/sglang-ci:latest
+  interruptible: true
+  timeout: 10m
+  allow_failure: true
+  variables:
+    GIT_DEPTH: 0  # need merge-base with target branch for the review diff
+  script:
+    - set -o pipefail
+    - >
+      claude
+      -p 'Read .claude/skills/gitlab-codereview/SKILL.md and follow it exactly.
+      MR metadata (IID, source/target branches) is in CI_MERGE_REQUEST_*
+      environment variables — read them from env, do not expect them in this prompt.
+      Print only the final Chinese markdown review to stdout. Do not modify files.'
+      --permission-mode default
+      --allowedTools "Bash Read Grep Glob Agent"
+      2> /tmp/claude.log | tee /tmp/review.md
+    - |
+      set -o pipefail
+      if [ ! -s /tmp/review.md ]; then
+        echo "Claude produced an empty review; skipping MR comment."
+        echo "--- /tmp/claude.log ---"
+        cat /tmp/claude.log || true
+        exit 0
+      fi
+      if [ -z "${GITLAB_API_TOKEN:-}" ]; then
+        echo "GITLAB_API_TOKEN not set; skipping MR note post."
+        echo "Review content follows:"
+        cat /tmp/review.md
+        exit 0
+      fi
+      { echo "### Claude Code Review"; echo; cat /tmp/review.md; } > /tmp/note.md
+      python3 -c 'import json,sys; print(json.dumps({"body": sys.stdin.read()}))' \
+        < /tmp/note.md > /tmp/note.json
+      API_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes"
+      HTTP_CODE=$(curl -sS -o /tmp/note_resp.json -w "%{http_code}" \
+        --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" \
+        --header "Content-Type: application/json" \
+        --data @/tmp/note.json \
+        "$API_URL")
+      echo "POST $API_URL -> HTTP $HTTP_CODE"
+      : "${HTTP_CODE:=000}"
+      if [ "$HTTP_CODE" -ge 400 ]; then
+        echo "Failed to post MR note (HTTP $HTTP_CODE):"
+        cat /tmp/note_resp.json || true
+        echo "Review content was:"
+        cat /tmp/review.md
+        exit 1
+      fi
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
 # =============================================================================
 # Stage: stage-a (CPU Preflight Tests)
 # =============================================================================

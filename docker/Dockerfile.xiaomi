@@ -27,4 +27,6 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages --no-build-iso
     nvtx==0.2.13 \
     pybind11==3.0.1
 
+# cleanup sglang workspace
+RUN rm -fr /sgl-workspace/sglang
 COPY . .

@@ -2,7 +2,7 @@
 # GitLab CI Configuration for SGLang
 # =============================================================================
 #
-# Pipeline structure:  lint -> stage-a -> stage-c (8-gpu-h200) -> finish
+# Pipeline: lint -> stage-a -> stage-b -> stage-c -> mimo-test -> finish | release
 #
 # =============================================================================
 
@@ -11,6 +11,7 @@ stages:
   - stage-a
   - stage-b
   - stage-c
+  - mimo-test
   - finish
   - release
 
@@ -162,7 +163,7 @@ stage-a-test-cpu:
     - job: lint
       optional: true
   script:
-    - pip install --no-cache-dir -e "python/[test]"
+    - pip install --no-cache-dir --no-deps -e "python/[test]"
     - cd test/
     - python3 run_suite.py --hw cpu --suite stage-a-test-cpu --enable-retry --max-attempts 2
   rules:
@@ -194,7 +195,7 @@ stage-a-test-1-gpu-small:
 # =============================================================================
 
 .gpu-test-template:
-  image: micr.cloud.mioffice.cn/llm-infra/sglang-ci-gpu:latest
+  image: micr.cloud.mioffice.cn/llm-infra/sglang-ci:latest
   interruptible: true
   variables:
     SGLANG_CUDA_COREDUMP: "1"
@@ -299,7 +300,7 @@ stage-c-test-8-gpu-h200:
       optional: true
   script:
     - pip install --no-cache-dir -e "python/[test]"
-    # - bash scripts/ci/cuda/ci_install_dependency.sh  # pre-installed in sglang-ci-gpu image
+    # - bash scripts/ci/cuda/ci_install_dependency.sh  # pre-installed in sglang-ci image
     - python3 scripts/ci/cuda/warmup_deep_gemm.py
         deepseek-ai/DeepSeek-V3-0324:8
         deepseek-ai/DeepSeek-V3.2-Exp:8
@@ -400,3 +401,32 @@ release-docker-cu130:
   extends: .release-docker-template
   variables:
     BASE_IMAGE_VERSION: "v0.5.10-cu130"
+
+# =============================================================================
+# Stage: mimo-test (mimo-v2-flash startup/smoke test)
+# =============================================================================
+
+mimo-v2-flash-startup-test:
+  extends:
+    - .gpu-test-template
+  stage: mimo-test
+  tags: [8-gpu-h200]
+  rules:
+    - when: on_success
+  allow_failure: true
+  timeout: 2h
+  needs:
+    - job: stage-a-test-1-gpu-small
+      optional: true
+  script:
+    - pip install --no-cache-dir --no-deps -e "python/"
+    - python3 test/registered/8-gpu-models/test_mimo_models.py
+    # Deploy script uses --moe-a2a-backend deepep, which the ci image does not ship.
+    - python3 -c "import deep_ep" 2>/dev/null || bash scripts/ci/cuda/ci_install_deepep.sh
+    - bash scripts/ci/cuda/deploy_test_mimo_v2_flash.sh
+  artifacts:
+    when: always
+    paths:
+      - mimo_v2_flash_server_*.log
+      - smoke_response.json
+    expire_in: 7 days

@@ -2,7 +2,7 @@
 # GitLab CI Configuration for SGLang
 # =============================================================================
 #
-# Pipeline: lint -> stage-a -> stage-b -> stage-c -> mimo-test -> finish | release
+# Pipeline: lint -> stage-a -> stage-b -> stage-c -> mimo-test -> finish | release | deploy
 #
 # =============================================================================
 
@@ -14,6 +14,7 @@ stages:
   - mimo-test
   - finish
   - release
+  - deploy
 
 variables:
   SGLANG_IS_IN_CI: "true"
@@ -391,6 +392,10 @@ pr-test-finish:
     - docker build -f docker/Dockerfile.xiaomi --build-arg BASE_IMAGE_VERSION="${BASE_IMAGE_VERSION}" -t "${IMAGE}:${TAG}" .
     - docker push "${IMAGE}:${TAG}"
     - echo "Pushed ${IMAGE}:${TAG}"
+    - echo "SGLANG_IMAGE_URL=${IMAGE}:${TAG}" > build.env
+  artifacts:
+    reports:
+      dotenv: build.env
 
 release-docker-cu129:
   extends: .release-docker-template
@@ -430,3 +435,31 @@ mimo-v2-flash-startup-test:
       - mimo_v2_flash_server_*.log
       - smoke_response.json
     expire_in: 7 days
+
+# =============================================================================
+# Stage: deploy (CloudML deployment)
+# =============================================================================
+
+# --- deploy-cloudml-pd (PD disaggregation deployment) ---
+# Creates a new multi-role deployment (Prefill + Encode + Decode + Router) on CloudML.
+# Uses flash-1p1d-gm403.yaml as roles config, replacing Prefill/Decode imageUrl.
+# Requires CLOUDML_ACCESS_KEY and CLOUDML_SECRET_KEY as masked CI/CD variables.
+
+deploy-cloudml-pd:
+  stage: deploy
+  image: micr.cloud.mioffice.cn/llm-infra/sglang-ci:latest
+  rules:
+    - when: manual
+  allow_failure: true
+  timeout: 10m
+  needs:
+    - job: release-docker-cu129
+      artifacts: true
+  variables:
+    CLOUDML_WORKSPACE_ID: "10042"
+    CLOUDML_SERVICE_ID: "s-20260422174439-m61fj"
+    CLOUDML_AREA: "安康"
+    CLOUDML_QUEUE_NAME: "router-for-test"
+  script:
+    - echo "Deploying image ${SGLANG_IMAGE_URL}"
+    - bash scripts/ci/cloudml/deploy_pd.sh

@@ -374,6 +374,7 @@ class ModelConfig:
             "MiMoV2FlashForCausalLM",
             "MiMoV2MTP",
             "MiMoV2ProForCausalLM",
+            "MiMoV2OmniForCausalLM",
         ]
 
     def _derive_context_length(self, context_length: int):
@@ -1313,6 +1314,7 @@ multimodal_model_archs = [
     "LlavaVidForCausalLM",
     "Lfm2VlForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
+    "MiMoV2OmniForCausalLM",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
@@ -1443,6 +1445,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "MiMoV2FlashForCausalLM",
         "MiMoV2MTP",
         "MiMoV2ProForCausalLM",
+        "MiMoV2OmniForCausalLM",
         "Step3p5ForCausalLM",
         "Step3p5MTP",
     }
@@ -1469,7 +1472,7 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
-    elif any(x in model_architectures for x in ("MiMoV2FlashForCausalLM", "MiMoV2ProForCausalLM")):
+    elif any(x in model_architectures for x in ("MiMoV2FlashForCausalLM", "MiMoV2ProForCausalLM", "MiMoV2OmniForCausalLM")):
         hybrid_layer_pattern = getattr(hf_text_config, "hybrid_layer_pattern", None)
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1

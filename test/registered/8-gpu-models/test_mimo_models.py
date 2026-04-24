@@ -2,8 +2,10 @@ import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.mmmu_vlm_kit import MMMUMixin
 from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
+from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
 
 register_cuda_ci(est_time=200, suite="stage-c-test-8-gpu-h200")
 
@@ -46,6 +48,37 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
 
     bs_1_speed_thres = 170
     accept_length_thres = 3.2
+
+
+MIMO_V2_OMNI_MODEL = "XiaomiMiMo/MiMo-V2-Omni"
+MIMO_V2_OMNI_OTHER_ARGS = [
+    "--tp",
+    "8",
+    "--dp",
+    "2",
+    "--enable-dp-attention",
+    "--trust-remote-code",
+    "--mm-enable-dp-encoder",
+    "--attention-backend",
+    "fa3",
+    "--mm-attention-backend",
+    "fa3",
+]
+
+
+@unittest.skip("Skip MiMo-V2-Omni GSM8K test")
+class TestMiMoV2OmniGSM8K(GSM8KMixin, DefaultServerBase):
+    gsm8k_accuracy_thres = 0.75
+    model = MIMO_V2_OMNI_MODEL
+    other_args = MIMO_V2_OMNI_OTHER_ARGS
+
+
+@unittest.skip("MMMU dataset not pre-cached on 8-gpu-h200 runner; skip until cache is primed")
+class TestMiMoV2OmniMMMU(MMMUMixin, MMMUServerBase):
+    accuracy = 0.444
+    model = MIMO_V2_OMNI_MODEL
+    other_args = MIMO_V2_OMNI_OTHER_ARGS
+    mmmu_args = ["--limit=0.1"]
 
 
 if __name__ == "__main__":

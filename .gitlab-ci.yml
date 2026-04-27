@@ -43,6 +43,7 @@ workflow:
   - python/pyproject.toml
   - scripts/ci/cuda/*
   - scripts/ci/utils/*
+  - scripts/ci/xiaomi/*
   - test/**/*
   - .gitlab-ci.yml
 
@@ -111,37 +112,13 @@ claudecode-codereview:
       --allowedTools "Bash Read Grep Glob Agent"
       2> /tmp/claude.log | tee /tmp/review.md
     - |
-      set -o pipefail
       if [ ! -s /tmp/review.md ]; then
         echo "Claude produced an empty review; skipping MR comment."
-        echo "--- /tmp/claude.log ---"
-        cat /tmp/claude.log || true
-        exit 0
-      fi
-      if [ -z "${GITLAB_API_TOKEN:-}" ]; then
-        echo "GITLAB_API_TOKEN not set; skipping MR note post."
-        echo "Review content follows:"
-        cat /tmp/review.md
+        cat /tmp/claude.log 2>/dev/null || true
         exit 0
       fi
       { echo "### Claude Code Review"; echo; cat /tmp/review.md; } > /tmp/note.md
-      python3 -c 'import json,sys; print(json.dumps({"body": sys.stdin.read()}))' \
-        < /tmp/note.md > /tmp/note.json
-      API_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes"
-      HTTP_CODE=$(curl -sS -o /tmp/note_resp.json -w "%{http_code}" \
-        --header "PRIVATE-TOKEN: ${GITLAB_API_TOKEN}" \
-        --header "Content-Type: application/json" \
-        --data @/tmp/note.json \
-        "$API_URL")
-      echo "POST $API_URL -> HTTP $HTTP_CODE"
-      : "${HTTP_CODE:=000}"
-      if [ "$HTTP_CODE" -ge 400 ]; then
-        echo "Failed to post MR note (HTTP $HTTP_CODE):"
-        cat /tmp/note_resp.json || true
-        echo "Review content was:"
-        cat /tmp/review.md
-        exit 1
-      fi
+      bash scripts/ci/xiaomi/post_mr_note.sh /tmp/note.md
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
@@ -426,14 +403,51 @@ mimo-v2-flash-startup-test:
   script:
     - pip install --no-cache-dir --no-deps -e "python/"
     - python3 test/registered/8-gpu-models/test_mimo_models.py
-    # Deploy script uses --moe-a2a-backend deepep, which the ci image does not ship.
+
+mimo-v2-flash-benchmark:
+  extends:
+    - .gpu-test-template
+  stage: mimo-test
+  tags: [8-gpu-h200]
+  rules:
+    - when: on_success
+  allow_failure: true
+  timeout: 3h
+  needs:
+    - job: stage-a-test-1-gpu-small
+      optional: true
+  script:
+    - pip install --no-cache-dir --no-deps -e "python/"
     - python3 -c "import deep_ep" 2>/dev/null || bash scripts/ci/cuda/ci_install_deepep.sh
-    - bash scripts/ci/cuda/deploy_test_mimo_v2_flash.sh
+    - bash scripts/ci/xiaomi/benchmark_mimo_v2_flash_prefill.sh
+    - bash scripts/ci/xiaomi/benchmark_mimo_v2_flash_decode.sh
+    - python3 scripts/ci/xiaomi/summarize_benchmark_results.py
+        --title "Prefill Benchmark (mimo-v2-flash)"
+        --output benchmark_summary_prefill.md
+        "benchmark_results_prefill-*.json"
+    - python3 scripts/ci/xiaomi/summarize_benchmark_results.py
+        --title "Decode Benchmark (mimo-v2-flash)"
+        --output benchmark_summary_decode.md
+        "benchmark_results_decode-*.json"
+    - |
+      if [ ! -f benchmark_summary_prefill.md ] && [ ! -f benchmark_summary_decode.md ]; then
+        echo "No summary files found; skipping MR note."
+        exit 0
+      fi
+      {
+        echo "## MiMo-V2-Flash Benchmark Results"
+        echo
+        cat benchmark_summary_prefill.md 2>/dev/null || true
+        echo
+        cat benchmark_summary_decode.md 2>/dev/null || true
+      } > benchmark_note.md
+      bash scripts/ci/xiaomi/post_mr_note.sh benchmark_note.md
   artifacts:
     when: always
     paths:
       - mimo_v2_flash_server_*.log
-      - smoke_response.json
+      - benchmark_results_*.json
+      - benchmark_summary_*.md
     expire_in: 7 days
 
 # =============================================================================
@@ -462,4 +476,4 @@ deploy-cloudml-pd:
     CLOUDML_QUEUE_NAME: "router-for-test"
   script:
     - echo "Deploying image ${SGLANG_IMAGE_URL}"
-    - bash scripts/ci/cloudml/deploy_pd.sh
+    - bash scripts/ci/xiaomi/deploy_pd.sh

@@ -54,6 +54,16 @@ workflow:
 # Stage: lint
 # =============================================================================
 
+lint-mr-title:
+  stage: lint
+  image: micr.cloud.mioffice.cn/llm-infra/ubuntu:24.04
+  interruptible: true
+  timeout: 5m
+  script:
+    - bash scripts/ci/xiaomi/check_mr_title.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
 lint:
   stage: lint
   image: micr.cloud.mioffice.cn/llm-infra/sglang-ci:latest

@@ -76,7 +76,7 @@ from sglang.srt.utils import (
     make_layers,
 )
 
-MiMoV2FlashConfig = None
+MiMoV2Config = None
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +178,7 @@ class MiMoV2MoE(nn.Module):
 
     def __init__(
         self,
-        config: MiMoV2FlashConfig,
+        config: MiMoV2Config,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -563,7 +563,7 @@ class MiMoV2Attention(nn.Module):
 class MiMoV2DecoderLayer(nn.Module):
     def __init__(
         self,
-        config: MiMoV2FlashConfig,
+        config: MiMoV2Config,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -797,7 +797,7 @@ class MiMoV2DecoderLayer(nn.Module):
 class MiMoV2Model(nn.Module):
     def __init__(
         self,
-        config: MiMoV2FlashConfig,
+        config: MiMoV2Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         decoder_layer_type: type[nn.Module] = MiMoV2DecoderLayer,
@@ -948,7 +948,7 @@ class MiMoV2Model(nn.Module):
                 )
 
 
-class MiMoV2FlashForCausalLM(nn.Module):
+class MiMoV2ForCausalLM(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -970,7 +970,7 @@ class MiMoV2FlashForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: MiMoV2FlashConfig,
+        config: MiMoV2Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -1188,9 +1188,9 @@ class MiMoV2FlashForCausalLM(nn.Module):
         )
 
 
-# Pro uses the same architecture; subclass so registry sees a distinct __name__
-class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
+# Keep the old Flash architecture name loadable while new configs use MiMoV2ForCausalLM.
+class MiMoV2FlashForCausalLM(MiMoV2ForCausalLM):
     pass
 
 
-EntryClass = [MiMoV2FlashForCausalLM, MiMoV2ProForCausalLM]
+EntryClass = [MiMoV2ForCausalLM, MiMoV2FlashForCausalLM]

@@ -42,13 +42,13 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.mimo_v2 import (
     MiMoV2Attention,
-    MiMoV2FlashForCausalLM,
+    MiMoV2ForCausalLM,
     MiMoV2MLP,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
-MiMoV2FlashConfig = None
+MiMoV2Config = None
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 class MiMoV2MTPLayer(nn.Module):
     def __init__(
         self,
-        config: MiMoV2FlashConfig,
+        config: MiMoV2Config,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -233,7 +233,7 @@ class MiMoV2ModelNextN(nn.Module):
         return hidden_states, hidden_states_before_norm
 
 
-class MiMoV2MTP(MiMoV2FlashForCausalLM):
+class MiMoV2MTP(MiMoV2ForCausalLM):
 
     def __init__(
         self,

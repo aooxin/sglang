@@ -30,4 +30,8 @@ RUN apt-get update \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/*
 
+RUN mkdir -p ~/.claude/skills/ \
+    && git clone git@git.n.xiaomi.com:ai-studio/cloudml-service-deploy-skill.git \
+  ~/.claude/skills/cloudml-service-deploy
+
 WORKDIR /

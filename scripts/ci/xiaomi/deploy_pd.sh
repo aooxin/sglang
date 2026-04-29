@@ -1,20 +1,32 @@
 #!/usr/bin/env bash
 # Deploy a PD-disaggregation service to CloudML.
-# Uses flash-1p1d-gm403.yaml as the roles config, replacing imageUrl for
-# Prefill/Decode roles with SGLANG_IMAGE_URL.
+#
+# Usage:
+#   deploy_pd.sh --deploy-yaml <path> [--deployment-name <name>]
+#
+# --deploy-yaml      (required) path to the deployment YAML config
+# --deployment-name  defaults to "gitlab-ci-flash-1p1d-<CI_JOB_ID>"
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CLOUDML_API="${SCRIPT_DIR}/cloudml_api.py"
-ROLES_CONFIG="${SCRIPT_DIR}/flash-1p1d-gm403.yaml"
-MODEL_REPO_CONFIG="${SCRIPT_DIR}/flash-model-repo.yaml"
+CLOUDML_API="${CLOUDML_MAAS_HOME}/scripts/cloudml_api.py"
+
+# --- Parse arguments ---
+DEPLOYMENT_NAME=""
+DEPLOY_YAML=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --deployment-name) DEPLOYMENT_NAME="$2"; shift 2 ;;
+        --deploy-yaml)     DEPLOY_YAML="$2";     shift 2 ;;
+        *) echo "ERROR: Unknown argument: $1"; exit 1 ;;
+    esac
+done
 
 # --- Validate required variables ---
 REQUIRED_VARS=(
+    CLOUDML_MAAS_HOME
     CLOUDML_WORKSPACE_ID
     CLOUDML_SERVICE_ID
-    CLOUDML_AREA
-    CLOUDML_QUEUE_NAME
     CLOUDML_ACCESS_KEY
     CLOUDML_SECRET_KEY
     SGLANG_IMAGE_URL
@@ -31,15 +43,36 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
     exit 1
 fi
 
-CLOUDML_DEPLOYMENT_NAME="gitlab-ci-flash-1p1d-${CI_JOB_ID:-local}"
+# --- Validate arguments ---
+if [[ -z "${DEPLOY_YAML}" ]]; then
+    echo "ERROR: --deploy-yaml is required"
+    exit 1
+fi
+
+DEPLOYMENT_NAME="${DEPLOYMENT_NAME:-gitlab-ci-flash-1p1d-${CI_JOB_ID:-local}}"
+
+# --- Temp files (cleaned up on exit) ---
+RENDERED_DEPLOY_YAML=$(mktemp /tmp/pd-roles-config.XXXXXX.yaml)
+DEPLOY_JSON=$(mktemp /tmp/pd-deployment.XXXXXX.json)
+DEPLOYMENT_ID=""
+
+cleanup() {
+    rm -f "${RENDERED_DEPLOY_YAML}" "${DEPLOY_JSON}"
+    if [[ -n "${DEPLOYMENT_ID}" ]]; then
+        echo "=== cleaning up deployment ${DEPLOYMENT_ID} ==="
+        python3 "${CLOUDML_API}" stop-deployment \
+            --workspace-id "${CLOUDML_WORKSPACE_ID}" \
+            --service-id "${CLOUDML_SERVICE_ID}" \
+            --deployment-id "${DEPLOYMENT_ID}" || true
+    fi
+}
+trap cleanup EXIT
 
 echo "=== CloudML PD Deployment ==="
 echo "Workspace:  ${CLOUDML_WORKSPACE_ID}"
 echo "Service:    ${CLOUDML_SERVICE_ID}"
-echo "Deployment: ${CLOUDML_DEPLOYMENT_NAME}"
-echo "Area:       ${CLOUDML_AREA}"
-echo "Queue:      ${CLOUDML_QUEUE_NAME}"
-echo "Image:      ${SGLANG_IMAGE_URL}"
+echo "Deployment: ${DEPLOYMENT_NAME}"
+echo "YAML:       ${DEPLOY_YAML}"
 
 # --- Step 1: Save AK/SK ---
 echo "=== saving credentials ==="
@@ -48,23 +81,20 @@ python3 "${CLOUDML_API}" save-aksk \
     --secret-key "${CLOUDML_SECRET_KEY}" \
     --owner "${CLOUDML_OWNER:-ci-deploy}"
 
-# --- Step 2: Replace SGLang imageUrl (all non-Router roles) ---
-RENDERED="/tmp/pd-roles-config.yaml"
-ESCAPED_URL=$(printf '%s\n' "${SGLANG_IMAGE_URL}" | sed 's/[\\&/]/\\&/g')
+# --- Step 2: Render deploy YAML with image URL ---
+ESCAPED_URL=$(printf '%s\n' "${SGLANG_IMAGE_URL}" | sed 's/[\\&|]/\\&/g')
 sed "s|imageUrl: micr\.cloud\.mioffice\.cn/llm-infra/sglang:.*|imageUrl: ${ESCAPED_URL}|" \
-    "${ROLES_CONFIG}" > "${RENDERED}"
+    "${DEPLOY_YAML}" > "${RENDERED_DEPLOY_YAML}"
 
-# --- Step 3: Create deployment and capture deployment ID ---
+# --- Step 3: Create deployment ---
 echo "=== creating multi-role deployment ==="
 python3 "${CLOUDML_API}" create-multi-role-deployment \
+    --deployment-name "${DEPLOYMENT_NAME}" \
     --workspace-id "${CLOUDML_WORKSPACE_ID}" \
     --service-id "${CLOUDML_SERVICE_ID}" \
-    --deployment-name "${CLOUDML_DEPLOYMENT_NAME}" \
-    --area "${CLOUDML_AREA}" \
-    --queue-name "${CLOUDML_QUEUE_NAME}" \
-    --roles-config "@${RENDERED}" \
-    --model-repo-config "@${MODEL_REPO_CONFIG}" | tee /tmp/deployment.json
-read -r DEPLOYMENT_ID DEPLOYMENT_ENDPOINT < <(python3 -c "import json; d=json.load(open('/tmp/deployment.json')); print(d['deploymentId'], d.get('endpoint',''))")
+    --from-file "@${RENDERED_DEPLOY_YAML}" | tee "${DEPLOY_JSON}"
+
+read -r DEPLOYMENT_ID DEPLOYMENT_ENDPOINT < <(python3 -c "import json; d=json.load(open('${DEPLOY_JSON}')); print(d['deploymentId'], d.get('endpoint',''))")
 echo "=== deployment created: ${DEPLOYMENT_ID} endpoint: ${DEPLOYMENT_ENDPOINT} ==="
 
 # --- Step 4: Wait for deployment to be ready ---
@@ -76,13 +106,9 @@ python3 "${CLOUDML_API}" wait-for-deployment-ready \
     --timeout 1200
 
 echo "=== deployment is ready ==="
+
 # --- Step 5: run the benchmark ---
 echo "=== running benchmark ==="
 # TODO: run the benchmark
 
-# --- Step 6: delete the deployment ---
-echo "=== deleting deployment ==="
-python3 "${CLOUDML_API}" delete-deployment \
-    --workspace-id "${CLOUDML_WORKSPACE_ID}" \
-    --service-id "${CLOUDML_SERVICE_ID}" \
-    --deployment-id "${DEPLOYMENT_ID}"
+# cleanup trap handles stop-deployment on both success and failure

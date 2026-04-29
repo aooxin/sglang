@@ -1,11 +1,43 @@
-- roleName: Prefill
+serviceId: s-20260428181726-3v2tw
+deployGroupId: s-20260428181726-3v2tw-2uit5
+deploymentName: gitlab-ci-flash-1p1d-48834916
+state: running
+areaCode: chn-qinghai
+profile: prod
+queueId: '8600'
+cluster: kscn-hd-cloudml-prod
+gatewayConfig:
+  gatewayId: 10105
+  gatewayDomain: cloudml-hd-pri-ksytjv.alb.xiaomi.srv
+  loadbalancerLayer: APPLICATION
+  mode: wrr
+  enabled: true
+  mifeForwardId: a9251ca8-a791-433b-a69f-4e3bccee6300
+  domain: kscn-hd-cloudml
+  readTimeout: 300
+modelRepoConfig:
+  modelType: custom
+  modelUri: AI_AIE/Mimo-V2-Flash/1
+  modelName: Mimo-V2-Flash
+  availableClusters:
+  - name: alicn-bj-cloudml-prod-2
+  - name: kscn-hd-cloudml-prod
+  - name: wlcb-cloudml-prod-3
+roles:
+- deploymentId: s-20260428181726-3v2tw-2uit5
+  roleId: s-20260428181726-3v2tw-2uit5-enli8
+  roleName: Prefill
+  roleType: prefill
   entryPoint: false
-  imageUrl: micr.cloud.mioffice.cn/llm-infra/sglang:v0.5.10-xm
+  routerType: null
+  num: 1
+  imageUrl: micr.cloud.mioffice.cn/llm-infra/sglang:v0.5.10-xm-3b6a28c9-20260422-2345
   imageCommand: |-
+    export HF_HUB_OFFLINE=1
     python3 -m sglang.launch_server \
                   --model-path XiaomiMiMo/MiMo-V2-Flash \
                   --served-model-name mimo-v2-flash \
-                  --disaggregation-ib-device ${NCCL_IB_HCA_NEW} \
+                  --disaggregation-ib-device ${NCCL_IB_HCA:1} \
                   --disaggregation-mode prefill \
                   --log-level-http warning \
                   --enable-cache-report \
@@ -39,23 +71,37 @@
                   --skip-server-warmup \
                   --moe-dense-tp-size 1 \
                   --enable-dp-lm-head \
-                  --enable-hierarchical-cache \
-                  --hicache-ratio 2.3 \
-                  --hicache-mem-layout page_first \
-                  --speculative-algorithm EAGLE \
-                  --speculative-num-steps 3 \
-                  --speculative-eagle-topk 1 \
-                  --speculative-num-draft-tokens 4 \
-                  --enable-multi-layer-eagle \
                   --disable-tokenizer-batch-decode
-  resourceInstance: cloudml.ng1h20e-8-8.20-224
-  num: 1
   modelFrame: SGLang
-  envs:
+  resourceInstance: cloudml.ng1gm403-8-8.20-224
+  resourcePriority: GUARANTEED_PUBLIC
+  numPerInstance: 8.0
+  trafficPorts:
+  - id: 72326
+    serviceId: s-20260428181726-3v2tw
+    deploymentId: ''
+    port: 9001
+    path: /
+    type: 1
+    protocol: HTTP
+    mifeServiceId: ad5720dc-d7fe-4667-9bb1-a422eeee625d
+    mifePathUuid: 74e21ba6-6414-4535-a36e-a241d3ff33c3
+    creator: ''
+    deployGroupId: ''
+  - id: 72403
+    serviceId: s-20260428181726-3v2tw
+    deploymentId: s-20260428181726-3v2tw-2uit5-enli8
+    port: 9001
+    path: /metrics
+    type: 2
+    protocol: Metric
+    mifeServiceId: ''
+    mifePathUuid: ''
+    creator: liushaohui3
+    deployGroupId: s-20260428181726-3v2tw-2uit5
+  envConfigs:
   - name: SGLANG_DG_CACHE_DIR
     value: /mnt/deepgemm-cache
-  - name: NCCL_IB_HCA_NEW
-    value: mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3
   - name: RESOURCE_GPU
     value: '8'
   - name: WORLD_SIZE
@@ -88,18 +134,13 @@
     value: 'true'
   - name: SGLANG_FORCE_SHUTDOWN
     value: 'true'
-  - name: GCACHE_MASTER_ADDR
-    value: bj9-cloudml.juicefs.srv
-  - name: GCACHE_CACHE_GROUP
-    value: mtp-gcache-test
-  - name: GCACHE_CLIENT_IFNAME
-    value: bond0,bond1,bond2,bond3
-  storage:
+  healthCheck: {}
+  externalStorageMountConfigs:
   - juiceFsSecretConfig:
       volume: aie-gitlab-runner-cache
       treeId: '488416'
-      endpoint: bj9-cloudml-ali
-      metaUrl: bj9-cloudml-ali.juicefs.srv
+      endpoint: hd1-cloudml
+      metaUrl: hd1-cloudml.juicefs.srv
       target: ssd-tgt
       readOnly: false
       juiceFsExtra:
@@ -111,14 +152,20 @@
     mountPath: /root/.cache/huggingface/
     subPath: /huggingface
     source: NEW
-- roleName: Decode
+- deploymentId: s-20260428181726-3v2tw-2uit5
+  roleId: s-20260428181726-3v2tw-2uit5-d4e1q
+  roleName: Decode
+  roleType: decode
   entryPoint: false
-  imageUrl: micr.cloud.mioffice.cn/llm-infra/sglang:v0.5.10-xm
+  routerType: null
+  num: 1
+  imageUrl: micr.cloud.mioffice.cn/llm-infra/sglang:v0.5.10-xm-3b6a28c9-20260422-2345
   imageCommand: |-
+    export HF_HUB_OFFLINE=1
     python3 -m sglang.launch_server \
                   --model-path XiaomiMiMo/MiMo-V2-Flash \
                   --served-model-name mimo-v2-flash \
-                  --disaggregation-ib-device ${NCCL_IB_HCA_NEW} \
+                  --disaggregation-ib-device ${NCCL_IB_HCA:1} \
                   --disaggregation-mode decode \
                   --enable-cache-report \
                   --pp-size 1 \
@@ -153,20 +200,37 @@
                   --disable-radix-cache \
                   --enable-metrics-for-all-schedulers \
                   --quantization fp8 \
-                  --speculative-algorithm EAGLE \
-                  --speculative-num-steps 3 \
-                  --speculative-eagle-topk 1 \
-                  --speculative-num-draft-tokens 4 \
-                  --enable-multi-layer-eagle \
                   --moe-dense-tp-size 1 \
                   --enable-dp-lm-head \
                   --disable-tokenizer-batch-decode
-  resourceInstance: cloudml.ng1h20e-8-8.20-224
-  num: 1
   modelFrame: SGLang
-  envs:
-  - name: NCCL_IB_HCA_NEW
-    value: mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3
+  resourceInstance: cloudml.ng1gm403-8-8.20-224
+  resourcePriority: GUARANTEED_PUBLIC
+  numPerInstance: 8.0
+  trafficPorts:
+  - id: 72326
+    serviceId: s-20260428181726-3v2tw
+    deploymentId: ''
+    port: 9001
+    path: /
+    type: 1
+    protocol: HTTP
+    mifeServiceId: ad5720dc-d7fe-4667-9bb1-a422eeee625d
+    mifePathUuid: 74e21ba6-6414-4535-a36e-a241d3ff33c3
+    creator: ''
+    deployGroupId: ''
+  - id: 72404
+    serviceId: s-20260428181726-3v2tw
+    deploymentId: s-20260428181726-3v2tw-2uit5-d4e1q
+    port: 9001
+    path: /metrics
+    type: 2
+    protocol: Metric
+    mifeServiceId: ''
+    mifePathUuid: ''
+    creator: liushaohui3
+    deployGroupId: s-20260428181726-3v2tw-2uit5
+  envConfigs:
   - name: RESOURCE_GPU
     value: '8'
   - name: WORLD_SIZE
@@ -205,24 +269,13 @@
     value: '1'
   - name: SGLANG_FORCE_SHUTDOWN
     value: 'true'
-  - name: GCACHE_MASTER_ADDR
-    value: bj9-cloudml.juicefs.srv
-  - name: GCACHE_CACHE_GROUP
-    value: mtp-gcache-test
-  - name: GCACHE_SERVER_THREADS
-    value: '16'
-  - name: GCACHE_SERVER_MEM_CAP_GB
-    value: '400'
-  - name: GCACHE_SERVER_IFNAME
-    value: bond0,bond1,bond2,bond3
-  - name: GCACHE_SERVER_PREALLOC_MEM
-    value: 'true'
-  storage:
+  healthCheck: {}
+  externalStorageMountConfigs:
   - juiceFsSecretConfig:
       volume: aie-gitlab-runner-cache
       treeId: '488416'
-      endpoint: bj9-cloudml-ali
-      metaUrl: bj9-cloudml-ali.juicefs.srv
+      endpoint: hd1-cloudml
+      metaUrl: hd1-cloudml.juicefs.srv
       target: ssd-tgt
       readOnly: false
       juiceFsExtra:
@@ -234,9 +287,13 @@
     mountPath: /root/.cache/huggingface/
     subPath: /huggingface
     source: NEW
-- roleName: LLM-Router
+- deploymentId: s-20260428181726-3v2tw-2uit5
+  roleId: s-20260428181726-3v2tw-2uit5-rlvgu
+  roleName: LLM-Router
+  roleType: default
   entryPoint: true
-  routerType: LLM-Router
+  routerType: null
+  num: 1
   imageUrl: micr.cloud.mioffice.cn/aie-inference/llm-router:0.3.2
   imageCommand: |-
     ./manager -n ns-3038161 \
@@ -251,15 +308,30 @@
         --framework SGLang \
         --deployType 1 \
         --traceIDKey X-Model-Request-Id
-  resourceInstance: cloudml.cputype3-108.1-8
-  num: 1
   modelFrame: other
-  storage:
+  resourceInstance: cloudml.cputype1-108.1-8
+  resourcePriority: GUARANTEED_PUBLIC
+  numPerInstance: 16.0
+  trafficPorts:
+  - id: 72326
+    serviceId: s-20260428181726-3v2tw
+    deploymentId: ''
+    port: 9001
+    path: /
+    type: 1
+    protocol: HTTP
+    mifeServiceId: ad5720dc-d7fe-4667-9bb1-a422eeee625d
+    mifePathUuid: 74e21ba6-6414-4535-a36e-a241d3ff33c3
+    creator: ''
+    deployGroupId: ''
+  envConfigs: []
+  healthCheck: {}
+  externalStorageMountConfigs:
   - juiceFsSecretConfig:
       volume: aie-gitlab-runner-cache
       treeId: '488416'
-      endpoint: bj9-cloudml-ali
-      metaUrl: bj9-cloudml-ali.juicefs.srv
+      endpoint: hd1-cloudml
+      metaUrl: hd1-cloudml.juicefs.srv
       target: ssd-tgt
       readOnly: false
       juiceFsExtra:
@@ -271,3 +343,26 @@
     mountPath: /root/.cache/huggingface/
     subPath: /huggingface
     source: NEW
+trafficPorts:
+- id: 72326
+  serviceId: s-20260428181726-3v2tw
+  deploymentId: ''
+  port: 9001
+  path: /
+  type: 1
+  protocol: HTTP
+  mifeServiceId: ad5720dc-d7fe-4667-9bb1-a422eeee625d
+  mifePathUuid: 74e21ba6-6414-4535-a36e-a241d3ff33c3
+  creator: ''
+  deployGroupId: ''
+externalStorageMountConfigs:
+- juiceFsSecretConfig:
+    volume: aie-gitlab-runner-cache
+    treeId: '488416'
+    endpoint: hd1-cloudml
+    metaUrl: hd1-cloudml.juicefs.srv
+    target: ssd-tgt
+    readOnly: false
+  mountPath: /root/.cache/huggingface/
+  subPath: /huggingface
+  source: NEW

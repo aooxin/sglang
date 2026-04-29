@@ -106,7 +106,7 @@ claudecode-codereview:
   stage: lint
   image: micr.cloud.mioffice.cn/llm-infra/sglang-ci:latest
   interruptible: true
-  timeout: 10m
+  timeout: 20m
   allow_failure: true
   variables:
     GIT_DEPTH: 0  # need merge-base with target branch for the review diff
@@ -465,9 +465,8 @@ mimo-v2-flash-benchmark:
 # =============================================================================
 
 # --- deploy-cloudml-pd (PD disaggregation deployment) ---
-# Creates a new multi-role deployment (Prefill + Encode + Decode + Router) on CloudML.
-# Uses flash-1p1d-gm403.yaml as roles config, replacing Prefill/Decode imageUrl.
-# Requires CLOUDML_ACCESS_KEY and CLOUDML_SECRET_KEY as masked CI/CD variables.
+# Creates a new multi-role deployment (Prefill + Decode + Router) on CloudML.
+# Requires CLOUDML_ACCESS_KEY, CLOUDML_SECRET_KEY, and CLOUDML_MAAS_HOME as CI/CD variables.
 
 deploy-cloudml-pd:
   stage: deploy
@@ -475,15 +474,13 @@ deploy-cloudml-pd:
   rules:
     - when: manual
   allow_failure: true
-  timeout: 10m
+  timeout: 30m
   needs:
     - job: release-docker-cu129
       artifacts: true
   variables:
     CLOUDML_WORKSPACE_ID: "10042"
-    CLOUDML_SERVICE_ID: "s-20260422174439-m61fj"
-    CLOUDML_AREA: "安康"
-    CLOUDML_QUEUE_NAME: "router-for-test"
+    CLOUDML_SERVICE_ID: "s-20260428233805-sxie2"
   script:
     - echo "Deploying image ${SGLANG_IMAGE_URL}"
-    - bash scripts/ci/xiaomi/deploy_pd.sh
+    - bash scripts/ci/xiaomi/deploy_pd.sh --deploy-yaml scripts/ci/xiaomi/flash-1p1d-gm403-hd.yaml

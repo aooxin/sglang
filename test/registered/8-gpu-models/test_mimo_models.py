@@ -50,36 +50,65 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
     accept_length_thres = 3.2
 
 
-MIMO_V2_OMNI_MODEL = "XiaomiMiMo/MiMo-V2-Omni"
-MIMO_V2_OMNI_OTHER_ARGS = [
+MIMO_V2_5_MODEL = "XiaomiMiMo/MiMo-V2.5"
+MIMO_V2_5_OTHER_ARGS = [
     "--tp",
     "8",
     "--dp",
     "2",
     "--enable-dp-attention",
-    "--trust-remote-code",
     "--mm-enable-dp-encoder",
+    "--trust-remote-code",
     "--attention-backend",
     "fa3",
     "--mm-attention-backend",
     "fa3",
 ]
+MIMO_V2_5_MTP_OTHER_ARGS = MIMO_V2_5_OTHER_ARGS + [
+    "--speculative-algorithm",
+    "EAGLE",
+    "--speculative-num-steps",
+    "3",
+    "--speculative-eagle-topk",
+    "1",
+    "--speculative-num-draft-tokens",
+    "4",
+    "--enable-multi-layer-eagle",
+]
+
+# MiMo-V2.5 is a reasoning VLM: needs large max_new_tokens so the CoT isn't
+# truncated before the final answer, and sampling (temperature=1, top_p=0.95)
+# to match the production evaluation recipe. Mirrors the omni_eval image job
+# in scripts/ci/omni_eval/run_image_eval.sh.
+MIMO_V2_5_MMMU_ARGS = [
+    "--limit=0.1",
+    "--gen_kwargs",
+    "max_new_tokens=65536,temperature=1,top_p=0.95",
+]
 
 
-@unittest.skip("Skip MiMo-V2-Omni GSM8K test")
-class TestMiMoV2OmniGSM8K(GSM8KMixin, DefaultServerBase):
+class TestMiMoV25GSM8K(GSM8KMixin, DefaultServerBase):
     gsm8k_accuracy_thres = 0.75
-    model = MIMO_V2_OMNI_MODEL
-    other_args = MIMO_V2_OMNI_OTHER_ARGS
+    model = MIMO_V2_5_MODEL
+    other_args = MIMO_V2_5_OTHER_ARGS
 
 
-@unittest.skip("MMMU dataset not pre-cached on 8-gpu-h200 runner; skip until cache is primed")
-class TestMiMoV2OmniMMMU(MMMUMixin, MMMUServerBase):
+class TestMiMoV25MMMU(MMMUMixin, MMMUServerBase):
     accuracy = 0.444
-    model = MIMO_V2_OMNI_MODEL
-    other_args = MIMO_V2_OMNI_OTHER_ARGS
-    mmmu_args = ["--limit=0.1"]
+    model = MIMO_V2_5_MODEL
+    other_args = MIMO_V2_5_OTHER_ARGS
+    mmmu_args = MIMO_V2_5_MMMU_ARGS
 
+
+class TestMiMoV25MTP(GSM8KMixin, MMMUMixin, MMMUServerBase):
+    gsm8k_accuracy_thres = 0.75
+    gsm8k_accept_length_thres = 2.5
+    accuracy = 0.444
+    model = MIMO_V2_5_MODEL
+    mem_fraction_static = 0.65
+    server_api_key = None
+    other_args = MIMO_V2_5_MTP_OTHER_ARGS
+    mmmu_args = MIMO_V2_5_MMMU_ARGS
 
 if __name__ == "__main__":
     unittest.main()

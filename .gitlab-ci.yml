@@ -289,6 +289,11 @@ stage-c-test-8-gpu-h200:
   script:
     - pip install --no-cache-dir -e "python/[test]"
     # - bash scripts/ci/cuda/ci_install_dependency.sh  # pre-installed in sglang-ci image
+    - |
+      if ! python3 -c "import lmms_eval" 2>/dev/null; then
+        git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git /tmp/lmms-eval
+        pip install --no-cache-dir -e /tmp/lmms-eval
+      fi
     - python3 scripts/ci/cuda/warmup_deep_gemm.py
         deepseek-ai/DeepSeek-V3-0324:8
         deepseek-ai/DeepSeek-V3.2-Exp:8
@@ -412,6 +417,11 @@ mimo-v2-flash-startup-test:
       optional: true
   script:
     - pip install --no-cache-dir --no-deps -e "python/"
+    - |
+      if ! python3 -c "import lmms_eval" 2>/dev/null; then
+        git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git /tmp/lmms-eval
+        pip install --no-cache-dir -e /tmp/lmms-eval
+      fi
     - python3 test/registered/8-gpu-models/test_mimo_models.py
 
 mimo-v2-flash-benchmark:

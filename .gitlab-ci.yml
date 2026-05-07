@@ -341,8 +341,11 @@ pr-test-finish:
   timeout: 5m
   needs:
     - job: stage-a-test-cpu
+      optional: true
     - job: stage-a-test-1-gpu-small
+      optional: true
     - job: stage-b-test-1-gpu-small
+      optional: true
     - job: stage-b-test-1-gpu-large
       optional: true
     - job: stage-c-test-8-gpu-h200

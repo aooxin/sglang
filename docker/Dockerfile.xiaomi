@@ -36,7 +36,8 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages --no-build-iso
     accelerate==1.12.0
 
 RUN python3 -m pip install --no-cache-dir --break-system-packages \
-    decord
+    decord \
+    "apache-tvm-ffi>=0.1.5,<0.2"
 
 # cleanup sglang workspace
 RUN rm -fr /sgl-workspace/sglang

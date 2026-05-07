@@ -42,7 +42,7 @@ setsid python3 -m sglang.launch_server \
     --watchdog-timeout 1000000 \
     --mem-fraction-static 0.75 \
     --max-running-requests 96 \
-    --chunked-prefill-size 16384 \
+    --chunked-prefill-size 65536 \
     --reasoning-parser qwen3 \
     --tool-call-parser mimo \
     --context-length 262144 \
@@ -55,6 +55,7 @@ setsid python3 -m sglang.launch_server \
     --prefill-round-robin-balance \
     --attention-backend fa3 \
     --enable-metrics-for-all-schedulers \
+    --disaggregation-mode decode \
     --disaggregation-transfer-backend fake \
     >"${LOG_FILE}" 2>&1 &
 SERVER_PID=$!
@@ -77,7 +78,7 @@ trap cleanup EXIT INT TERM
 
 echo "=== waiting for /health_generate (timeout=${STARTUP_TIMEOUT}s) ==="
 DEADLINE=$(( $(date +%s) + STARTUP_TIMEOUT ))
-until curl -fsS -o /dev/null "${BASE_URL}/health_generate"; do
+until curl -fs -o /dev/null "${BASE_URL}/health_generate" 2>/dev/null; do
     if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
         echo "server process died during startup"
         exit 1
@@ -104,7 +105,7 @@ BENCH_COMMON_ARGS=(
     --fake-prefill
 )
 
-for RATE in 6 8 10 15; do
+for RATE in 6 30 100; do
     echo "=== decode benchmark: input=16k, output=1k, rate=${RATE} ==="
     python3 -m sglang.bench_serving \
         "${BENCH_COMMON_ARGS[@]}" \

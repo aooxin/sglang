@@ -40,7 +40,7 @@ setsid python3 -m sglang.launch_server \
     --watchdog-timeout 1000000 \
     --mem-fraction-static 0.75 \
     --max-running-requests 128 \
-    --chunked-prefill-size 16384 \
+    --chunked-prefill-size 65536 \
     --reasoning-parser qwen3 \
     --tool-call-parser mimo \
     --context-length 262144 \
@@ -74,7 +74,7 @@ trap cleanup EXIT INT TERM
 
 echo "=== waiting for /health_generate (timeout=${STARTUP_TIMEOUT}s) ==="
 DEADLINE=$(( $(date +%s) + STARTUP_TIMEOUT ))
-until curl -fsS -o /dev/null "${BASE_URL}/health_generate"; do
+until curl -fs -o /dev/null "${BASE_URL}/health_generate" 2>/dev/null; do
     if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
         echo "server process died during startup"
         exit 1
@@ -108,20 +108,22 @@ BENCH_COMMON_ARGS=(
     --flush-cache
 )
 
-echo "=== benchmark: 16k input, output=1, rate=3, reqs=2000 ==="
-python3 -m sglang.bench_serving \
-    "${BENCH_COMMON_ARGS[@]}" \
-    --random-input-len 16384 \
-    --request-rate 3 \
-    --num-prompts 2000 \
-    --output-file benchmark_results_prefill-16k.json
+# (input_len, label, rate, num_prompts)
+BENCH_CONFIGS=(
+    "16384 16k 3 1000"
+    "16384 16k 5 1000"
+    "32768 32k 2.5 1000"
+)
 
-echo "=== benchmark: 32k input, output=1, rate=1.5, reqs=1000 ==="
-python3 -m sglang.bench_serving \
-    "${BENCH_COMMON_ARGS[@]}" \
-    --random-input-len 32768 \
-    --request-rate 1.5 \
-    --num-prompts 1000 \
-    --output-file benchmark_results_prefill-32k.json
+for cfg in "${BENCH_CONFIGS[@]}"; do
+    read -r input_len label rate num_prompts <<< "$cfg"
+    echo "=== benchmark: ${label} input, output=1, rate=${rate}, reqs=${num_prompts} ==="
+    python3 -m sglang.bench_serving \
+        "${BENCH_COMMON_ARGS[@]}" \
+        --random-input-len "$input_len" \
+        --request-rate "$rate" \
+        --num-prompts "$num_prompts" \
+        --output-file "benchmark_results_prefill-${label}-r${rate}.json"
+done
 
 echo "=== prefill benchmark complete ==="

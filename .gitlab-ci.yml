@@ -15,6 +15,7 @@ stages:
   - finish
   - release
   - deploy
+  - eval
 
 variables:
   SGLANG_IS_IN_CI: "true"
@@ -498,3 +499,59 @@ deploy-cloudml-pd:
   script:
     - echo "Deploying image ${SGLANG_IMAGE_URL}"
     - bash scripts/ci/xiaomi/deploy_pd.sh --deploy-yaml scripts/ci/xiaomi/flash-1p1d-gm403-hd.yaml
+
+# =============================================================================
+# Stage: eval (Accuracy evaluation on CloudML)
+# =============================================================================
+# Each eval job:
+#   1) deploys an sglang server to CloudML via deploy_pd.sh (cleaned up on exit)
+#   2) runs an evaluation suite from inside an eval-specific container against
+#      the deployed endpoint
+#   3) exports summaries as GitLab artifacts and posts a markdown note on the MR
+#
+# The eval matrix grows along two dimensions:
+#   model       : flash / pro / omni
+#   eval suite  : basic (mini_eval) / swe-bench / tau-bench / ...
+# Job naming convention: "<model>-<eval-suite>", e.g. flash-basic-eval.
+#
+# Common config lives in .eval-base-template; concrete jobs only specify the
+# image, timeout, model-specific CLOUDML_SERVICE_ID, runner script and
+# artifact paths.
+#
+# Requires: release-docker-cu129 (for SGLANG_IMAGE_URL).
+# Requires: CLOUDML_ACCESS_KEY and CLOUDML_SECRET_KEY as masked CI/CD variables.
+
+.eval-base-template:
+  stage: eval
+  rules:
+    - when: manual
+  allow_failure: true
+  needs:
+    - job: release-docker-cu129
+      artifacts: true
+  variables:
+    CLOUDML_WORKSPACE_ID: "10042"
+    # Shared runner pool cap is 64Gi; eval containers are mostly HTTP clients
+    # driving traffic to CloudML. Concrete jobs may override these.
+    KUBERNETES_CPU_REQUEST: "8"
+    KUBERNETES_CPU_LIMIT: "16"
+    KUBERNETES_MEMORY_REQUEST: "16Gi"
+    KUBERNETES_MEMORY_LIMIT: "32Gi"
+  artifacts:
+    when: always
+    expire_in: 30 days
+    # `paths:` must be specified by inheriting jobs.
+
+flash-basic-eval:
+  extends: .eval-base-template
+  image: micr.cloud.mioffice.cn/llm-infra/mini-eval:3002791-V1
+  timeout: 12h
+  variables:
+    CLOUDML_SERVICE_ID: "s-20260508193803-jw56o"
+  script:
+    - echo "Evaluating image ${SGLANG_IMAGE_URL}"
+    - bash scripts/ci/xiaomi/flash_eval/run_eval.sh --deploy-yaml scripts/ci/xiaomi/flash_eval/flash-1p1d-gm403-hd.yaml
+  artifacts:
+    paths:
+      - mini_eval_output/
+      - eval_summary_*.md

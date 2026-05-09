@@ -103,7 +103,7 @@ python3 "${CLOUDML_API}" wait-for-deployment-ready \
     --workspace-id "${CLOUDML_WORKSPACE_ID}" \
     --service-id "${CLOUDML_SERVICE_ID}" \
     --deployment-id "${DEPLOYMENT_ID}" \
-    --timeout 1200
+    --timeout 3600
 
 echo "=== deployment is ready ==="
 

@@ -45,6 +45,7 @@ workflow:
   - scripts/ci/utils/*
   - scripts/ci/xiaomi/*
   - test/**/*
+  - benchmark/**/*
   - .gitlab-ci.yml
 
 .sgl-kernel-paths: &sgl-kernel-paths

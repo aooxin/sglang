@@ -25,18 +25,14 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
     rm -rf /var/lib/apt/lists/*
 
 # for debugging: py-spy, nvtx
-# for transformerengine: pybind11, tilelang
-RUN python3 -m pip install --no-cache-dir --break-system-packages --no-build-isolation \
+# for omni: torchcodec, joblib, accelerate, decord, apache-tvm-ffi
+RUN python3 -m pip install --no-cache-dir --break-system-packages --no-build-isolation --no-deps \
     py-spy==0.4.1 \
     nvtx==0.2.13 \
-    pybind11==3.0.1 \
-    tilelang==0.1.7 \
     torchcodec==0.9.1 \
     joblib==1.5.3 \
-    accelerate==1.12.0
-
-RUN python3 -m pip install --no-cache-dir --break-system-packages \
-    decord \
+    accelerate==1.12.0 \
+    decord==0.6.0 \
     "apache-tvm-ffi>=0.1.5,<0.2"
 
 # cleanup sglang workspace

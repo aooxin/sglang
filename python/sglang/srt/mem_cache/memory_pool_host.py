@@ -45,7 +45,7 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
 if not (_is_npu or _is_xpu or _is_mps):
-    from sgl_kernel.kvcacheio import (
+    from transfer_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,
         transfer_kv_all_layer_fuse_lf_pf,
@@ -2112,6 +2112,16 @@ class SWATokenToKVPoolHost:
         # {global_layer_id: (pool_layer_id, is_swa_layer)}
         self.layers_mapping = self.device_pool.layers_mapping
         self.layer_num = self.device_pool.layer_num
+
+    # full 和 swa 两个子池容量恒等（构造时 host_size==host_size_swa），全程也按相同
+    # need_size 一起 alloc/free（见 alloc/free），所以 size / available_size 直接代理
+    # 到 full_pool_host 即可，与外层 HostKVCache 类签名保持一致。
+    @property
+    def size(self) -> int:
+        return self.full_pool_host.size
+
+    def available_size(self) -> int:
+        return self.full_pool_host.available_size()
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         full_select_index = self.full_pool_host.alloc(need_size)

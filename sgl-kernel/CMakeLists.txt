@@ -13,6 +13,9 @@ set(CMAKE_VERBOSE_MAKEFILE ON CACHE BOOL "ON")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_SHARED_LIBRARY_PREFIX "")
 
+# GitHub Artifactory
+set(GITHUB_ARTIFACTORY "pkgs.d.xiaomi.net/artifactory/github" CACHE STRING "GitHub mirror URL")
+
 # Python
 find_package(Python COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
@@ -46,63 +49,49 @@ clear_cuda_arches(CMAKE_FLAG)
 # cutlass
 FetchContent_Declare(
     repo-cutlass
-    GIT_REPOSITORY https://github.com/NVIDIA/cutlass
-    GIT_TAG        57e3cfb47a2d9e0d46eb6335c3dc411498efa198
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/57e3cfb47a2d9e0d46eb6335c3dc411498efa198.tar.gz
 )
 FetchContent_Populate(repo-cutlass)
 
 # DeepGEMM
 FetchContent_Declare(
     repo-deepgemm
-    GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        ffe2b6b97420a9f8c58268ca55755168e6e2f360
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/sgl-project/DeepGEMM/archive/ffe2b6b97420a9f8c58268ca55755168e6e2f360.tar.gz
 )
 FetchContent_Populate(repo-deepgemm)
 
 # fmt
 FetchContent_Declare(
     repo-fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt
-    GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/fmtlib/fmt/archive/553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28.tar.gz
 )
 FetchContent_Populate(repo-fmt)
 
 # Triton kernel
 FetchContent_Declare(
     repo-triton
-    GIT_REPOSITORY "https://github.com/triton-lang/triton"
-    GIT_TAG        v3.5.1
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.5.1.tar.gz
 )
 FetchContent_Populate(repo-triton)
 
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
-    GIT_REPOSITORY https://github.com/flashinfer-ai/flashinfer.git
-    GIT_TAG        bc29697ba20b7e6bdb728ded98f04788e16ee021
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/flashinfer-ai/flashinfer/archive/bc29697ba20b7e6bdb728ded98f04788e16ee021.tar.gz
 )
 FetchContent_Populate(repo-flashinfer)
 
 # flash-attention
 FetchContent_Declare(
     repo-flash-attention
-    GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        bcf72ccc6816b36a5fae2c5a3c027604629785e0
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/sgl-project/sgl-attn/archive/bcf72ccc6816b36a5fae2c5a3c027604629785e0.tar.gz
 )
 FetchContent_Populate(repo-flash-attention)
 
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
-    GIT_REPOSITORY https://github.com/microsoft/mscclpp.git
-    GIT_TAG        51eca89d20f0cfb3764ccd764338d7b22cd486a6
-    GIT_SHALLOW    OFF
+    URL https://${GITHUB_ARTIFACTORY}/microsoft/mscclpp/archive/51eca89d20f0cfb3764ccd764338d7b22cd486a6.tar.gz
 )
 FetchContent_Populate(repo-mscclpp)
 
@@ -124,6 +113,9 @@ else()
 endif()
 
 option(ENABLE_BELOW_SM90 "Enable gencode below SM90" ${DEFAULT_ENABLE_BELOW_SM90})
+
+# Option to build only transfer kernel as standalone package
+option(BUILD_TRANSFER_ONLY "Build only transfer kernel" OFF)
 
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
@@ -253,6 +245,32 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-DENABLE_NVFP4=1"
     )
+endif()
+
+# =========================== BUILD_TRANSFER_ONLY Mode ============================= #
+if (BUILD_TRANSFER_ONLY)
+    message(STATUS "Building transfer kernel only")
+
+    set(TRANSFER_SOURCES
+        "csrc/kvcacheio/transfer.cu"
+        "csrc/transfer.cc"
+    )
+
+    Python_add_library(transfer_ops MODULE WITH_SOABI ${TRANSFER_SOURCES})
+
+    target_compile_options(transfer_ops PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
+    )
+
+    target_link_libraries(transfer_ops PRIVATE
+        ${TORCH_LIBRARIES}
+        CUDA::cudart
+    )
+
+    install(TARGETS transfer_ops LIBRARY DESTINATION transfer_kernel)
+
+    # Skip the rest of the file
+    return()
 endif()
 
 # All source files

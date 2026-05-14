@@ -10,7 +10,9 @@
 #ifndef USE_ROCM
 #include <dlfcn.h>
 #define WARP_SIZE 32
-#include "pytorch_extension_utils.h"
+// TODO(yingchun): when build separately, pytorch_extension_utils.h is not visible, use torch/extension.h instead
+// #include "pytorch_extension_utils.h"
+#include <torch/extension.h>
 #else
 #include "pytorch_extension_utils_rocm.h"
 #include "utils.h"  // WARP_SIZE
@@ -269,65 +271,6 @@ __global__ void transfer_kernel_impl(
   }
 }
 
-// TODO(yingchun): transfer_kernel_fuse_impl 与 transfer_kernel_impl 完全重复，需要删除新增的
-template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA>
-__global__ void transfer_kernel_fuse_impl(
-    const void* __restrict__ src_k,
-    void* __restrict__ dst_k,
-    const void* __restrict__ src_v,
-    void* __restrict__ dst_v,
-    const int64_t* __restrict__ src_indices,
-    const int64_t* __restrict__ dst_indices,
-    int64_t start_layer_id,
-    int64_t num_layers_to_process,
-    int64_t num_items,
-    int64_t items_per_warp,
-    int64_t item_size_bytes,
-    int64_t src_layout_dim,
-    int64_t dst_layout_dim,
-    int64_t v_item_size_bytes,
-    int64_t v_src_layout_dim,
-    int64_t v_dst_layout_dim,
-    const uintptr_t* __restrict__ src_k_layer_tbl,
-    const uintptr_t* __restrict__ dst_k_layer_tbl,
-    const uintptr_t* __restrict__ src_v_layer_tbl,
-    const uintptr_t* __restrict__ dst_v_layer_tbl) {
-  int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int32_t lane_id = tid % WARP_SIZE;
-  int32_t warp_id = tid / WARP_SIZE;
-
-  for (int i = 0; i < items_per_warp; ++i) {
-    int64_t item_id = warp_id * items_per_warp + i;
-    if (item_id >= num_items) {
-      break;
-    }
-    const int64_t src_page_id = src_indices[item_id];
-    const int64_t dst_page_id = dst_indices[item_id];
-
-    // Loop over layers if necessary
-    for (int64_t layer_id = start_layer_id; layer_id < start_layer_id + num_layers_to_process; ++layer_id) {
-      const char* src_ptr = SrcOffsetFn(
-          static_cast<const char*>(src_k), src_k_layer_tbl, layer_id, src_layout_dim, src_page_id, item_size_bytes);
-      char* dst_ptr = DstOffsetFn(
-          static_cast<char*>(dst_k), dst_k_layer_tbl, layer_id, dst_layout_dim, dst_page_id, item_size_bytes);
-      transfer_item_warp(lane_id, src_ptr, dst_ptr, item_size_bytes);
-
-      if constexpr (!IsMLA) {
-        const char* src_v_ptr = SrcOffsetFn(
-            static_cast<const char*>(src_v),
-            src_v_layer_tbl,
-            layer_id,
-            v_src_layout_dim,
-            src_page_id,
-            v_item_size_bytes);
-        char* dst_v_ptr = DstOffsetFn(
-            static_cast<char*>(dst_v), dst_v_layer_tbl, layer_id, v_dst_layout_dim, dst_page_id, v_item_size_bytes);
-        transfer_item_warp(lane_id, src_v_ptr, dst_v_ptr, v_item_size_bytes);
-      }
-    }
-  }
-}
-
 template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA, bool PageHeadLayout = false>
 void transfer_kv_launcher(
     const at::Tensor& src_k,
@@ -486,7 +429,7 @@ void transfer_kv_fuse_launcher(
   const uintptr_t* src_v_tbl_ptr = src_v_layers.defined() ? src_v_layers.data_ptr<uintptr_t>() : nullptr;
   const uintptr_t* dst_v_tbl_ptr = dst_v_layers.defined() ? dst_v_layers.data_ptr<uintptr_t>() : nullptr;
   cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
-  transfer_kernel_fuse_impl<SrcOffsetFn, DstOffsetFn, IsMLA><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
+  transfer_kernel_impl<SrcOffsetFn, DstOffsetFn, IsMLA><<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
       src_k_ptr,
       dst_k_ptr,
       src_v_ptr,

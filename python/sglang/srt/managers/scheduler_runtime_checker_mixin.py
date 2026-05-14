@@ -380,9 +380,9 @@ class SchedulerRuntimeCheckerMixin:
             if queue_size:
                 return
 
-        # TODO(yingchun): 055 version disabled the 2 checks
-        self.check_memory()
-        self.check_tree_cache()
+        # TODO(yingchun): 055 version disabled the 2 checks, we should open the checks
+        # self.check_memory()
+        # self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio
         self.maybe_sleep_on_idle()
 

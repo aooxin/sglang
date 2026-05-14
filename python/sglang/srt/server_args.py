@@ -1800,7 +1800,7 @@ class ServerArgs:
                 ), "Triton kernel MoE is only supported when ep_size == 1"
 
         elif model_arch in MIMO_V2_MODEL_ARCHS:
-            if model_arch == "MiMoV2ForCausalLM":
+            if model_arch == "MiMoV2ForCausalLM" and not self.encoder_only:
                 expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
                     hf_config
                 )
@@ -3325,7 +3325,7 @@ class ServerArgs:
                 self.disaggregation_ib_device
             )
 
-        # Validate model type: only support Qwen models for now
+        # Validate model type for encoder disaggregation
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
         if (self.encoder_only or self.language_only) and model_arch not in [
@@ -3336,9 +3336,11 @@ class ServerArgs:
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
+            "MiMoV2ForCausalLM",
         ]:
             raise ValueError(
-                f"Model type {model_arch} is not supported for encoder disaggregation, only Qwen models are supported for now."
+                f"Model type {model_arch} is not supported for encoder disaggregation. "
+                f"Supported architectures: Qwen2VL, Qwen3VL, Qwen2Audio, Qwen2.5Omni, MiMoV2."
             )
 
     def _validate_ib_devices(self, device_str: str) -> Optional[str]:

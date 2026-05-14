@@ -79,7 +79,6 @@ _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
 
-
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
@@ -970,12 +969,16 @@ class MHATokenToKVPool(KVCache):
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.k_buffer[layer_id - self.start_layer]
 
-    def get_key_buffer(self, layer_id: int):
+    # TODO(yingchun): 更好的做法：让 SWAKVPool.register_layer_transfer_counter 内部适配 counter，使子池收到的 counter 自动映射为全局 layer ID，无需向通用 API 暴露此参数。
+    def get_key_buffer(self, layer_id: int, global_layer_id: Optional[int] = None):
         # note: get_key_buffer is hooked with synchronization for layer-wise KV cache loading
         # it is supposed to be used only by attention backend not for information purpose
         # same applies to get_value_buffer and get_kv_buffer
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            if global_layer_id is not None:
+                self.layer_transfer_counter.wait_until(global_layer_id - self.start_layer)
+            else:
+                self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self._get_key_buffer(layer_id)
 
     def _get_value_buffer(self, layer_id: int):
@@ -984,13 +987,17 @@ class MHATokenToKVPool(KVCache):
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.v_buffer[layer_id - self.start_layer]
 
-    def get_value_buffer(self, layer_id: int):
+    def get_value_buffer(self, layer_id: int, global_layer_id: Optional[int] = None):
         if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+            if global_layer_id is not None:
+                self.layer_transfer_counter.wait_until(global_layer_id - self.start_layer)
+            else:
+                self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self._get_value_buffer(layer_id)
 
-    def get_kv_buffer(self, layer_id: int):
-        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+    def get_kv_buffer(self, layer_id: int, global_layer_id: Optional[int] = None):
+        # TODO(yingchun): 两次调用会有两次 wait_until，可优化
+        return self.get_key_buffer(layer_id, global_layer_id), self.get_value_buffer(layer_id, global_layer_id)
 
     def set_kv_buffer(
         self,

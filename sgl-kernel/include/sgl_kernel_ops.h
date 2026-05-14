@@ -514,6 +514,21 @@ void transfer_kv_all_layer_lf_ph(
     int64_t block_quota,
     int64_t num_warps_per_block);
 
+void transfer_kv_all_layer_fuse_lf_pf(
+    const at::Tensor src_k_layers,
+    at::Tensor dst_k,
+    const at::Tensor src_v_layers,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t k_item_size,
+    int64_t k_dst_layout_dim,
+    int64_t v_item_size,
+    int64_t v_dst_layout_dim,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
 void transfer_kv_per_layer_mla(
     const at::Tensor src,
     at::Tensor dst,

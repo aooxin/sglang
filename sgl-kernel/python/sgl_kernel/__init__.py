@@ -56,6 +56,7 @@ from sgl_kernel.gemm import (
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer,
+    transfer_kv_all_layer_fuse_lf_pf,
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,

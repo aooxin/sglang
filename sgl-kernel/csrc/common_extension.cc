@@ -308,6 +308,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "head_num, int block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_all_layer_lf_ph", torch::kCUDA, &transfer_kv_all_layer_lf_ph);
   m.def(
+      "transfer_kv_all_layer_fuse_lf_pf(Tensor src_k_layers, Tensor dst_k, Tensor src_v_layers, Tensor dst_v, "
+      "Tensor src_indices, Tensor dst_indices, int k_item_size, int k_dst_layout_dim, int v_item_size, int "
+      "v_dst_layout_dim, int num_layers, int block_quota, int num_warps_per_block) -> ()");
+  m.impl("transfer_kv_all_layer_fuse_lf_pf", torch::kCUDA, &transfer_kv_all_layer_fuse_lf_pf);
+  m.def(
       "transfer_kv_per_layer_mla(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices, int item_size, int "
       "block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_per_layer_mla", torch::kCUDA, &transfer_kv_per_layer_mla);

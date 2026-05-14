@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 import numpy as np
 import psutil
@@ -47,6 +48,7 @@ if not (_is_npu or _is_xpu or _is_mps):
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,
+        transfer_kv_all_layer_fuse_lf_pf,
         transfer_kv_all_layer_lf_pf,
         transfer_kv_all_layer_lf_ph,
         transfer_kv_all_layer_mla,
@@ -61,6 +63,7 @@ if not (_is_npu or _is_xpu or _is_mps):
     )
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+
 
 logger = logging.getLogger(__name__)
 
@@ -437,9 +440,10 @@ class MHATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
 
-        # TODO(yingchun): deal with different self.v_head_dim
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
+        self.v_token_stride_size = self.head_num * self.v_head_dim * self.dtype.itemsize
+        self.v_layout_dim = self.v_token_stride_size * self.layer_num
 
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
         buffer = alloc_func(
@@ -2049,4 +2053,153 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         )
         self._backup_indexer_from_device_all_layer(
             device_pool, host_indices, device_indices, io_backend
+        )
+
+
+# TODO(yingchun): 最好继承自 HostKVCache，但目前 HostKVCache 的接口设计不太适合 TokenToKVPoolHost 的双 pool 结构。
+class SWATokenToKVPoolHost:
+    device_pool: SWAKVPool
+    # Only used on prefill; requires swa kv indices length == full kv indices length.
+
+    def __init__(
+        self,
+        device_pool: SWAKVPool,
+        host_to_device_ratio: float,
+        host_size: int,
+        host_size_swa: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        host_to_device_ratio_swa: float = None,
+        allocator_type: str = "default",
+    ):
+        self.device_pool = device_pool
+        self.page_size = page_size
+        self.layout = layout
+        self.pin_memory = pin_memory
+        self.device = device
+        if host_size or host_size_swa:
+            assert (
+                host_size == host_size_swa
+            ), "Host size for full and swa should be the same"
+        if host_to_device_ratio_swa is None:
+            host_to_device_ratio_swa = host_to_device_ratio
+        # full layers host pool
+        self.full_pool_host = MHATokenToKVPoolHost(
+            device_pool=self.device_pool.full_kv_pool,
+            host_to_device_ratio=host_to_device_ratio,
+            host_size=host_size,
+            page_size=page_size,
+            layout=layout,
+            pin_memory=pin_memory,
+            device=device,
+            allocator_type=allocator_type,
+        )
+
+        # swa layers host pool (different kv shape handled by swa_kv_pool)
+        self.swa_pool_host = MHATokenToKVPoolHost(
+            device_pool=self.device_pool.swa_kv_pool,
+            host_to_device_ratio=host_to_device_ratio_swa,
+            host_size=host_size_swa,
+            page_size=page_size,
+            layout=layout,
+            pin_memory=pin_memory,
+            device=device,
+            allocator_type=allocator_type,
+        )
+
+        # {global_layer_id: (pool_layer_id, is_swa_layer)}
+        self.layers_mapping = self.device_pool.layers_mapping
+        self.layer_num = self.device_pool.layer_num
+
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        full_select_index = self.full_pool_host.alloc(need_size)
+        swa_select_index = self.swa_pool_host.alloc(need_size)
+        assert (full_select_index is None) == (swa_select_index is None)
+        if full_select_index is not None:
+            assert len(full_select_index) == need_size
+            assert len(swa_select_index) == need_size
+        return full_select_index
+
+    def free(self, indices: torch.Tensor) -> int:
+        self.full_pool_host.free(indices)
+        self.swa_pool_host.free(indices)
+        return len(indices)
+
+    def clear(self):
+        self.full_pool_host.clear()
+        self.swa_pool_host.clear()
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        layer_id_pool, is_swa = self.device_pool.layers_mapping[layer_id]
+        if is_swa:
+            self.swa_pool_host.load_to_device_per_layer(
+                self.device_pool.swa_kv_pool,
+                host_indices,
+                device_indices,
+                layer_id_pool,
+                io_backend,
+            )
+        else:
+            self.full_pool_host.load_to_device_per_layer(
+                self.device_pool.full_kv_pool,
+                host_indices,
+                device_indices,
+                layer_id_pool,
+                io_backend,
+            )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        assert io_backend == "kernel", "Only kernel IO backend is supported."
+        # Backup full-attention KV cache.
+        transfer_kv_all_layer_fuse_lf_pf(
+            src_k_layers=device_pool.full_kv_pool.k_data_ptrs,
+            dst_k=self.full_pool_host.k_buffer,
+            src_v_layers=device_pool.full_kv_pool.v_data_ptrs,
+            dst_v=self.full_pool_host.v_buffer,
+            src_indices=device_indices,
+            dst_indices=host_indices,
+            item_size=self.full_pool_host.token_stride_size,
+            dst_layout_dim=self.full_pool_host.layout_dim,
+            v_item_size=self.full_pool_host.v_token_stride_size,
+            v_dst_layout_dim=self.full_pool_host.v_layout_dim,
+            num_layers=self.device_pool.full_layer_nums,
+        )
+        transfer_kv_all_layer_fuse_lf_pf(
+            src_k_layers=device_pool.swa_kv_pool.k_data_ptrs,
+            dst_k=self.swa_pool_host.k_buffer,
+            src_v_layers=device_pool.swa_kv_pool.v_data_ptrs,
+            dst_v=self.swa_pool_host.v_buffer,
+            src_indices=device_indices,
+            dst_indices=host_indices,
+            item_size=self.swa_pool_host.token_stride_size,
+            dst_layout_dim=self.swa_pool_host.layout_dim,
+            v_item_size=self.swa_pool_host.v_token_stride_size,
+            v_dst_layout_dim=self.swa_pool_host.v_layout_dim,
+            num_layers=self.device_pool.swa_layer_nums,
+        )
+
+    def get_data_page(self, index, flat: bool = True):
+        raise NotImplementedError(
+            "SWATokenToKVPoolHost does not support get_data_page."
+        )
+
+    def get_dummy_flat_data_page(self):
+        raise NotImplementedError(
+            "SWATokenToKVPoolHost does not support get_dummy_flat_data_page."
+        )
+
+    def set_from_flat_data_page(self, index: int, data_page):
+        raise NotImplementedError(
+            "SWATokenToKVPoolHost does not support set_from_flat_data_page."
+        )
+
+    def get_page_buffer_meta(self, indices):
+        raise NotImplementedError(
+            "SWATokenToKVPoolHost does not support get_page_buffer_meta."
         )

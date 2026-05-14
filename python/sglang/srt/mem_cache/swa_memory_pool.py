@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers.cache_controller import LayerDoneCounter
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -89,6 +90,7 @@ class SWAKVPool(KVCache):
             self.layers_mapping[global_layer_id] = (full_attn_layer_id, False)
         for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
             self.layers_mapping[global_layer_id] = (swa_layer_id, True)
+        self.layer_num = self.full_layer_nums + self.swa_layer_nums
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
 
         k_size, v_size = self.get_kv_size_bytes()
@@ -96,6 +98,10 @@ class SWAKVPool(KVCache):
         logger.info(
             f"SWAKVPool mem usage: {self.mem_usage:.2f} GB, swa size: {self.size_swa}, full size: {self.size}"
         )
+
+    def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
+        self.full_kv_pool.layer_transfer_counter = layer_transfer_counter
+        self.swa_kv_pool.layer_transfer_counter = layer_transfer_counter
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
@@ -125,23 +131,23 @@ class SWAKVPool(KVCache):
     def get_key_buffer(self, layer_id: int):
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
-            return self.swa_kv_pool.get_key_buffer(layer_id_pool)
+            return self.swa_kv_pool.get_key_buffer(layer_id_pool, layer_id)
         else:
-            return self.full_kv_pool.get_key_buffer(layer_id_pool)
+            return self.full_kv_pool.get_key_buffer(layer_id_pool, layer_id)
 
     def get_value_buffer(self, layer_id: int):
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
-            return self.swa_kv_pool.get_value_buffer(layer_id_pool)
+            return self.swa_kv_pool.get_value_buffer(layer_id_pool, layer_id)
         else:
-            return self.full_kv_pool.get_value_buffer(layer_id_pool)
+            return self.full_kv_pool.get_value_buffer(layer_id_pool, layer_id)
 
     def get_kv_buffer(self, layer_id: int):
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
-            return self.swa_kv_pool.get_kv_buffer(layer_id_pool)
+            return self.swa_kv_pool.get_kv_buffer(layer_id_pool, layer_id)
         else:
-            return self.full_kv_pool.get_kv_buffer(layer_id_pool)
+            return self.full_kv_pool.get_kv_buffer(layer_id_pool, layer_id)
 
     def set_swa_loc(self, loc: torch.Tensor):
         self.swa_loc = loc

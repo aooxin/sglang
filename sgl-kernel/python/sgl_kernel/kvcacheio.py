@@ -180,6 +180,38 @@ def transfer_kv_all_layer_lf_ph(
     )
 
 
+def transfer_kv_all_layer_fuse_lf_pf(
+    src_k_layers: torch.Tensor,
+    dst_k: torch.Tensor,
+    src_v_layers: torch.Tensor,
+    dst_v: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    item_size: int,
+    dst_layout_dim: int,
+    v_item_size: int,
+    v_dst_layout_dim: int,
+    num_layers: int,
+    block_quota: int = 2,
+    num_warps_per_block: int = 16 if _is_hip else 32,
+):
+    torch.ops.sgl_kernel.transfer_kv_all_layer_fuse_lf_pf.default(
+        src_k_layers,
+        dst_k,
+        src_v_layers,
+        dst_v,
+        src_indices,
+        dst_indices,
+        item_size,
+        dst_layout_dim,
+        v_item_size,
+        v_dst_layout_dim,
+        num_layers,
+        block_quota,
+        num_warps_per_block,
+    )
+
+
 def transfer_kv_direct(
     src_layers: List[torch.Tensor],
     dst_layers: List[torch.Tensor],

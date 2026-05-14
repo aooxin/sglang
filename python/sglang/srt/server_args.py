@@ -1836,16 +1836,6 @@ class ServerArgs:
                     logger.warning(
                         "Spec v2 is enabled for multi-layer EAGLE speculative decoding."
                     )
-
-            if self.enable_hierarchical_cache:
-                self.swa_full_tokens_ratio = 1.0
-                logger.warning(
-                    "Reset swa_full_tokens_ratio to 1.0 for MiMoV2 model with hierarchical cache"
-                )
-                self.disable_hybrid_swa_memory = True
-                logger.warning(
-                    "Disable hybrid SWA memory for MiMoV2 model with hierarchical cache"
-                )
         elif "Step3p5ForCausalLM" in model_arch:
             if self.speculative_algorithm == "EAGLE":
                 self.enable_multi_layer_eagle = True

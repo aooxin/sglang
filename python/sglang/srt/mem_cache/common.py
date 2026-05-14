@@ -10,6 +10,7 @@ import triton.language as tl
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
 from sglang.srt.utils.common import ceil_align
@@ -243,9 +244,14 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
             swa_num_tokens = max(0, num_tokens - swa_available_size)
-            tree_cache.evict(
-                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
-            )
+            if isinstance(tree_cache, SWARadixCache):
+                tree_cache.evict(
+                    EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+                )
+            else:
+                tree_cache.evict(
+                    EvictParams(num_tokens=full_num_tokens)
+                )
     else:
         # Standard allocator
         if allocator.available_size() < num_tokens:

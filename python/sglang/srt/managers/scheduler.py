@@ -795,10 +795,10 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
-            elif self.is_hybrid_swa:
-                from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+            #elif self.is_hybrid_swa:
+            #    from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
-                self.tree_cache = SWARadixCache(params=params)
+            #    self.tree_cache = SWARadixCache(params=params)
             elif self.is_hybrid_ssm:
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 

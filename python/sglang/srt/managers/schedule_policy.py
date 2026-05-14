@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -426,6 +427,7 @@ class PrefillAdder:
         self.is_hybrid_swa = isinstance(
             self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
         )
+        self.is_swa_radix_cache = isinstance(self.tree_cache, SWARadixCache)
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
 
         self.priority_scheduling_preemption_threshold = (
@@ -456,12 +458,18 @@ class PrefillAdder:
     @property
     def rem_total_tokens(self):
         if self.is_hybrid_swa:
-            available_and_evictable = min(
-                self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size(),
-                self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size(),
-            )
+            if self.is_swa_radix_cache:
+                available_and_evictable = min(
+                    self.token_to_kv_pool_allocator.full_available_size()
+                    + self.tree_cache.full_evictable_size(),
+                    self.token_to_kv_pool_allocator.swa_available_size()
+                    + self.tree_cache.swa_evictable_size(),
+                )
+            else:
+                available_and_evictable = (
+                    self.token_to_kv_pool_allocator.full_available_size()
+                    + self.tree_cache.evictable_size()
+                )
         elif self.is_hybrid_ssm_cache:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
@@ -477,12 +485,19 @@ class PrefillAdder:
     @property
     def cur_rem_tokens(self):
         if self.is_hybrid_swa:
-            available_and_evictable = min(
-                self.token_to_kv_pool_allocator.full_available_size()
-                + self.tree_cache.full_evictable_size(),
-                self.token_to_kv_pool_allocator.swa_available_size()
-                + self.tree_cache.swa_evictable_size(),
-            )
+            if self.is_swa_radix_cache:
+                available_and_evictable = min(
+                    self.token_to_kv_pool_allocator.full_available_size()
+                    + self.tree_cache.full_evictable_size(),
+                    self.token_to_kv_pool_allocator.swa_available_size()
+                    + self.tree_cache.swa_evictable_size(),
+                )
+            else:
+                available_and_evictable = (
+                    self.token_to_kv_pool_allocator.full_available_size()
+                    + self.tree_cache.evictable_size()
+                )
+
         elif self.is_hybrid_ssm_cache:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
@@ -565,7 +580,7 @@ class PrefillAdder:
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
-        if self.is_hybrid_swa:
+        if self.is_hybrid_swa and self.is_swa_radix_cache:
             req.swa_uuid_for_lock = result.swa_uuid_for_lock
 
     def add_dllm_staging_req(self, req: Req):
@@ -627,11 +642,11 @@ class PrefillAdder:
     def _lock_node(self, last_node: TreeNode):
         try:
             result = self.tree_cache.inc_lock_ref(last_node)
-            if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
+            if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache() and self.is_swa_radix_cache:
                 swa_uuid_for_lock = result.swa_uuid_for_lock
             yield None
         finally:
-            if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
+            if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache() and self.is_swa_radix_cache:
                 self.tree_cache.dec_lock_ref(
                     last_node, DecLockRefParams(swa_uuid_for_lock=swa_uuid_for_lock)
                 )
@@ -678,7 +693,7 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
-        if not self.is_hybrid_swa:
+        if not self.is_hybrid_swa or not self.is_swa_radix_cache:
             # Skip this logic for swa. The SWA has different memory management, and
             # this mechanism is underestimating the memory usage.
             cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(

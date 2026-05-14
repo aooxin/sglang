@@ -107,22 +107,39 @@ def get_allocator_from_storage(allocator_type):
         return HostTensorAllocator()
 
 
+# TODO(yingchun): unify to return Tuple[Tensor, Tensor]
 def alloc_with_host_register(
     dims,
     dtype: torch.dtype,
     device: str,
     pin_memory: bool,
     allocator: HostTensorAllocator,
+    k_dims: tuple = None,
+    v_dims: tuple = None,
 ) -> torch.Tensor:
     """
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
     """
-    buffer = allocator.allocate(dims, dtype=dtype, device=device)
-    if pin_memory:
-        torch.cuda.cudart().cudaHostRegister(
-            buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
-        )
+    if dims is not None:
+        assert k_dims is None
+        assert v_dims is None
+        buffer = allocator.allocate(dims, dtype=dtype, device=device)
+        if pin_memory:
+            torch.cuda.cudart().cudaHostRegister(
+                buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
+            )
+    else:
+        assert k_dims is not None
+        assert v_dims is not None
+        k_buffer = allocator.allocate(k_dims, dtype=dtype, device=device)
+        v_buffer = allocator.allocate(v_dims, dtype=dtype, device=device)
+        buffer = [k_buffer, v_buffer]
+        if pin_memory:
+            for cache in buffer:
+                torch.cuda.cudart().cudaHostRegister(
+                    cache.data_ptr(), cache.numel() * cache.element_size(), 0
+                )
     return buffer
 
 
@@ -132,10 +149,13 @@ def alloc_with_pin_memory(
     device: str,
     pin_memory: bool,
     allocator: None,
+    k_dims: tuple = None,
+    v_dims: tuple = None,
 ) -> torch.Tensor:
     """
     Allocate tensor using PyTorch's built-in pin_memory flag.
     """
+    assert dims is not None, "dims should be provided"
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
     return buffer
 
@@ -340,37 +360,84 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
         self.layer_num = self.device_pool.layer_num
+        self.v_head_dim = self.device_pool.v_head_dim
+        if self.head_dim != self.v_head_dim:
+            return (
+                (self.head_dim + self.v_head_dim)
+                * self.head_num
+                * self.layer_num
+                * self.dtype.itemsize
+            )
 
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
 
     def get_ksize_per_token(self):
+        if self.head_dim != self.v_head_dim:
+            return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize
         return self.get_size_per_token() // 2
 
     def init_kv_buffer(self):
-        if self.layout == "layer_first":
-            dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
-        elif self.layout == "page_first":
-            dims = (2, self.size, self.layer_num, self.head_num, self.head_dim)
-        elif self.layout == "page_first_direct":
-            dims = (
-                2,
-                self.page_num,
-                self.layer_num,
-                self.page_size,
-                self.head_num,
-                self.head_dim,
-            )
-        elif self.layout == "page_head":
-            dims = (
-                2,
-                self.page_num,
-                self.head_num,
-                self.page_size,
-                self.layer_num,
-                self.head_dim,
-            )
+        if self.head_dim == self.v_head_dim:
+            k_dims = None
+            v_dims = None
+            if self.layout == "layer_first":
+                dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
+            elif self.layout == "page_first":
+                dims = (2, self.size, self.layer_num, self.head_num, self.head_dim)
+            elif self.layout == "page_first_direct":
+                dims = (
+                    2,
+                    self.page_num,
+                    self.layer_num,
+                    self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                )
+            elif self.layout == "page_head":
+                dims = (
+                    2,
+                    self.page_num,
+                    self.head_num,
+                    self.page_size,
+                    self.layer_num,
+                    self.head_dim,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
         else:
-            raise ValueError(f"Unsupported layout: {self.layout}")
+            dims = None
+            if self.layout == "page_first":
+                k_dims = (
+                    self.size,
+                    self.layer_num,
+                    self.head_num,
+                    self.head_dim,
+                )
+                v_dims = (
+                    self.size,
+                    self.layer_num,
+                    self.head_num,
+                    self.v_head_dim,
+                )
+            elif self.layout == "page_first_direct":
+                k_dims = (
+                    self.page_num,
+                    self.layer_num,
+                    self.page_size,
+                    self.head_num,
+                    self.head_dim,
+                )
+                v_dims = (
+                    self.page_num,
+                    self.layer_num,
+                    self.page_size,
+                    self.head_num,
+                    self.v_head_dim,
+                )
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
+
+        # TODO(yingchun): deal with different self.v_head_dim
         self.token_stride_size = self.head_num * self.head_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
 
@@ -381,6 +448,8 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+            k_dims=k_dims,
+            v_dims=v_dims,
         )
         return buffer
 
@@ -616,6 +685,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    # TODO(yingchun): deal with different self.v_head_dim
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, :, index : index + self.page_size, :, :]
@@ -630,6 +700,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             data_page = data_page.flatten()
         return data_page
 
+    # TODO(yingchun): deal with different self.v_head_dim
     def get_dummy_flat_data_page(self) -> torch.Tensor:
         return torch.zeros(
             (2, self.layer_num, self.page_size, self.head_num, self.head_dim),
@@ -638,6 +709,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
         ).flatten()
 
+    # TODO(yingchun): deal with different self.v_head_dim
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         if self.layout == "layer_first":
             self.kv_buffer[:, :, index : index + self.page_size, :, :] = (
@@ -672,6 +744,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
+    # TODO(yingchun): deal with different self.v_head_dim
     def get_split_heads_page_buffer_meta(
         self, indices: torch.Tensor, split_factor: int
     ):
@@ -726,26 +799,44 @@ class MHATokenToKVPoolHost(HostKVCache):
         """
         assert len(indices) % self.page_size == 0
         ptr_list = []
-        kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
-        v_offset = (
-            self.layer_num
-            * self.size
-            * self.head_num
-            * self.head_dim
-            * self.dtype.itemsize
-        )
-        if self.layout == "layer_first":
-            for index in range(0, len(indices), self.page_size):
-                for layer_id in range(self.layer_num):
+        if self.head_dim == self.v_head_dim:
+            kv_buffer_data_ptr = self.kv_buffer.data_ptr()
+            v_offset = (
+                self.layer_num
+                * self.size
+                * self.head_num
+                * self.head_dim
+                * self.dtype.itemsize
+            )
+            if self.layout == "layer_first":
+                for index in range(0, len(indices), self.page_size):
+                    for layer_id in range(self.layer_num):
+                        k_ptr = (
+                            kv_buffer_data_ptr
+                            + indices[index]
+                            * self.head_num
+                            * self.head_dim
+                            * self.dtype.itemsize
+                            + layer_id
+                            * self.size
+                            * self.head_num
+                            * self.head_dim
+                            * self.dtype.itemsize
+                        )
+                        v_ptr = k_ptr + v_offset
+                        ptr_list.append(k_ptr)
+                        ptr_list.append(v_ptr)
+                element_size = (
+                    self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
+                )
+                element_size_list = [element_size] * len(ptr_list)
+            elif self.layout in ["page_first", "page_first_direct", "page_head"]:
+                for index in range(0, len(indices), self.page_size):
                     k_ptr = (
                         kv_buffer_data_ptr
                         + indices[index]
-                        * self.head_num
-                        * self.head_dim
-                        * self.dtype.itemsize
-                        + layer_id
-                        * self.size
+                        * self.layer_num
                         * self.head_num
                         * self.head_dim
                         * self.dtype.itemsize
@@ -753,33 +844,56 @@ class MHATokenToKVPoolHost(HostKVCache):
                     v_ptr = k_ptr + v_offset
                     ptr_list.append(k_ptr)
                     ptr_list.append(v_ptr)
-            element_size = (
-                self.dtype.itemsize * self.page_size * self.head_num * self.head_dim
-            )
-            element_size_list = [element_size] * len(ptr_list)
-        elif self.layout in ["page_first", "page_first_direct", "page_head"]:
-            for index in range(0, len(indices), self.page_size):
-                k_ptr = (
-                    kv_buffer_data_ptr
-                    + indices[index]
-                    * self.layer_num
+                element_size = (
+                    self.layer_num
+                    * self.dtype.itemsize
+                    * self.page_size
                     * self.head_num
                     * self.head_dim
-                    * self.dtype.itemsize
                 )
-                v_ptr = k_ptr + v_offset
-                ptr_list.append(k_ptr)
-                ptr_list.append(v_ptr)
-            element_size = (
-                self.layer_num
-                * self.dtype.itemsize
-                * self.page_size
-                * self.head_num
-                * self.head_dim
-            )
-            element_size_list = [element_size] * len(ptr_list)
+                element_size_list = [element_size] * len(ptr_list)
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
         else:
-            raise ValueError(f"Unsupported layout: {self.layout}")
+            k_base_ptr = self.k_buffer.data_ptr()
+            v_base_ptr = self.v_buffer.data_ptr()
+            if self.layout in ["page_first", "page_first_direct"]:
+                k_element_size = (
+                        self.layer_num
+                        * self.dtype.itemsize
+                        * self.page_size
+                        * self.head_num
+                        * self.head_dim
+                )
+                v_element_size = (
+                        self.layer_num
+                        * self.dtype.itemsize
+                        * self.page_size
+                        * self.head_num
+                        * self.v_head_dim
+                )
+                element_size_list = []
+                for index in range(0, len(indices), self.page_size):
+                    k_ptr = (
+                            k_base_ptr
+                            + indices[index]
+                            * self.layer_num
+                            * self.head_num
+                            * self.head_dim
+                            * self.dtype.itemsize
+                    )
+                    v_ptr = (
+                            v_base_ptr
+                            + indices[index]
+                            * self.layer_num
+                            * self.head_num
+                            * self.v_head_dim
+                            * self.dtype.itemsize
+                    )
+                    ptr_list.extend([k_ptr, v_ptr])
+                    element_size_list.extend([k_element_size, v_element_size])
+            else:
+                raise ValueError(f"Unsupported layout: {self.layout}")
         return ptr_list, element_size_list
 
 

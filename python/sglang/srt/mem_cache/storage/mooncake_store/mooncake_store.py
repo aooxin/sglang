@@ -5,7 +5,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Union
 
 import requests
 import torch
@@ -261,17 +261,22 @@ class MooncakeBaseStore:
 
         return config
 
-    def register_buffer(self, tensor: torch.Tensor):
+    def register_buffer(self, tensor: Union[torch.Tensor, List[torch.Tensor]]):
         if self.store is None:
             raise RuntimeError("Mooncake store is not initialized.")
-        ptr = tensor.data_ptr()
-        size = tensor.numel() * tensor.element_size()
-        ret_code = self.store.register_buffer(ptr, size)
-        if ret_code != 0:
-            logger.error(f"Failed to register buffer, error code: {ret_code}")
-            raise RuntimeError(
-                f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
-            )
+        if isinstance(tensor, torch.Tensor):
+            ptr = tensor.data_ptr()
+            size = tensor.numel() * tensor.element_size()
+            ret_code = self.store.register_buffer(ptr, size)
+            if ret_code != 0:
+                logger.error(f"Failed to register buffer, error code: {ret_code}")
+                raise RuntimeError(
+                    f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
+                )
+        else:
+            assert isinstance(tensor, list) and len(tensor) == 2, "Tensor must be a list of [k_buffer, v_buffer]"
+            self.register_buffer(tensor[0])
+            self.register_buffer(tensor[1])
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):

@@ -127,6 +127,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     out_cache_loc: torch.Tensor
+    out_cache_loc_swa: torch.Tensor
     positions: torch.Tensor
     mrope_positions: torch.Tensor
     num_token_non_padded: torch.Tensor
@@ -167,6 +168,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+            # TODO(yingchun): should alloc for out_cache_loc_swa in hybrid-SWA only
+            out_cache_loc_swa = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
@@ -238,6 +241,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_swa=out_cache_loc_swa,
             positions=positions,
             mrope_positions=mrope_positions,
             num_token_non_padded=num_token_non_padded,
@@ -269,6 +273,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
+            self.out_cache_loc_swa.zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
@@ -280,6 +285,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             self.req_pool_indices[:raw_bs],
             self.seq_lens[:raw_bs],
             self.out_cache_loc[:raw_num_token],
+            self.out_cache_loc_swa[:raw_num_token],
             self.positions[:raw_num_token],
         ]
         srcs = [
@@ -287,6 +293,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             forward_batch.out_cache_loc,
+            forward_batch.out_cache_loc_swa,
             forward_batch.positions,
         ]
 
@@ -851,6 +858,7 @@ class CudaGraphRunner:
         seq_lens = buffers.seq_lens[:bs]
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
+        out_cache_loc_swa = buffers.out_cache_loc_swa[:num_tokens]
         positions = buffers.positions[:num_tokens]
         if self.is_encoder_decoder:
             encoder_lens = buffers.encoder_lens[:bs]
@@ -945,6 +953,7 @@ class CudaGraphRunner:
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=attn_backend,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_swa=out_cache_loc_swa,
             seq_lens_sum=seq_lens.sum().item(),
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,

@@ -167,6 +167,8 @@ class SWAKVPool(KVCache):
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
+        # TODO(yingchun): because self.swa_loc is passed in, so use_mapping maybe useless, can be removed
+        use_mapping: bool = False,
     ):
 
         layer_id = layer.layer_id
@@ -175,7 +177,7 @@ class SWAKVPool(KVCache):
             if self.swa_loc is not None:
                 loc = self.swa_loc
             else:
-                if self.full_to_swa_index_mapping is not None:
+                if use_mapping and self.full_to_swa_index_mapping is not None:
                     loc = self.translate_loc_from_full_to_swa(loc)
 
             self.swa_kv_pool.set_kv_buffer(
@@ -371,6 +373,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        return alloc_full_indices
+
+    def pre_alloc(self, need_size: int, chunked_size: int):
+        # Pre-allocate KV cache for decode requests in PD-disaggregation mode.
+        swa_need_size = min(need_size, chunked_size)
+        if need_size > self.full_attn_allocator.available_size():
+            return None
+        if swa_need_size > self.swa_attn_allocator.available_size():
+            return None
+        alloc_full_indices = self.full_attn_allocator.alloc(need_size)
+        alloc_swa_indices = self.swa_attn_allocator.alloc(swa_need_size)
+        self.full_to_swa_index_mapping[alloc_full_indices[-swa_need_size:]] = (
+            alloc_swa_indices
+        )
         return alloc_full_indices
 
     def alloc_extend(

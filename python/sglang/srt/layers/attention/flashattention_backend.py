@@ -552,9 +552,23 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+                    # TODO(yingchun): can we use is_swa_layer below?
+                    _, is_swa = forward_batch.token_to_kv_pool.layers_mapping[
+                        layer.layer_id
+                    ]
+                    if is_swa:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer,
+                            forward_batch.out_cache_loc_swa,
+                            k,
+                            v,
+                            layer.k_scale,
+                            layer.v_scale,
+                        )
+                    else:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
@@ -922,9 +936,23 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
+                    # TODO(yingchun): can we use is_swa_layer below?
+                    _, is_swa = forward_batch.token_to_kv_pool.layers_mapping[
+                        layer.layer_id
+                    ]
+                    if is_swa:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer,
+                            forward_batch.out_cache_loc_swa,
+                            k,
+                            v,
+                            layer.k_scale,
+                            layer.v_scale,
+                        )
+                    else:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
@@ -2736,6 +2764,9 @@ def normal_decode_set_metadata(
         # SWA parameters
         if use_swa:
             assert isinstance(token_to_kv_pool, SWAKVPool)
+            # TODO(yingchun): code from 055 is:
+            # swa_page_indices = token_to_kv_pool.translate_loc_from_full_to_swa(page_indices)
+            # swa_page_table[:, :max_seq_pages].copy_(swa_page_indices // page_size)
             swa_page_table = swa_page_table.contiguous()
             swa_page_table_stride_0 = swa_page_table.stride(0)
             swa_page_table_stride_1 = swa_page_table.stride(1)

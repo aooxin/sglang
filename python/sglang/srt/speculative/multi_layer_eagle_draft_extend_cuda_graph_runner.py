@@ -303,6 +303,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         extend_start_loc = buffers.extend_start_loc[:bs]
         accept_length = buffers.accept_length[:bs]
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
+        swa_out_cache_loc = buffers.swa_out_cache_loc[:num_tokens]
         positions = buffers.positions[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
         hidden_states = buffers.hidden_states[:num_tokens]
@@ -363,6 +364,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_swa=swa_out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
             positions=positions,
@@ -507,6 +509,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             buffers.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens)
             buffers.extend_start_loc[:raw_bs].copy_(forward_batch.extend_start_loc)
         buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
+        buffers.swa_out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc_swa)
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
         if (
             forward_batch.spec_info.hidden_states.shape[1]

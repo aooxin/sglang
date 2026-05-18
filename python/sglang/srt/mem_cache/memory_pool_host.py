@@ -803,6 +803,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         """
         assert len(indices) % self.page_size == 0
         ptr_list = []
+        # TODO(yingchun): 改为 indices[::self.page_size].tolist() 可减少 (page_size-1)/page_size 的对象分配
         indices = indices.tolist()
         if self.head_dim == self.v_head_dim:
             kv_buffer_data_ptr = self.kv_buffer.data_ptr()
@@ -862,6 +863,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             k_base_ptr = self.k_buffer.data_ptr()
             v_base_ptr = self.v_buffer.data_ptr()
             if self.layout in ["page_first", "page_first_direct"]:
+                # TODO(yingchun): 可预计算变量降低重复计算
                 k_element_size = (
                         self.layer_num
                         * self.dtype.itemsize
@@ -2108,7 +2110,6 @@ class SWATokenToKVPoolHost:
             device=device,
             allocator_type=allocator_type,
         )
-
         # {global_layer_id: (pool_layer_id, is_swa_layer)}
         self.layers_mapping = self.device_pool.layers_mapping
         self.layer_num = self.device_pool.layer_num
@@ -2119,6 +2120,10 @@ class SWATokenToKVPoolHost:
     @property
     def size(self) -> int:
         return self.full_pool_host.size
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.full_pool_host.dtype
 
     def available_size(self) -> int:
         return self.full_pool_host.available_size()
@@ -2209,7 +2214,89 @@ class SWATokenToKVPoolHost:
             "SWATokenToKVPoolHost does not support set_from_flat_data_page."
         )
 
+    # TODO(yingchun): 考虑复用 get_page_buffer_meta 中的方法
     def get_page_buffer_meta(self, indices):
-        raise NotImplementedError(
-            "SWATokenToKVPoolHost does not support get_page_buffer_meta."
+        """
+        meta data for zero copy
+        """
+        assert len(indices) % self.page_size == 0
+        full_k_base_ptr = self.full_pool_host.k_buffer.data_ptr()
+        full_v_base_ptr = self.full_pool_host.v_buffer.data_ptr()
+        swa_k_base_ptr = self.swa_pool_host.k_buffer.data_ptr()
+        swa_v_base_ptr = self.swa_pool_host.v_buffer.data_ptr()
+        # TODO(yingchun): 改为 indices[::self.page_size].tolist() 可减少 (page_size-1)/page_size 的对象分配
+        indices = indices.tolist()
+        full_k_element_size = (
+            self.device_pool.full_layer_nums
+            * self.dtype.itemsize
+            * self.page_size
+            * self.full_pool_host.head_num
+            * self.full_pool_host.head_dim
         )
+        full_v_element_size = (
+            self.device_pool.full_layer_nums
+            * self.dtype.itemsize
+            * self.page_size
+            * self.full_pool_host.head_num
+            * self.full_pool_host.v_head_dim
+        )
+        swa_k_element_size = (
+            self.device_pool.swa_layer_nums
+            * self.dtype.itemsize
+            * self.page_size
+            * self.swa_pool_host.head_num
+            * self.swa_pool_host.head_dim
+        )
+        swa_v_element_size = (
+            self.device_pool.swa_layer_nums
+            * self.dtype.itemsize
+            * self.page_size
+            * self.swa_pool_host.head_num
+            * self.swa_pool_host.v_head_dim
+        )
+        ptr_list = []
+        element_size_list = []
+        for index in range(0, len(indices), self.page_size):
+            # TODO(yingchun): 可预计算变量降低重复计算
+            full_k_ptr = (
+                full_k_base_ptr
+                + indices[index]
+                * self.device_pool.full_layer_nums
+                * self.full_pool_host.head_num
+                * self.full_pool_host.head_dim
+                * self.dtype.itemsize
+            )
+            full_v_ptr = (
+                full_v_base_ptr
+                + indices[index]
+                * self.device_pool.full_layer_nums
+                * self.full_pool_host.head_num
+                * self.full_pool_host.v_head_dim
+                * self.dtype.itemsize
+            )
+            swa_k_ptr = (
+                swa_k_base_ptr
+                + indices[index]
+                * self.device_pool.swa_layer_nums
+                * self.swa_pool_host.head_num
+                * self.swa_pool_host.head_dim
+                * self.dtype.itemsize
+            )
+            swa_v_ptr = (
+                swa_v_base_ptr
+                + indices[index]
+                * self.device_pool.swa_layer_nums
+                * self.swa_pool_host.head_num
+                * self.swa_pool_host.v_head_dim
+                * self.dtype.itemsize
+            )
+            ptr_list.extend([full_k_ptr, full_v_ptr, swa_k_ptr, swa_v_ptr])
+            element_size_list.extend(
+                [
+                    full_k_element_size,
+                    full_v_element_size,
+                    swa_k_element_size,
+                    swa_v_element_size,
+                ]
+            )
+        return ptr_list, element_size_list

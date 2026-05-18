@@ -5,7 +5,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional
 
 import requests
 import torch
@@ -16,7 +16,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
+from sglang.srt.mem_cache.memory_pool_host import (
+    HostKVCache,
+    HostTensorAllocator,
+    SWATokenToKVPoolHost,
+)
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
@@ -261,22 +265,18 @@ class MooncakeBaseStore:
 
         return config
 
-    def register_buffer(self, tensor: Union[torch.Tensor, List[torch.Tensor]]):
+    def register_buffer(self, tensor: torch.Tensor, hint_buffer: Optional[str] = None):
         if self.store is None:
             raise RuntimeError("Mooncake store is not initialized.")
-        if isinstance(tensor, torch.Tensor):
-            ptr = tensor.data_ptr()
-            size = tensor.numel() * tensor.element_size()
-            ret_code = self.store.register_buffer(ptr, size)
-            if ret_code != 0:
-                logger.error(f"Failed to register buffer, error code: {ret_code}")
-                raise RuntimeError(
-                    f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
-                )
-        else:
-            assert isinstance(tensor, list) and len(tensor) == 2, "Tensor must be a list of [k_buffer, v_buffer]"
-            self.register_buffer(tensor[0])
-            self.register_buffer(tensor[1])
+        ptr = tensor.data_ptr()
+        size = tensor.numel() * tensor.element_size()
+        ret_code = self.store.register_buffer(ptr, size)
+        if ret_code != 0:
+            hint_buffer = "buffer" if hint_buffer is None else hint_buffer
+            logger.error(f"Failed to register {hint_buffer}, error code: {ret_code}")
+            raise RuntimeError(
+                f"Failed to register {hint_buffer} to Mooncake Store, error code: {ret_code}"
+            )
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
@@ -489,13 +489,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             "page_first_direct",
             "page_head",
         ], "mooncake store storage backend only support page first or page first direct layout"
-        buffer = self.mem_pool_host.kv_buffer
         try:
-            super().register_buffer(buffer)
+            # If k and v head dim are inconsistent, host_k_buffer and host_v_buffer are two separate memory addresses when allocating memory, so they need to be registered separately
+            if isinstance(self.mem_pool_host, SWATokenToKVPoolHost):
+                self.register_buffer(self.mem_pool_host.full_pool_host.k_buffer, hint_buffer="full K buffer")
+                self.register_buffer(self.mem_pool_host.full_pool_host.v_buffer, hint_buffer="full V buffer")
+                self.register_buffer(self.mem_pool_host.swa_pool_host.k_buffer, hint_buffer="SWA K buffer")
+                self.register_buffer(self.mem_pool_host.swa_pool_host.v_buffer, hint_buffer="SWA V buffer")
+            else:
+                buffer = self.mem_pool_host.kv_buffer
+                super().register_buffer(buffer)
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
 
+        # TODO(yingchun): get_ksize_per_token is not implemented for SWATokenToKVPoolHost now, need to adapt when enabling SWA support
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
 
@@ -530,11 +538,27 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
+    def _get_swa_buffer_meta(self, keys, indices):
+        # TODO(yingchun): not support pp_rank now
+        assert not self.enable_pp
+        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
+        key_list = []
+        for key_ in keys:
+            key_list.append(f"{key_}_{self.local_rank}_full_k")
+            key_list.append(f"{key_}_{self.local_rank}_full_v")
+            key_list.append(f"{key_}_{self.local_rank}_swa_k")
+            key_list.append(f"{key_}_{self.local_rank}_swa_v")
+        assert len(key_list) == len(ptr_list)
+        return key_list, ptr_list, element_size_list
+
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
+        # TODO(yingchun): 新增 self.is_swa_backend, 简化判断
+        elif isinstance(self.mem_pool_host, SWATokenToKVPoolHost):
+            return self._get_swa_buffer_meta(keys, host_indices)
         else:
             if self.storage_config.should_split_heads:
                 return self._get_mha_split_heads_buffer_meta(keys, host_indices)
@@ -551,6 +575,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         """
         if self.is_mla_backend:
             return [k_res == 0 if is_set_operate else k_res > 0 for k_res in results]
+        elif isinstance(self.mem_pool_host, SWATokenToKVPoolHost):
+            # 4 个 entry 一组 (full_k, full_v, swa_k, swa_v)
+            kv_groups = [results[i : i + 4] for i in range(0, len(results), 4)]
+            return [
+                (
+                    all(res == 0 for res in kv_group)
+                    if is_set_operate
+                    else all(res > 0 for res in kv_group)
+                )
+                for kv_group in kv_groups
+            ]
         else:
             if self.storage_config.should_split_heads:
                 kv_groups = [
@@ -757,6 +792,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             key_multiplier = 1
         else:
             key_multiplier = 2
+        # TODO(yingchun): should also adapt to SWATokenToKVPoolHost, key_multiplier = 4
 
         if self.enable_storage_metrics:
             self.prefetch_pgs.append(len(keys))
@@ -784,6 +820,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.is_mla_backend:
             query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
             key_multiplier = 1
+        elif isinstance(self.mem_pool_host, SWATokenToKVPoolHost):
+            # TODO(yingchun): 复用 _get_swa_buffer_meta
+            query_keys = []
+            for key in keys:
+                query_keys.append(f"{key}_{self.local_rank}_full_k")
+                query_keys.append(f"{key}_{self.local_rank}_full_v")
+                query_keys.append(f"{key}_{self.local_rank}_swa_k")
+                query_keys.append(f"{key}_{self.local_rank}_swa_v")
+            key_multiplier = 4
         else:
             query_keys = []
             if self.storage_config.should_split_heads:

@@ -334,8 +334,12 @@ class MHATokenToKVPoolHost(HostKVCache):
             allocator_type,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
-        self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
-            element_size=self.element_dim * self.dtype.itemsize
+        self.can_use_jit = (
+            _is_cuda
+            and self.device_pool.head_dim == self.device_pool.v_head_dim
+            and can_use_hicache_jit_kernel(
+                element_size=self.element_dim * self.dtype.itemsize
+            )
         )
 
         if self.layout == "page_first":

@@ -1,0 +1,301 @@
+import logging
+import os
+import time
+from typing import Any, List, Optional
+
+import torch
+from gcache_sdk import GCacheClient
+
+from sglang.srt.layers.dp_attention import get_attention_dp_rank
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorage,
+    HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
+)
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache, SWATokenToKVPoolHost
+
+logger = logging.getLogger(__name__)
+
+GCACHE_CONFIG_FILE = "/sgl-workspace/gcache.flags"
+
+
+class GcacheStorage(HiCacheStorage):
+    def __init__(
+        self, hicache_config: HiCacheStorageConfig, mem_pool_host: HostKVCache
+    ):
+        self.dp_rank = get_attention_dp_rank()
+        self.tp_rank = hicache_config.tp_rank
+
+        # TODO(yingchun): move to python/sglang/srt/environ.py
+        master_addr = os.environ.get("GCACHE_MASTER_ADDR")
+        cache_group = os.environ.get("GCACHE_CACHE_GROUP")
+        client_ifname = os.environ.get("GCACHE_CLIENT_IFNAME")
+        if not master_addr or not cache_group or not client_ifname:
+            raise RuntimeError("Gcache need ENV variables, please check GCACHE_MASTER_ADDR, GCACHE_CACHE_GROUP or GCACHE_CLIENT_IFNAME")
+
+        subprocess_config = GCACHE_CONFIG_FILE + f".dp{self.dp_rank}tp{self.tp_rank}"
+        self.generate_config_file(
+            GCACHE_CONFIG_FILE,
+            subprocess_config,
+            master_addr,
+            cache_group,
+            client_ifname,
+        )
+
+        self.gcache_client = GCacheClient(conf_file=subprocess_config)
+
+        self.warmup()
+
+    def generate_config_file(
+        self,
+        config_file,
+        subprocess_config_file,
+        master_addr,
+        cache_group,
+        client_ifname,
+    ):
+        config_map = {
+            "master_addr": master_addr,
+            "cache_group": cache_group,
+            "client_ifname": client_ifname,
+        }
+        new_lines = []
+        with open(config_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line_strip = line.strip()
+                for key, new_val in config_map.items():
+                    if line_strip.startswith(f"--{key}="):
+                        new_line = f"--{key}={new_val}\n"
+                        new_lines.append(new_line)
+                        break
+                else:
+                    new_lines.append(line)
+        with open(subprocess_config_file, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+
+    def register_buffer(self, tensor: torch.Tensor, hint_buffer: str):
+        if self.gcache_client is None:
+            raise RuntimeError("Gcache store is not initialized.")
+        ptr = tensor.data_ptr()
+        size = tensor.numel() * tensor.element_size()
+        ret_code = self.gcache_client.register_memory(ptr, size)
+        if ret_code:
+            logger.error(f"Failed to register {hint_buffer}, error code: {ret_code}")
+            raise RuntimeError(
+                f"Failed to register {hint_buffer} to Gcache Store, error code: {ret_code}"
+            )
+
+    def register_mem_pool_host(self, mem_pool_host: HostKVCache) -> None:
+        super().register_mem_pool_host(mem_pool_host)
+        assert isinstance(self.mem_pool_host, SWATokenToKVPoolHost)
+        assert self.mem_pool_host.layout in [
+            "page_first",
+            "page_first_direct",
+        ], "gcache store storage backend only support page first or page first direct layout"
+        try:
+            # If k and v head dim are inconsistent, host_k_buffer and host_v_buffer are two separate memory addresses when allocating memory, so they need to be registered separately
+            self.register_buffer(self.mem_pool_host.full_pool_host.k_buffer, "full K buffer")
+            self.register_buffer(self.mem_pool_host.full_pool_host.v_buffer, "full V buffer")
+            self.register_buffer(self.mem_pool_host.swa_pool_host.k_buffer, "SWA K buffer")
+            self.register_buffer(self.mem_pool_host.swa_pool_host.v_buffer, "SWA V buffer")
+
+        except TypeError as err:
+            logger.error("Failed to register buffer to Gcache Store: %s", err)
+            raise TypeError("Gcache Store Register Buffer Error.") from err
+
+    def batch_exists(
+        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> int:
+        # TODO(yingchun): reduce cost in f-string debug logs
+        logger.debug(f"gcache: begin check {len(keys)} keys")
+
+        # TODO(yingchun): 求 key 列表封装一个函数
+        query_keys = []
+        for key in keys:
+            query_keys.append(f"{key}_{self.tp_rank}_full_k")
+            query_keys.append(f"{key}_{self.tp_rank}_full_v")
+            query_keys.append(f"{key}_{self.tp_rank}_swa_k")
+            query_keys.append(f"{key}_{self.tp_rank}_swa_v")
+        key_multiplier = 4
+
+        exist_mask = self.gcache_client.batch_exists(query_keys)
+
+        prefix_success = 0
+        for exist in exist_mask:
+            if exist:
+                prefix_success += 1
+            else:
+                break
+
+        prefix_success = prefix_success // key_multiplier
+        logger.debug(
+            f"gcache: end check {len(query_keys)} keys, {prefix_success} exist"
+        )
+        return prefix_success
+
+    def batch_set_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        logger.debug(f"gcache: begin set {len(keys)} keys")
+
+        if len(keys) == 0:
+            return [True] * len(keys)
+
+        start_time = time.perf_counter()
+        gcache_keys, value_ptr_list, value_size_list = self._batch_preprocess(
+            keys, host_indices
+        )
+
+        exist_result = self.gcache_client.batch_exists(gcache_keys)
+
+        set_keys = []
+        set_buffer_ptrs = []
+        set_buffer_sizes = []
+        set_indices = []
+        set_results = [False] * len(gcache_keys)
+
+        for i in range(len(gcache_keys)):
+            if not exist_result[i]:
+                set_keys.append(gcache_keys[i])
+                set_buffer_ptrs.append(value_ptr_list[i])
+                set_buffer_sizes.append(value_size_list[i])
+                set_indices.append(i)
+            else:
+                set_results[i] = True
+
+        # Only set non-existing keys to storage
+        if len(set_keys) > 0:
+            partial_set_results = self.gcache_client.batch_set(
+                set_keys, set_buffer_ptrs, set_buffer_sizes
+            )
+            for i in range(len(set_indices)):
+                set_results[set_indices[i]] = partial_set_results[i]
+
+        end_time = time.perf_counter()
+        execution_time = (end_time - start_time) * 1e6
+        success_count = sum(1 for each in set_results if each)
+
+        ret = self._batch_postprocess(set_results)
+
+        if len(gcache_keys) == success_count:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"gcache: end set {len(keys)} keys, success count: {success_count}, API results: {set_results}, "
+                    f"ret: {ret}, cost time: {execution_time:.2f} us"
+                )
+        else:
+            logger.error(
+                f"gcache: batch set failed: {len(gcache_keys)} keys, success count: {success_count}"
+            )
+
+        return ret
+
+    def batch_get_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        logger.debug(f"gcache: begin get {len(keys)} keys")
+
+        if len(keys) == 0:
+            return [True] * len(keys)
+
+        start_time = time.perf_counter()
+        gcache_keys, value_ptr_list, value_size_list = self._batch_preprocess(
+            keys, host_indices
+        )
+
+        results = self.gcache_client.batch_get(
+            gcache_keys, value_ptr_list, value_size_list
+        )
+
+        end_time = time.perf_counter()
+        execution_time = (end_time - start_time) * 1e6
+        success_count = sum(1 for each in results if each)
+        logger.debug(
+            f"gcache: end get {len(keys)} keys, success count: {success_count}, "
+            f"cost time: {execution_time:.2f} us"
+        )
+
+        return self._batch_postprocess(results)
+
+    ####################################################################################################################
+
+    def set(
+        self,
+        key: str,
+        value: Optional[Any] = None,
+        target_location: Optional[Any] = None,
+        target_size: Optional[Any] = None,
+    ) -> bool:
+        raise NotImplementedError("gcache: deprecated single set. SHOULD NOT HAPPEN")
+
+    def batch_set(
+        self,
+        keys: List[str],
+        values: Optional[Any] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        raise NotImplementedError("gcache: deprecated batch set. SHOULD NOT HAPPEN")
+
+    def get(
+        self,
+        key,
+        target_location: Optional[Any] = None,
+        target_size: Optional[Any] = None,
+    ) -> torch.Tensor | None:
+        raise NotImplementedError("gcache: deprecated single get. SHOULD NOT HAPPEN")
+
+    def batch_get(
+        self,
+        keys: List[str],
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> List[torch.Tensor | None] | int:
+        raise NotImplementedError("gcache: deprecated batch get. SHOULD NOT HAPPEN")
+
+    def exists(self, key) -> bool:
+        raise NotImplementedError("gcache: deprecated single exists. SHOULD NOT HAPPEN")
+
+    ####################################################################################################################
+
+    def warmup(self):
+        num_warmup = 2048
+        keys = ["gcache_warmup_key" + str(i) for i in range(num_warmup)]
+        logger.info("begin warming up gcache client")
+        start_time = time.perf_counter()
+        # Just check exists, in order to create RDMA connections in advance
+        self.batch_exists(keys)
+        logger.info(
+            f"finish warming up gcache client, cost {time.perf_counter() - start_time:.2f} seconds"
+        )
+
+    def _batch_preprocess(self, keys, host_indices):
+        assert len(keys) > 0
+        assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
+        assert isinstance(self.mem_pool_host, SWATokenToKVPoolHost)
+
+        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(
+            host_indices
+        )
+        # TODO(yingchun): 求 key 列表封装一个函数
+        key_list = []
+        for key_ in keys:
+            key_list.append(f"{key_}_{self.tp_rank}_full_k")
+            key_list.append(f"{key_}_{self.tp_rank}_full_v")
+            key_list.append(f"{key_}_{self.tp_rank}_swa_k")
+            key_list.append(f"{key_}_{self.tp_rank}_swa_v")
+        assert len(key_list) == len(ptr_list)
+        return key_list, ptr_list, element_size_list
+
+    def _batch_postprocess(self, results: List[bool]):
+        all_kv_pairs = zip(results[::4], results[1::4], results[2::4], results[3::4])
+        return [
+            (full_k_res and full_v_res and swa_k_res and swa_v_res)
+            for full_k_res, full_v_res, swa_k_res, swa_v_res in all_kv_pairs
+        ]

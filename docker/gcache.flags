@@ -1,0 +1,14 @@
+--master_addr=value_need_update_in_production
+--cache_group=value_need_update_in_production
+--client_ifname=value_need_update_in_production
+--client_threads=16
+--rpc_socket_type=rdma
+--use_byterpc=true
+--log_dir=/home/work/log/
+--log_level=1
+--log_filename_suffix_use_pid=true
+--verify_checksum=false
+--calculate_checksum=false
+--set_max_open_fds=false
+--force_same_rail_nic=false
+--fixed_numa_node=false

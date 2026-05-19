@@ -25,6 +25,9 @@ class GcacheStorage(HiCacheStorage):
     ):
         self.dp_rank = get_attention_dp_rank()
         self.tp_rank = hicache_config.tp_rank
+        # self.tp_size = hicache_config.tp_size
+        self.model_name: str = hicache_config.model_name
+        assert self.model_name, "Empty model name"
 
         # TODO(yingchun): move to python/sglang/srt/environ.py
         master_addr = os.environ.get("GCACHE_MASTER_ADDR")
@@ -32,6 +35,10 @@ class GcacheStorage(HiCacheStorage):
         client_ifname = os.environ.get("GCACHE_CLIENT_IFNAME")
         if not master_addr or not cache_group or not client_ifname:
             raise RuntimeError("Gcache need ENV variables, please check GCACHE_MASTER_ADDR, GCACHE_CACHE_GROUP or GCACHE_CLIENT_IFNAME")
+
+        # One client only uses one NIC
+        # nic_names = client_ifname.split(",")
+        # nic_index = (self.dp_rank * self.tp_size + self.tp_rank) % len(nic_names)
 
         subprocess_config = GCACHE_CONFIG_FILE + f".dp{self.dp_rank}tp{self.tp_rank}"
         self.generate_config_file(
@@ -109,13 +116,7 @@ class GcacheStorage(HiCacheStorage):
         # TODO(yingchun): reduce cost in f-string debug logs
         logger.debug(f"gcache: begin check {len(keys)} keys")
 
-        # TODO(yingchun): 求 key 列表封装一个函数
-        query_keys = []
-        for key in keys:
-            query_keys.append(f"{key}_{self.tp_rank}_full_k")
-            query_keys.append(f"{key}_{self.tp_rank}_full_v")
-            query_keys.append(f"{key}_{self.tp_rank}_swa_k")
-            query_keys.append(f"{key}_{self.tp_rank}_swa_v")
+        query_keys = self._convert_hybrid_keys(keys)
         key_multiplier = 4
 
         exist_mask = self.gcache_client.batch_exists(query_keys)
@@ -149,7 +150,7 @@ class GcacheStorage(HiCacheStorage):
             keys, host_indices
         )
 
-        exist_result = self.gcache_client.batch_exists(gcache_keys)
+        exist_result = self.gcache_client.batch_exists(gcache_keys, False)
 
         set_keys = []
         set_buffer_ptrs = []
@@ -275,6 +276,16 @@ class GcacheStorage(HiCacheStorage):
             f"finish warming up gcache client, cost {time.perf_counter() - start_time:.2f} seconds"
         )
 
+    # TODO(yingchun): not support pp_rank now
+    def _convert_hybrid_keys(self, keys: List[str]) -> List[str]:
+        ret = []
+        for key_ in keys:
+            ret.append(f"{self.model_name}_{key_}_{self.tp_rank}_full_k")
+            ret.append(f"{self.model_name}_{key_}_{self.tp_rank}_full_v")
+            ret.append(f"{self.model_name}_{key_}_{self.tp_rank}_swa_k")
+            ret.append(f"{self.model_name}_{key_}_{self.tp_rank}_swa_v")
+        return ret
+
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
@@ -283,13 +294,7 @@ class GcacheStorage(HiCacheStorage):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(
             host_indices
         )
-        # TODO(yingchun): 求 key 列表封装一个函数
-        key_list = []
-        for key_ in keys:
-            key_list.append(f"{key_}_{self.tp_rank}_full_k")
-            key_list.append(f"{key_}_{self.tp_rank}_full_v")
-            key_list.append(f"{key_}_{self.tp_rank}_swa_k")
-            key_list.append(f"{key_}_{self.tp_rank}_swa_v")
+        key_list = self._convert_hybrid_keys(keys)
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 

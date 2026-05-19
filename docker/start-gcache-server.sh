@@ -68,8 +68,8 @@ nohup ./gcache-server \
     --cache_write_mode=write_only \
     --metric_exposer_addr=0.0.0.0:19090 \
     --mem_pool_prealloc_size_GB=${PREALLOC_SIZE} \
-    --set_max_open_fds=false \
-    --memory_cache_entry_expected_size_KB=8 \
+    --set_max_open_fds=true \
+    --memory_cache_entry_expected_size_KB=128 \
     &> /dev/null &
 
 while true; do

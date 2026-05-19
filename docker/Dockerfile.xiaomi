@@ -47,9 +47,9 @@ RUN mkdir -p /home/work/gcache && \
     cd /home/work/gcache && \
     mkdir -p /home/work/log && \
     ln -s /home/work/log log && \
-    curl -LO http://cnbj1-fds.api.xiaomi.net/juicefs/gcache/release/tmp-build/20260209-ef34bd72/gcache-server && \
+    curl -LO http://cnbj1-fds.api.xiaomi.net/juicefs/gcache/release/tmp-build/20260415-aa25c909/gcache-server && \
     chmod +x gcache-server && \
-    pip install http://cnbj1-fds.api.xiaomi.net/juicefs/gcache/release/tmp-build/20260209-ef34bd72/gcache_sdk-0.1.0-py3-none-any.whl
+    pip install http://cnbj1-fds.api.xiaomi.net/juicefs/gcache/release/tmp-build/20260415-aa25c909/gcache_sdk-0.1.0-py3-none-any.whl
 COPY docker/start-gcache-server.sh /home/work/gcache/
 COPY docker/wait-gcache-server.sh /home/work/gcache/
 

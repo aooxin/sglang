@@ -540,6 +540,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _get_swa_buffer_meta(self, keys, indices):
         # TODO(yingchun): not support pp_rank now
+        # TODO(yingchun): add self.model_name into key when model_name is available, to support multiple models sharing the same storage backend
         assert not self.enable_pp
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
         key_list = []

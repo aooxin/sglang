@@ -356,7 +356,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
 
     def alloc(self, need_size: int):
-        assert self.page_size == 1
+        # TODO(yingchun): 社区版依然有下面的 assert
+        # assert self.page_size == 1
         if need_size > self.full_attn_allocator.available_size():
             return None
         if need_size > self.swa_attn_allocator.available_size():
@@ -377,13 +378,62 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def pre_alloc(self, need_size: int, chunked_size: int):
         # Pre-allocate KV cache for decode requests in PD-disaggregation mode.
-        swa_need_size = min(need_size, chunked_size)
-        if need_size > self.full_attn_allocator.available_size():
-            return None
-        if swa_need_size > self.swa_attn_allocator.available_size():
-            return None
-        alloc_full_indices = self.full_attn_allocator.alloc(need_size)
-        alloc_swa_indices = self.swa_attn_allocator.alloc(swa_need_size)
+        if need_size <= 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        align_start = max(need_size - chunked_size, 0)
+        align_start = align_start // self.page_size * self.page_size
+        swa_need_size = need_size - align_start
+        if self.page_size == 1:
+            if need_size > self.full_attn_allocator.available_size():
+                return None
+            if swa_need_size > self.swa_attn_allocator.available_size():
+                return None
+            alloc_full_indices = self.full_attn_allocator.alloc(need_size)
+            alloc_swa_indices = self.swa_attn_allocator.alloc(swa_need_size)
+        else:
+            # TODO(yingchun): 在 __init__ 中优化为常量
+            prefix_lens = torch.tensor([0], dtype=torch.int64, device=self.device)
+            prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
+            last_loc = torch.tensor([-1], dtype=torch.int64, device=self.device)
+
+            seq_lens_full = torch.tensor(
+                [need_size], dtype=torch.int64, device=self.device
+            )
+            seq_lens_full_cpu = torch.tensor([need_size], dtype=torch.int64)
+            seq_lens_swa = torch.tensor(
+                [swa_need_size], dtype=torch.int64, device=self.device
+            )
+            seq_lens_swa_cpu = torch.tensor([swa_need_size], dtype=torch.int64)
+            num_tokens = need_size + len(seq_lens_full) * self.page_size
+            swa_num_tokens = swa_need_size + len(seq_lens_swa) * self.page_size
+            if num_tokens > self.full_attn_allocator.available_size():
+                return None
+            if swa_num_tokens > self.swa_attn_allocator.available_size():
+                return None
+            alloc_full_indices = self.full_attn_allocator.alloc_extend(
+                prefix_lens=prefix_lens,
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens=seq_lens_full,
+                seq_lens_cpu=seq_lens_full_cpu,
+                last_loc=last_loc,
+                extend_num_tokens=need_size,
+            )
+            swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
+            alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
+                prefix_lens=prefix_lens,
+                prefix_lens_cpu=prefix_lens_cpu,
+                seq_lens=seq_lens_swa,
+                seq_lens_cpu=seq_lens_swa_cpu,
+                last_loc=swa_last_loc,
+                extend_num_tokens=swa_need_size,
+            )
+
+        assert alloc_full_indices is not None
+        assert alloc_swa_indices is not None
+        # Clear stale mappings on all allocated full indices before writing
+        # the current request's SWA tail mapping.
+        self.full_to_swa_index_mapping[alloc_full_indices] = 0
         self.full_to_swa_index_mapping[alloc_full_indices[-swa_need_size:]] = (
             alloc_swa_indices
         )

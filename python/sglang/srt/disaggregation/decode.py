@@ -283,6 +283,7 @@ class DecodePreallocQueue:
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
         self.pp_rank = pp_rank
+        assert num_reserved_decode_tokens % self.token_to_kv_pool_allocator.page_size == 0
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
@@ -315,6 +316,13 @@ class DecodePreallocQueue:
                     * self.scheduler.server_args.speculative_eagle_topk,
                     self.scheduler.server_args.speculative_num_draft_tokens,
                 )
+                # TODO(yingchun): 所有这些对齐都替换为 ceil_align 来简化
+                if self.scheduler.page_size > 1:
+                    self.swa_extra_need_tokens = (
+                            (self.swa_extra_need_tokens + self.scheduler.page_size - 1)
+                            // self.scheduler.page_size
+                            * self.scheduler.page_size
+                    )
         else:
             self.evict_len_per_step = None
             self.swa_extra_need_tokens = 0
@@ -494,6 +502,8 @@ class DecodePreallocQueue:
         resumed_reqs = []
         indices_to_remove = set()
         allocatable_tokens = self._allocatable_tokens(count_retracted=False)
+        # TODO(yingchun): page_size 设置为成员变量
+        page_size = self.token_to_kv_pool_allocator.page_size
 
         for i, req in enumerate(self.retracted_queue):
             if rids_to_check is not None and req.rid not in rids_to_check:
@@ -507,6 +517,10 @@ class DecodePreallocQueue:
                     + len(req.output_ids)
                     + self.num_reserved_decode_tokens
                 )
+                if page_size > 1:
+                    required_tokens_for_request = (
+                        (required_tokens_for_request + page_size - 1) // page_size
+                    ) * page_size
                 if required_tokens_for_request > allocatable_tokens:
                     break
                 allocatable_tokens -= required_tokens_for_request
@@ -523,6 +537,13 @@ class DecodePreallocQueue:
                     self.scheduler.sliding_window_size,
                 ) + min(self.num_reserved_decode_tokens, self.evict_len_per_step)
                 swa_required_tokens_for_request += self.swa_extra_need_tokens
+                if page_size > 1:
+                    full_required_tokens_for_request = (
+                        (full_required_tokens_for_request + page_size - 1) // page_size
+                    ) * page_size
+                    swa_required_tokens_for_request = (
+                        (swa_required_tokens_for_request + page_size - 1) // page_size
+                    ) * page_size
                 if (
                     full_required_tokens_for_request > full_allocatable_tokens
                     or swa_required_tokens_for_request > swa_allocatable_tokens
@@ -693,6 +714,11 @@ class DecodePreallocQueue:
         allocatable_tokens = self._allocatable_tokens(
             retractable_tokens=retractable_tokens, count_retracted=True
         )
+        if self.scheduler.enable_hisparse:
+            # TODO(yingchun): is page size should always be 1 when enable_hisparse?
+            page_size = 1  # host pool page_size
+        else:
+            page_size = self.token_to_kv_pool_allocator.page_size
         if self.scheduler.model_config.is_hybrid_swa:
             # TODO(yingchun): duplicate to _allocatable_tokens(), should reuse
             # Count KV cache that would be freed if all running requests were retracted.
@@ -740,16 +766,28 @@ class DecodePreallocQueue:
             required_tokens_for_request = (
                 origin_input_len + self.num_reserved_decode_tokens
             )
+            if page_size > 1:
+                required_tokens_for_request = (
+                    (required_tokens_for_request + page_size - 1) // page_size
+                ) * page_size
             if not self.scheduler.model_config.is_hybrid_swa:
+                max_tokens_for_request = (
+                    origin_input_len
+                    + min(
+                        decode_req.req.sampling_params.max_new_tokens,
+                        CLIP_MAX_NEW_TOKEN,
+                    )
+                    - retractable_tokens
+                )
+                if page_size > 1:
+                    max_tokens_for_request = max(max_tokens_for_request, 0)
+                    max_tokens_for_request = (
+                        (max_tokens_for_request + page_size - 1) // page_size
+                    ) * page_size
                 if (
                     max(
                         required_tokens_for_request,
-                        origin_input_len
-                        + min(
-                            decode_req.req.sampling_params.max_new_tokens,
-                            CLIP_MAX_NEW_TOKEN,
-                        )
-                        - retractable_tokens,
+                        max_tokens_for_request,
                     )
                     > allocatable_tokens
                 ):
@@ -765,30 +803,51 @@ class DecodePreallocQueue:
                     origin_input_len, self.scheduler.sliding_window_size
                 ) + min(self.num_reserved_decode_tokens, self.evict_len_per_step)
                 swa_required_tokens_for_request += self.swa_extra_need_tokens
+                full_max_tokens_for_request = (
+                    origin_input_len
+                    + min(
+                        decode_req.req.sampling_params.max_new_tokens,
+                        CLIP_MAX_NEW_TOKEN,
+                    )
+                    - retractable_tokens
+                )
+                swa_max_tokens_for_request = (
+                    min(origin_input_len, self.scheduler.sliding_window_size)
+                    + min(
+                        decode_req.req.sampling_params.max_new_tokens,
+                        CLIP_MAX_NEW_TOKEN,
+                        self.evict_len_per_step,
+                    )
+                    - swa_retractable_tokens
+                    + self.swa_extra_need_tokens
+                )
+                if page_size > 1:
+                    full_required_tokens_for_request = (
+                        (full_required_tokens_for_request + page_size - 1) // page_size
+                    ) * page_size
+                    swa_required_tokens_for_request = (
+                        (swa_required_tokens_for_request + page_size - 1) // page_size
+                    ) * page_size
+                    full_max_tokens_for_request = max(full_max_tokens_for_request, 0)
+                    full_max_tokens_for_request = (
+                        (full_max_tokens_for_request + page_size - 1) // page_size
+                    ) * page_size
+                    swa_max_tokens_for_request = max(swa_max_tokens_for_request, 0)
+                    swa_max_tokens_for_request = (
+                        (swa_max_tokens_for_request + page_size - 1) // page_size
+                    ) * page_size
                 # Estimate whether this request would exceed the token limit in the most extreme case,
                 # assuming all currently running requests are retracted.
                 if (
                     max(
                         required_tokens_for_request,
-                        origin_input_len
-                        + min(
-                            decode_req.req.sampling_params.max_new_tokens,
-                            CLIP_MAX_NEW_TOKEN,
-                        )
-                        - retractable_tokens,
+                        full_max_tokens_for_request,
                     )
                     > full_allocatable_tokens
                 ) or (
                     max(
                         swa_required_tokens_for_request,
-                        min(origin_input_len, self.scheduler.sliding_window_size)
-                        + min(
-                            decode_req.req.sampling_params.max_new_tokens,
-                            CLIP_MAX_NEW_TOKEN,
-                            self.evict_len_per_step,
-                        )
-                        - swa_retractable_tokens
-                        + self.swa_extra_need_tokens,
+                        swa_max_tokens_for_request,
                     )
                     > swa_allocatable_tokens
                 ):
@@ -815,13 +874,11 @@ class DecodePreallocQueue:
                 kv_indices = (
                     dst_kv_indices[:origin_input_len].cpu().numpy().astype(np.int32)
                 )
-                page_size = 1  # host pool page_size
             else:
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx
                 ][:origin_input_len]
                 kv_indices = kv_indices_full.cpu().numpy()
-                page_size = self.token_to_kv_pool_allocator.page_size
 
             # Prepare extra pool indices for hybrid models
             if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
@@ -898,6 +955,7 @@ class DecodePreallocQueue:
     def _allocatable_tokens(
         self, retractable_tokens: Optional[int] = None, count_retracted: bool = True
     ) -> Union[int, Tuple[int, int]]:
+        page_size = self.token_to_kv_pool_allocator.page_size
         need_space_for_single_req = (
             max(
                 [
@@ -911,6 +969,11 @@ class DecodePreallocQueue:
             and len(self.scheduler.running_batch.reqs) > 0
             else 0
         )
+        if page_size > 1:
+            need_space_for_single_req = max(need_space_for_single_req, 0)
+            need_space_for_single_req = (
+                (need_space_for_single_req + page_size - 1) // page_size
+            ) * page_size
         total_reqs = (
             len(self.scheduler.running_batch.reqs)
             + len(self.transfer_queue.queue)
@@ -918,10 +981,16 @@ class DecodePreallocQueue:
         )
         if not self.scheduler.model_config.is_hybrid_swa:
             available_size = self.token_to_kv_pool_allocator.available_size()
+            # TODO(yingchun): can be removed because self.num_reserved_decode_tokens is already aligned with page_size
+            reserved_tokens = self.num_reserved_decode_tokens * total_reqs
+            if page_size > 1:
+                reserved_tokens = (
+                    (reserved_tokens + page_size - 1) // page_size
+                ) * page_size
+
             allocatable_tokens = available_size - max(
                 # preserve some space for future decode
-                self.num_reserved_decode_tokens
-                * total_reqs,
+                reserved_tokens,
                 # make sure each request can finish if reach max_tokens with all other requests retracted
                 need_space_for_single_req,
             )
@@ -932,16 +1001,34 @@ class DecodePreallocQueue:
                 self.scheduler.last_batch
                 and self.scheduler.last_batch.forward_mode.is_prebuilt()
             ):
-                allocatable_tokens -= self.num_reserved_decode_tokens * len(
+                last_batch_reserved_tokens = self.num_reserved_decode_tokens * len(
                     self.scheduler.last_batch.reqs
                 )
+                if page_size > 1:
+                    last_batch_reserved_tokens = (
+                        (last_batch_reserved_tokens + page_size - 1) // page_size
+                    ) * page_size
+                allocatable_tokens -= last_batch_reserved_tokens
 
             if count_retracted:
+                # TODO(yingchun): page_size 是循环不变量，提取为局部辅助函数或将分支提到循环外
                 allocatable_tokens -= sum(
                     [
-                        len(req.origin_input_ids)
-                        + len(req.output_ids)
-                        + self.num_reserved_decode_tokens
+                        (
+                            (
+                                len(req.origin_input_ids)
+                                + len(req.output_ids)
+                                + self.num_reserved_decode_tokens
+                                + page_size
+                                - 1
+                            )
+                            // page_size
+                            * page_size
+                            if page_size > 1
+                            else len(req.origin_input_ids)
+                                 + len(req.output_ids)
+                                 + self.num_reserved_decode_tokens
+                        )
                         for req in self.retracted_queue
                     ]
                 )
@@ -977,11 +1064,19 @@ class DecodePreallocQueue:
                 and len(self.scheduler.running_batch.reqs) > 0
                 else 0
             )
+            if page_size > 1:
+                need_swa_space_for_single_req = max(need_swa_space_for_single_req, 0)
+                need_swa_space_for_single_req = (
+                    (need_swa_space_for_single_req + page_size - 1) // page_size
+                ) * page_size
 
             full_available_size = self.token_to_kv_pool_allocator.full_available_size()
             swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
 
             reserved_full = self.num_reserved_decode_tokens * total_reqs
+            if page_size > 1:
+                # TODO(yingchun): can be removed because self.num_reserved_decode_tokens is already aligned with page_size
+                reserved_full = ((reserved_full + page_size - 1) // page_size) * page_size
             alloc_full = full_available_size - max(
                 reserved_full,
                 need_full_space_for_single_req,
@@ -996,27 +1091,58 @@ class DecodePreallocQueue:
                 self.scheduler.last_batch
                 and self.scheduler.last_batch.forward_mode.is_prebuilt()
             ):
-                alloc_full -= self.num_reserved_decode_tokens * len(
+                last_batch_reserved_full = self.num_reserved_decode_tokens * len(
                     self.scheduler.last_batch.reqs
                 )
+                if page_size > 1:
+                    last_batch_reserved_full = (
+                        (last_batch_reserved_full + page_size - 1) // page_size
+                    ) * page_size
+                alloc_full -= last_batch_reserved_full
 
             if count_retracted:
                 alloc_full -= sum(
                     [
-                        len(req.origin_input_ids)
-                        + len(req.output_ids)
-                        + self.num_reserved_decode_tokens
+                        (
+                            (
+                                len(req.origin_input_ids)
+                                + len(req.output_ids)
+                                + self.num_reserved_decode_tokens
+                                + page_size
+                                - 1
+                            )
+                            // page_size
+                            * page_size
+                            if page_size > 1
+                            else len(req.origin_input_ids)
+                            + len(req.output_ids)
+                            + self.num_reserved_decode_tokens
+                        )
                         for req in self.retracted_queue
                     ]
                 )
 
                 alloc_swa -= sum(
                     [
-                        min(
-                            len(req.origin_input_ids) + len(req.output_ids),
-                            self.scheduler.sliding_window_size,
-                        )  ## pre-alloc for prefill
-                        + self.evict_len_per_step  ## alloc for decode, evict every SGLANG_SWA_EVICT_LENGTH_PER_STEP tokens
+                        (
+                            (
+                                min(
+                                    len(req.origin_input_ids) + len(req.output_ids),
+                                    self.scheduler.sliding_window_size,
+                                )
+                                + self.evict_len_per_step
+                                + page_size
+                                - 1
+                            )
+                            // page_size
+                            * page_size
+                            if page_size > 1
+                            else min(
+                                len(req.origin_input_ids) + len(req.output_ids),
+                                self.scheduler.sliding_window_size,
+                            )
+                            + self.evict_len_per_step
+                        )  ## pre-alloc for prefill + alloc for decode
                         for req in self.retracted_queue
                     ]
                 )
@@ -1058,15 +1184,14 @@ class DecodePreallocQueue:
                 )
             host_indices = host_indices.to(device=coordinator.device)
             coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
+        # TODO(yingchun): should use a flag inited in __init__ to reduce cost
+        elif hasattr(self.token_to_kv_pool_allocator, "pre_alloc"):
+            kv_loc = self.token_to_kv_pool_allocator.pre_alloc(
+                fill_len,
+                self.scheduler.sliding_window_size,
+            )
         elif self.token_to_kv_pool_allocator.page_size == 1:
-            # TODO(yingchun): should use a flag inited in __init__ to reduce cost
-            if hasattr(self.token_to_kv_pool_allocator, "pre_alloc"):
-                kv_loc = self.token_to_kv_pool_allocator.pre_alloc(
-                    fill_len,
-                    self.scheduler.sliding_window_size,
-                )
-            else:
-                kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
+            kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
         else:
             device = self.token_to_kv_pool_allocator.device
             kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
@@ -1087,17 +1212,19 @@ class DecodePreallocQueue:
         # populate metadata
         req.fill_ids = req.origin_input_ids + req.output_ids
         req.set_extend_input_len(len(req.fill_ids))
-        # FIXME(yingchun): should use max
         # TODO(yingchun): check whether it has any callers
-        req.evicted_seqlen_local = min(
+        req.evicted_seqlen_local = max(
             (
                 len(req.origin_input_ids)
                 + max(len(req.output_ids) - 1, 0)
                 - self.scheduler.sliding_window_size
-                - 1
             ),
             0,
         )
+        if self.token_to_kv_pool_allocator.page_size > 1:
+            req.evicted_seqlen_local = (
+                req.evicted_seqlen_local // self.token_to_kv_pool_allocator.page_size
+            ) * self.token_to_kv_pool_allocator.page_size
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:

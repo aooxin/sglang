@@ -633,7 +633,12 @@ class HiRadixCache(RadixCache):
         if host_indices is not None:
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
-            self.ongoing_write_through[node.id] = node
+            self.ongoing_write_through[node.id] = {
+                "node": node,
+                "key": RadixKey(token_ids=node.key.token_ids),
+                "hash_value": list(node.hash_value) if node.hash_value else None,
+                "host_value": host_indices,
+            }
             if not write_back:
                 # no need to lock nodes if write back
                 self.inc_lock_ref(node)
@@ -673,7 +678,10 @@ class HiRadixCache(RadixCache):
                 for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
-                        backuped_node = self.ongoing_write_through.pop(ack_id)
+                        snapshot = self.ongoing_write_through.pop(ack_id)
+                        backuped_node = snapshot["node"]
+                        # TODO(yingchun): 注意 write_back 时，存储的不是之前的快照值。
+                        #  split node 之后的新节点会延迟到它自己触发 write_back 时再存储。
                         if self.enable_storage:
                             self.write_backup_storage(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
@@ -703,10 +711,25 @@ class HiRadixCache(RadixCache):
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                backuped_node = self.ongoing_write_through.pop(ack_id)
+                snapshot = self.ongoing_write_through.pop(ack_id)
+                backuped_node = snapshot["node"]
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
-                    self.write_backup_storage(backuped_node)
+                    current_key = backuped_node.key
+                    current_hash_value = backuped_node.hash_value
+                    current_host_value = backuped_node.host_value
+                    try:
+                        # 当 node 发生 split 时，此时的 hash_value, host_value 已经是之前把 node 放入 ongoing_write_through
+                        # 时的子集，缺失了部分数据，这里是保证写到 storage 的数据与入队时的一致。
+                        backuped_node.key = snapshot["key"]
+                        backuped_node.hash_value = snapshot["hash_value"]
+                        backuped_node.host_value = snapshot["host_value"]
+                        self.write_backup_storage(backuped_node)
+                    finally:
+                        # Restore current values to keep tree structure intact
+                        backuped_node.key = current_key
+                        backuped_node.hash_value = current_hash_value
+                        backuped_node.host_value = current_host_value
             finish_count -= 1
 
     def loading_check(self):

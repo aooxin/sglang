@@ -542,6 +542,17 @@ deploy-cloudml-pd:
     expire_in: 30 days
     # `paths:` must be specified by inheriting jobs.
 
+.omni-eval-template:
+  extends: .eval-base-template
+  image: micr.cloud.mioffice.cn/llm-infra/omni_eval_ci:v8
+  variables:
+    CLOUDML_SERVICE_ID: "s-20260514203050-fd4sl"
+    KUBERNETES_MEMORY_REQUEST: "64Gi"
+    KUBERNETES_MEMORY_LIMIT: "64Gi"
+  script:
+    - echo "Deploying image ${SGLANG_IMAGE_URL}"
+    - bash scripts/ci/xiaomi/run_${MODALITY}_eval.sh --deploy-yaml scripts/ci/xiaomi/omni-epd-gm403-hd.yaml
+
 flash-basic-eval:
   extends: .eval-base-template
   image: micr.cloud.mioffice.cn/llm-infra/mini-eval:3002791-V1
@@ -555,3 +566,25 @@ flash-basic-eval:
     paths:
       - mini_eval_output/
       - eval_summary_*.md
+
+omni-image-eval:
+  extends: .omni-eval-template
+  timeout: 12h
+  variables:
+    MODALITY: image
+    DECODE_NUM: "2"
+
+omni-audio-eval:
+  extends: .omni-eval-template
+  timeout: 12h
+  variables:
+    MODALITY: audio
+
+omni-video-eval:
+  extends: .omni-eval-template
+  timeout: 24h
+  variables:
+    MODALITY: video
+    PREFILL_NUM: "7"
+    DECODE_NUM: "7"
+    ENCODER_NUM: "4"

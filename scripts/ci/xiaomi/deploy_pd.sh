@@ -56,11 +56,37 @@ RENDERED_DEPLOY_YAML=$(mktemp /tmp/pd-roles-config.XXXXXX.yaml)
 DEPLOY_JSON=$(mktemp /tmp/pd-deployment.XXXXXX.json)
 DEPLOYMENT_ID=""
 
+wait_for_stopped() {
+    local deployment_id="$1"
+    local timeout=600
+    local deadline=$(( $(date +%s) + timeout ))
+    local state
+    while (( $(date +%s) < deadline )); do
+        state=$(python3 "${CLOUDML_API}" deployment-detail \
+            --workspace-id "${CLOUDML_WORKSPACE_ID}" \
+            --service-id "${CLOUDML_SERVICE_ID}" \
+            --deployment-id "${deployment_id}" 2>/dev/null \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state",""))' 2>/dev/null || true)
+        echo "  state: ${state:-<unknown>}"
+        [[ "${state}" == "stopped" ]] && return 0
+        sleep 10
+    done
+    echo "  timeout waiting for stop; proceeding to delete anyway"
+    return 0
+}
+
 cleanup() {
     rm -f "${RENDERED_DEPLOY_YAML}" "${DEPLOY_JSON}"
     if [[ -n "${DEPLOYMENT_ID}" ]]; then
-        echo "=== cleaning up deployment ${DEPLOYMENT_ID} ==="
+        echo "=== stopping deployment ${DEPLOYMENT_ID} ==="
         python3 "${CLOUDML_API}" stop-deployment \
+            --workspace-id "${CLOUDML_WORKSPACE_ID}" \
+            --service-id "${CLOUDML_SERVICE_ID}" \
+            --deployment-id "${DEPLOYMENT_ID}" || true
+        echo "=== waiting for deployment ${DEPLOYMENT_ID} to reach stopped state ==="
+        wait_for_stopped "${DEPLOYMENT_ID}"
+        echo "=== deleting deployment ${DEPLOYMENT_ID} ==="
+        python3 "${CLOUDML_API}" delete-deployment \
             --workspace-id "${CLOUDML_WORKSPACE_ID}" \
             --service-id "${CLOUDML_SERVICE_ID}" \
             --deployment-id "${DEPLOYMENT_ID}" || true
@@ -85,6 +111,18 @@ python3 "${CLOUDML_API}" save-aksk \
 ESCAPED_URL=$(printf '%s\n' "${SGLANG_IMAGE_URL}" | sed 's/[\\&|]/\\&/g')
 sed "s|imageUrl: micr\.cloud\.mioffice\.cn/llm-infra/sglang:.*|imageUrl: ${ESCAPED_URL}|" \
     "${DEPLOY_YAML}" > "${RENDERED_DEPLOY_YAML}"
+
+if [[ -n "${PREFILL_NUM:-}" ]]; then
+    sed -i -E "s|^(  num: )[0-9]+([[:space:]]+# __PREFILL_NUM__)$|\1${PREFILL_NUM}\2|" "${RENDERED_DEPLOY_YAML}"
+fi
+
+if [[ -n "${DECODE_NUM:-}" ]]; then
+    sed -i -E "s|^(  num: )[0-9]+([[:space:]]+# __DECODE_NUM__)$|\1${DECODE_NUM}\2|" "${RENDERED_DEPLOY_YAML}"
+fi
+
+if [[ -n "${ENCODER_NUM:-}" ]]; then
+    sed -i -E "s|^(  num: )[0-9]+([[:space:]]+# __ENCODER_NUM__)$|\1${ENCODER_NUM}\2|" "${RENDERED_DEPLOY_YAML}"
+fi
 
 # --- Step 3: Create deployment ---
 echo "=== creating multi-role deployment ==="

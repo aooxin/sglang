@@ -68,7 +68,11 @@ from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -1069,13 +1073,15 @@ class MiMoV2ForCausalLM(nn.Module):
             self.audio_encoder = MiMoAudioEncoder(self.audio_config)
 
         self._routed_experts_weights_of_layer = LazyValue(
-            lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, MiMoV2MoE)
-            }
-            if self.model is not None
-            else {}
+            lambda: (
+                {
+                    layer_id: layer.mlp.get_moe_weights()
+                    for layer_id, layer in enumerate(self.model.layers)
+                    if isinstance(layer.mlp, MiMoV2MoE)
+                }
+                if self.model is not None
+                else {}
+            )
         )
 
     @property
@@ -1083,9 +1089,9 @@ class MiMoV2ForCausalLM(nn.Module):
         return self._routed_experts_weights_of_layer.value
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        assert self.model is not None, (
-            "get_input_embedding() is not available in encoder_only mode"
-        )
+        assert (
+            self.model is not None
+        ), "get_input_embedding() is not available in encoder_only mode"
         return self.model.get_input_embedding(input_ids)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
@@ -1122,6 +1128,69 @@ class MiMoV2ForCausalLM(nn.Module):
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         return self.audio_encoder.get_audio_feature(items)
 
+    @torch.inference_mode()
+    def encode_video_audio(self, mm_inputs: Dict) -> Optional[torch.Tensor]:
+        import numpy as np
+
+        audio_features = mm_inputs.get("video_audio_features")
+        if not audio_features:
+            return None
+
+        def _as_tensor(data):
+            if isinstance(data, torch.Tensor):
+                return data
+            if isinstance(data, np.ndarray):
+                return torch.tensor(data)
+            if isinstance(data, list) and data and isinstance(data[0], np.ndarray):
+                return torch.tensor(np.array(data))
+            if isinstance(data, list) and data and isinstance(data[0], (int, float)):
+                return torch.tensor(data)
+            return data
+
+        audio_feature_lens = mm_inputs["video_audio_feature_lens"]
+        audio_item = MultimodalDataItem.from_dict(
+            {
+                "modality": Modality.AUDIO,
+                "feature": _as_tensor(audio_features),
+            }
+        )
+        audio_item.set("audio_feature_lens", _as_tensor(audio_feature_lens))
+
+        audio_embedding = self.get_audio_feature([audio_item]).cpu()
+        if audio_embedding.ndim != 2:
+            audio_embedding = audio_embedding.reshape(-1, audio_embedding.shape[-1])
+
+        segment_lens_flat = mm_inputs["video_audio_segment_lens_flat"]
+        segment_starts_flat = mm_inputs["video_audio_segment_starts_flat"]
+        per_video_num_units = mm_inputs["video_audio_per_video_num_units"]
+        per_video_audio_token_lens = (
+            audio_feature_lens.tolist()
+            if hasattr(audio_feature_lens, "tolist")
+            else list(audio_feature_lens)
+        )
+
+        trimmed_chunks = []
+        emb_offset = 0
+        unit_idx = 0
+        audio_video_idx = 0
+        for num_units in per_video_num_units:
+            if num_units <= 0:
+                continue
+            vid_audio_len = per_video_audio_token_lens[audio_video_idx]
+            for _ in range(num_units):
+                start = segment_starts_flat[unit_idx]
+                seg_len = segment_lens_flat[unit_idx]
+                trimmed_chunks.append(
+                    audio_embedding[emb_offset + start : emb_offset + start + seg_len]
+                )
+                unit_idx += 1
+            emb_offset += vid_audio_len
+            audio_video_idx += 1
+
+        return (
+            torch.cat(trimmed_chunks, dim=0) if trimmed_chunks else audio_embedding[:0]
+        )
+
     def get_input_embeddings(self) -> Optional[nn.Embedding]:
         return self.model.embed_tokens if self.model is not None else None
 
@@ -1134,9 +1203,9 @@ class MiMoV2ForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        assert not self.config.encoder_only, (
-            "forward() should not be called in encoder_only mode"
-        )
+        assert (
+            not self.config.encoder_only
+        ), "forward() should not be called in encoder_only mode"
 
         if self._is_multimodal:
             hidden_states, hidden_states_before_norm = general_mm_embed_routine(
@@ -1414,15 +1483,15 @@ class MiMoV2ForCausalLM(nn.Module):
                         logger.warning(f"Parameter {name} not found in params_dict")
 
     def get_embed_and_head(self):
-        assert self.model is not None and self.lm_head is not None, (
-            "get_embed_and_head() is not available in encoder_only mode"
-        )
+        assert (
+            self.model is not None and self.lm_head is not None
+        ), "get_embed_and_head() is not available in encoder_only mode"
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
-        assert self.model is not None and self.lm_head is not None, (
-            "set_embed_and_head() is not available in encoder_only mode"
-        )
+        assert (
+            self.model is not None and self.lm_head is not None
+        ), "set_embed_and_head() is not available in encoder_only mode"
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed

@@ -13,6 +13,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 import aiohttp
+import numpy as np
 import torch
 import zmq
 import zmq.asyncio
@@ -192,11 +193,15 @@ _MODALITY_GRID_ATTRS = {
     Modality.VIDEO: ("video_grid_thw", False),
     Modality.AUDIO: ("audio_feature_lens", True),
 }
-# Per-part video metadata; keys must match MiMoProcessor.preprocess_for_encoder.
-# Tensor attrs cat on dim=0 across parts; others chain as lists.
-VIDEO_META_ATTRS = (
+# Per-part video metadata for EPD. Tensor attrs cat on dim=0 across parts;
+# others chain as lists. video_meta_attrs_for(model_type) resolves the active
+# set per instance so non-MiMo runs skip the MiMo audio fields entirely.
+_GENERAL_VIDEO_META_ATTRS = (
     "video_timestamps",
     "second_per_grid_ts",
+)
+# MiMo-VL audio-in-video fields; appended only when model_type is MiMo.
+_MIMO_VIDEO_AUDIO_META_ATTRS = (
     "video_audio_feature_lens",
     "video_audio_segment_lens_flat",
     "video_audio_per_video_num_units",
@@ -205,13 +210,36 @@ VIDEO_META_ATTRS = (
 _VIDEO_META_TENSOR_ATTRS = ("video_audio_feature_lens", "video_audio_embedding")
 
 
+def video_meta_attrs_for(model_type: Optional[str]) -> tuple:
+    """Video-meta attrs for model_type. MiMo appends its audio-in-video fields."""
+    attrs = _GENERAL_VIDEO_META_ATTRS
+    if model_type and "mimo" in model_type.lower():
+        attrs = attrs + _MIMO_VIDEO_AUDIO_META_ATTRS
+    return attrs
+
+
 def _cat_grid(dims, flatten_items=False):
-    """Concatenate non-None tensors from a list; optionally flatten each before cat."""
-    valid = (
-        [g.flatten() for g in dims if g is not None]
-        if flatten_items
-        else [g for g in dims if g is not None]
-    )
+    """Concatenate non-None grid entries; supports tensor/ndarray/list inputs."""
+
+    def _to_tensor(g):
+        if isinstance(g, torch.Tensor):
+            return g.cpu() if g.is_cuda else g
+        if isinstance(g, np.ndarray):
+            return torch.from_numpy(g)
+        return torch.as_tensor(g)
+
+    valid = []
+    for g in dims:
+        if g is None:
+            continue
+        t = _to_tensor(g)
+        if flatten_items:
+            t = t.flatten()
+        elif t.ndim == 0:
+            # Keep cat semantics stable for scalar-like metadata.
+            t = t.unsqueeze(0)
+        valid.append(t)
+
     return torch.cat(valid, dim=0) if valid else None
 
 
@@ -225,6 +253,7 @@ class MultiModalEmbeddingData(EmbeddingData):
         modality,
         embedding,
         embedding_shape,
+        model_type: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(
@@ -237,6 +266,7 @@ class MultiModalEmbeddingData(EmbeddingData):
             embedding_shape,
             **kwargs,
         )
+        self.video_meta_attrs = video_meta_attrs_for(model_type)
         self.img_grid_thw = [None] * num_parts
         self.video_grid_thw = [None] * num_parts
         self.audio_feature_lens = [None] * num_parts
@@ -250,7 +280,7 @@ class MultiModalEmbeddingData(EmbeddingData):
         self.embedding_shape_list = [
             embedding_shape if i == part_idx else None for i in range(num_parts)
         ]
-        for attr in VIDEO_META_ATTRS:
+        for attr in self.video_meta_attrs:
             setattr(self, attr, [None] * num_parts)
 
         self._set_part_grid(part_idx, modality, self.get_grid())
@@ -268,7 +298,7 @@ class MultiModalEmbeddingData(EmbeddingData):
 
     def _set_video_meta_for_part(self, part_idx, source):
         """Copy video_timestamps and second_per_grid_ts from source (dict or object)."""
-        for attr_name in VIDEO_META_ATTRS:
+        for attr_name in self.video_meta_attrs:
             val = (
                 source.get(attr_name)
                 if isinstance(source, dict)
@@ -278,11 +308,15 @@ class MultiModalEmbeddingData(EmbeddingData):
                 getattr(self, attr_name)[part_idx] = val
 
     @classmethod
-    def from_embedding_data(cls, embedding_data: EmbeddingData):
+    def from_embedding_data(
+        cls,
+        embedding_data: EmbeddingData,
+        model_type: Optional[str] = None,
+    ):
         """Create MultiModalEmbeddingData from an EmbeddingData instance."""
         # Only forward known optional attrs (e.g. video metadata) so they land on the instance
         extra = {}
-        for attr in VIDEO_META_ATTRS:
+        for attr in video_meta_attrs_for(model_type):
             val = getattr(embedding_data, attr, None)
             if val is not None:
                 extra[attr] = val
@@ -294,6 +328,7 @@ class MultiModalEmbeddingData(EmbeddingData):
             modality=embedding_data.modality,
             embedding=embedding_data.embedding,
             embedding_shape=embedding_data.shape,
+            model_type=model_type,
             **extra,
         )
         mm_data.send_time = embedding_data.send_time
@@ -308,10 +343,7 @@ class MultiModalEmbeddingData(EmbeddingData):
             for i, e in enumerate(self.embedding_list):
                 if e is not None:
                     groups[self.modality_list[i]].append(e)
-            return {
-                mod: torch.cat(tensors, dim=0)
-                for mod, tensors in groups.items()
-            }
+            return {mod: torch.cat(tensors, dim=0) for mod, tensors in groups.items()}
         return self.embedding_list
 
     @property
@@ -327,7 +359,7 @@ class MultiModalEmbeddingData(EmbeddingData):
                 self.audio_feature_lens, flatten_items=True
             ),
         }
-        for attr in VIDEO_META_ATTRS:
+        for attr in self.video_meta_attrs:
             lst = getattr(self, attr, None)
             if not lst:
                 continue
@@ -341,7 +373,12 @@ class MultiModalEmbeddingData(EmbeddingData):
         return kwargs
 
     def add(self, embedding_data: EmbeddingData):
-        assert self.req_id == embedding_data.req_id
+        if self.req_id != embedding_data.req_id:
+            logger.warning(
+                f"Dropping embedding data with mismatched req_id: "
+                f"expected {self.req_id}, got {embedding_data.req_id}"
+            )
+            return False
         assert not self.ready_list[embedding_data.part_idx]
         pid = embedding_data.part_idx
         self.ready_list[pid] = True
@@ -534,7 +571,7 @@ class WaitingImageRequest:
 
             if self.recv_embedding_data is None:
                 self.recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
-                    recv_obj
+                    recv_obj, model_type=self.model_type
                 )
             else:
                 self.recv_embedding_data.add(recv_obj)
@@ -624,6 +661,11 @@ class MMReceiverBase(ABC):
         self.encode_urls = server_args.encoder_urls
         self.recv_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.host = get_local_ip_auto(server_args.host)
+        self.model_type = (
+            getattr(hf_config, "model_type", "").lower()
+            if hf_config is not None
+            else None
+        )
         if self.encoder_transfer_backend == "mooncake":
             self.dtype = dtype
             self.embeddings_engine = get_mooncake_transfer_engine()
@@ -798,7 +840,7 @@ class MMReceiverBase(ABC):
                     )
                 if recv_embedding_data is None:
                     recv_embedding_data = MultiModalEmbeddingData.from_embedding_data(
-                        recv_obj
+                        recv_obj, model_type=self.model_type
                     )
                 else:
                     recv_embedding_data.add(recv_obj)
@@ -883,6 +925,7 @@ class MMReceiverBase(ABC):
                     host_name=self.hostname,
                     receive_count=self.tp_size,
                 )
+                waiting_req.model_type = self.model_type
                 waiting_req.send_encode_request()
                 self.waiting_list.append(waiting_req)
             else:

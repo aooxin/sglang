@@ -1560,7 +1560,6 @@ class ShmPointerMMData:
         self.shm_name = state["shm_name"]
         self.shape = state["shape"]
         self.dtype = state["dtype"]
-        self.shm = None
         self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
         # Zero-copy view into shared memory (no clone, no unlink)
         self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
@@ -1605,11 +1604,7 @@ def _wrap_tensor_or_list(value):
         return ShmPointerMMData(value)
     elif isinstance(value, (list, tuple)):
         wrapped = [
-            (
-                ShmPointerMMData(t)
-                if isinstance(t, torch.Tensor) and t.is_cpu
-                else t
-            )
+            (ShmPointerMMData(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
             for t in value
         ]
         return type(value)(wrapped) if isinstance(value, tuple) else wrapped
@@ -1656,9 +1651,7 @@ def has_shm_features(recv_reqs):
             for item in req.mm_inputs.mm_items:
                 if _feature_has_shm(item.feature):
                     return True
-                if _feature_has_shm(
-                    getattr(item, "precomputed_embeddings", None)
-                ):
+                if _feature_has_shm(getattr(item, "precomputed_embeddings", None)):
                     return True
     return False
 

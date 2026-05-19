@@ -272,9 +272,7 @@ def _decode_frames_and_timestamps(vdw, ele):
     # Shared E/D frame-sampling recipe: smart_nframes + linspace + permute.
     total_frames, video_fps = len(vdw), vdw.avg_fps
     nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
-    idx = list(
-        np.unique(np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64))
-    )
+    idx = list(np.unique(np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)))
     video_tensor = vdw.get_frames_as_tensor(idx).permute(0, 3, 1, 2).float()
     timestamps = torch.as_tensor(idx, dtype=torch.float32) / video_fps
     return video_tensor, timestamps
@@ -284,9 +282,20 @@ def _ffprobe_has_audio(src, stdin=None, label=None) -> bool:
     # Header-only audio-stream probe for HTTP URLs; avoids full download.
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json",
-             "-show_streams", "-select_streams", "a", src],
-            input=stdin, capture_output=True, timeout=30,
+            [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_streams",
+                "-select_streams",
+                "a",
+                src,
+            ],
+            input=stdin,
+            capture_output=True,
+            timeout=30,
         )
         if r.returncode != 0:
             stderr = r.stderr.decode("utf-8", errors="replace")
@@ -517,13 +526,23 @@ class MiMoProcessor:
             "use_video_timestamps": pc.get("use_video_timestamps", False),
         }
         # audio_sampling_rate: processor_config > audio_config > mm_config.audio.
-        asr = pc.get("audio_sampling_rate") or ac.get("sampling_rate") or ac.get("sample_rate")
+        asr = (
+            pc.get("audio_sampling_rate")
+            or ac.get("sampling_rate")
+            or ac.get("sample_rate")
+        )
         if asr is not None:
             kwargs["audio_sampling_rate"] = asr
 
         audio_cfg = (mm_config or {}).get("audio", {})
-        for k in ("audio_sampling_rate", "audio_hop_length", "audio_n_mels",
-                  "audio_kernel_size", "audio_stride_size", "audio_avg_pooler"):
+        for k in (
+            "audio_sampling_rate",
+            "audio_hop_length",
+            "audio_n_mels",
+            "audio_kernel_size",
+            "audio_stride_size",
+            "audio_avg_pooler",
+        ):
             if k in audio_cfg:
                 kwargs[k] = audio_cfg[k]
         if "sampling_rate" in audio_cfg and "audio_sampling_rate" not in kwargs:
@@ -562,9 +581,7 @@ class MiMoProcessor:
             and path_or_data.startswith("data:")
             and ";base64," in path_or_data
         ):
-            source = io.BytesIO(
-                base64.b64decode(path_or_data.split(";base64,")[1])
-            )
+            source = io.BytesIO(base64.b64decode(path_or_data.split(";base64,")[1]))
         else:
             source = path_or_data  # local path or file://
         try:
@@ -647,8 +664,11 @@ class MiMoProcessor:
                 if self.has_audio_track(video_blob):
                     audio_spec, audio_token_len = self.preprocess_audio(video_blob)
                     units = self._build_video_audio_units(
-                        grid, aligned_ts, video_meta,
-                        processed_audio=audio_spec, is_tokenized=False,
+                        grid,
+                        aligned_ts,
+                        video_meta,
+                        processed_audio=audio_spec,
+                        is_tokenized=False,
                         audio_token_len=audio_token_len,
                     )
                     audio_features.append(audio_spec)
@@ -740,13 +760,13 @@ class MiMoProcessor:
         return kwargs
 
     def preprocess_audio(self, audio: str | bytes):
+        self._ensure_audio_dependencies()
         """
         - Input: audio filename string, bytes, or tuple of (waveform, original_sr)
         - Output:
             - mel spectrogram: torch.Tensor (T, n_mels)
             - number of tokens: int
         """
-        self._ensure_audio_dependencies()
         assert isinstance(
             audio, (str, bytes, tuple)
         ), f"audio must be a str, bytes or tuple, but got {type(audio)}"
@@ -1173,8 +1193,13 @@ class MiMoProcessor:
         }
 
     def _build_video_audio_units(
-        self, thw_grid, timestamps, video_meta, processed_audio,
-        is_tokenized, audio_token_len,
+        self,
+        thw_grid,
+        timestamps,
+        video_meta,
+        processed_audio,
+        is_tokenized,
+        audio_token_len,
     ):
         # Compute per-grid_t audio-segment boundaries. Tokenizer-free so it
         # runs identically on the single-node path and the EPD encoder side.
@@ -1224,8 +1249,14 @@ class MiMoProcessor:
         return units
 
     def _build_video_audio_input_ids(
-        self, units, thw_grid, video_meta, is_tokenized, audio_token_len,
-        verbose=False, timestamps=None,
+        self,
+        units,
+        thw_grid,
+        video_meta,
+        is_tokenized,
+        audio_token_len,
+        verbose=False,
+        timestamps=None,
     ):
         # Assemble video+audio input_ids from the unit list produced above.
         # Tokenizer-dependent; the language node replays this on EPD.
@@ -1342,12 +1373,21 @@ class MiMoProcessor:
             audio_input = None
 
         units = self._build_video_audio_units(
-            thw_grid, timestamps, video_meta, processed_audio,
-            is_tokenized, audio_token_len,
+            thw_grid,
+            timestamps,
+            video_meta,
+            processed_audio,
+            is_tokenized,
+            audio_token_len,
         )
         built = self._build_video_audio_input_ids(
-            units, thw_grid, video_meta, is_tokenized, audio_token_len,
-            verbose=verbose, timestamps=timestamps,
+            units,
+            thw_grid,
+            video_meta,
+            is_tokenized,
+            audio_token_len,
+            verbose=verbose,
+            timestamps=timestamps,
         )
 
         return {
@@ -2265,9 +2305,7 @@ class MiMoV2Processor(BaseMultimodalProcessor):
         video_timestamps = kwargs.get("video_timestamps")
         video_audio_feature_lens = kwargs.get("video_audio_feature_lens")
         video_audio_segment_lens_flat = kwargs.get("video_audio_segment_lens_flat")
-        video_audio_per_video_num_units = kwargs.get(
-            "video_audio_per_video_num_units"
-        )
+        video_audio_per_video_num_units = kwargs.get("video_audio_per_video_num_units")
         video_audio_embedding = kwargs.get("video_audio_embedding")
 
         if not isinstance(prompt, str):
@@ -2299,9 +2337,11 @@ class MiMoV2Processor(BaseMultimodalProcessor):
                 off += nu
                 per_video_audio_info[i] = {
                     "segment_lens": seg_lens,
-                    "audio_token_len": int(video_audio_feature_lens[av_idx].item())
-                    if video_audio_feature_lens is not None
-                    else sum(seg_lens),
+                    "audio_token_len": (
+                        int(video_audio_feature_lens[av_idx].item())
+                        if video_audio_feature_lens is not None
+                        else sum(seg_lens)
+                    ),
                 }
                 av_idx += 1
 

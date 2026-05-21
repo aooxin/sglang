@@ -308,6 +308,8 @@ class DecodePreallocQueue:
             )
 
     def _init_hybrid_extra_tokens(self):
+        self.evict_len_per_step = None
+        self.swa_extra_need_tokens = 0
         if self.scheduler.model_config.is_hybrid_swa:
             self.evict_len_per_step = envs.SGLANG_SWA_EVICT_LENGTH_PER_STEP.get()
             if not self.scheduler.spec_algorithm.is_none():
@@ -323,9 +325,6 @@ class DecodePreallocQueue:
                             // self.scheduler.page_size
                             * self.scheduler.page_size
                     )
-        else:
-            self.evict_len_per_step = None
-            self.swa_extra_need_tokens = 0
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)

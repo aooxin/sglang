@@ -1211,8 +1211,8 @@ class DecodePreallocQueue:
         # populate metadata
         req.fill_ids = req.origin_input_ids + req.output_ids
         req.set_extend_input_len(len(req.fill_ids))
-        # TODO(yingchun): check whether it has any callers
-        req.evicted_seqlen_local = max(
+        # 会在 maybe_evict_swa 中使用
+        req.swa_evicted_seqlen = max(
             (
                 len(req.origin_input_ids)
                 + max(len(req.output_ids) - 1, 0)
@@ -1221,8 +1221,8 @@ class DecodePreallocQueue:
             0,
         )
         if self.token_to_kv_pool_allocator.page_size > 1:
-            req.evicted_seqlen_local = (
-                req.evicted_seqlen_local // self.token_to_kv_pool_allocator.page_size
+            req.swa_evicted_seqlen = (
+                req.swa_evicted_seqlen // self.token_to_kv_pool_allocator.page_size
             ) * self.token_to_kv_pool_allocator.page_size
 
         # Return the transfer destination indices:

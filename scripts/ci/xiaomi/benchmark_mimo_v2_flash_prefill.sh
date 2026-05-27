@@ -3,6 +3,8 @@
 # Single scenario: 16k input, output-len=1 (prefill-dominated, baseline-comparable).
 set -euo pipefail
 
+source "$(dirname "${BASH_SOURCE[0]}")/benchmark_common.sh"
+
 MODEL_PATH="${MODEL_PATH:-XiaomiMiMo/MiMo-V2-Flash}"
 SERVED_NAME="${SERVED_NAME:-mimo-v2-flash-1207-sft}"
 PORT="${PORT:-9001}"
@@ -11,13 +13,7 @@ BASE_URL="http://${HOST}:${PORT}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-1800}"
 LOG_FILE="mimo_v2_flash_server_$(date +%Y%m%d_%H%M%S).log"
 
-if [[ -d /mnt/deepgemm-cache ]]; then
-    export SGLANG_DG_CACHE_DIR=/mnt/deepgemm-cache
-    export CLOUDML_DG_CACHE_DIR=/mnt/deepgemm-cache
-fi
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024
-export SGLANG_USE_FUSED_MOE_GATE=true
-export SGLANG_USE_UPDATE_LOCAL_ATTN_METADATA_CUDA=true
+setup_common_env
 
 echo "=== launching mimo-v2-flash (model=${MODEL_PATH}) ==="
 setsid python3 -m sglang.launch_server \
@@ -55,37 +51,11 @@ setsid python3 -m sglang.launch_server \
     --enable-metrics-for-all-schedulers \
     >"${LOG_FILE}" 2>&1 &
 SERVER_PID=$!
-SERVER_PGID=$(ps -o pgid= "${SERVER_PID}" | tr -d ' ')
-echo "=== server pid=${SERVER_PID} pgid=${SERVER_PGID}, log=${LOG_FILE} ==="
+echo "=== server pid=${SERVER_PID}, log=${LOG_FILE} ==="
 
-cleanup() {
-    local rc=$?
-    echo "=== cleaning up server (pgid=${SERVER_PGID}, exit=${rc}) ==="
-    if [[ -n "${SERVER_PGID:-}" ]]; then
-        kill -TERM -"${SERVER_PGID}" 2>/dev/null || true
-        sleep 10
-        kill -KILL -"${SERVER_PGID}" 2>/dev/null || true
-    fi
-    echo "=== tail of server log ==="
-    tail -n 200 "${LOG_FILE}" || true
-    exit "${rc}"
-}
-trap cleanup EXIT INT TERM
+trap cleanup_bench_server EXIT INT TERM
 
-echo "=== waiting for /health_generate (timeout=${STARTUP_TIMEOUT}s) ==="
-DEADLINE=$(( $(date +%s) + STARTUP_TIMEOUT ))
-until curl -fs -o /dev/null "${BASE_URL}/health_generate" 2>/dev/null; do
-    if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-        echo "server process died during startup"
-        exit 1
-    fi
-    if (( $(date +%s) > DEADLINE )); then
-        echo "server did not become ready within ${STARTUP_TIMEOUT}s"
-        exit 1
-    fi
-    sleep 10
-done
-echo "=== server ready ==="
+wait_for_server_ready
 
 echo "=== smoke test: POST /v1/chat/completions ==="
 curl -fsS "${BASE_URL}/v1/chat/completions" \

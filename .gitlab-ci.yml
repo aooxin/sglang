@@ -193,6 +193,11 @@ stage-a-test-1-gpu-small:
     SGLANG_CUDA_COREDUMP_DIR: "/tmp/sglang_cuda_coredumps"
   before_script:
     - mkdir -p "$SGLANG_CUDA_COREDUMP_DIR"
+    - |
+      # GPU preflight: kill leaked sglang from prior jobs (CUDA_VISIBLE_DEVICES
+      # scoped). exit 75 (mapped via retry.exit_codes) lets GitLab reschedule
+      # us onto a clean runner if memory still >10% after retries.
+      python3 python/sglang/cli/killall.py || exit 75
   after_script:
     - |
       if [ -d "$SGLANG_CUDA_COREDUMP_DIR" ] && [ "$(ls -A $SGLANG_CUDA_COREDUMP_DIR 2>/dev/null)" ]; then
@@ -205,6 +210,8 @@ stage-a-test-1-gpu-small:
     when:
       - runner_system_failure
       - stuck_or_timeout_failure
+    exit_codes:
+      - 75  # GPU preflight bailed; reschedule to a clean runner
 
 .rules-main-package:
   rules:
@@ -293,6 +300,7 @@ stage-c-test-8-gpu-h200:
     # - bash scripts/ci/cuda/ci_install_dependency.sh  # pre-installed in sglang-ci image
     - |
       if ! python3 -c "import lmms_eval" 2>/dev/null; then
+        rm -rf /tmp/lmms-eval
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git /tmp/lmms-eval
         pip install --no-cache-dir -e /tmp/lmms-eval
       fi
@@ -417,6 +425,8 @@ mimo-v2-flash-startup-test:
     - when: on_success
   allow_failure: true
   timeout: 2h
+  variables:
+    HF_HUB_OFFLINE: "1"
   needs:
     - job: stage-a-test-1-gpu-small
       optional: true
@@ -424,6 +434,7 @@ mimo-v2-flash-startup-test:
     - pip install --no-cache-dir --no-deps -e "python/"
     - |
       if ! python3 -c "import lmms_eval" 2>/dev/null; then
+        rm -rf /tmp/lmms-eval
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git /tmp/lmms-eval
         pip install --no-cache-dir -e /tmp/lmms-eval
       fi
@@ -438,6 +449,8 @@ mimo-v2-flash-benchmark:
     - when: on_success
   allow_failure: true
   timeout: 3h
+  variables:
+    HF_HUB_OFFLINE: "1"
   needs:
     - job: stage-a-test-1-gpu-small
       optional: true

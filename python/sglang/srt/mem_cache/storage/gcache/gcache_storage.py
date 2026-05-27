@@ -124,13 +124,13 @@ class GcacheStorage(HiCacheStorage):
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
-        # TODO(yingchun): reduce cost in f-string debug logs
-        logger.debug(f"gcache: begin check {len(keys)} keys")
-
         query_keys = self._convert_hybrid_keys(keys)
+        # TODO(yingchun): reduce cost in f-string debug logs
+        logger.debug(f"gcache: begin check {len(query_keys)} keys")
         key_multiplier = 4
-
+        assert len(query_keys) == len(keys) * key_multiplier
         exist_mask = self.gcache_client.batch_exists(query_keys)
+        assert len(exist_mask) == len(query_keys)
 
         prefix_success = 0
         for exist in exist_mask:
@@ -139,11 +139,39 @@ class GcacheStorage(HiCacheStorage):
             else:
                 break
 
-        prefix_success = prefix_success // key_multiplier
         logger.debug(
             f"gcache: end check {len(query_keys)} keys, {prefix_success} exist"
         )
+        prefix_success = prefix_success // key_multiplier
         return prefix_success
+
+    def batch_exists_hybrid(
+        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> tuple[int, list[bool]]:
+        query_keys = self._convert_hybrid_keys(keys)
+        logger.debug(f"gcache: begin hybrid check {len(query_keys)} keys")
+        key_multiplier = 4
+        assert len(query_keys) == len(keys) * key_multiplier
+        exist_mask: List[bool] = self.gcache_client.batch_exists(query_keys)
+        assert len(exist_mask) == len(query_keys)
+
+        full_prefix_success = len(keys)
+        for i in range(full_prefix_success):
+            ii = i * key_multiplier
+            if not (exist_mask[ii] and exist_mask[ii + 1]):
+                full_prefix_success = i
+                break
+
+        valid_swa_mask = [
+            exist_mask[ii + 2] and exist_mask[ii + 3]
+            for ii in range(0, full_prefix_success * key_multiplier, key_multiplier)
+        ]
+
+        logger.debug(
+            f"gcache: end hybrid check {len(query_keys)} keys, "
+            f"{full_prefix_success=}, swa_valid={sum(valid_swa_mask)}/{len(valid_swa_mask)}"
+        )
+        return full_prefix_success, valid_swa_mask
 
     def batch_set_v1(
         self,
@@ -151,17 +179,17 @@ class GcacheStorage(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        logger.debug(f"gcache: begin set {len(keys)} keys")
-
         if len(keys) == 0:
             return [True] * len(keys)
 
         start_time = time.perf_counter()
-        gcache_keys, value_ptr_list, value_size_list = self._batch_preprocess(
-            keys, host_indices
+        gcache_keys, value_ptr_list, value_size_list, swa_valid_list = (
+            self._batch_preprocess(keys, host_indices)
         )
+        logger.debug(f"gcache: begin set {len(gcache_keys)} keys")
 
         exist_result = self.gcache_client.batch_exists(gcache_keys, False)
+        assert len(exist_result) == len(gcache_keys)
 
         set_keys = []
         set_buffer_ptrs = []
@@ -198,12 +226,11 @@ class GcacheStorage(HiCacheStorage):
         execution_time = (end_time - start_time) * 1e6
         success_count = sum(1 for each in set_results if each)
 
-        ret = self._batch_postprocess(set_results)
-
+        ret = self._batch_postprocess(set_results, swa_valid_list)
         if len(gcache_keys) == success_count:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
-                    f"gcache: end set {len(keys)} keys, success count: {success_count}, API results: {set_results}, "
+                    f"gcache: end set {len(gcache_keys)} keys, success count: {success_count}, API results: {set_results}, "
                     f"ret: {ret}, cost time: {execution_time:.2f} us"
                 )
         else:
@@ -219,19 +246,24 @@ class GcacheStorage(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        logger.debug(f"gcache: begin get {len(keys)} keys")
-
         if len(keys) == 0:
             return [True] * len(keys)
 
-        start_time = time.perf_counter()
-        gcache_keys, value_ptr_list, value_size_list = self._batch_preprocess(
-            keys, host_indices
+        swa_needed_per_page = (
+            extra_info.swa_needed_per_page if extra_info is not None else None
         )
+
+        start_time = time.perf_counter()
+        gcache_keys, value_ptr_list, value_size_list, swa_valid_list = (
+            self._batch_preprocess(keys, host_indices, swa_needed_per_page)
+        )
+        assert len(gcache_keys) == len(value_ptr_list) == len(value_size_list)
+        logger.debug(f"gcache: begin get {len(gcache_keys)} keys")
 
         results = self.gcache_client.batch_get(
             gcache_keys, value_ptr_list, value_size_list
         )
+        assert len(results) == len(gcache_keys)
 
         end_time = time.perf_counter()
         execution_time = (end_time - start_time) * 1e6
@@ -244,11 +276,11 @@ class GcacheStorage(HiCacheStorage):
             )
 
         logger.debug(
-            f"gcache: end get {len(keys)} keys, success count: {success_count}, "
+            f"gcache: end get {len(gcache_keys)} keys, success count: {success_count}, "
             f"cost time: {execution_time:.2f} us"
         )
 
-        return self._batch_postprocess(results)
+        return self._batch_postprocess(results, swa_valid_list)
 
     ####################################################################################################################
 
@@ -302,34 +334,55 @@ class GcacheStorage(HiCacheStorage):
             f"finish warming up gcache client, cost {time.perf_counter() - start_time:.2f} seconds"
         )
 
-    # TODO(yingchun): not support pp_rank now
-    def _convert_hybrid_keys(self, keys: List[str]) -> List[str]:
+    def _convert_hybrid_keys(
+        self, keys: List[str], swa_valid_list: Optional[List[bool]] = None
+    ) -> List[str]:
+        if swa_valid_list is not None:
+            assert len(keys) == len(swa_valid_list)
         ret = []
-        for key_ in keys:
+        for i in range(len(keys)):
+            key_ = keys[i]
             ret.append(f"{self.model_name}_{key_}_{self.tp_rank}_full_k")
             ret.append(f"{self.model_name}_{key_}_{self.tp_rank}_full_v")
-            ret.append(f"{self.model_name}_{key_}_{self.tp_rank}_swa_k")
-            ret.append(f"{self.model_name}_{key_}_{self.tp_rank}_swa_v")
+            if swa_valid_list is None or swa_valid_list[i]:
+                ret.append(f"{self.model_name}_{key_}_{self.tp_rank}_swa_k")
+                ret.append(f"{self.model_name}_{key_}_{self.tp_rank}_swa_v")
         return ret
 
-    def _batch_preprocess(self, keys, host_indices):
+    def _batch_preprocess(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        swa_needed_per_page: Optional[list[bool]] = None,
+    ):
         assert len(keys) > 0
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
         assert isinstance(self.mem_pool_host, SWATokenToKVPoolHost)
 
-        ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(
-            host_indices
+        ptr_list, element_size_list, swa_valid_list = (
+            self.mem_pool_host.get_page_buffer_meta(host_indices, swa_needed_per_page)
         )
-        key_list = self._convert_hybrid_keys(keys)
-        assert len(key_list) == len(ptr_list)
-        return key_list, ptr_list, element_size_list
+        assert len(ptr_list) == len(element_size_list)
+        assert len(swa_valid_list) == len(keys)
 
-    def _batch_postprocess(self, results: List[bool]):
-        all_kv_pairs = zip(results[::4], results[1::4], results[2::4], results[3::4])
-        return [
-            (full_k_res and full_v_res and swa_k_res and swa_v_res)
-            for full_k_res, full_v_res, swa_k_res, swa_v_res in all_kv_pairs
-        ]
+        key_list = self._convert_hybrid_keys(keys, swa_valid_list)
+
+        assert len(key_list) == len(ptr_list) == len(element_size_list)
+        return key_list, ptr_list, element_size_list, swa_valid_list
+
+    def _batch_postprocess(
+        self,
+        results: List[bool],
+        swa_valid_list: List[bool],
+    ) -> List[bool]:
+        ret = []
+        idx = 0
+        for swa_valid in swa_valid_list:
+            step = 4 if swa_valid else 2
+            ret.append(all(results[idx : idx + step]))
+            idx += step
+        assert idx == len(results)
+        return ret
 
     def get_stats(self):
         # Atomic swap under GIL to avoid race with IO threads appending

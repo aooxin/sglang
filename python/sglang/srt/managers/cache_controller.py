@@ -197,6 +197,7 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        swa_host_indices: Optional[torch.Tensor] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -204,6 +205,7 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        self.swa_host_indices = swa_host_indices
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -220,14 +222,22 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        swa_host_indices: Optional[torch.Tensor] = None,
     ):
         self.request_id = request_id
+        self.swa_valid_mask: Optional[torch.Tensor] = None
 
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
 
-        super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
+        super().__init__(
+            host_indices,
+            token_ids,
+            last_hash,
+            prefix_keys=prefix_keys,
+            swa_host_indices=swa_host_indices,
+        )
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -291,6 +301,12 @@ class HiCacheController:
         self.enable_storage_metrics = enable_storage_metrics
         self.metrics_collector = None
         self.sliding_window_size = sliding_window_size
+        self.sliding_window_pages = (
+            sliding_window_size // self.page_size
+            if sliding_window_size is not None
+            else None
+        )
+        self.is_hybrid_swa = sliding_window_size is not None
 
         if is_dp_attention_enabled():
             self.tp_rank = get_attention_tp_rank()
@@ -371,7 +387,10 @@ class HiCacheController:
 
         self.prefetch_revoke_queue = Queue()
         self.ack_backup_queue = Queue()
+        # Host full + optional swa
         self.host_mem_release_queue = Queue()
+        # Host swa only
+        self.swa_only_host_mem_release_queue = Queue()
 
         self.prefetch_thread.start()
         self.backup_thread.start()
@@ -758,7 +777,7 @@ class HiCacheController:
         # TODO(yingchun): this assert has D2H op
         assert swa_host_indices[-ensure_swa_length:].min().item() > 0, (
             f"Last {ensure_swa_length} SWA slots must be valid, "
-            f"got {swa_host_indices[-ensure_swa_length :].tolist()}"
+            f"got {swa_host_indices[-ensure_swa_length:].tolist()}"
         )
 
     def alloc_device(
@@ -918,7 +937,8 @@ class HiCacheController:
     def prefetch(
         self,
         request_id: str,
-        host_indices: torch.Tensor,
+        full_host_indices: torch.Tensor,
+        swa_host_indices: torch.Tensor,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
@@ -927,7 +947,12 @@ class HiCacheController:
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            request_id,
+            full_host_indices,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            swa_host_indices=swa_host_indices,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -942,6 +967,39 @@ class HiCacheController:
         pages = host_indices.split(self.mem_pool_host.page_size)
         for page in pages:
             self.host_mem_release_queue.put(page)
+
+    def append_swa_only_host_mem_release(
+        self, swa_only_to_release: Optional[torch.Tensor]
+    ):
+        assert swa_only_to_release is not None
+        # swa_only_to_release 是 SWATokenToKVPoolHost 中未与 full 做 mapping 的 SWA indices，需要单独释放
+        if swa_only_to_release.numel() == 0:
+            return
+
+        page_size = self.mem_pool_host.page_size
+        paged = swa_only_to_release.view(-1, page_size)
+        valid_count_per_page = paged.count_nonzero(dim=1)
+        assert (
+            (valid_count_per_page == 0) | (valid_count_per_page == page_size)
+        ).all(), f"Each page must be all-zero or all-valid, got {valid_count_per_page.tolist()}"
+
+        valid_page_mask = valid_count_per_page > 0
+        if valid_page_mask.any():
+            # TODO(yingchun): 单独 put 入队，lock 获取频繁。可考虑批量入队。
+            for page in paged[valid_page_mask]:
+                self.swa_only_host_mem_release_queue.put(page)
+
+    def append_full_and_swa_mem_release_separately(
+        self, full_host_indices_to_release: torch.Tensor
+    ):
+        if full_host_indices_to_release.numel() == 0:
+            return
+
+        swa_host_indices = self.mem_pool_host.unmapping_full_and_swa_indices(
+            full_host_indices_to_release
+        )
+        self.append_host_mem_release(full_host_indices_to_release)
+        self.append_swa_only_host_mem_release(swa_host_indices)
 
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
@@ -991,8 +1049,14 @@ class HiCacheController:
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
             prev_completed_tokens = operation.completed_tokens
-            # Get one batch token, and update the completed_tokens if succeed
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            # 使用 swa_valid_mask 过滤需要 batch get 的 SWA KV cache
+            if self.is_hybrid_swa and operation.swa_valid_mask is not None:
+                extra_info.swa_needed_per_page = operation.swa_valid_mask[
+                    i : i + len(batch_hashes)
+                ]
+
+            # Get one batch token, and update the completed_tokens if succeed
             t0_io = time.perf_counter()
             self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
             if self.metrics_collector is not None:
@@ -1021,7 +1085,7 @@ class HiCacheController:
                     continue
                 self._page_transfer(operation)
                 # operation terminated by controller, release pre-allocated memory
-                self.append_host_mem_release(
+                self.append_full_and_swa_mem_release_separately(
                     operation.host_indices[operation.completed_tokens :]
                 )
             except Empty:
@@ -1037,13 +1101,58 @@ class HiCacheController:
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
 
-    def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+    # TODO(yingchun): 在 _compute_safe_storage_prefix 中只考虑了 storage 中的 SWA 安全，未考虑 device 和 host 上的 SWA，
+    #  更好的做法是同时考虑 device 和 host 的拼接
+    # TODO(yingchun): 与 simple_swa_radix_cache.compute_swa_safe_len() 相似，考虑重构复用
+    @staticmethod
+    def _compute_safe_storage_prefix(
+        swa_valid_per_page: torch.Tensor,
+        sliding_window_pages: int,
+    ) -> int:
+        """
+        Find the longest prefix of pages L such that the trailing SWA window
+        ``[max(0, L - sliding_window_pages), L)`` all have valid SWA.
+
+        Same algorithm as SimpleSWARadixCache._compute_safe_prefix_len but at
+        page granularity, using tensor operations.
+        """
+        full_prefix_pages = len(swa_valid_per_page)
+        if full_prefix_pages == 0:
+            return 0
+
+        # Fast path: tail window all valid → full prefix is usable.
+        if swa_valid_per_page[
+            max(0, full_prefix_pages - sliding_window_pages) : full_prefix_pages
+        ].all():
+            return full_prefix_pages
+
+        # Slow path: prefix-sum scan to find the longest safe L.
+        # invalid_cumsum[i] = number of invalid pages in [0, i)
+        invalid_cumsum = (~swa_valid_per_page).int().cumsum(0)
+        # prepend a 0 so invalid_cumsum_ext[i] = count of invalid in [0, i)
+        invalid_cumsum_ext = torch.cat(
+            [torch.zeros(1, dtype=torch.int), invalid_cumsum]
+        )
+
+        best = 0
+        # TODO(yingchun): 可向量化：构造 L = arange(1, N+1), win_starts = (L - window).clamp(0)，一次比较
+        #  invalid_cumsum_ext[L] - invalid_cumsum_ext[win_starts] == 0，取最后一个 True 位置。
+        for l in range(1, full_prefix_pages + 1):
+            win_start = max(0, l - sliding_window_pages)
+            if invalid_cumsum_ext[l] - invalid_cumsum_ext[win_start] == 0:
+                best = l
+        return best
+
+    def _storage_hit_query(
+        self, operation
+    ) -> Tuple[list[str], int, Optional[torch.Tensor]]:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
 
         storage_query_count = 0
-        hash_value = []
+        hash_values = []
+        swa_valid_per_page = []
 
         for start in range(
             0, len(tokens_to_fetch), self.page_size * self.storage_batch_size
@@ -1059,20 +1168,45 @@ class HiCacheController:
                 )
                 batch_hashes.append(last_hash)
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            t0_exists = time.perf_counter()
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            t0_query = time.perf_counter()
+            if self.is_hybrid_swa:
+                hit_page_num, part_swa_mask = self.storage_backend.batch_exists_hybrid(
+                    batch_hashes, extra_info
+                )
+                assert hit_page_num <= len(batch_hashes)
+                assert hit_page_num == len(part_swa_mask)
+                # 确定哪些 SWA 是有效的
+                swa_valid_per_page.extend(part_swa_mask)
+            else:
+                hit_page_num = self.storage_backend.batch_exists(
+                    batch_hashes, extra_info
+                )
             if self.metrics_collector is not None:
                 self.metrics_collector.log_storage_query_latency(
-                    time.perf_counter() - t0_exists
+                    time.perf_counter() - t0_query
                 )
-            hash_value.extend(batch_hashes[:hit_page_num])
+            hash_values.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
                 break
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
-        return hash_value, storage_query_count
+        if self.is_hybrid_swa:
+            # 对于 hybrid 模型，需要裁剪到 SWA 安全的部分
+            swa_valid_mask = torch.tensor(swa_valid_per_page, dtype=torch.bool)
+            swa_valid_len = self._compute_safe_storage_prefix(
+                swa_valid_mask,
+                self.sliding_window_pages,
+            )
+            assert swa_valid_len <= len(tokens_to_fetch) // self.page_size
+            return (
+                hash_values[:swa_valid_len],
+                swa_valid_len * self.page_size,
+                swa_valid_mask[:swa_valid_len],
+            )
+        else:
+            return hash_values, storage_query_count, None
 
     def prefetch_thread_func(self):
         """
@@ -1088,38 +1222,106 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                hash_value, storage_hit_count = self._storage_hit_query(operation)
+
+                # 通过 batch_exists 查看 storage 上存在的 KV cache（含 SWA 的有效区间 mask）
+                hash_value, storage_hit_count, valid_swa_mask = self._storage_hit_query(
+                    operation
+                )
+                hit_pages = storage_hit_count // self.page_size
+                assert (
+                    len(hash_value) * self.page_size == storage_hit_count
+                ), f"{len(hash_value)=}, {storage_hit_count=}"
+                assert valid_swa_mask is None or len(valid_swa_mask) == len(
+                    hash_value
+                ), f"{len(valid_swa_mask)=}, {len(hash_value)=}"
+
+                # TODO(yingchun): 通信的数据更多了，可以优化到新的队列/线程中
+                #  各 TP 同步，对齐 storage_hit_count 和 valid_swa_mask
                 if self.tp_world_size > 1:
-                    storage_hit_count_tensor = torch.tensor(
-                        storage_hit_count, dtype=torch.int
+                    new_input_pages = len(operation.token_ids) // self.page_size
+                    storage_hit_count_tensor = torch.empty(
+                        1 + new_input_pages, dtype=torch.int
                     )
+                    storage_hit_count_tensor[0] = storage_hit_count
+                    swa_mask_len = (
+                        len(valid_swa_mask) if valid_swa_mask is not None else 0
+                    )
+                    # FIXME(yingchun): storage_hit_count_tensor[swa_mask_len + 1:] 元素未初始化
+                    if swa_mask_len > 0:
+                        storage_hit_count_tensor[1 : swa_mask_len + 1] = (
+                            valid_swa_mask.int()
+                        )
                     torch.distributed.all_reduce(
                         storage_hit_count_tensor,
                         op=torch.distributed.ReduceOp.MIN,
                         group=self.prefetch_tp_group,
                     )
-                    storage_hit_count = storage_hit_count_tensor.item()
+                    storage_hit_count = storage_hit_count_tensor[0].item()
+                    hit_pages = storage_hit_count // self.page_size
+                    if swa_mask_len > 0:
+                        valid_swa_mask = storage_hit_count_tensor[
+                            1 : hit_pages + 1
+                        ].bool()
 
+                # 没有达到 prefetch 阈值，则放弃从 storage 预取
+                # TODO(yingchun): 跳过预取可能造成在树上回退很长，硬算过长。
+                #  可以把阈值设置成 0
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
+                    self.append_swa_only_host_mem_release(operation.swa_host_indices)
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
-                else:
-                    operation.hash_value = hash_value[
-                        : (storage_hit_count // self.page_size)
-                    ]
-                    # free the pre-allocated memory for pages that are not hit
-                    self.append_host_mem_release(
-                        operation.host_indices[storage_hit_count:]
+                    continue
+
+                # 在 hybrid 模型下，若 SWA 不足 sliding window 大小，则放弃预取
+                if self.is_hybrid_swa:
+                    # 各 TP 同步后，valid_swa_mask 会收缩，使用收缩后的再算一次 SWA 安全长度
+                    # TODO(yingchun): 可以比较下与同步前的 valid_swa_mask 是否变化，未变化则可以跳过
+                    swa_valid_len = self._compute_safe_storage_prefix(
+                        valid_swa_mask,
+                        self.sliding_window_pages,
                     )
-                    operation.host_indices = operation.host_indices[:storage_hit_count]
-                    logger.debug(
-                        f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
+                    if swa_valid_len < self.sliding_window_pages:
+                        self.prefetch_revoke_queue.put(operation.request_id)
+                        self.append_host_mem_release(operation.host_indices)
+                        self.append_swa_only_host_mem_release(
+                            operation.swa_host_indices
+                        )
+                        logger.debug(
+                            f"Revoking prefetch for request {operation.request_id} due to insufficient SWA hits ({swa_valid_len})."
+                        )
+                        continue
+
+                # 截取需要从 storage prefetch 的部分
+                operation.hash_value = hash_value[:hit_pages]
+                # FIXME(yingchun): 需要先 free，再截断
+                operation.host_indices = operation.host_indices[:storage_hit_count]
+                # free the pre-allocated memory for pages that are not hit
+                self.append_host_mem_release(operation.host_indices[storage_hit_count:])
+                # 把一开始未做 mapping 的 full 和 swa 的 host memory 做 mapping
+                if self.is_hybrid_swa:
+                    assert valid_swa_mask is not None
+                    trimmed_swa_mask, surplus_swa = (
+                        self.mem_pool_host.mapping_full_and_swa_indices(
+                            operation.host_indices,
+                            operation.swa_host_indices,
+                            valid_swa_mask[:hit_pages],
+                        )
                     )
-                    self.prefetch_buffer.put(operation)
+                    # free the SWA ONLY pre-allocated memory for pages that are not hit
+                    if surplus_swa is not None:
+                        self.append_swa_only_host_mem_release(surplus_swa)
+                    # Reset swa_host_indices to None after being mapped
+                    operation.swa_host_indices = None
+                    operation.swa_valid_mask = trimmed_swa_mask
+
+                logger.debug(
+                    f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
+                )
+                self.prefetch_buffer.put(operation)
 
             except Empty:
                 continue
@@ -1162,6 +1364,11 @@ class HiCacheController:
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
+            assert len(batch_hashes) > 0, f"{len(batch_hashes)=}"
+            assert (
+                len(batch_hashes)
+                == len(batch_host_indices) // self.mem_pool_host.page_size
+            ), f"{len(batch_hashes)=}, {len(batch_host_indices)=}, {self.mem_pool_host.page_size=}"
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
@@ -1171,6 +1378,7 @@ class HiCacheController:
                     f"Write page to storage: {len(batch_hashes)} pages failed."
                 )
                 break
+            logger.debug(f"Write page to storage: {len(batch_hashes)} pages succeeded.")
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes

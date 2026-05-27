@@ -31,6 +31,7 @@ from sglang.jit_kernel.hicache import (
 from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MambaPool,
@@ -461,14 +462,14 @@ class MHATokenToKVPoolHost(HostKVCache):
                 )
             elif self.layout == "page_first_direct":
                 k_dims = (
-                    self.page_num,
+                    self.page_num + 1,
                     self.layer_num,
                     self.page_size,
                     self.head_num,
                     self.head_dim,
                 )
                 v_dims = (
-                    self.page_num,
+                    self.page_num + 1,
                     self.layer_num,
                     self.page_size,
                     self.head_num,
@@ -2154,6 +2155,7 @@ class SWATokenToKVPoolHost:
         # Mapping must be sized by the ACTUAL host pool capacity (self.full_pool_host.size),
         # not the raw host_size argument. host_size may be interpreted as bytes/GB in
         # HostKVCache and converted to token slots, so using raw host_size can under-allocate.
+        # TODO(yingchun): mapping 使用前，也做 assert，确保内容都为 0
         self.full_to_swa_index_mapping = torch.cat(
             [
                 torch.zeros(
@@ -2167,6 +2169,8 @@ class SWATokenToKVPoolHost:
         # {global_layer_id: (pool_layer_id, is_swa_layer)}
         self.layers_mapping = self.device_pool.layers_mapping
         self.layer_num = self.device_pool.layer_num
+        self.reserve_swa_size = envs.SGLANG_RESERVE_SWA_SIZE_BEFORE_PREFETCHING.get()
+        assert self.reserve_swa_size % self.page_size == 0
 
     # full 和 swa 两个子池容量恒等（构造时 host_size==host_size_swa），全程也按相同
     # need_size 一起 alloc/free（见 alloc/free），所以 size / available_size 直接代理
@@ -2198,6 +2202,29 @@ class SWATokenToKVPoolHost:
         #     assert len(full_select_index) == need_size
         #     assert len(swa_select_index) == need_size
         # return full_select_index
+
+    # 注意这里的 full 和 swa 未做 mapping。释放时需要注意：
+    # - 对于后续已做 mapping 的部分，使用 free 即可释放 full + swa
+    # - 对于后续未做 mapping 的部分，使用 free 可释放 full，使用 free_swa_only 可释放 swa
+    def alloc_unmapped_host_by_len(
+        self,
+        full_need_size: int,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, int]:
+        assert full_need_size % self.page_size == 0
+        swa_need_size = min(full_need_size, self.reserve_swa_size)
+        assert swa_need_size % self.page_size == 0
+
+        lack_full_size = full_need_size - self.full_pool_host.available_size()
+        lack_swa_size = swa_need_size - self.swa_pool_host.available_size()
+        if lack_full_size > 0 or lack_swa_size > 0:
+            return None, None, max(0, lack_full_size), max(0, lack_swa_size)
+
+        full_host_indices = self.full_pool_host.alloc(full_need_size)
+        # 注意: 此时并不做 mapping，而会在 cc._storage_hit_query 之后确定要真正要 batch_get 的 SWA 区间之后再做 mapping
+        self.full_to_swa_index_mapping[full_host_indices] = 0
+        swa_host_indices = self.swa_pool_host.alloc(swa_need_size)
+
+        return full_host_indices, swa_host_indices, 0, 0
 
     def alloc_host(
         self,
@@ -2242,6 +2269,86 @@ class SWATokenToKVPoolHost:
 
         return int(full_host_indices.numel()), swa_freed
 
+    def mapping_full_and_swa_indices(
+        self,
+        full_host_indices: torch.Tensor,
+        swa_host_indices: torch.Tensor,
+        swa_valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Vectorized version of mapping_full_and_swa_indices.
+
+        Same semantics: bind pre-allocated SWA pages to True pages in
+        swa_valid_mask from tail.  When SWA pages are insufficient the
+        frontmost True entries are trimmed; when surplus, leftover SWA
+        indices are returned from the head of swa_host_indices.
+
+        This implementation replaces the Python for-loop with pure tensor
+        operations for better performance on large inputs.
+        """
+        ps = self.page_size
+        num_pages = len(swa_valid_mask)
+        assert len(full_host_indices) == num_pages * ps
+
+        swa_available_tokens = len(swa_host_indices)
+        assert swa_available_tokens % ps == 0
+        swa_available_pages = swa_available_tokens // ps
+
+        nonzero_idx = swa_valid_mask.nonzero(as_tuple=False).view(-1)
+        num_needed_pages = len(nonzero_idx)
+        assert num_needed_pages > 0
+        assert swa_available_pages > 0
+
+        updated_mask = swa_valid_mask.clone()
+        surplus_swa = None
+
+        if swa_available_pages >= num_needed_pages:
+            pages_to_bind = nonzero_idx
+            surplus_swa_tokens = (swa_available_pages - num_needed_pages) * ps
+            swa_to_bind = swa_host_indices[surplus_swa_tokens:]
+            if surplus_swa_tokens > 0:
+                surplus_swa = swa_host_indices[:surplus_swa_tokens]
+        else:
+            trim_count = num_needed_pages - swa_available_pages
+            trimmed_indices = nonzero_idx[:trim_count]
+            updated_mask[trimmed_indices] = False
+            pages_to_bind = nonzero_idx[trim_count:]
+            swa_to_bind = swa_host_indices
+
+        # pages_to_bind: [P], arange(ps): [ps] → broadcast [P, ps] → flatten [P*ps]
+        token_indices = (pages_to_bind.unsqueeze(1) * ps + torch.arange(ps)).flatten()
+
+        full_at_tokens = full_host_indices[token_indices]
+        self.full_to_swa_index_mapping[full_at_tokens] = swa_to_bind[
+            : len(full_at_tokens)
+        ]
+
+        return updated_mask, surplus_swa
+
+    def unmapping_full_and_swa_indices(
+        self,
+        full_host_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        # 由于 full 和 SWA 在一开始是 unmapped 的，且 SWA 也只分配了 self.reserve_swa_size 长度，
+        # 所以 full 对应的 SWA 不一定有效，不能做 assert
+        swa_host_indices = self.full_to_swa_index_mapping[full_host_indices]
+        # swa_valid_num = torch.count_nonzero(swa_host_indices).item()
+        # assert swa_valid_num > 0, f"{swa_valid_num=}"
+
+        # 解除 mapping
+        self.full_to_swa_index_mapping[full_host_indices] = 0
+
+        # 返回悬垂的 SWA，供 caller 释放
+        return swa_host_indices
+
+    def free_swa_only(self, swa_indices: torch.Tensor) -> int:
+        """Free raw SWA indices that were never mapped to any full index."""
+        if swa_indices.numel() == 0:
+            return 0
+
+        self.swa_pool_host.free(swa_indices)
+        return int(swa_indices.numel())
+
     def clear(self):
         self.full_pool_host.clear()
         self.swa_pool_host.clear()
@@ -2258,6 +2365,7 @@ class SWATokenToKVPoolHost:
             swa_device_indices = self.device_pool.full_to_swa_index_mapping[
                 device_indices
             ]
+            # TODO(yingchun): 0 的位置直接跳过
             self.swa_pool_host.load_to_device_per_layer(
                 self.device_pool.swa_kv_pool,
                 swa_host_indices,
@@ -2337,88 +2445,109 @@ class SWATokenToKVPoolHost:
         )
 
     # TODO(yingchun): 考虑复用 get_page_buffer_meta 中的方法
-    def get_page_buffer_meta(self, indices):
+    def get_page_buffer_meta(self, full_host_indices, swa_needed_per_page=None):
         """
         meta data for zero copy
         """
-        assert len(indices) % self.page_size == 0
+        assert len(full_host_indices) % self.page_size == 0
         full_k_base_ptr = self.full_pool_host.k_buffer.data_ptr()
         full_v_base_ptr = self.full_pool_host.v_buffer.data_ptr()
         swa_k_base_ptr = self.swa_pool_host.k_buffer.data_ptr()
         swa_v_base_ptr = self.swa_pool_host.v_buffer.data_ptr()
-        # TODO(yingchun): 改为 indices[::self.page_size].tolist() 可减少 (page_size-1)/page_size 的对象分配
-        indices = indices.tolist()
+        # TODO(yingchun): 改为 full_host_indices[::self.page_size].tolist() 可减少 (page_size-1)/page_size 的对象分配
+        full_host_indices = full_host_indices.tolist()
+        swa_host_indices = self.full_to_swa_index_mapping[full_host_indices]
+
+        itemsize = self.dtype.itemsize
         full_k_element_size = (
             self.device_pool.full_layer_nums
-            * self.dtype.itemsize
+            * itemsize
             * self.page_size
             * self.full_pool_host.head_num
             * self.full_pool_host.head_dim
         )
         full_v_element_size = (
             self.device_pool.full_layer_nums
-            * self.dtype.itemsize
+            * itemsize
             * self.page_size
             * self.full_pool_host.head_num
             * self.full_pool_host.v_head_dim
         )
         swa_k_element_size = (
             self.device_pool.swa_layer_nums
-            * self.dtype.itemsize
+            * itemsize
             * self.page_size
             * self.swa_pool_host.head_num
             * self.swa_pool_host.head_dim
         )
         swa_v_element_size = (
             self.device_pool.swa_layer_nums
-            * self.dtype.itemsize
+            * itemsize
             * self.page_size
             * self.swa_pool_host.head_num
             * self.swa_pool_host.v_head_dim
         )
+
+        full_k_stride = (
+            self.device_pool.full_layer_nums
+            * self.full_pool_host.head_num
+            * self.full_pool_host.head_dim
+            * itemsize
+        )
+        full_v_stride = (
+            self.device_pool.full_layer_nums
+            * self.full_pool_host.head_num
+            * self.full_pool_host.v_head_dim
+            * itemsize
+        )
+        swa_k_stride = (
+            self.device_pool.swa_layer_nums
+            * self.swa_pool_host.head_num
+            * self.swa_pool_host.head_dim
+            * itemsize
+        )
+        swa_v_stride = (
+            self.device_pool.swa_layer_nums
+            * self.swa_pool_host.head_num
+            * self.swa_pool_host.v_head_dim
+            * itemsize
+        )
+
         ptr_list = []
         element_size_list = []
-        for index in range(0, len(indices), self.page_size):
-            # TODO(yingchun): 可预计算变量降低重复计算
-            full_k_ptr = (
-                full_k_base_ptr
-                + indices[index]
-                * self.device_pool.full_layer_nums
-                * self.full_pool_host.head_num
-                * self.full_pool_host.head_dim
-                * self.dtype.itemsize
+        swa_valid_list = []
+        page_idx = 0
+        for index in range(0, len(full_host_indices), self.page_size):
+            full_idx = full_host_indices[index]
+            full_k_ptr = full_k_base_ptr + full_idx * full_k_stride
+            full_v_ptr = full_v_base_ptr + full_idx * full_v_stride
+
+            # TODO(yingchun): 可以像 full_host_indices 一样先转为 list，避免 PyTorch dispatch 开销
+            swa_needed = swa_host_indices[index] != 0 and (
+                swa_needed_per_page is None or swa_needed_per_page[page_idx]
             )
-            full_v_ptr = (
-                full_v_base_ptr
-                + indices[index]
-                * self.device_pool.full_layer_nums
-                * self.full_pool_host.head_num
-                * self.full_pool_host.v_head_dim
-                * self.dtype.itemsize
-            )
-            swa_k_ptr = (
-                swa_k_base_ptr
-                + indices[index]
-                * self.device_pool.swa_layer_nums
-                * self.swa_pool_host.head_num
-                * self.swa_pool_host.head_dim
-                * self.dtype.itemsize
-            )
-            swa_v_ptr = (
-                swa_v_base_ptr
-                + indices[index]
-                * self.device_pool.swa_layer_nums
-                * self.swa_pool_host.head_num
-                * self.swa_pool_host.v_head_dim
-                * self.dtype.itemsize
-            )
-            ptr_list.extend([full_k_ptr, full_v_ptr, swa_k_ptr, swa_v_ptr])
-            element_size_list.extend(
-                [
-                    full_k_element_size,
-                    full_v_element_size,
-                    swa_k_element_size,
-                    swa_v_element_size,
-                ]
-            )
-        return ptr_list, element_size_list
+            if swa_needed:
+                swa_idx = swa_host_indices[index]
+                swa_k_ptr = swa_k_base_ptr + swa_idx * swa_k_stride
+                swa_v_ptr = swa_v_base_ptr + swa_idx * swa_v_stride
+                ptr_list.extend([full_k_ptr, full_v_ptr, swa_k_ptr, swa_v_ptr])
+                element_size_list.extend(
+                    [
+                        full_k_element_size,
+                        full_v_element_size,
+                        swa_k_element_size,
+                        swa_v_element_size,
+                    ]
+                )
+                swa_valid_list.append(True)
+            else:
+                ptr_list.extend([full_k_ptr, full_v_ptr])
+                element_size_list.extend(
+                    [
+                        full_k_element_size,
+                        full_v_element_size,
+                    ]
+                )
+                swa_valid_list.append(False)
+            page_idx += 1
+        return ptr_list, element_size_list, swa_valid_list

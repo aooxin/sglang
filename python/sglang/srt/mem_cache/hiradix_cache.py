@@ -234,6 +234,7 @@ class BaseHiRadixCache(abc.ABC):
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
+        self.sliding_window_size = params.sliding_window_size
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -527,6 +528,7 @@ class BaseHiRadixCache(abc.ABC):
         n_backup: Optional[int],
         n_release: Optional[int],
         log_metrics: bool,
+        n_swa_only_release: Optional[int] = None,
     ):
         cc = self.cache_controller
 
@@ -569,9 +571,22 @@ class BaseHiRadixCache(abc.ABC):
                 host_indices = torch.cat(host_indices_list, dim=0)
                 cc.mem_pool_host.free(host_indices)
 
+        def _drain_swa_only_release():
+            if n_swa_only_release is None:
+                return
+            swa_indices_list = []
+            for swa_indices in _drain_queue(
+                cc.swa_only_host_mem_release_queue, n_swa_only_release
+            ):
+                swa_indices_list.append(swa_indices)
+            if swa_indices_list:
+                swa_host_indices = torch.cat(swa_indices_list, dim=0)
+                cc.mem_pool_host.free_swa_only(swa_host_indices)
+
         _drain_revoke()
         _drain_backup()
         _drain_release()
+        _drain_swa_only_release()
 
     def _parse_storage_backend_extra_config(
         self, storage_backend_extra_config: Optional[str]
@@ -834,16 +849,38 @@ class BaseHiRadixCache(abc.ABC):
             if not finish_event.query():
                 break
             finish_count += 1
-        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         if self.tp_world_size > 1:
             # synchronize TP workers to make the same update to radix cache
+            cc = self.cache_controller
+            states = torch.tensor(
+                [
+                    finish_count,
+                    cc.mem_pool_host.full_pool_host.available_size(),
+                    cc.mem_pool_host.swa_pool_host.available_size(),
+                ],
+                dtype=torch.int,
+                device="cpu",
+            )
             torch.distributed.all_reduce(
-                queue_size,
+                states,
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_group,
             )
+            (
+                finish_count,
+                n_host_full_available_size,
+                n_host_swa_available_size,
+            ) = states.tolist()
+            # TODO(yingchun): 重复代码，可封装为函数
+            assert (
+                n_host_full_available_size
+                == cc.mem_pool_host.full_pool_host.available_size()
+            )
+            assert (
+                n_host_swa_available_size
+                == cc.mem_pool_host.swa_pool_host.available_size()
+            )
 
-        finish_count = int(queue_size.item())
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
@@ -1240,25 +1277,53 @@ class BaseHiRadixCache(abc.ABC):
         """
         cc = self.cache_controller
 
-        qsizes = torch.tensor(
-            [
-                cc.prefetch_revoke_queue.qsize(),
-                cc.ack_backup_queue.qsize(),
-                cc.host_mem_release_queue.qsize(),
-            ],
-            dtype=torch.int,
-        )
+        if cc.is_hybrid_swa:
+            qsizes = torch.tensor(
+                [
+                    cc.prefetch_revoke_queue.qsize(),
+                    cc.ack_backup_queue.qsize(),
+                    cc.host_mem_release_queue.qsize(),
+                    cc.swa_only_host_mem_release_queue.qsize(),
+                    cc.mem_pool_host.full_pool_host.available_size(),
+                    cc.mem_pool_host.swa_pool_host.available_size(),
+                ],
+                dtype=torch.int,
+            )
+        else:
+            qsizes = torch.tensor(
+                [
+                    cc.prefetch_revoke_queue.qsize(),
+                    cc.ack_backup_queue.qsize(),
+                    cc.host_mem_release_queue.qsize(),
+                ],
+                dtype=torch.int,
+            )
+
         if self.tp_world_size > 1:
             torch.distributed.all_reduce(
                 qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
 
-        n_revoke, n_backup, n_release = map(int, qsizes.tolist())
+        n_swa_only_release = None
+        if cc.is_hybrid_swa:
+            n_revoke, n_backup, n_release, n_swa_only_release, n_host_full_available_size, n_host_swa_available_size = map(
+                int, qsizes.tolist()
+            )
+            assert (
+                n_host_full_available_size
+                == cc.mem_pool_host.full_pool_host.available_size()
+            )
+            assert (
+                n_host_swa_available_size == cc.mem_pool_host.swa_pool_host.available_size()
+            )
+        else:
+            n_revoke, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
             n_revoke=n_revoke,
             n_backup=n_backup,
             n_release=n_release,
             log_metrics=True,
+            n_swa_only_release=n_swa_only_release,
         )
 
     # Timeout is linearly increasing with the number of pages
@@ -1293,8 +1358,14 @@ class BaseHiRadixCache(abc.ABC):
 
         operation_terminated = operation.is_terminated()
         if self.tp_world_size > 1:
+            cc = self.cache_controller
             states = torch.tensor(
-                [1 - int(can_terminate), int(operation_terminated)],
+                [
+                    1 - int(can_terminate),
+                    int(operation_terminated),
+                    cc.mem_pool_host.full_pool_host.available_size(),
+                    cc.mem_pool_host.swa_pool_host.available_size(),
+                ],
                 dtype=torch.int,
             )
             torch.distributed.all_reduce(
@@ -1302,8 +1373,25 @@ class BaseHiRadixCache(abc.ABC):
                 op=torch.distributed.ReduceOp.MAX,
                 group=self.tp_group,
             )
-            can_terminate = states[0].item() == 0
-            operation_terminated = states[1].item() == 1
+            (
+                can_terminate,
+                operation_terminated,
+                n_host_full_available_size,
+                n_host_swa_available_size,
+            ) = states.tolist()
+            # all TP can_terminate are True
+            can_terminate = can_terminate == 0
+            # any TP operation_terminated is True
+            operation_terminated = operation_terminated == 1
+            # TODO(yingchun): Defensive programming only, maybe can be removed
+            assert (
+                n_host_full_available_size
+                == cc.mem_pool_host.full_pool_host.available_size()
+            )
+            assert (
+                n_host_swa_available_size
+                == cc.mem_pool_host.swa_pool_host.available_size()
+            )
         # the operation should be terminated if it is already terminated on any TP worker
         # or it meets the termination condition on all TP workers
         can_terminate = can_terminate or operation_terminated
@@ -1321,6 +1409,7 @@ class BaseHiRadixCache(abc.ABC):
         ]
 
         if operation.host_indices is None:
+            assert operation.swa_host_indices is None
             # prefetch has not been issued due to insufficient host memory
             return True
 
@@ -1334,16 +1423,36 @@ class BaseHiRadixCache(abc.ABC):
 
         min_completed_tokens = completed_tokens
         if self.tp_world_size > 1:
-            # synchrnoize TP workers to make the same update to hiradix cache
-            completed_tokens_tensor = torch.tensor(
-                min_completed_tokens, dtype=torch.int
+            # synchronize TP workers to make the same update to hiradix cache
+            cc = self.cache_controller
+            states = torch.tensor(
+                [
+                    min_completed_tokens,
+                    # TODO(yingchun): Defensive programming only, maybe can be removed
+                    cc.mem_pool_host.full_pool_host.available_size(),
+                    cc.mem_pool_host.swa_pool_host.available_size(),
+                ],
+                dtype=torch.int,
             )
             torch.distributed.all_reduce(
-                completed_tokens_tensor,
+                states,
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_group,
             )
-            min_completed_tokens = completed_tokens_tensor.item()
+            (
+                min_completed_tokens,
+                n_host_full_available_size,
+                n_host_swa_available_size,
+            ) = states.tolist()
+            assert (
+                n_host_full_available_size
+                == cc.mem_pool_host.full_pool_host.available_size()
+            )
+            assert (
+                n_host_swa_available_size
+                == cc.mem_pool_host.swa_pool_host.available_size()
+            )
+
         fetched_token_ids = token_ids[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(
@@ -1356,7 +1465,7 @@ class BaseHiRadixCache(abc.ABC):
         )
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
-        self.cache_controller.append_host_mem_release(
+        self.cache_controller.append_full_and_swa_mem_release_separately(
             host_indices[min_completed_tokens:completed_tokens]
         )
         last_host_node.release_host()
@@ -1368,6 +1477,7 @@ class BaseHiRadixCache(abc.ABC):
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
 
         if self.enable_storage_metrics:
+            self.storage_metrics_collector.log_prefetch_dropped_tokens(matched_length)
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
 
         return True
@@ -1378,6 +1488,7 @@ class BaseHiRadixCache(abc.ABC):
 
         _, _, _, operation = self.ongoing_prefetch[req_id]
         if operation.host_indices is None:
+            assert operation.swa_host_indices is None
             return
         operation.mark_terminate()
 
@@ -1457,21 +1568,36 @@ class BaseHiRadixCache(abc.ABC):
             return
 
         last_host_node.protect_host()
-        host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-        if host_indices is None:
-            self.evict_host(prefetch_length)
-            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
-        if host_indices is None:
+        full_host_indices, swa_host_indices, lack_full_size, lack_swa_size = (
+            self.cache_controller.mem_pool_host.alloc_unmapped_host_by_len(
+                prefetch_length
+            )
+        )
+        if full_host_indices is None:
+            assert lack_full_size > 0 or lack_swa_size > 0
+            self.evict_host(lack_full_size, lack_swa_size)
+            full_host_indices, swa_host_indices, _, _ = (
+                self.cache_controller.mem_pool_host.alloc_unmapped_host_by_len(
+                    prefetch_length
+                )
+            )
+        if full_host_indices is None:
+            assert swa_host_indices is None
             last_host_node.release_host()
             # no sufficient host memory for prefetch
             return
         operation = self.cache_controller.prefetch(
-            req_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            req_id,
+            full_host_indices,
+            swa_host_indices,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
             new_input_tokens,
-            host_indices,
+            full_host_indices,
             operation,
         )
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
@@ -1666,6 +1792,7 @@ class BaseHiRadixCache(abc.ABC):
 
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[rid]
         if operation.host_indices is None:
+            assert operation.swa_host_indices is None
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
@@ -1673,7 +1800,9 @@ class BaseHiRadixCache(abc.ABC):
             torch.distributed.barrier(group=self.tp_group)
         last_host_node.release_host()
         del self.ongoing_prefetch[rid]
-        self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
+        self.cache_controller.append_full_and_swa_mem_release_separately(
+            host_indices[:completed_tokens]
+        )
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
 

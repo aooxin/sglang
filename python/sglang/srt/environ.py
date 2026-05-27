@@ -484,6 +484,9 @@ class Envs:
     # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
 
+    # Memory cache (Simple SWA hi-cache prefetch reserve)
+    SGLANG_RESERVE_SWA_SIZE_BEFORE_PREFETCHING = EnvInt(512)
+
     # Memory cache (Simple SWA reserved points)
     SGLANG_SIMPLE_SWA_RESERVED_POINTS = EnvStr(
         "512,1024,2048,4096,8192,12288,16384,24576,32768"

@@ -50,7 +50,6 @@ from sglang.srt.utils.common import log_info_on_rank0
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -199,6 +198,10 @@ class SimpleSWARadixCache(RadixCache):
         self.swa_active_freed_tokens: int = 0
         self.swa_evicted_from_tree: int = 0
         self.full_evicted_from_tree: int = 0
+        assert self.sliding_window_size % self.page_size == 0
+        logger.info(
+            f"SimpleSWARadixCache initialized with sliding_window_size={self.sliding_window_size}"
+        )
 
         # Cached length of the most recent raw prefix-tree match (before SWA
         # safety trim) used by callers for diagnostics. Updated in match_prefix().

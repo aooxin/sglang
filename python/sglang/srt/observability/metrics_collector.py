@@ -1590,7 +1590,13 @@ class StorageMetricsCollector:
 
         self.prefetched_tokens_total = Counter(
             name="sglang:prefetched_tokens_total",
-            documentation="Number of prefetched prompt tokens.",
+            documentation="Number of prefetched prompt tokens newly inserted into the host cache.",
+            labelnames=labels.keys(),
+        )
+
+        self.prefetch_dropped_tokens_total = Counter(
+            name="sglang:prefetch_dropped_tokens_total",
+            documentation="Number of prefetched prompt tokens dropped during host cache insertion because they matched existing entries.",
             labelnames=labels.keys(),
         )
 
@@ -1678,6 +1684,10 @@ class StorageMetricsCollector:
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
+
+    def log_prefetch_dropped_tokens(self, dropped_tokens: int):
+        if dropped_tokens > 0:
+            self.prefetch_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
 
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:

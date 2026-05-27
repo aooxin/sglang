@@ -64,6 +64,8 @@ class HiCacheStorageConfig:
 class HiCacheStorageExtraInfo:
     prefix_keys: Optional[List[str]] = (None,)
     extra_info: Optional[dict] = None
+    # 需要取哪些 page 的 SWA
+    swa_needed_per_page: Optional[List[bool]] = None
 
 
 class PoolName(str, Enum):
@@ -293,6 +295,26 @@ class HiCacheStorage(ABC):
                 return i
         return len(keys)
 
+    def batch_exists_hybrid(
+        self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> tuple[int, list[bool]]:
+        """
+        Check full-attention and SWA key existence separately.
+
+        Returns:
+            (full_prefix_pages, swa_valid_per_page):
+                full_prefix_pages: number of consecutive pages whose full-attention
+                    keys (full_k + full_v) all exist from the start.
+                swa_valid_per_page: per-page boolean list (length == full_prefix_pages)
+                    indicating whether the SWA keys (swa_k + swa_v) exist for
+                    each page within the full prefix.
+
+        Default implementation falls back to batch_exists, treating all pages
+        within the prefix as having valid SWA.
+        """
+        prefix_pages = self.batch_exists(keys, extra_info)
+        return prefix_pages, [True] * prefix_pages
+
     def clear(self) -> None:
         pass
 
@@ -301,7 +323,6 @@ class HiCacheStorage(ABC):
 
 
 class HiCacheFile(HiCacheStorage):
-
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):

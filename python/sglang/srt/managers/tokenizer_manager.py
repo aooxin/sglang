@@ -1992,7 +1992,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 )
                 if (
                     state.is_first_itl
-                    and self.server_args.disaggregation_mode != "null"
+                    and self.server_args.disaggregation_mode == "decode"
                 ):
                     state.is_first_itl = False
                 else:

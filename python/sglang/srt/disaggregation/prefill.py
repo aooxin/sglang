@@ -349,6 +349,11 @@ class PrefillBootstrapQueue:
 
             # KV.WaitingForInput - init here
             req.time_stats.set_bootstrap_done_time()
+            if self.scheduler.enable_metrics:
+                ts = req.time_stats
+                self.scheduler.metrics_collector.observe_prefill_bootstrap_time(
+                    ts.bootstrap_done_time - ts.prefill_bootstrap_queue_entry_time
+                )
             num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
                 break

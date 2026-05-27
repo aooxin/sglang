@@ -416,8 +416,11 @@ class ServerArgs:
     bucket_time_to_first_token: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
-    bucket_storage_query_latency_ms: Optional[List[float]] = None
-    bucket_prefetch_io_latency_ms: Optional[List[float]] = None
+    bucket_storage_query_latency: Optional[List[float]] = None
+    bucket_prefetch_io_latency: Optional[List[float]] = None
+    bucket_prefill_bootstrap_time: Optional[List[float]] = None
+    bucket_decode_bootstrap_time: Optional[List[float]] = None
+    bucket_decode_alloc_wait_time: Optional[List[float]] = None
     bucket_io: Optional[List[float]] = None
     bucket_bandwidth: Optional[List[float]] = None
     collect_tokens_histogram: bool = False
@@ -4386,18 +4389,39 @@ class ServerArgs:
             help="The buckets of end-to-end request latency, specified as a list of floats.",
         )
         parser.add_argument(
-            "--bucket-storage-query-latency-ms",
+            "--bucket-storage-query-latency",
             type=float,
             nargs="+",
-            default=ServerArgs.bucket_storage_query_latency_ms,
-            help="The buckets (in ms) for the storage batch_exists call latency histogram.",
+            default=ServerArgs.bucket_storage_query_latency,
+            help="The buckets (in seconds) for the storage query latency histogram.",
         )
         parser.add_argument(
-            "--bucket-prefetch-io-latency-ms",
+            "--bucket-prefetch-io-latency",
             type=float,
             nargs="+",
-            default=ServerArgs.bucket_prefetch_io_latency_ms,
-            help="The buckets (in ms) for the prefetch IO latency histogram.",
+            default=ServerArgs.bucket_prefetch_io_latency,
+            help="The buckets (in seconds) for the prefetch IO latency histogram.",
+        )
+        parser.add_argument(
+            "--bucket-prefill-bootstrap-time",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_prefill_bootstrap_time,
+            help="The buckets (in seconds) for the prefill bootstrap time histogram.",
+        )
+        parser.add_argument(
+            "--bucket-decode-bootstrap-time",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_decode_bootstrap_time,
+            help="The buckets (in seconds) for the decode bootstrap time histogram.",
+        )
+        parser.add_argument(
+            "--bucket-decode-alloc-wait-time",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_decode_alloc_wait_time,
+            help="The buckets (in seconds) for the decode alloc wait time histogram.",
         )
         parser.add_argument(
             "--bucket-io",

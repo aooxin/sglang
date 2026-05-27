@@ -965,6 +965,14 @@ class DecodePreallocQueue:
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+            if self.scheduler.enable_metrics:
+                ts = decode_req.req.time_stats
+                self.scheduler.metrics_collector.observe_decode_bootstrap_time(
+                    ts.bootstrap_done_time - ts.decode_prealloc_queue_entry_time
+                )
+                self.scheduler.metrics_collector.observe_decode_alloc_wait_time(
+                    ts.decode_transfer_queue_entry_time - ts.bootstrap_done_time
+                )
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove

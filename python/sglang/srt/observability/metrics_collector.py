@@ -481,6 +481,44 @@ class SchedulerMetricsCollector:
             ],
         )
 
+        _default_bootstrap_buckets = [
+            0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600,
+        ]
+        bucket_prefill_bootstrap_time = (
+            getattr(server_args, "bucket_prefill_bootstrap_time", None)
+            if server_args
+            else None
+        )
+        bucket_decode_bootstrap_time = (
+            getattr(server_args, "bucket_decode_bootstrap_time", None)
+            if server_args
+            else None
+        )
+        bucket_decode_alloc_wait_time = (
+            getattr(server_args, "bucket_decode_alloc_wait_time", None)
+            if server_args
+            else None
+        )
+
+        self.histogram_prefill_bootstrap_time = Histogram(
+            name="sglang:prefill_bootstrap_time_seconds",
+            documentation="Histogram of prefill-side bootstrap duration per request in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_prefill_bootstrap_time or _default_bootstrap_buckets,
+        )
+        self.histogram_decode_bootstrap_time = Histogram(
+            name="sglang:decode_bootstrap_time_seconds",
+            documentation="Histogram of decode-side bootstrap duration per request in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_decode_bootstrap_time or _default_bootstrap_buckets,
+        )
+        self.histogram_decode_alloc_wait_time = Histogram(
+            name="sglang:decode_alloc_wait_time_seconds",
+            documentation="Histogram of decode-side alloc wait duration per request in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_decode_alloc_wait_time or _default_bootstrap_buckets,
+        )
+
         # Grammar metrics
         self.grammar_compilation_time = Histogram(
             name="sglang:grammar_compilation_time_seconds",
@@ -900,6 +938,15 @@ class SchedulerMetricsCollector:
 
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
+
+    def observe_prefill_bootstrap_time(self, latency: float) -> None:
+        self._log_histogram(self.histogram_prefill_bootstrap_time, latency)
+
+    def observe_decode_bootstrap_time(self, latency: float) -> None:
+        self._log_histogram(self.histogram_decode_bootstrap_time, latency)
+
+    def observe_decode_alloc_wait_time(self, latency: float) -> None:
+        self._log_histogram(self.histogram_decode_alloc_wait_time, latency)
 
     def observe_prefill_delayer_outcome(
         self,
@@ -1505,13 +1552,13 @@ class StorageMetricsCollector:
         from sglang.srt.server_args import get_global_server_args
 
         server_args = get_global_server_args()
-        bucket_storage_query_latency_ms = (
-            getattr(server_args, "bucket_storage_query_latency_ms", None)
+        bucket_storage_query_latency = (
+            getattr(server_args, "bucket_storage_query_latency", None)
             if server_args
             else None
         )
-        bucket_prefetch_io_latency_ms = (
-            getattr(server_args, "bucket_prefetch_io_latency_ms", None)
+        bucket_prefetch_io_latency = (
+            getattr(server_args, "bucket_prefetch_io_latency", None)
             if server_args
             else None
         )
@@ -1540,11 +1587,11 @@ class StorageMetricsCollector:
         if bucket_bandwidth is None:
             bucket_bandwidth = [0.1, 0.5, 1, 5, 10, 50, 100]
 
-        if bucket_storage_query_latency_ms is None:
-            bucket_storage_query_latency_ms = [1, 5, 10, 50, 100, 500, 1000, 5000, 10000]
+        if bucket_storage_query_latency is None:
+            bucket_storage_query_latency = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10]
 
-        if bucket_prefetch_io_latency_ms is None:
-            bucket_prefetch_io_latency_ms = [1, 5, 10, 50, 100, 500, 1000, 5000, 10000]
+        if bucket_prefetch_io_latency is None:
+            bucket_prefetch_io_latency = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10]
 
         self.histogram_prefetch_pgs = Histogram(
             name="sglang:prefetch_pgs",
@@ -1574,18 +1621,18 @@ class StorageMetricsCollector:
             buckets=bucket_bandwidth,
         )
 
-        self.histogram_storage_query_latency_ms = Histogram(
-            name="sglang:storage_query_latency_ms",
-            documentation="Histogram of per-batch batch_exists call latency in ms.",
+        self.histogram_storage_query_latency_seconds = Histogram(
+            name="sglang:storage_query_latency_seconds",
+            documentation="Histogram of per-batch storage query call latency in seconds.",
             labelnames=labels.keys(),
-            buckets=bucket_storage_query_latency_ms,
+            buckets=bucket_storage_query_latency,
         )
 
-        self.histogram_prefetch_io_latency_ms = Histogram(
-            name="sglang:prefetch_io_latency_ms",
-            documentation="Histogram of per-batch prefetch IO (page_get_func) latency in ms.",
+        self.histogram_prefetch_io_latency_seconds = Histogram(
+            name="sglang:prefetch_io_latency_seconds",
+            documentation="Histogram of per-batch prefetch IO (page_get_func) latency in seconds.",
             labelnames=labels.keys(),
-            buckets=bucket_prefetch_io_latency_ms,
+            buckets=bucket_prefetch_io_latency,
         )
 
         self.prefetch_queue_length = Gauge(
@@ -1620,11 +1667,11 @@ class StorageMetricsCollector:
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
 
-    def log_storage_query_latency(self, latency_ms: float):
-        self._log_histogram(self.histogram_storage_query_latency_ms, latency_ms)
+    def log_storage_query_latency(self, latency_s: float):
+        self._log_histogram(self.histogram_storage_query_latency_seconds, latency_s)
 
-    def log_prefetch_io_latency(self, latency_ms: float):
-        self._log_histogram(self.histogram_prefetch_io_latency_ms, latency_ms)
+    def log_prefetch_io_latency(self, latency_s: float):
+        self._log_histogram(self.histogram_prefetch_io_latency_seconds, latency_s)
 
     def log_storage_metrics(self, storage_metrics: Optional[StorageMetrics] = None):
         if storage_metrics is None:

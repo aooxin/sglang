@@ -276,6 +276,13 @@ class HiCacheController:
         self.page_size = page_size
         self.io_backend = io_backend
         self.enable_storage = False
+
+        self.has_draft_kv_pool = False
+        self.has_draft_kv_pool_list = False
+        self.mem_pool_device_draft = None
+        self.mem_pool_host_draft = None
+        self.mem_pool_device_draft_list = []
+        self.mem_pool_host_draft_list = []
         self.storage_backend = None
         self.storage_backend_type = None
         self.pp_rank = pp_rank
@@ -686,6 +693,21 @@ class HiCacheController:
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
             )
+            if self.has_draft_kv_pool_list:
+                for i, draft_device_pool in enumerate(self.mem_pool_device_draft_list):
+                    self.mem_pool_host_draft_list[i].backup_from_device_all_layer(
+                        draft_device_pool,
+                        host_indices,
+                        device_indices,
+                        self.io_backend,
+                    )
+            elif self.has_draft_kv_pool:
+                self.mem_pool_host_draft.backup_from_device_all_layer(
+                    self.mem_pool_device_draft,
+                    host_indices,
+                    device_indices,
+                    self.io_backend,
+                )
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
@@ -758,6 +780,25 @@ class HiCacheController:
                     i,
                     self.io_backend,
                 )
+                if self.has_draft_kv_pool_list:
+                    for j, draft_host_pool in enumerate(self.mem_pool_host_draft_list):
+                        if i < self.mem_pool_host_draft_list[j].layer_num:
+                            draft_host_pool.load_to_device_per_layer(
+                                self.mem_pool_device_draft_list[j],
+                                host_indices,
+                                device_indices,
+                                i,
+                                self.io_backend,
+                            )
+                elif self.has_draft_kv_pool:
+                    if i < self.mem_pool_host_draft.layer_num:
+                        self.mem_pool_host_draft.load_to_device_per_layer(
+                            self.mem_pool_device_draft,
+                            host_indices,
+                            device_indices,
+                            i,
+                            self.io_backend,
+                        )
                 producer_event.complete(i)
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
@@ -779,6 +820,22 @@ class HiCacheController:
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)
         return len(device_indices)
+
+    def set_draft_kv_pool(
+        self,
+        draft_kv_pool,
+        draft_kv_pool_list,
+        draft_host_kv_pool,
+        draft_host_kv_pool_list,
+    ):
+        if draft_kv_pool_list:
+            self.has_draft_kv_pool_list = True
+            self.mem_pool_device_draft_list = draft_kv_pool_list
+            self.mem_pool_host_draft_list = draft_host_kv_pool_list
+        elif draft_kv_pool:
+            self.has_draft_kv_pool = True
+            self.mem_pool_device_draft = draft_kv_pool
+            self.mem_pool_host_draft = draft_host_kv_pool
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
         if not backup_only:

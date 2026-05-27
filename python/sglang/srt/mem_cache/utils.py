@@ -359,3 +359,13 @@ def convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
     if len(tokens) < 2:
         return []
     return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
+
+
+def convert_to_steps_key(tokens: List[int], step: int) -> List[tuple]:
+    # MTP uses multistep keys in the radix tree since n-th draft model is the n-token-shifted version of target
+    # [1, 2, 3, 4] -> [(1,2,3), (2,3,4)] for step=2
+    if len(tokens) and isinstance(tokens[0], tuple):
+        return tokens
+    if len(tokens) < step + 1:
+        return []
+    return [tuple(tokens[i : i + step + 1]) for i in range(len(tokens) - step)]

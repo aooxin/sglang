@@ -774,5 +774,54 @@ class TestRadixCache(unittest.TestCase):
         print(available_and_evictable_str(cache))
 
 
+class TestRadixCacheMTP(unittest.TestCase):
+    """Test cases for MTP radix cache with tuple keys."""
+
+    def test_insert_and_match_mtp(self):
+        """Test insert and match operations for MTP."""
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+
+        cache = RadixCache(
+            CacheInitParams(
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=None,
+                page_size=1,
+                disable=False,
+                is_eagle=True,
+                speculative_num_steps=3,
+            )
+        )
+
+        # [1,2,3,4,5,6] with step=3 -> [(1,2,3,4), (2,3,4,5), (3,4,5,6)], len=3
+        # Pass raw token_ids, let cache internally convert via maybe_bigram_convert
+        key = RadixKey([1, 2, 3, 4, 5, 6])
+        value = torch.tensor([10, 20, 30, 40, 50, 60], dtype=torch.int64)
+
+        result = cache.insert(InsertParams(key=key, value=value))
+        prefix_len = result.prefix_len
+
+        self.assertEqual(prefix_len, 0)
+        self.assertEqual(cache.total_size(), 3)
+        self.assertEqual(cache.evictable_size(), 3)
+
+        # Test match_prefix with full key (raw token_ids, cache converts internally)
+        result = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey([1, 2, 3, 4, 5, 6]))
+        )
+        self.assertEqual(len(result.device_indices), 3)
+        torch.testing.assert_close(
+            result.device_indices, torch.tensor([10, 20, 30], dtype=torch.int64)
+        )
+
+        # Test partial match: [1,2,3,4] -> [(1,2,3,4)], len=1
+        result = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey([1, 2, 3, 4]))
+        )
+        self.assertEqual(len(result.device_indices), 1)
+        torch.testing.assert_close(
+            result.device_indices, torch.tensor([10], dtype=torch.int64)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

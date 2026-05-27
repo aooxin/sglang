@@ -397,6 +397,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         topk_p_list = []
         topk_index_list = []
         for step in range(self.speculative_num_steps):
+            forward_batch.token_to_kv_pool = self.draft_runner_list[step].token_to_kv_pool
             output: ModelRunnerOutput = self.draft_runner_list[step].forward(
                 forward_batch
             )
@@ -435,6 +436,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 self.req_to_hidden_states_pool,
                 self.speculative_num_steps - 1,
                 forward_batch.batch_size,
+                forward_batch.seq_lens,
                 forward_batch.extend_seq_lens,
                 forward_batch.extend_start_loc,
             )
@@ -535,6 +537,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 self.req_to_hidden_states_pool,
                 self.speculative_num_steps - 1,
                 forward_batch.batch_size,
+                None,
                 last_cuda_graph_runner.buffers.extend_seq_lens,
                 last_cuda_graph_runner.buffers.extend_start_loc,
             )

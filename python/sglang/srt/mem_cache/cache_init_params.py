@@ -18,6 +18,7 @@ class CacheInitParams:
     page_size: int
 
     is_eagle: bool = False
+    speculative_num_steps: int = 1
     tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     eviction_policy: str = "lru"
     disable_finished_insert: bool = False

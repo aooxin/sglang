@@ -263,6 +263,7 @@ def assign_hidden_states_pool_kernel(
     hidden_states_ptr,
     req_pool_indices_ptr,
     req_to_hidden_states_pool_ptr,
+    seq_lens_ptr,
     extend_seq_lens_ptr,
     extend_start_loc_ptr,
     stride_hidden_seq,
@@ -273,9 +274,14 @@ def assign_hidden_states_pool_kernel(
     HIDDEN_DIM: tl.constexpr,
     pool_size: tl.constexpr,
     BLOCK_HID: tl.constexpr,
+    DTYPE: tl.constexpr = tl.bfloat16,
 ):
     pid = tl.program_id(0)
 
+    if seq_lens_ptr is None:
+        seq_len = -1
+    else:
+        seq_len = tl.load(seq_lens_ptr + pid)
     extend_len = tl.load(extend_seq_lens_ptr + pid)
     start_loc = tl.load(extend_start_loc_ptr + pid)
     end_loc = start_loc + extend_len
@@ -283,7 +289,29 @@ def assign_hidden_states_pool_kernel(
     req_idx = tl.load(req_pool_indices_ptr + pid)
     pool_vec_offset_base = req_idx * stride_pool_req
 
-    for i in range(pool_size):
+    move_tokens = max(0, pool_size - extend_len)
+    for i in range(move_tokens):
+        for off_h in range(0, HIDDEN_DIM, BLOCK_HID):
+            offs_h = off_h + tl.arange(0, BLOCK_HID)
+            mask_h = offs_h < HIDDEN_DIM
+
+            base_ptr = (
+                req_to_hidden_states_pool_ptr
+                + pool_vec_offset_base
+                + offs_h * stride_pool_dim
+            )
+            if seq_len == extend_len:
+                hid_val = tl.zeros((BLOCK_HID,), dtype=DTYPE)
+            else:
+                old_pool_ptr = (
+                    base_ptr + (pool_size - move_tokens + i) * stride_pool_step
+                )
+                hid_val = tl.load(old_pool_ptr, mask=mask_h)
+            tl.debug_barrier()
+            pool_ptr = base_ptr + i * stride_pool_step
+            tl.store(pool_ptr, hid_val, mask=mask_h)
+
+    for i in range(move_tokens, pool_size):
         for off_h in range(0, HIDDEN_DIM, BLOCK_HID):
             offs_h = off_h + tl.arange(0, BLOCK_HID)
             mask_h = offs_h < HIDDEN_DIM
@@ -310,14 +338,25 @@ def assign_hidden_states_pool_triton(
     req_to_hidden_states_pool: torch.Tensor,
     pool_size: int,
     num_seqs: int,
+    seq_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     extend_start_loc: torch.Tensor,
 ):
+    import triton.language as _tl
+
+    _DTYPE_MAP = {
+        torch.bfloat16: _tl.bfloat16,
+        torch.float16: _tl.float16,
+        torch.float32: _tl.float32,
+    }
+    triton_dtype = _DTYPE_MAP.get(hidden_states.dtype, _tl.bfloat16)
+
     grid = (num_seqs,)
     assign_hidden_states_pool_kernel[grid](
         hidden_states,
         req_pool_indices,
         req_to_hidden_states_pool,
+        seq_lens,
         extend_seq_lens,
         extend_start_loc,
         hidden_states.stride(0),
@@ -328,6 +367,7 @@ def assign_hidden_states_pool_triton(
         HIDDEN_DIM=hidden_states.shape[1],
         pool_size=pool_size,
         BLOCK_HID=64,
+        DTYPE=triton_dtype,
     )
 
 
@@ -337,14 +377,25 @@ def assign_hidden_states_pool_torch(
     req_to_hidden_states_pool: torch.Tensor,
     pool_size: int,
     num_seqs: int,
+    seq_lens: torch.Tensor,
     extend_seq_lens: torch.Tensor,
     extend_start_loc: torch.Tensor,
 ):
     for req in range(num_seqs):
         pool_idx = req_pool_indices[req]
+        seq_len = seq_lens[req] if seq_lens is not None else -1
         extend_len = extend_seq_lens[req]
         start_loc = extend_start_loc[req]
         end_loc = start_loc + extend_len
-        req_to_hidden_states_pool[pool_idx, :pool_size, :].copy_(
-            hidden_states[end_loc - pool_size : end_loc, :]
+        pool_copy_start = max(0, pool_size - extend_len)
+        if pool_copy_start > 0:
+            if seq_len == extend_len:
+                req_to_hidden_states_pool[pool_idx, :pool_copy_start, :].zero_()
+            else:
+                req_to_hidden_states_pool[pool_idx, :pool_copy_start, :].copy_(
+                    req_to_hidden_states_pool[pool_idx, -pool_copy_start:, :].clone()
+                )
+        num_copy = pool_size - pool_copy_start
+        req_to_hidden_states_pool[pool_idx, pool_copy_start:pool_size, :].copy_(
+            hidden_states[end_loc - num_copy : end_loc, :]
         )

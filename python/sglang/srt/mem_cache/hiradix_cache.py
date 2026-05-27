@@ -44,7 +44,7 @@ from sglang.srt.mem_cache.radix_cache import (
     split_node_hash_value,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.utils import convert_to_bigram_key
+from sglang.srt.mem_cache.utils import convert_to_steps_key
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 
 if TYPE_CHECKING:
@@ -1222,7 +1222,7 @@ class HiRadixCache(RadixCache):
         prefix_keys: Optional[List[str]] = None,
     ):
         new_input_tokens = (
-            convert_to_bigram_key(new_input_tokens)
+            convert_to_steps_key(new_input_tokens, self.speculative_num_steps)
             if self.is_eagle
             else new_input_tokens
         )

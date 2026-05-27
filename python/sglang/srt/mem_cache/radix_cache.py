@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.utils import convert_to_bigram_key
+from sglang.srt.mem_cache.utils import convert_to_steps_key
 
 """
 Copyright 2023-2024 SGLang Team
@@ -102,9 +102,10 @@ def maybe_bigram_convert(
     is_eagle: bool,
     key: RadixKey,
     value: Optional[torch.Tensor] = None,
+    speculative_num_steps: int = 1,
 ) -> Tuple[RadixKey, Optional[torch.Tensor]]:
     if is_eagle and not key.is_bigram:
-        key.token_ids = convert_to_bigram_key(key.token_ids)
+        key.token_ids = convert_to_steps_key(key.token_ids, speculative_num_steps)
         key.is_bigram = True
         if value is not None:
             value = value[: len(key)]
@@ -290,6 +291,7 @@ class RadixCache(BasePrefixCache):
         self.page_size = params.page_size
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.is_eagle = params.is_eagle
+        self.speculative_num_steps = params.speculative_num_steps
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
 
@@ -369,7 +371,7 @@ class RadixCache(BasePrefixCache):
     def maybe_bigram_convert(
         self, key: RadixKey, value: Optional[torch.Tensor] = None
     ) -> Tuple[RadixKey, Optional[torch.Tensor]]:
-        return maybe_bigram_convert(self.is_eagle, key, value)
+        return maybe_bigram_convert(self.is_eagle, key, value, self.speculative_num_steps)
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
@@ -479,8 +481,8 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # Maybe convert to bigram keys for EAGLE
-        keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
+        # Maybe convert to tuple keys for EAGLE/MTP
+        keys = convert_to_steps_key(token_ids, self.speculative_num_steps) if self.is_eagle else token_ids
         keys = page_align_keys(keys, self.page_size)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
@@ -517,8 +519,8 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # Maybe convert to bigram keys for EAGLE
-        keys = convert_to_bigram_key(token_ids) if self.is_eagle else token_ids
+        # Maybe convert to tuple keys for EAGLE/MTP
+        keys = convert_to_steps_key(token_ids, self.speculative_num_steps) if self.is_eagle else token_ids
         keys = page_align_keys(keys, self.page_size)
         values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
         radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)

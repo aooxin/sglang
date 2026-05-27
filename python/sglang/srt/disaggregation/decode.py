@@ -249,6 +249,7 @@ class DecodePreallocQueue:
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         draft_token_to_kv_pool: Optional[KVCache],
+        draft_token_to_kv_pool_list: Optional[List[KVCache]],
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         metadata_buffers: MetadataBuffers,
         scheduler: Scheduler,
@@ -269,6 +270,7 @@ class DecodePreallocQueue:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        self.draft_token_to_kv_pool_list = draft_token_to_kv_pool_list or []
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
@@ -345,7 +347,15 @@ class DecodePreallocQueue:
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 self.token_to_kv_pool.get_contiguous_buf_infos()
             )
-        if self.draft_token_to_kv_pool is not None:
+        if len(self.draft_token_to_kv_pool_list):
+            for draft_kv_pool in self.draft_token_to_kv_pool_list:
+                draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
+                    draft_kv_pool.get_contiguous_buf_infos()
+                )
+                kv_data_ptrs += draft_kv_data_ptrs
+                kv_data_lens += draft_kv_data_lens
+                kv_item_lens += draft_kv_item_lens
+        elif self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -393,6 +403,23 @@ class DecodePreallocQueue:
             kv_args.state_data_lens = []
             kv_args.state_item_lens = []
             kv_args.state_type = "none"
+
+        if len(self.draft_token_to_kv_pool_list):
+            for draft_kv_pool in self.draft_token_to_kv_pool_list:
+                if hasattr(draft_kv_pool, "get_state_buf_infos"):
+                    state_data_ptrs, state_data_lens, state_item_lens = (
+                        draft_kv_pool.get_state_buf_infos()
+                    )
+                    kv_args.state_data_ptrs += state_data_ptrs
+                    kv_args.state_data_lens += state_data_lens
+                    kv_args.state_item_lens += state_item_lens
+        elif hasattr(self.draft_token_to_kv_pool, "get_state_buf_infos"):
+            state_data_ptrs, state_data_lens, state_item_lens = (
+                self.draft_token_to_kv_pool.get_state_buf_infos()
+            )
+            kv_args.state_data_ptrs += state_data_ptrs
+            kv_args.state_data_lens += state_data_lens
+            kv_args.state_item_lens += state_item_lens
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id

@@ -140,9 +140,11 @@ def alloc_with_host_register(
         buffer = [k_buffer, v_buffer]
         if pin_memory:
             for cache in buffer:
-                torch.cuda.cudart().cudaHostRegister(
-                    cache.data_ptr(), cache.numel() * cache.element_size(), 0
-                )
+                if cache.numel() > 0:
+                    torch.cuda.cudart().cudaHostRegister(
+                        cache.data_ptr(), cache.numel() * cache.element_size(), 0
+                    )
+    torch.cuda.synchronize()
     return buffer
 
 

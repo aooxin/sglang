@@ -755,6 +755,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             page_size=self.page_size,
             is_eagle=self.spec_algorithm.is_eagle(),
+            speculative_num_steps=server_args.speculative_num_steps if server_args.enable_multi_layer_eagle else 1,
             tp_cache_group=(
                 self.attn_tp_cpu_group
                 if self.server_args.enable_dp_attention
@@ -810,6 +811,8 @@ class Scheduler(
                     params=params,
                     speculative_num_steps=server_args.speculative_num_steps,
                 )
+                if self.spec_algorithm.is_eagle():
+                    self._register_draft_kv_pool_for_hicache(server_args)
             elif self.is_hybrid_ssm:
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
@@ -988,6 +991,91 @@ class Scheduler(
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
 
+    def _register_host_kv_pool(self, kv_pool, server_args):
+        from sglang.srt.mem_cache.memory_pool import (
+            MHATokenToKVPool,
+            MLATokenToKVPool,
+        )
+        from sglang.srt.mem_cache.memory_pool_host import (
+            MHATokenToKVPoolHost,
+            MLATokenToKVPoolHost,
+            SWATokenToKVPoolHost,
+        )
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        if isinstance(kv_pool, MHATokenToKVPool):
+            host_kv_pool = MHATokenToKVPoolHost(
+                kv_pool,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            )
+        elif isinstance(kv_pool, MLATokenToKVPool):
+            host_kv_pool = MLATokenToKVPoolHost(
+                kv_pool,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            )
+        elif isinstance(kv_pool, SWAKVPool):
+            host_kv_pool = SWATokenToKVPoolHost(
+                kv_pool,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            )
+        else:
+            logger.warning(
+                f"Draft KV pool type {type(kv_pool).__name__} not supported for HiCache, "
+                "draft model KV cache will not be backed up/restored"
+            )
+            raise NotImplementedError
+        return host_kv_pool
+
+    def _register_draft_kv_pool_for_hicache(self, server_args):
+        """Register draft model KV pool with HiCache for EAGLE speculative decoding"""
+        draft_kv_pool, draft_host_kv_pool = None, None
+        draft_kv_pool_list, draft_host_kv_pool_list = [], []
+
+        if self.enable_overlap:
+            if self.server_args.enable_multi_layer_eagle:
+                draft_kv_pool_list = [
+                    mtp_runner.token_to_kv_pool
+                    for mtp_runner in self.draft_worker.draft_worker.draft_runner_list
+                ]
+                for mtp_kv_pool in draft_kv_pool_list:
+                    draft_host_kv_pool_list.append(
+                        self._register_host_kv_pool(mtp_kv_pool, server_args)
+                    )
+            else:
+                draft_kv_pool = (
+                    self.draft_worker.draft_worker.draft_runner.token_to_kv_pool
+                )
+                draft_host_kv_pool = self._register_host_kv_pool(
+                    draft_kv_pool, server_args
+                )
+        else:
+            draft_runner = self.draft_worker.model_runner
+            draft_kv_pool = draft_runner.token_to_kv_pool
+            draft_host_kv_pool = self._register_host_kv_pool(draft_kv_pool, server_args)
+
+        self.tree_cache.cache_controller.set_draft_kv_pool(
+            draft_kv_pool,
+            draft_kv_pool_list,
+            draft_host_kv_pool,
+            draft_host_kv_pool_list,
+        )
+        logger.info(
+            f"Registered draft model KV pool with HiCache"
+        )
+
     def init_disaggregation(self):
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
@@ -996,17 +1084,23 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
+        draft_token_to_kv_pool_list = []
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
+                for i in range(len(self.draft_worker.draft_worker.draft_runner_list)):
+                    draft_token_to_kv_pool_list.append(
+                        self.draft_worker.draft_worker.draft_runner_list[
+                            i
+                        ].token_to_kv_pool
+                    )
             else:
                 draft_runner = self.draft_worker.draft_worker.draft_runner
             draft_token_to_kv_pool = draft_runner.token_to_kv_pool
             model_config = draft_runner.model_config
         else:
-            # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
             draft_token_to_kv_pool = self.draft_worker.model_runner.token_to_kv_pool
             model_config = self.draft_worker.model_config
 
@@ -1047,6 +1141,7 @@ class Scheduler(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 draft_token_to_kv_pool=draft_token_to_kv_pool,
+                draft_token_to_kv_pool_list=draft_token_to_kv_pool_list,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 scheduler=self,
@@ -1090,6 +1185,7 @@ class Scheduler(
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
                 token_to_kv_pool=self.token_to_kv_pool_allocator.get_kvcache(),
                 draft_token_to_kv_pool=draft_token_to_kv_pool,
+                draft_token_to_kv_pool_list=draft_token_to_kv_pool_list,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 metadata_buffers=self.disagg_metadata_buffers,
                 tp_rank=self.tp_rank,

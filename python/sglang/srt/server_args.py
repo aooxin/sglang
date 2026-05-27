@@ -416,6 +416,10 @@ class ServerArgs:
     bucket_time_to_first_token: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
+    bucket_storage_query_latency_ms: Optional[List[float]] = None
+    bucket_prefetch_io_latency_ms: Optional[List[float]] = None
+    bucket_io: Optional[List[float]] = None
+    bucket_bandwidth: Optional[List[float]] = None
     collect_tokens_histogram: bool = False
     prompt_tokens_buckets: Optional[List[str]] = None
     generation_tokens_buckets: Optional[List[str]] = None
@@ -4380,6 +4384,34 @@ class ServerArgs:
             nargs="+",
             default=ServerArgs.bucket_e2e_request_latency,
             help="The buckets of end-to-end request latency, specified as a list of floats.",
+        )
+        parser.add_argument(
+            "--bucket-storage-query-latency-ms",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_storage_query_latency_ms,
+            help="The buckets (in ms) for the storage batch_exists call latency histogram.",
+        )
+        parser.add_argument(
+            "--bucket-prefetch-io-latency-ms",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_prefetch_io_latency_ms,
+            help="The buckets (in ms) for the prefetch IO latency histogram.",
+        )
+        parser.add_argument(
+            "--bucket-io",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_io,
+            help="The buckets for the storage IO histogram (prefetch_pgs and backup_pgs).",
+        )
+        parser.add_argument(
+            "--bucket-bandwidth",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_bandwidth,
+            help="The buckets (in GB/s) for the storage bandwidth histogram (prefetch_bandwidth and backup_bandwidth).",
         )
         parser.add_argument(
             "--collect-tokens-histogram",

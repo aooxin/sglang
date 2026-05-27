@@ -2220,6 +2220,18 @@ class SWATokenToKVPoolHost:
             "SWATokenToKVPoolHost does not support set_from_flat_data_page."
         )
 
+    def get_size_per_token(self):
+        return (
+            self.full_pool_host.get_size_per_token()
+            + self.swa_pool_host.get_size_per_token()
+        )
+
+    def get_ksize_per_token(self):
+        return (
+            self.full_pool_host.get_ksize_per_token()
+            + self.swa_pool_host.get_ksize_per_token()
+        )
+
     # TODO(yingchun): 考虑复用 get_page_buffer_meta 中的方法
     def get_page_buffer_meta(self, indices):
         """

@@ -101,9 +101,12 @@ class SchedulerStats:
     num_retracted_reqs: int = 0
     num_paused_reqs: int = 0
 
+    req_pool_usage: float = 0.0
+
     # PD disaggregation
     num_prefill_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_prefill_inflight_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_prefill_total_reqs: int = 0
     num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
     kv_transfer_speed_gb_s: float = 0.0
@@ -214,6 +217,12 @@ class SchedulerMetricsCollector:
         self.full_token_usage = Gauge(
             name="sglang:full_token_usage",
             documentation="The token usage for full attention layers.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.req_pool_usage = Gauge(
+            name="sglang:req_pool_usage",
+            documentation="The req-to-token pool usage (fraction of slots in use).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -332,6 +341,12 @@ class SchedulerMetricsCollector:
         self.num_prefill_inflight_queue_reqs = Gauge(
             name="sglang:num_prefill_inflight_queue_reqs",
             documentation="The number of requests in the prefill inflight queue.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.num_prefill_total_reqs = Gauge(
+            name="sglang:num_prefill_total_reqs",
+            documentation="Total number of requests on the prefill node across all states.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1008,6 +1023,7 @@ class SchedulerMetricsCollector:
         self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
         self._log_gauge(self.token_usage, stats.token_usage)
+        self._log_gauge(self.req_pool_usage, stats.req_pool_usage)
         self._log_gauge(self.full_token_usage, stats.full_token_usage)
         self._log_gauge(
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
@@ -1036,6 +1052,7 @@ class SchedulerMetricsCollector:
         self._log_gauge_queue_count(
             self.num_prefill_inflight_queue_reqs, stats.num_prefill_inflight_queue_reqs
         )
+        self._log_gauge(self.num_prefill_total_reqs, stats.num_prefill_total_reqs)
         self._log_gauge_queue_count(
             self.num_decode_prealloc_queue_reqs, stats.num_decode_prealloc_queue_reqs
         )
@@ -1327,6 +1344,13 @@ class TokenizerMetricsCollector:
             buckets=bucket_inter_token_latency,
         )
 
+        self.histogram_inter_token_latency_rm_first = Histogram(
+            name="sglang:inter_token_latency_seconds_rm_first",
+            documentation="Histogram of inter-token latency in seconds, excluding the first ITL after TTFT.",
+            labelnames=labels.keys(),
+            buckets=bucket_inter_token_latency,
+        )
+
         self.histogram_e2e_request_latency = Histogram(
             name="sglang:e2e_request_latency_seconds",
             documentation="Histogram of End-to-end request latency in seconds",
@@ -1443,6 +1467,19 @@ class TokenizerMetricsCollector:
                 his._buckets[i].inc(num_new_tokens)
                 break
 
+    def observe_inter_token_latency_rm_first(
+        self, labels: Dict[str, str], internval: float, num_new_tokens: int
+    ):
+        adjusted_interval = internval / num_new_tokens
+
+        his = self.histogram_inter_token_latency_rm_first.labels(**labels)
+        his._sum.inc(internval)
+
+        for i, bound in enumerate(his._upper_bounds):
+            if adjusted_interval <= bound:
+                his._buckets[i].inc(num_new_tokens)
+                break
+
     def observe_one_aborted_request(self, labels: Dict[str, str]):
         self.num_aborted_requests_total.labels(**labels).inc(1)
 
@@ -1453,6 +1490,9 @@ class StorageMetrics:
     backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
+    prefetch_queue_length: int = 0
+    prefetch_buffer_length: int = 0
+    ongoing_prefetch_queue_length: int = 0
 
 
 class StorageMetricsCollector:
@@ -1460,7 +1500,25 @@ class StorageMetricsCollector:
         self,
         labels: Dict[str, str],
     ):
-        from prometheus_client import Counter, Histogram
+        from prometheus_client import Counter, Gauge, Histogram
+
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        bucket_storage_query_latency_ms = (
+            getattr(server_args, "bucket_storage_query_latency_ms", None)
+            if server_args
+            else None
+        )
+        bucket_prefetch_io_latency_ms = (
+            getattr(server_args, "bucket_prefetch_io_latency_ms", None)
+            if server_args
+            else None
+        )
+        bucket_io = getattr(server_args, "bucket_io", None) if server_args else None
+        bucket_bandwidth = (
+            getattr(server_args, "bucket_bandwidth", None) if server_args else None
+        )
 
         self.labels = labels
 
@@ -1476,23 +1534,17 @@ class StorageMetricsCollector:
             labelnames=labels.keys(),
         )
 
-        bucket_io = [
-            1,
-            5,
-            10,
-            50,
-            100,
-        ]
+        if bucket_io is None:
+            bucket_io = [1, 5, 10, 50, 100]
 
-        bucket_bandwidth = [
-            0.1,
-            0.5,
-            1,
-            5,
-            10,
-            50,
-            100,
-        ]
+        if bucket_bandwidth is None:
+            bucket_bandwidth = [0.1, 0.5, 1, 5, 10, 50, 100]
+
+        if bucket_storage_query_latency_ms is None:
+            bucket_storage_query_latency_ms = [1, 5, 10, 50, 100, 500, 1000, 5000, 10000]
+
+        if bucket_prefetch_io_latency_ms is None:
+            bucket_prefetch_io_latency_ms = [1, 5, 10, 50, 100, 500, 1000, 5000, 10000]
 
         self.histogram_prefetch_pgs = Histogram(
             name="sglang:prefetch_pgs",
@@ -1522,6 +1574,41 @@ class StorageMetricsCollector:
             buckets=bucket_bandwidth,
         )
 
+        self.histogram_storage_query_latency_ms = Histogram(
+            name="sglang:storage_query_latency_ms",
+            documentation="Histogram of per-batch batch_exists call latency in ms.",
+            labelnames=labels.keys(),
+            buckets=bucket_storage_query_latency_ms,
+        )
+
+        self.histogram_prefetch_io_latency_ms = Histogram(
+            name="sglang:prefetch_io_latency_ms",
+            documentation="Histogram of per-batch prefetch IO (page_get_func) latency in ms.",
+            labelnames=labels.keys(),
+            buckets=bucket_prefetch_io_latency_ms,
+        )
+
+        self.prefetch_queue_length = Gauge(
+            name="sglang:prefetch_queue_length",
+            documentation="The length of the prefetch queue.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.prefetch_buffer_length = Gauge(
+            name="sglang:prefetch_buffer_length",
+            documentation="The length of the prefetch buffer (IO queue).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.ongoing_prefetch_queue_length = Gauge(
+            name="sglang:ongoing_prefetch_queue_length",
+            documentation="The number of requests with ongoing prefetch operations.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
@@ -1532,6 +1619,12 @@ class StorageMetricsCollector:
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
+
+    def log_storage_query_latency(self, latency_ms: float):
+        self._log_histogram(self.histogram_storage_query_latency_ms, latency_ms)
+
+    def log_prefetch_io_latency(self, latency_ms: float):
+        self._log_histogram(self.histogram_prefetch_io_latency_ms, latency_ms)
 
     def log_storage_metrics(self, storage_metrics: Optional[StorageMetrics] = None):
         if storage_metrics is None:
@@ -1547,6 +1640,16 @@ class StorageMetricsCollector:
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
+
+        self.prefetch_queue_length.labels(**self.labels).set(
+            storage_metrics.prefetch_queue_length
+        )
+        self.prefetch_buffer_length.labels(**self.labels).set(
+            storage_metrics.prefetch_buffer_length
+        )
+        self.ongoing_prefetch_queue_length.labels(**self.labels).set(
+            storage_metrics.ongoing_prefetch_queue_length
+        )
 
 
 class ExpertDispatchCollector:

@@ -222,6 +222,7 @@ class HiRadixCache(RadixCache):
             existing_collector = getattr(self, "storage_metrics_collector", None)
             if existing_collector is None:
                 self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
+                self.cache_controller.metrics_collector = self.storage_metrics_collector
             elif set(existing_collector.labels.keys()) == set(labels.keys()):
                 existing_collector.labels = labels
             else:
@@ -1015,9 +1016,17 @@ class HiRadixCache(RadixCache):
         if self.enable_storage:
             self.drain_storage_control_queues()
         if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_storage_metrics(
-                self.cache_controller.storage_backend.get_stats()
-            )
+            storage_metrics = self.cache_controller.storage_backend.get_stats()
+            if storage_metrics is not None:
+                cc = self.cache_controller
+                storage_metrics.prefetch_queue_length = cc.prefetch_queue.qsize()
+                storage_metrics.prefetch_buffer_length = (
+                    cc.prefetch_buffer.qsize() if hasattr(cc, "prefetch_buffer") else 0
+                )
+                storage_metrics.ongoing_prefetch_queue_length = len(
+                    self.ongoing_prefetch
+                )
+            self.storage_metrics_collector.log_storage_metrics(storage_metrics)
 
     def drain_storage_control_queues(self):
         """

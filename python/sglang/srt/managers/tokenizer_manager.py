@@ -135,6 +135,7 @@ class ReqState:
     # For performance metrics
     time_stats: APIServerReqTimeStats
     last_completion_tokens: int = 1
+    is_first_itl: bool = True
     ttft_observed: bool = False
 
     # For streaming output
@@ -1983,11 +1984,23 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         else:
             num_new_tokens = completion_tokens - state.last_completion_tokens
             if num_new_tokens:
+                interval = state.time_stats.get_interval()
                 self.metrics_collector.observe_inter_token_latency(
                     labels,
-                    state.time_stats.get_interval(),
+                    interval,
                     num_new_tokens,
                 )
+                if (
+                    state.is_first_itl
+                    and self.server_args.disaggregation_mode != "null"
+                ):
+                    state.is_first_itl = False
+                else:
+                    self.metrics_collector.observe_inter_token_latency_rm_first(
+                        labels,
+                        interval,
+                        num_new_tokens,
+                    )
                 state.time_stats.set_last_time()
                 state.last_completion_tokens = completion_tokens
 

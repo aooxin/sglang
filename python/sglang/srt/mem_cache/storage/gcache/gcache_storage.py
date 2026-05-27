@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache, SWATokenToKVPoolHost
+from sglang.srt.observability.metrics_collector import StorageMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,13 @@ class GcacheStorage(HiCacheStorage):
         )
 
         self.gcache_client = GCacheClient(conf_file=subprocess_config)
+
+        self.enable_storage_metrics = hicache_config.enable_storage_metrics
+        self.gb_per_page = None
+        self.prefetch_pgs: list = []
+        self.backup_pgs: list = []
+        self.prefetch_bandwidth: list = []
+        self.backup_bandwidth: list = []
 
         self.warmup()
 
@@ -110,6 +118,9 @@ class GcacheStorage(HiCacheStorage):
             logger.error("Failed to register buffer to Gcache Store: %s", err)
             raise TypeError("Gcache Store Register Buffer Error.") from err
 
+        size_per_token = mem_pool_host.get_size_per_token()
+        self.gb_per_page = size_per_token * mem_pool_host.page_size / (1 << 30)
+
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
@@ -169,11 +180,19 @@ class GcacheStorage(HiCacheStorage):
 
         # Only set non-existing keys to storage
         if len(set_keys) > 0:
+            t0_set = time.perf_counter()
             partial_set_results = self.gcache_client.batch_set(
                 set_keys, set_buffer_ptrs, set_buffer_sizes
             )
+            t1_set = time.perf_counter()
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = partial_set_results[i]
+
+            if self.enable_storage_metrics and self.gb_per_page is not None:
+                self.backup_pgs.append(len(set_keys))
+                self.backup_bandwidth.append(
+                    len(set_keys) / (t1_set - t0_set) * self.gb_per_page
+                )
 
         end_time = time.perf_counter()
         execution_time = (end_time - start_time) * 1e6
@@ -217,6 +236,13 @@ class GcacheStorage(HiCacheStorage):
         end_time = time.perf_counter()
         execution_time = (end_time - start_time) * 1e6
         success_count = sum(1 for each in results if each)
+
+        if self.enable_storage_metrics and self.gb_per_page is not None:
+            self.prefetch_pgs.append(len(keys))
+            self.prefetch_bandwidth.append(
+                len(keys) / (end_time - start_time) * self.gb_per_page
+            )
+
         logger.debug(
             f"gcache: end get {len(keys)} keys, success count: {success_count}, "
             f"cost time: {execution_time:.2f} us"
@@ -304,3 +330,17 @@ class GcacheStorage(HiCacheStorage):
             (full_k_res and full_v_res and swa_k_res and swa_v_res)
             for full_k_res, full_v_res, swa_k_res, swa_v_res in all_kv_pairs
         ]
+
+    def get_stats(self):
+        # Atomic swap under GIL to avoid race with IO threads appending
+        prefetch_pgs, self.prefetch_pgs = self.prefetch_pgs, []
+        backup_pgs, self.backup_pgs = self.backup_pgs, []
+        prefetch_bandwidth, self.prefetch_bandwidth = self.prefetch_bandwidth, []
+        backup_bandwidth, self.backup_bandwidth = self.backup_bandwidth, []
+
+        storage_metrics = StorageMetrics()
+        storage_metrics.prefetch_pgs = prefetch_pgs
+        storage_metrics.backup_pgs = backup_pgs
+        storage_metrics.prefetch_bandwidth = prefetch_bandwidth
+        storage_metrics.backup_bandwidth = backup_bandwidth
+        return storage_metrics

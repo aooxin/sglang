@@ -459,6 +459,10 @@ class SchedulerMetricsMixin:
             self.stats.num_running_reqs_offline_batch = 0
             self.stats.num_used_tokens = num_used
             self.stats.token_usage = token_usage
+            self.stats.req_pool_usage = (
+                1.0
+                - self.req_to_token_pool.available_size() / self.req_to_token_pool.size
+            )
             self.stats.full_token_usage = full_token_usage
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
@@ -500,6 +504,13 @@ class SchedulerMetricsMixin:
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
                     self.disagg_prefill_inflight_queue, priority_enabled
+                )
+                self.stats.num_prefill_total_reqs = (
+                    len(self.disagg_prefill_bootstrap_queue.queue)
+                    + len(self.disagg_prefill_inflight_queue)
+                    + len(self.waiting_queue)
+                    + prefill_stats.num_running_reqs.total
+                    + len(self.grammar_manager.grammar_queue)
                 )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
@@ -706,6 +717,10 @@ class SchedulerMetricsMixin:
             self.stats.num_used_tokens = num_used
             # maximum usage of all pools
             self.stats.token_usage = token_usage
+            self.stats.req_pool_usage = (
+                1.0
+                - self.req_to_token_pool.available_size() / self.req_to_token_pool.size
+            )
             # usage of full attention
             self.stats.full_token_usage = full_token_usage
             if self.is_hybrid_swa:

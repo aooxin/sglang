@@ -503,7 +503,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
 
-        # TODO(yingchun): get_ksize_per_token is not implemented for SWATokenToKVPoolHost now, need to adapt when enabling SWA support
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
 

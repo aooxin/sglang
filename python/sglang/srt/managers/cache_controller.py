@@ -288,6 +288,7 @@ class HiCacheController:
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.enable_storage_metrics = enable_storage_metrics
+        self.metrics_collector = None
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -922,7 +923,11 @@ class HiCacheController:
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            t0_io = time.perf_counter()
             self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
+            if self.metrics_collector is not None:
+                io_ms = (time.perf_counter() - t0_io) * 1e3
+                self.metrics_collector.log_prefetch_io_latency(io_ms)
             # Check termination
             if (
                 operation.completed_tokens
@@ -983,7 +988,11 @@ class HiCacheController:
                 )
                 batch_hashes.append(last_hash)
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            t0_exists = time.perf_counter()
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            if self.metrics_collector is not None:
+                query_ms = (time.perf_counter() - t0_exists) * 1e3
+                self.metrics_collector.log_storage_query_latency(query_ms)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):

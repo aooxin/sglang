@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Prefill benchmark for mimo-v2-flash.
-# Runs two scenarios: 16k input and 32k input, output-len=1 (prefill-dominated).
+# Single scenario: 16k input, output-len=1 (prefill-dominated, baseline-comparable).
 set -euo pipefail
 
 MODEL_PATH="${MODEL_PATH:-XiaomiMiMo/MiMo-V2-Flash}"
@@ -95,6 +95,7 @@ curl -fsS "${BASE_URL}/v1/chat/completions" \
 echo
 grep -q '"content"' smoke_response.json
 
+
 BENCH_COMMON_ARGS=(
     --backend sglang
     --model "${SERVED_NAME}"
@@ -106,13 +107,12 @@ BENCH_COMMON_ARGS=(
     --random-range-ratio 1.0
     --seed 12345
     --flush-cache
+    --warmup-requests 100
 )
 
 # (input_len, label, rate, num_prompts)
 BENCH_CONFIGS=(
-    "16384 16k 3 1000"
-    "16384 16k 5 1000"
-    "32768 32k 2.5 1000"
+    "16384 16k 4.65 1000"   # ttft <= 1s, max throughput, expected input tok/s ~ 75277
 )
 
 for cfg in "${BENCH_CONFIGS[@]}"; do

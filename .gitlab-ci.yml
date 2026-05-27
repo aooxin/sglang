@@ -445,17 +445,30 @@ mimo-v2-flash-benchmark:
     - pip install --no-cache-dir --no-deps -e "python/"
     - python3 -c "import deep_ep" 2>/dev/null || bash scripts/ci/cuda/ci_install_deepep.sh
     - bash scripts/ci/xiaomi/benchmark_mimo_v2_flash_prefill.sh
-    - bash scripts/ci/xiaomi/benchmark_mimo_v2_flash_decode.sh
+    - MODE=decode bash scripts/ci/xiaomi/benchmark_mimo_v2_flash_decode.sh
+    - MODE=mtp bash scripts/ci/xiaomi/benchmark_mimo_v2_flash_decode.sh
     - python3 scripts/ci/xiaomi/summarize_benchmark_results.py
         --title "Prefill Benchmark (mimo-v2-flash)"
         --output benchmark_summary_prefill.md
+        --baseline scripts/ci/xiaomi/benchmark_baseline.jsonl
+        --compare input_throughput,mean_ttft_ms
         "benchmark_results_prefill-*.json"
     - python3 scripts/ci/xiaomi/summarize_benchmark_results.py
         --title "Decode Benchmark (mimo-v2-flash)"
         --output benchmark_summary_decode.md
+        --baseline scripts/ci/xiaomi/benchmark_baseline.jsonl
+        --compare output_throughput,mean_tpot_ms
         "benchmark_results_decode-*.json"
+    - python3 scripts/ci/xiaomi/summarize_benchmark_results.py
+        --title "MTP Decode Benchmark (mimo-v2-flash)"
+        --output benchmark_summary_mtp_decode.md
+        --baseline scripts/ci/xiaomi/benchmark_baseline.jsonl
+        --compare output_throughput,mean_tpot_ms
+        "benchmark_results_mtp_decode-*.json"
     - |
-      if [ ! -f benchmark_summary_prefill.md ] && [ ! -f benchmark_summary_decode.md ]; then
+      if [ ! -f benchmark_summary_prefill.md ] \
+        && [ ! -f benchmark_summary_decode.md ] \
+        && [ ! -f benchmark_summary_mtp_decode.md ]; then
         echo "No summary files found; skipping MR note."
         exit 0
       fi
@@ -465,6 +478,8 @@ mimo-v2-flash-benchmark:
         cat benchmark_summary_prefill.md 2>/dev/null || true
         echo
         cat benchmark_summary_decode.md 2>/dev/null || true
+        echo
+        cat benchmark_summary_mtp_decode.md 2>/dev/null || true
       } > benchmark_note.md
       bash scripts/ci/xiaomi/post_mr_note.sh benchmark_note.md
   artifacts:

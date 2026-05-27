@@ -2,8 +2,36 @@
 # Decode-only benchmark for mimo-v2-flash.
 # Uses --fake-prefill + --disaggregation-transfer-backend fake to skip real prefill
 # and stress-test pure decode throughput.
-# Scenario: input=16k, output=1k, sweep rate=6/8/10/15.
+# Single scenario: input=16k, output=1k, rate=100 (baseline-comparable).
+#
+# MODE selects between plain decode and MTP (EAGLE) decode:
+#   MODE=decode (default) — pure decode, no speculative decoding
+#   MODE=mtp              — decode with EAGLE multi-token prediction
 set -euo pipefail
+
+MODE="${MODE:-decode}"
+case "${MODE}" in
+    decode)
+        TAG="decode"
+        SPEC_ARGS=()
+        ;;
+    mtp)
+        TAG="mtp_decode"
+        SPEC_ARGS=(
+            --speculative-algorithm EAGLE
+            --speculative-num-steps 3
+            --speculative-eagle-topk 1
+            --speculative-num-draft-tokens 4
+        )
+        # specify mtp accept length
+        export SGLANG_SIMULATE_ACC_LEN=3.0
+        export SGLANG_SIMULATE_ACC_METHOD=match-expected
+        ;;
+    *)
+        echo "unknown MODE='${MODE}', expected 'decode' or 'mtp'" >&2
+        exit 2
+        ;;
+esac
 
 MODEL_PATH="${MODEL_PATH:-XiaomiMiMo/MiMo-V2-Flash}"
 SERVED_NAME="${SERVED_NAME:-mimo-v2-flash-1207-sft}"
@@ -11,7 +39,7 @@ PORT="${PORT:-9002}"
 HOST="127.0.0.1"
 BASE_URL="http://${HOST}:${PORT}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-1800}"
-LOG_FILE="mimo_v2_flash_server_decode_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="mimo_v2_flash_server_${TAG}_$(date +%Y%m%d_%H%M%S).log"
 
 if [[ -d /mnt/deepgemm-cache ]]; then
     export SGLANG_DG_CACHE_DIR=/mnt/deepgemm-cache
@@ -21,7 +49,7 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024
 export SGLANG_USE_FUSED_MOE_GATE=true
 export SGLANG_USE_UPDATE_LOCAL_ATTN_METADATA_CUDA=true
 
-echo "=== launching mimo-v2-flash decode-only (model=${MODEL_PATH}) ==="
+echo "=== launching mimo-v2-flash ${TAG} (model=${MODEL_PATH}) ==="
 setsid python3 -m sglang.launch_server \
     --model-path "${MODEL_PATH}" \
     --served-model-name "${SERVED_NAME}" \
@@ -57,6 +85,7 @@ setsid python3 -m sglang.launch_server \
     --enable-metrics-for-all-schedulers \
     --disaggregation-mode decode \
     --disaggregation-transfer-backend fake \
+    "${SPEC_ARGS[@]}" \
     >"${LOG_FILE}" 2>&1 &
 SERVER_PID=$!
 SERVER_PGID=$(ps -o pgid= "${SERVER_PID}" | tr -d ' ')
@@ -103,16 +132,16 @@ BENCH_COMMON_ARGS=(
     --seed 12345
     --flush-cache
     --fake-prefill
+    --warmup-requests 100
 )
 
-for RATE in 6 30 100; do
-    echo "=== decode benchmark: input=16k, output=1k, rate=${RATE} ==="
-    python3 -m sglang.bench_serving \
-        "${BENCH_COMMON_ARGS[@]}" \
-        --random-input-len 16384 \
-        --random-output-len 1024 \
-        --request-rate "${RATE}" \
-        --output-file "benchmark_results_decode-rate${RATE}.json"
-done
+RATE=100
+echo "=== ${TAG} benchmark: input=16k, output=1k, rate=${RATE} ==="
+python3 -m sglang.bench_serving \
+    "${BENCH_COMMON_ARGS[@]}" \
+    --random-input-len 16384 \
+    --random-output-len 1024 \
+    --request-rate "${RATE}" \
+    --output-file "benchmark_results_${TAG}-rate${RATE}.json"
 
-echo "=== decode benchmark complete ==="
+echo "=== ${TAG} benchmark complete ==="

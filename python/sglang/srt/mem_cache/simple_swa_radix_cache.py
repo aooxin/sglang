@@ -85,7 +85,10 @@ class SimpleSWARadixCache(RadixCache):
         # Updated in evict_swa() and evict(); read by the scheduler to compute
         # per-interval deltas for Prometheus counters.
         self.swa_active_freed_tokens: int = 0
+        self.swa_evicted_from_tree: int = 0
         self.full_evicted_from_tree: int = 0
+
+        self._last_raw_match_len: int = 0
 
     ##### Public API #####
 
@@ -266,9 +269,10 @@ class SimpleSWARadixCache(RadixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
+        self.swa_evicted_from_tree += swa_num_evicted
+        self.full_evicted_from_tree += full_num_evicted
 
         self.update_eviction_metrics(full_num_evicted + swa_num_evicted, start_time)
-        self.full_evicted_from_tree += full_num_evicted
         return EvictResult(
             num_tokens_evicted=full_num_evicted,
             swa_num_tokens_evicted=swa_num_evicted,
@@ -318,6 +322,7 @@ class SimpleSWARadixCache(RadixCache):
 
         matched_indices = base_result.device_indices
         matched_len = len(matched_indices)
+        self._last_raw_match_len = matched_len
         if matched_len == 0:
             return base_result
 

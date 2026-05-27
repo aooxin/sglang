@@ -809,6 +809,8 @@ class Req(ReqDllmMixin):
 
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
+        self.raw_cached_tokens = 0
+        self.raw_prefix_len = 0
         self.already_computed = 0
 
         # Detailed breakdown of cached tokens by source (for HiCache)
@@ -1036,6 +1038,9 @@ class Req(ReqDllmMixin):
                     self.cache_protected_len = len(self.prefix_indices)
 
             update_matched_prefix(token_ids)
+            self.raw_prefix_len = getattr(
+                tree_cache, "_last_raw_match_len", len(self.prefix_indices)
+            )
             if (
                     getattr(tree_cache, "is_eagle", False)
                     and not self.return_logprob
@@ -1047,6 +1052,9 @@ class Req(ReqDllmMixin):
                 # logits. Keep the full-match probe for hit-rate, then trim back
                 # to a one-token tail only in this degenerate case.
                 update_matched_prefix(self.fill_ids[:-1])
+                self.raw_prefix_len = getattr(
+                    tree_cache, "_last_raw_match_len", len(self.prefix_indices)
+                )
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -1696,6 +1704,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if not req.retracted_stain:
                 new_cached = pre_len - req.already_computed
                 req.cached_tokens += new_cached
+                req.raw_cached_tokens += req.raw_prefix_len - req.already_computed
 
                 # Calculate detailed breakdown of cached tokens by source (for HiCache)
                 # Only compute once on FIRST chunk - subsequent chunks in chunked prefill

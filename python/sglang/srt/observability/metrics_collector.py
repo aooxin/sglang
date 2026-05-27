@@ -144,6 +144,7 @@ class SchedulerStats:
     full_tree_evictable_tokens: int = 0
     # Counter deltas: tokens freed/evicted since the last log interval
     swa_active_freed_tokens_delta: int = 0
+    swa_evicted_from_tree_delta: int = 0
     full_evicted_from_tree_delta: int = 0
 
 
@@ -882,6 +883,11 @@ class SchedulerMetricsCollector:
             documentation="Cumulative full-attention KV tokens evicted from the radix tree by cache pressure.",
             labelnames=labels.keys(),
         )
+        self.swa_evicted_from_tree_total = Counter(
+            name="sglang:swa_evicted_from_tree_total",
+            documentation="Cumulative SWA KV tokens evicted from the radix tree by cache pressure.",
+            labelnames=labels.keys(),
+        )
 
     def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
         # Convenience function for logging a scalar to gauge.
@@ -1167,6 +1173,10 @@ class SchedulerMetricsCollector:
             self.full_evicted_from_tree_total.labels(**self.labels).inc(
                 stats.full_evicted_from_tree_delta
             )
+        if stats.swa_evicted_from_tree_delta > 0:
+            self.swa_evicted_from_tree_total.labels(**self.labels).inc(
+                stats.swa_evicted_from_tree_delta
+            )
 
         self.last_log_time = time.perf_counter()
 
@@ -1282,6 +1292,12 @@ class TokenizerMetricsCollector:
             name="sglang:cached_tokens_total",
             documentation="Number of cached prompt tokens by source (device/host/storage).",
             labelnames=list(labels.keys()) + ["cache_source"],
+        )
+
+        self.raw_cached_tokens_total = Counter(
+            name="sglang:raw_cached_tokens_total",
+            documentation="Cumulative raw (pre-SWA-trim) prefix cache hit tokens scheduled for prefill.",
+            labelnames=labels.keys(),
         )
 
         self.num_requests_total = Counter(
@@ -1439,6 +1455,7 @@ class TokenizerMetricsCollector:
         prompt_tokens: int,
         generation_tokens: int,
         cached_tokens: int,
+        raw_cached_tokens: int,
         e2e_latency: float,
         has_grammar: bool,
         retraction_count: int,
@@ -1472,6 +1489,8 @@ class TokenizerMetricsCollector:
                 labels_total = {**labels, "cache_source": "total"}
                 self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
 
+        if raw_cached_tokens > 0:
+            self.raw_cached_tokens_total.labels(**labels).inc(raw_cached_tokens)
         self.num_requests_total.labels(**labels).inc(1)
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)

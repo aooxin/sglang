@@ -114,6 +114,7 @@ class SchedulerMetricsMixin:
         # Snapshots of SimpleSWARadixCache cumulative counters from the last
         # log interval, used to compute per-interval deltas for Prometheus.
         self.last_swa_active_freed_tokens: int = 0
+        self.last_swa_evicted_from_tree: int = 0
         self.last_full_evicted_from_tree: int = 0
 
         self.stats = SchedulerStats()
@@ -471,14 +472,19 @@ class SchedulerMetricsMixin:
                 self.stats.full_tree_evictable_tokens = full_evictable_size
                 # TODO(yingchun): 使用接口，避免直接访问 self.tree_cache
                 cur_swa_freed = self.tree_cache.swa_active_freed_tokens
+                cur_swa_evicted = self.tree_cache.swa_evicted_from_tree
                 cur_full_evicted = self.tree_cache.full_evicted_from_tree
                 self.stats.swa_active_freed_tokens_delta = (
                         cur_swa_freed - self.last_swa_active_freed_tokens
+                )
+                self.stats.swa_evicted_from_tree_delta = (
+                        cur_swa_evicted - self.last_swa_evicted_from_tree
                 )
                 self.stats.full_evicted_from_tree_delta = (
                         cur_full_evicted - self.last_full_evicted_from_tree
                 )
                 self.last_swa_active_freed_tokens = cur_swa_freed
+                self.last_swa_evicted_from_tree = cur_swa_evicted
                 self.last_full_evicted_from_tree = cur_full_evicted
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage

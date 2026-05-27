@@ -2020,11 +2020,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             ):
                 cached_tokens_details = recv_obj.cached_tokens_details[i]
 
+            raw_cached = (
+                recv_obj.raw_cached_tokens[i]
+                if recv_obj.raw_cached_tokens and i < len(recv_obj.raw_cached_tokens)
+                else 0
+            )
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
                 completion_tokens,
                 recv_obj.cached_tokens[i],
+                raw_cached,
                 state.time_stats.get_e2e_latency(),
                 self._request_has_grammar(state.obj),
                 retraction_count,

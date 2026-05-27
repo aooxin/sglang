@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.mem_cache.simple_swa_radix_cache import SimpleSWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
@@ -967,8 +968,37 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
-        max_prefix_len = input_len - 1
+        if (
+            tree_cache is not None
+            and len(self.output_ids) == 0
+            and len(self.prefix_indices) > self.cache_protected_len
+        ):
+            # Chunked prefills carry their already-computed full prefix in
+            # request-local prefix_indices beyond the tree-owned safe prefix.
+            # Rematching the tree here would overwrite that local suffix with a
+            # shorter tree hit, orphan the previously allocated full KV, and
+            # make the full pool grow chunk after chunk until admission stalls.
+            preserved_prefix_len = min(len(self.prefix_indices), input_len)
+            self.prefix_indices = self.prefix_indices[:preserved_prefix_len]
+            self.cache_protected_len = min(
+                self.cache_protected_len, preserved_prefix_len
+            )
+            self.extend_input_len = input_len - preserved_prefix_len
+            return
+
+        if tree_cache is None:
+            self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
+            return
+
+        # For regular next-token models we leave one token uncached so prefill can
+        # still produce the next-token logits. For EAGLE/speculative caches, the
+        # radix tree key is already shorter by speculative_num_steps in KV space,
+        # so trimming one more token here breaks otherwise valid cache hits.
+        max_prefix_len = (
+            input_len
+            if getattr(tree_cache, "is_eagle", False) and not self.return_logprob
+            else input_len - 1
+        )
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
         max_prefix_len = max(max_prefix_len, 0)
@@ -977,30 +1007,46 @@ class Req(ReqDllmMixin):
         if tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
-            match_result = tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
-                    req=self,
-                    cow_mamba=cow_mamba,
+
+            def update_matched_prefix(to_match_token_ids):
+                match_result = tree_cache.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(token_ids=to_match_token_ids, extra_key=self.extra_key),
+                        req=self,
+                        cow_mamba=cow_mamba,
+                    )
                 )
-            )
-            (
-                self.prefix_indices,
-                self.last_node,
-                self.last_host_node,
-                self.host_hit_length,
-                self.mamba_branching_seqlen,
-            ) = (
-                match_result.device_indices,
-                match_result.last_device_node,
-                match_result.last_host_node,
-                match_result.host_hit_length,
-                match_result.mamba_branching_seqlen,
-            )
-            if match_result.cache_protected_len is not None:
-                self.cache_protected_len = match_result.cache_protected_len
-            else:
-                self.cache_protected_len = len(self.prefix_indices)
+
+                (
+                    self.prefix_indices,
+                    self.last_node,
+                    self.last_host_node,
+                    self.host_hit_length,
+                    self.mamba_branching_seqlen,
+                ) = (
+                    match_result.device_indices,
+                    match_result.last_device_node,
+                    match_result.last_host_node,
+                    match_result.host_hit_length,
+                    match_result.mamba_branching_seqlen,
+                )
+                if match_result.cache_protected_len is not None:
+                    self.cache_protected_len = match_result.cache_protected_len
+                else:
+                    self.cache_protected_len = len(self.prefix_indices)
+
+            update_matched_prefix(token_ids)
+            if (
+                    getattr(tree_cache, "is_eagle", False)
+                    and not self.return_logprob
+                    and input_len > 0
+                    and len(self.prefix_indices) == input_len
+            ):
+                # A full prefix hit would leave extend_input_len == 0, but EXTEND
+                # forward still needs one uncached token to produce next-token
+                # logits. Keep the full-match probe for hit-rate, then trim back
+                # to a one-token tail only in this degenerate case.
+                update_matched_prefix(self.fill_ids[:-1])
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
@@ -2438,6 +2484,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     if req.decode_batch_idx % sliding_window_size == 1:
                         self._evict_swa(req, req.seqlen - 1)
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
+                    # SWAChunkCache reclaims request-local SWA KV immediately before the next
+                    # extend allocation. SimpleSWARadixCache intentionally does not: its real
+                    # shrink happens at chunk/finish boundaries in cache_unfinished_req() /
+                    # cache_finished_req(), while the request still owns a req_to_token row.
+                    # By the time alloc_for_extend() runs, carried chunked requests have already
+                    # released that row and fresh prefix-hit requests may only reference shared
+                    # radix-tree slots, so there is nothing request-local to free here.
+                    assert not isinstance(self.tree_cache, SimpleSWARadixCache)
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:
                         # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens

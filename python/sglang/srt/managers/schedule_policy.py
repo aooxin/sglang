@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.mem_cache.simple_swa_radix_cache import SimpleSWARadixCache
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.server_args import ServerArgs
@@ -429,6 +430,15 @@ class PrefillAdder:
         )
         self.is_swa_radix_cache = isinstance(self.tree_cache, SWARadixCache)
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
+        self.is_simple_swa_radix_cache = isinstance(
+            self.tree_cache, SimpleSWARadixCache
+        )
+        # 旧 SWARadixCache 和新 SimpleSWARadixCache 都属于 “hybrid SWA radix”
+        # 家族，但二者的内存语义不同：前者靠 tombstone/LRU 维持，后者靠主动缩窗。
+        # 下面的预算逻辑需要先区分两类，再决定应该保守到什么程度。
+        self.is_any_swa_radix_cache = (
+            self.is_swa_radix_cache or self.is_simple_swa_radix_cache
+        )
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -458,7 +468,12 @@ class PrefillAdder:
     @property
     def rem_total_tokens(self):
         if self.is_hybrid_swa:
-            if self.is_swa_radix_cache:
+            if self.is_any_swa_radix_cache:
+                # rem_total_tokens 用来回答“这个 batch 总体上还能不能塞下新的请求”。
+                # 对 SimpleSWARadixCache，放松的是跨 chunk 的 SWA 保留语义，
+                # 不是“当前这一轮 live KV 能立刻分配多少”的约束。
+                # 因此 current-round admission 仍然要同时看 full / swa 两个池子，
+                # 取二者更紧的那个瓶颈。
                 available_and_evictable = min(
                     self.token_to_kv_pool_allocator.full_available_size()
                     + self.tree_cache.full_evictable_size(),
@@ -492,6 +507,15 @@ class PrefillAdder:
                     self.token_to_kv_pool_allocator.swa_available_size()
                     + self.tree_cache.swa_evictable_size(),
                 )
+            elif self.is_simple_swa_radix_cache:
+                # cur_rem_tokens 更偏向“当前这次 prefill chunk 能推进多少”。
+                # SimpleSWARadixCache 的核心假设是：窗口外 SWA 会在 chunk 边界被
+                # 及时释放，因此当前 chunk 的 admission 不需要再按“整段剩余请求
+                # 都要占着 SWA”来保守估计，而主要由 full 侧可分配量来约束。
+                available_and_evictable = (
+                    self.token_to_kv_pool_allocator.full_available_size()
+                    + self.tree_cache.evictable_size()
+                )
             else:
                 available_and_evictable = (
                     self.token_to_kv_pool_allocator.full_available_size()
@@ -513,6 +537,57 @@ class PrefillAdder:
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
+
+    def _get_effective_chunk_trunc_len(
+        self, truncation_align_size: Optional[int] = None
+    ) -> int:
+        """Return the schedulable chunk length for the current budget state.
+
+        For SimpleSWARadixCache, the SWA pool only needs to cover the current
+        prefill chunk, not the whole remaining request. We therefore cap the
+        chunk by both ``rem_chunk_tokens`` and the current ``rem_total_tokens``
+        so admission can make progress on very long requests.
+        """
+        if self.rem_chunk_tokens is None:
+            return 0
+
+        # 对 SimpleSWARadixCache，能调度的 chunk 上限同时受两件事约束：
+        # 1. 用户/服务端配置的 chunked_prefill_size；
+        # 2. 当前这一轮在 full/swa 双池语义下还剩多少真实预算。
+        # 两者取 min 才是“现在马上能推得进去”的 chunk 长度。
+        trunc_len = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+        if trunc_len <= 0:
+            return 0
+
+        trunc_len = trunc_len // self.page_size * self.page_size
+        if trunc_len <= 0:
+            return 0
+
+        if truncation_align_size is not None:
+            if trunc_len < truncation_align_size:
+                return 0
+            trunc_len = truncation_align_size * (trunc_len // truncation_align_size)
+
+        return trunc_len
+
+    def _should_chunk_simple_swa_req(
+        self,
+        input_tokens: int,
+        truncation_align_size: Optional[int] = None,
+    ) -> tuple[bool, int]:
+        """Whether a SimpleSWA request should be admitted via chunked prefill."""
+        if not (self.is_simple_swa_radix_cache and self.rem_chunk_tokens is not None):
+            return False, 0
+
+        trunc_len = self._get_effective_chunk_trunc_len(truncation_align_size)
+        # 返回值含义：
+        # - should_chunk=True：当前请求如果整段塞进来会超过本轮安全预算，
+        #   但裁成 trunc_len 后仍可以推进；
+        # - trunc_len：这轮实际允许它前进的 token 数。
+        #
+        # 例子：输入还剩 6k，当前只剩 2k 的 chunk 预算，则返回 (True, 2k)，
+        # scheduler 会让它先做一段 2k 的 prefill，而不是整条请求直接拒掉。
+        return trunc_len > 0 and input_tokens > trunc_len, trunc_len
 
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
@@ -619,6 +694,12 @@ class PrefillAdder:
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
+                if self.is_simple_swa_radix_cache:
+                    # Keep the unfinished chunk queued for a later round instead of
+                    # scheduling a zero-token extend batch. An empty extend batch reaches
+                    # logits_processor with empty hidden_states and crashes when it tries
+                    # to index the last token state.
+                    return req
                 _rem_tokens = self.rem_chunk_tokens
 
         truncated = req.extend_input_len > _rem_tokens
@@ -693,9 +774,10 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
-        if not self.is_hybrid_swa or not self.is_swa_radix_cache:
-            # Skip this logic for swa. The SWA has different memory management, and
-            # this mechanism is underestimating the memory usage.
+        if not self.is_any_swa_radix_cache:
+            # Only run this reserve check for non-SWA caches. Hybrid SWA caches
+            # have different memory semantics, and this mechanism underestimates
+            # their live usage.
             cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
                 req.extend_input_len
             )
@@ -766,27 +848,41 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        total_tokens = req.extend_input_len + min(
+        reserve_tokens = min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
+        total_tokens = req.extend_input_len + reserve_tokens
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
+        input_tokens = self.ceil_paged_tokens(req.extend_input_len)
         prefix_len = len(req.prefix_indices)
 
-        if total_tokens >= self.rem_total_tokens:
+        should_chunk_simple_swa, trunc_len = self._should_chunk_simple_swa_req(
+            input_tokens, truncation_align_size
+        )
+        if should_chunk_simple_swa and has_chunked_req:
+            # 当前 batch 已经有一个 chunked req 时，不再并入第二个 simple SWA
+            # chunked 请求，避免两条长请求同时吃掉“本轮本就紧张的 SWA 峰值预算”。
+            return AddReqResult.OTHER
+
+        if not should_chunk_simple_swa and total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
-        if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+        scheduled_input_tokens = (
+            min(real_input_tokens, trunc_len)
+            if should_chunk_simple_swa
+            else real_input_tokens
+        )
+        if (
+            scheduled_input_tokens >= self.rem_input_tokens
+            and len(self.can_run_list) != 0
+        ):
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
-            # self.rem_total_tokens may decrease after the lock acquisition
-            if total_tokens >= self.rem_total_tokens:
-                return AddReqResult.NO_TOKEN
-
             if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
@@ -801,8 +897,10 @@ class PrefillAdder:
                 req.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
-
-            if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+            should_chunk_simple_swa, trunc_len = self._should_chunk_simple_swa_req(
+                input_tokens, truncation_align_size
+            )
+            if should_chunk_simple_swa and has_chunked_req:
                 return AddReqResult.OTHER
 
             if self.dllm_config is not None:
@@ -815,6 +913,38 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
+
+            # self.rem_total_tokens may decrease after the lock acquisition
+            if not should_chunk_simple_swa:
+                total_tokens = req.extend_input_len + reserve_tokens
+                if total_tokens >= self.rem_total_tokens:
+                    return AddReqResult.NO_TOKEN
+
+            scheduled_input_tokens = (
+                trunc_len if should_chunk_simple_swa else input_tokens
+            )
+            if (
+                scheduled_input_tokens >= self.rem_input_tokens
+                and len(self.can_run_list) != 0
+            ):
+                return AddReqResult.OTHER
+
+            if should_chunk_simple_swa:
+                # SimpleSWARadixCache 的关键收益就在这里：
+                # 当整段输入放不下时，不是整条请求失败，而是把 fill_ids 裁成当前
+                # 安全可执行的 chunk。执行完这一段后，窗口左侧 SWA 会被释放，
+                # 下一轮还能继续推进剩余部分。
+                req.extend_input_len = trunc_len
+                req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
+
+                self.can_run_list.append(req)
+                self.new_chunked_req = req
+                if self.is_hybrid and self.is_swa_radix_cache:
+                    swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
+                    req.swa_uuid_for_lock = swa_uuid_for_lock
+                else:
+                    self.tree_cache.inc_lock_ref(req.last_node)
+                self._update_prefill_budget(prefix_len, trunc_len, 0)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
@@ -835,6 +965,9 @@ class PrefillAdder:
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
 
+                # 这一分支仍然保留“传统 chunked prefill”的处理方式，给非 SimpleSWA
+                # 或未进入 simple 特殊判定的请求使用。也就是说，SimpleSWA 只接管
+                # 自己那部分更激进的 admission 语义，不改其他模型的旧逻辑。
                 # When truncation align size is set, we want to assert that the prefill prefix length is multiple of truncation align size
                 # A typical use case is when deterministic inference is enabled with flashinfer attention backend,
                 # we need the prefill prefix length to be multiple of attention split size

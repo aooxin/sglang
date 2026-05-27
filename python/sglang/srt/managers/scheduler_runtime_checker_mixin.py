@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
+from sglang.srt.mem_cache.simple_swa_radix_cache import SimpleSWARadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
@@ -84,12 +85,12 @@ class SchedulerRuntimeCheckerMixin:
         full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         full_evictable_size = self.tree_cache.full_evictable_size()
         swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-        if isinstance(self.tree_cache, SWARadixCache):
+        if isinstance(self.tree_cache, (SWARadixCache, SimpleSWARadixCache)):
             swa_evictable_size = self.tree_cache.swa_evictable_size()
-            full_evictable_size = self.tree_cache.full_evictable_size()
         else:
-            swa_evictable_size = self.tree_cache.evictable_size()
-            full_evictable_size = self.tree_cache.evictable_size()
+            evictable_size = self.tree_cache.evictable_size()
+            swa_evictable_size = evictable_size
+            full_evictable_size = evictable_size
         full_num_used = self.full_tokens_per_layer - (
             full_available_size + full_evictable_size
         )

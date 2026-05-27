@@ -3565,9 +3565,13 @@ def get_num_new_pages(
 
     if prefix_lens is None or decode:
         # NOTE: Special case for handling decode, which prefix lens is `seq_lens - 1`.
+        # A new page is needed only when the just-added token is the first slot of a
+        # fresh page, i.e. seq_len % page_size == 1.
         assert decode
         return (seq_lens % page_size == 1).int().sum().item()
 
+    # ── Extend / Prefill path ────────────────────────────────────────────────
+    # ceil division: (x + page_size - 1) // page_size
     assert prefix_lens.device == cpu_device
     num_pages_after = (seq_lens + page_size - 1) // page_size
     num_pages_before = (prefix_lens + page_size - 1) // page_size

@@ -111,6 +111,11 @@ class SchedulerMetricsMixin:
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
 
+        # Snapshots of SimpleSWARadixCache cumulative counters from the last
+        # log interval, used to compute per-interval deltas for Prometheus.
+        self.last_swa_active_freed_tokens: int = 0
+        self.last_full_evicted_from_tree: int = 0
+
         self.stats = SchedulerStats()
 
         # Metrics
@@ -345,14 +350,16 @@ class SchedulerMetricsMixin:
         num_used = token_usage = full_token_usage = None
 
         if self.is_hybrid_swa:
-            full_num_used, swa_num_used, full_tok, swa_token_usage, *_ = (
+            full_num_used, swa_num_used, full_tok, swa_token_usage, _, full_evictable_size, _, swa_evictable_size = (
                 self._get_swa_token_info()
             )
             num_used = max(full_num_used, swa_num_used)
             token_usage = max(full_tok, swa_token_usage)
             full_token_usage = full_tok
             msg_parts += [
+                f"#full token: {full_num_used}, "
                 f"full token usage: {full_tok:.2f}",
+                f"#swa token: {swa_num_used}, "
                 f"swa token usage: {swa_token_usage:.2f}",
             ]
 
@@ -455,6 +462,20 @@ class SchedulerMetricsMixin:
             self.stats.full_token_usage = full_token_usage
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
+                # SWA radix cache metrics
+                self.stats.swa_tree_evictable_tokens = swa_evictable_size
+                self.stats.full_tree_evictable_tokens = full_evictable_size
+                # TODO(yingchun): 使用接口，避免直接访问 self.tree_cache
+                cur_swa_freed = self.tree_cache.swa_active_freed_tokens
+                cur_full_evicted = self.tree_cache.full_evicted_from_tree
+                self.stats.swa_active_freed_tokens_delta = (
+                        cur_swa_freed - self.last_swa_active_freed_tokens
+                )
+                self.stats.full_evicted_from_tree_delta = (
+                        cur_full_evicted - self.last_full_evicted_from_tree
+                )
+                self.last_swa_active_freed_tokens = cur_swa_freed
+                self.last_full_evicted_from_tree = cur_full_evicted
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
 

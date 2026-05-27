@@ -42,6 +42,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         device: str,
         kvcache: KVCache,
         need_sort: bool,
+        pool_label: str = "",
     ):
         self.size = size
         self.page_size = page_size
@@ -49,11 +50,70 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.device = device
         self._kvcache = kvcache
         self.need_sort = need_sort
+        self.pool_label = pool_label
+        self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+
+        # Allocation bitmap is debug-only because touching it in every alloc/free
+        # introduces extra synchronization on the hot path.
+        self._alloc_bitmap = None
+        if self.debug_mode:
+            num_units = size // page_size if page_size > 1 else size
+            self._alloc_bitmap = torch.zeros(
+                num_units + 1, dtype=torch.bool, device=device
+            )
+            self._alloc_bitmap[0] = True
 
         self.free_pages = None
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+
+    def _bitmap_assert_alloc(self, indices: torch.Tensor):
+        """Assert that none of the units being allocated are already in use."""
+        already_allocated = self._alloc_bitmap[indices]
+        if already_allocated.any().item():
+            dup_indices = indices[already_allocated]
+            sample_n = min(16, dup_indices.numel())
+            assert False, (
+                f"[pool={self.pool_label or 'default'}] Double-alloc detected: "
+                f"trying to allocate {indices.numel()} units, "
+                f"but {dup_indices.numel()} are already allocated. "
+                f"sample={dup_indices[:sample_n].tolist()}"
+            )
+
+    def _bitmap_assert_free(self, indices: torch.Tensor):
+        """Assert that all units being freed are currently allocated, and no
+        duplicates exist within the same free call."""
+
+        not_allocated = ~self._alloc_bitmap[indices]
+        if not_allocated.any().item():
+            bad_indices = indices[not_allocated]
+            sample_n = min(16, bad_indices.numel())
+            assert False, (
+                f"[pool={self.pool_label or 'default'}] Double-free detected: "
+                f"trying to free {indices.numel()} units, "
+                f"but {bad_indices.numel()} are NOT currently allocated. "
+                f"sample={bad_indices[:sample_n].tolist()}"
+            )
+        if indices.numel() > 1:
+            uniq = torch.unique(indices)
+            if uniq.numel() != indices.numel():
+                pages, counts = torch.unique(indices, return_counts=True)
+                dup_pages = pages[counts > 1]
+                dup_counts = counts[counts > 1]
+                sample_n = min(16, dup_pages.numel())
+                assert False, (
+                    f"[pool={self.pool_label or 'default'}] Intra-call duplicate free: "
+                    f"{indices.numel()} indices but only {uniq.numel()} unique. "
+                    f"dup_sample={dup_pages[:sample_n].tolist()}, "
+                    f"dup_counts={dup_counts[:sample_n].tolist()}"
+                )
+
+    def _bitmap_clear(self):
+        """Reset the allocation bitmap to all-free (except the padding slot 0)."""
+        if self.debug_mode:
+            self._alloc_bitmap.fill_(False)
+            self._alloc_bitmap[0] = True
 
     def debug_print(self) -> str:
         return ""
@@ -124,8 +184,11 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: KVCache,
         need_sort: bool,
+        pool_label: str = "",
     ):
-        super().__init__(size, 1, dtype, device, kvcache, need_sort)
+        super().__init__(
+            size, 1, dtype, device, kvcache, need_sort, pool_label=pool_label
+        )
         self.clear()
 
     def clear(self):
@@ -136,6 +199,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._bitmap_clear()
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
@@ -150,11 +214,19 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         select_index = self.free_pages[:need_size]
         self.free_pages = self.free_pages[need_size:]
+
+        if self.debug_mode:
+            self._bitmap_assert_alloc(select_index)
+            self._alloc_bitmap[select_index] = True
         return select_index
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+
+        if self.debug_mode:
+            self._bitmap_assert_free(free_index)
+            self._alloc_bitmap[free_index] = False
 
         if self.is_not_in_free_group:
             if self.need_sort:
@@ -371,10 +443,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device: str,
         kvcache: KVCache,
         need_sort: bool,
+        pool_label: str = "",
     ):
-        super().__init__(size, page_size, dtype, device, kvcache, need_sort)
+        super().__init__(
+            size, page_size, dtype, device, kvcache, need_sort, pool_label=pool_label
+        )
         self.num_pages = size // page_size
-        self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
         self.clear()
 
     def alloc(self, need_size: int):
@@ -392,6 +466,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         out_pages = self.free_pages[:num_pages]
         self.free_pages = self.free_pages[num_pages:]
+
+        if self.debug_mode:
+            self._bitmap_assert_alloc(out_pages)
+            self._alloc_bitmap[out_pages] = True
 
         out_indices = (
             out_pages[:, None] * self.page_size
@@ -445,6 +523,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        consumed_pages = self.free_pages[:num_new_pages]
+        if self.debug_mode:
+            self._bitmap_assert_alloc(consumed_pages)
+            self._alloc_bitmap[consumed_pages] = True
+
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -484,6 +567,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        consumed_pages = self.free_pages[:num_new_pages]
+        if self.debug_mode:
+            self._bitmap_assert_alloc(consumed_pages)
+            self._alloc_bitmap[consumed_pages] = True
+
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -493,6 +581,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         if self.is_not_in_free_group:
             free_page_indices = torch.unique(free_index // self.page_size)
+
+            if self.debug_mode:
+                self._bitmap_assert_free(free_page_indices)
+                self._alloc_bitmap[free_page_indices] = False
+
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:
@@ -511,6 +604,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._bitmap_clear()
 
     def get_cpu_copy(self, indices):
         return self._kvcache.get_cpu_copy(indices)

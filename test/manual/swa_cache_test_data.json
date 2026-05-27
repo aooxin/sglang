@@ -1,0 +1,274 @@
+{
+  "description": "SWA RadixCache stress test data for sglang serving. Covers prefix cache hit/miss/partial scenarios.",
+  "server_url": "http://localhost:9001",
+  "model_name": "mimo-v2-flash",
+  "scenarios": [
+    {
+      "name": "exact_cache_hit",
+      "description": "Send identical prompts repeatedly. Second+ requests should get full prefix cache hit.",
+      "repeat": 3,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a helpful assistant."
+        },
+        {
+          "role": "user",
+          "content": "What is the capital of France? Answer in one word."
+        }
+      ],
+      "max_tokens": 16,
+      "temperature": 0.0
+    },
+    {
+      "name": "prefix_sharing_short",
+      "description": "Multiple prompts sharing the same system prompt. Prefix cache should share the system prompt KV.",
+      "messages_list": [
+        [
+          {
+            "role": "system",
+            "content": "You are a helpful coding assistant. Always provide complete, working code examples with proper error handling."
+          },
+          {
+            "role": "user",
+            "content": "Write a Python function to compute fibonacci numbers."
+          }
+        ],
+        [
+          {
+            "role": "system",
+            "content": "You are a helpful coding assistant. Always provide complete, working code examples with proper error handling."
+          },
+          {
+            "role": "user",
+            "content": "Write a Python function to sort a list using quicksort."
+          }
+        ],
+        [
+          {
+            "role": "system",
+            "content": "You are a helpful coding assistant. Always provide complete, working code examples with proper error handling."
+          },
+          {
+            "role": "user",
+            "content": "Write a Python function to find the longest common subsequence."
+          }
+        ]
+      ],
+      "max_tokens": 256,
+      "temperature": 0.0
+    },
+    {
+      "name": "multi_turn_conversation",
+      "description": "Multi-turn conversation where each turn extends the prefix. Each new turn should partially hit the prefix cache from previous turns.",
+      "turns": [
+        [
+          {
+            "role": "system",
+            "content": "You are an expert mathematician. Show your work step by step."
+          },
+          {
+            "role": "user",
+            "content": "What is the derivative of x^3 + 2x^2 - 5x + 1?"
+          }
+        ],
+        [
+          {
+            "role": "system",
+            "content": "You are an expert mathematician. Show your work step by step."
+          },
+          {
+            "role": "user",
+            "content": "What is the derivative of x^3 + 2x^2 - 5x + 1?"
+          },
+          {
+            "role": "assistant",
+            "content": "The derivative is 3x^2 + 4x - 5."
+          },
+          {
+            "role": "user",
+            "content": "Now find the second derivative."
+          }
+        ],
+        [
+          {
+            "role": "system",
+            "content": "You are an expert mathematician. Show your work step by step."
+          },
+          {
+            "role": "user",
+            "content": "What is the derivative of x^3 + 2x^2 - 5x + 1?"
+          },
+          {
+            "role": "assistant",
+            "content": "The derivative is 3x^2 + 4x - 5."
+          },
+          {
+            "role": "user",
+            "content": "Now find the second derivative."
+          },
+          {
+            "role": "assistant",
+            "content": "The second derivative is 6x + 4."
+          },
+          {
+            "role": "user",
+            "content": "Find all critical points of the original function."
+          }
+        ]
+      ],
+      "max_tokens": 256,
+      "temperature": 0.0
+    },
+    {
+      "name": "cache_miss_unique_prompts",
+      "description": "Completely different prompts with no shared prefix. All should be cache misses.",
+      "messages_list": [
+        [
+          {
+            "role": "user",
+            "content": "Translate the following to French: The weather is beautiful today."
+          }
+        ],
+        [
+          {
+            "role": "user",
+            "content": "Explain quantum entanglement in simple terms."
+          }
+        ],
+        [
+          {
+            "role": "user",
+            "content": "Write a haiku about machine learning."
+          }
+        ],
+        [
+          {
+            "role": "user",
+            "content": "What are the main differences between TCP and UDP?"
+          }
+        ]
+      ],
+      "max_tokens": 128,
+      "temperature": 0.0
+    },
+    {
+      "name": "long_context_chunked_prefill",
+      "description": "Long input that exceeds chunked_prefill_size (16384 tokens), forcing multi-chunk prefill. SWA cache should free window-external KV between chunks.",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a document analysis assistant. Read the entire document carefully and answer questions about it."
+        },
+        {
+          "role": "user",
+          "content": "PLACEHOLDER_LONG_CONTEXT"
+        }
+      ],
+      "long_context_token_target": 20000,
+      "max_tokens": 256,
+      "temperature": 0.0
+    },
+    {
+      "name": "partial_prefix_hit",
+      "description": "Prompts that share a long prefix but diverge at different points. Tests partial cache hit with SWA tail-window safety.",
+      "shared_prefix": "The following is a comprehensive analysis of renewable energy sources. Solar energy harnesses sunlight through photovoltaic cells to generate electricity. Wind energy uses turbines to convert wind kinetic energy. Hydroelectric power generates electricity from flowing water. Geothermal energy taps heat from the Earth interior. Biomass energy converts organic materials into fuel. Each source has unique advantages and limitations that must be carefully considered when planning energy infrastructure for sustainable development.",
+      "suffixes": [
+        " Focusing on solar energy, what are the main efficiency challenges?",
+        " Focusing on wind energy, what are the environmental impacts?",
+        " Focusing on hydroelectric power, what are the geographical constraints?",
+        " Focusing on geothermal energy, what are the drilling costs?",
+        " Compare solar and wind energy in terms of reliability."
+      ],
+      "max_tokens": 256,
+      "temperature": 0.0
+    },
+    {
+      "name": "batch_concurrent_same_prefix",
+      "description": "Send a batch of requests simultaneously, all sharing the same prefix. Tests concurrent prefix sharing under SWA cache.",
+      "concurrency": 8,
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a creative writing assistant. Write engaging and vivid prose."
+        },
+        {
+          "role": "user",
+          "content": "Continue the following story: Once upon a time in a distant galaxy, a young explorer discovered a planet made entirely of crystal. The surface shimmered with every color imaginable, and the air hummed with a strange melody. As the explorer stepped onto the crystalline ground, they noticed"
+        }
+      ],
+      "max_tokens": 128,
+      "temperature": 0.8
+    },
+    {
+      "name": "speculative_decode_stress",
+      "description": "Short prompts with long generation to stress EAGLE speculative decoding path (speculative_num_steps=3, topk=1, num_draft_tokens=4). SWA eviction happens on each decode step.",
+      "messages_list": [
+        [
+          {
+            "role": "user",
+            "content": "Count from 1 to 200, one number per line."
+          }
+        ],
+        [
+          {
+            "role": "user",
+            "content": "Write the alphabet backwards, one letter per line, 10 times."
+          }
+        ],
+        [
+          {
+            "role": "user",
+            "content": "List all prime numbers between 1 and 500."
+          }
+        ]
+      ],
+      "max_tokens": 1024,
+      "temperature": 0.0
+    },
+    {
+      "name": "eviction_pressure",
+      "description": "Send many long unique prompts rapidly to fill KV cache and trigger radix tree eviction. Tests that SimpleSWARadixCache.evict() correctly reclaims both full and SWA budgets.",
+      "num_prompts": 16,
+      "prompt_template": "Write a detailed {num}-paragraph essay about the history and cultural significance of {topic}. Include specific dates, names, and places.",
+      "topics": [
+        "the Roman Colosseum",
+        "Japanese tea ceremony",
+        "Egyptian pyramids",
+        "Greek philosophy",
+        "Viking exploration",
+        "Silk Road trade routes",
+        "Mayan calendar system",
+        "Renaissance art movement",
+        "Industrial Revolution",
+        "French Revolution",
+        "ancient Chinese inventions",
+        "Inca architecture",
+        "Persian empire governance",
+        "Ottoman calligraphy",
+        "Indian classical music",
+        "African oral traditions"
+      ],
+      "max_tokens": 512,
+      "temperature": 0.0
+    },
+    {
+      "name": "interleaved_hit_miss",
+      "description": "Alternate between cache-hittable prompts and unique prompts. Tests cache behavior under mixed workload.",
+      "rounds": 5,
+      "hittable_messages": [
+        {
+          "role": "system",
+          "content": "You are a translator."
+        },
+        {
+          "role": "user",
+          "content": "Translate to Japanese: Hello, how are you?"
+        }
+      ],
+      "unique_prefix": "Random unique request number ",
+      "max_tokens": 64,
+      "temperature": 0.0
+    }
+  ]
+}

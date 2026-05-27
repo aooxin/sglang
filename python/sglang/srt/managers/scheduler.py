@@ -184,6 +184,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
+from sglang.srt.mem_cache.simple_swa_radix_cache import SimpleSWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -721,6 +722,15 @@ class Scheduler(
             self.full_tokens_per_layer, self.swa_tokens_per_layer = (
                 self.tp_worker.get_tokens_per_layer_info()
             )
+            if self.enable_hierarchical_cache:
+                if self.tp_rank == 0:
+                    logger.warning(
+                        "Hierarchical cache is not supported with hybrid SWA KV cache. "
+                        "Falling back to SimpleSWARadixCache and disabling HiCache/HiCache storage "
+                        "to avoid SWA OOM and illegal memory access."
+                    )
+                self.enable_hierarchical_cache = False
+                self.enable_hicache_storage = False
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
@@ -795,10 +805,11 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
-            #elif self.is_hybrid_swa:
-            #    from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-
-            #    self.tree_cache = SWARadixCache(params=params)
+            elif self.is_hybrid_swa and server_args.disaggregation_mode == DisaggregationMode.PREFILL.value:
+                self.tree_cache = SimpleSWARadixCache(
+                    params=params,
+                    speculative_num_steps=server_args.speculative_num_steps,
+                )
             elif self.is_hybrid_ssm:
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 
@@ -2484,7 +2495,13 @@ class Scheduler(
                 break
 
         # Update waiting queue
-        can_run_list: List[Req] = adder.can_run_list
+        can_run_list: List[Req] = [
+            req for req in adder.can_run_list if req.extend_input_len > 0
+        ]
+        # Zero-token extend batches do not produce hidden states, so letting them
+        # reach model forward will crash logits_processor when it indexes the
+        # last-token state. Keep those requests queued and only build batches
+        # that have at least one real token to extend.
         if len(can_run_list) == 0:
             return None
 

@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import get_num_new_pages
 
 _is_npu = is_npu()
 
@@ -263,6 +264,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 device,
                 kvcache.full_kv_pool,
                 need_sort,
+                pool_label="full",
             )
             self.swa_attn_allocator = TokenToKVPoolAllocator(
                 size_swa,
@@ -270,6 +272,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 device,
                 kvcache.swa_kv_pool,
                 need_sort,
+                pool_label="swa",
             )
         else:
             if _is_npu:
@@ -283,6 +286,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 device,
                 kvcache.full_kv_pool,
                 need_sort,
+                pool_label="full",
             )
             self.swa_attn_allocator = PagedTokenToKVPoolAllocatorClass(
                 size_swa,
@@ -291,6 +295,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 device,
                 kvcache.swa_kv_pool,
                 need_sort,
+                pool_label="swa",
             )
         # Note: append one more item of value -1 in the end so -1 maps to -1.
         # It is needed for the last_loc in alloc_extend, where the first full_last_loc
@@ -352,12 +357,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
+        # full slot 是 req_to_token_pool / radix tree 的统一索引口径，真正给 SWA
+        # attention backend 发送状态时，需要再映射到 swa pool 的物理槽位。
+        # 已被回收的 mapping 会是 0，后续逻辑把它当成 padding slot 处理。
         assert self._kvcache.full_to_swa_index_mapping is not None
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
 
     def alloc(self, need_size: int):
         # TODO(yingchun): 社区版依然有下面的 assert
         # assert self.page_size == 1
+        # hybrid 请求的每个 token 同时占用一份 full KV 和一份 SWA KV，
+        # 因此这里必须双池都够才允许分配。
         if need_size > self.full_attn_allocator.available_size():
             return None
         if need_size > self.swa_attn_allocator.available_size():
@@ -449,7 +459,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
     ):
         assert self.page_size > 1
-        num_tokens = extend_num_tokens + len(seq_lens) * self.page_size
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            prefix_lens=prefix_lens_cpu,
+        )
+        num_tokens = num_new_pages * self.page_size
         if num_tokens > self.full_attn_allocator.available_size():
             return None
         if num_tokens > self.swa_attn_allocator.available_size():
@@ -530,6 +545,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]
+        # 已经被主动缩窗过的 full slot，其 mapping 会被清成 0。
+        # 这里只释放 >0 的 live SWA slot，使 evict_swa()/cache_finished_req()
+        # 可以重复经过同一个 full_index 而不触发 double free。
         swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
         self.full_to_swa_index_mapping[free_index] = 0

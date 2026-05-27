@@ -135,6 +135,14 @@ class SchedulerStats:
     routing_key_running_req_counts: List[int] = field(default_factory=list)
     routing_key_all_req_counts: List[int] = field(default_factory=list)
 
+    # SWA radix cache metrics (SimpleSWARadixCache / HiSimpleSWARadixCache only)
+    # Gauge: current evictable token counts in the radix tree
+    swa_tree_evictable_tokens: int = 0
+    full_tree_evictable_tokens: int = 0
+    # Counter deltas: tokens freed/evicted since the last log interval
+    swa_active_freed_tokens_delta: int = 0
+    full_evicted_from_tree_delta: int = 0
+
 
 ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 3, 5, 7, 10, 20, 50, 100, 200]
 
@@ -797,6 +805,31 @@ class SchedulerMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        # SWA radix cache metrics (only meaningful for SimpleSWARadixCache /
+        # HiSimpleSWARadixCache; zero for other cache types).
+        self.swa_tree_evictable_tokens = Gauge(
+            name="sglang:swa_tree_evictable_tokens",
+            documentation="Number of evictable SWA KV tokens currently held in the radix tree.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.full_tree_evictable_tokens = Gauge(
+            name="sglang:full_tree_evictable_tokens",
+            documentation="Number of evictable full-attention KV tokens currently held in the radix tree.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.swa_active_freed_tokens_total = Counter(
+            name="sglang:swa_active_freed_tokens_total",
+            documentation="Cumulative SWA KV tokens proactively freed outside the sliding window.",
+            labelnames=labels.keys(),
+        )
+        self.full_evicted_from_tree_total = Counter(
+            name="sglang:full_evicted_from_tree_total",
+            documentation="Cumulative full-attention KV tokens evicted from the radix tree by cache pressure.",
+            labelnames=labels.keys(),
+        )
+
     def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
         # Convenience function for logging a scalar to gauge.
         gauge.labels(**self.labels).set(data)
@@ -1056,6 +1089,20 @@ class SchedulerMetricsCollector:
         self.routing_key_all_req_count.set_by_current_observations(
             self.labels, stats.routing_key_all_req_counts
         )
+
+        # SWA radix cache metrics
+        self._log_gauge(self.swa_tree_evictable_tokens, stats.swa_tree_evictable_tokens)
+        self._log_gauge(
+            self.full_tree_evictable_tokens, stats.full_tree_evictable_tokens
+        )
+        if stats.swa_active_freed_tokens_delta > 0:
+            self.swa_active_freed_tokens_total.labels(**self.labels).inc(
+                stats.swa_active_freed_tokens_delta
+            )
+        if stats.full_evicted_from_tree_delta > 0:
+            self.full_evicted_from_tree_total.labels(**self.labels).inc(
+                stats.full_evicted_from_tree_delta
+            )
 
         self.last_log_time = time.perf_counter()
 

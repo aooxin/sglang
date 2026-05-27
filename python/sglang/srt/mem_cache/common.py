@@ -9,6 +9,7 @@ import triton.language as tl
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.simple_swa_radix_cache import SimpleSWARadixCache
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.server_args import get_global_server_args
@@ -244,7 +245,12 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
             swa_num_tokens = max(0, num_tokens - swa_available_size)
-            if isinstance(tree_cache, SWARadixCache):
+            # 这里不能再像普通 radix cache 那样只看一个 shortage。
+            # 对 SimpleSWARadixCache，可能出现：
+            # - full 池还有富余；
+            # - 但很多老 token 的 SWA mapping 已提前回收，导致当前真正紧的是 swa 池。
+            # 因此驱逐接口必须同时收到 full/swa 两个缺口。
+            if isinstance(tree_cache, (SWARadixCache, SimpleSWARadixCache)):
                 tree_cache.evict(
                     EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
                 )

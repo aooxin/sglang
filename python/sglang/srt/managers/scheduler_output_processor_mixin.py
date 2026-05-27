@@ -191,6 +191,10 @@ class SchedulerOutputProcessorMixin:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                        # Update prefix cache state for the unfinished request.
+                        # For RadixCache this inserts into the tree so others
+                        # can match; for SimpleSWARadixCache this only frees
+                        # out-of-window SWA KV and saves prefix_indices.
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)

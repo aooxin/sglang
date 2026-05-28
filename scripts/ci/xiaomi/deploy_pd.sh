@@ -6,7 +6,38 @@
 #
 # --deploy-yaml      (required) path to the deployment YAML config
 # --deployment-name  defaults to "gitlab-ci-flash-1p1d-<CI_JOB_ID>"
+#
+# BYPASS MODE — skip CloudML deploy and point at a pre-deployed endpoint:
+#   Set EVAL_URL=<bare-base-url> in the CI variables. The script
+#   exports DEPLOYMENT_ENDPOINT from that URL and returns immediately —
+#   no save-aksk, no create-deployment, no EXIT trap. The caller manages
+#   the deployment's lifecycle.
+#
+#   Useful when (a) the workspace blocks OpenAPI writes, (b) you want to
+#   iterate on eval logic against a long-lived test deployment without
+#   paying the ~30 min deploy/teardown cycle each run.
+#
+#   The URL must be the bare base URL WITHOUT a trailing /v1 — runners
+#   append /v1 themselves. Trailing slash and trailing /v1 are both
+#   stripped defensively below, so any of these work:
+#     https://flash-xxx.cloudml-hd-pri-ksytjv.alb.xiaomi.srv
+#     https://flash-xxx.cloudml-hd-pri-ksytjv.alb.xiaomi.srv/
+#     https://flash-xxx.cloudml-hd-pri-ksytjv.alb.xiaomi.srv/v1
 set -euo pipefail
+
+# --- Bypass: use a pre-deployed endpoint instead of creating one ---
+# Must run BEFORE the CLOUDML_API line — that line expands ${CLOUDML_MAAS_HOME}
+# under `set -u`, so unset CLOUDML envs would error out before we get a chance
+# to skip them. Bypass mode is the whole point of letting CLOUDML envs be unset.
+if [[ -n "${EVAL_URL:-}" ]]; then
+    DEPLOYMENT_ENDPOINT="${EVAL_URL%/}"
+    DEPLOYMENT_ENDPOINT="${DEPLOYMENT_ENDPOINT%/v1}"
+    DEPLOYMENT_ID=""    # empty: any subsequent stop-deployment is a no-op
+    echo "=== EVAL_URL set — bypassing CloudML deploy ==="
+    echo "    Endpoint: ${DEPLOYMENT_ENDPOINT}"
+    # Script is sourced; `return` ends sourcing without exiting the parent shell.
+    return 0
+fi
 
 CLOUDML_API="${CLOUDML_MAAS_HOME}/scripts/cloudml_api.py"
 

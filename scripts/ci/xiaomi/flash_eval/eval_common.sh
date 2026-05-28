@@ -45,35 +45,14 @@ export EVAL_LABEL="${EVAL_LABEL:-FLASH}"
 
 FAILED_TASKS=()
 
-# One-shot end-to-end smoke test against /v1/chat/completions.
-# K8s readinessProbe / startupProbe on each role already gate traffic to
-# Ready pods at the infrastructure layer, so we don't re-poll /health_generate
-# here. This final check just verifies the full Router → Prefill → Decode
-# chain produces a non-empty completion before the real eval starts firing
-# thousands of requests.
+# Pull in shared smoke-test helper. eval_smoke_test() handles the actual POST.
+# shellcheck source=../eval_smoke.sh disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/eval_smoke.sh"
+
+# Thin wrapper: keeps the existing call site (`wait_for_service_ready`) working
+# while delegating to the shared helper.
 wait_for_service_ready() {
-    local base_url="${OPENAI_COMPATIBLE_API_URL%/}"
-    local served_model="${CREATED}"
-    echo "=== smoke test: POST ${base_url}/v1/chat/completions ==="
-    local smoke_resp
-    smoke_resp="$(mktemp /tmp/flash-eval-smoke.XXXXXX.json)"
-    if ! curl -fsS "${base_url}/v1/chat/completions" \
-            -H "Content-Type: application/json" \
-            -d "{\"model\":\"${served_model}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" \
-            | tee "${smoke_resp}"; then
-        echo ""
-        echo "ERROR: smoke test request failed" >&2
-        rm -f "${smoke_resp}"
-        return 1
-    fi
-    echo ""
-    if ! grep -q '"content"' "${smoke_resp}"; then
-        echo "ERROR: smoke response has no 'content' field" >&2
-        rm -f "${smoke_resp}"
-        return 1
-    fi
-    rm -f "${smoke_resp}"
-    echo "=== smoke test passed ==="
+    eval_smoke_test "${OPENAI_COMPATIBLE_API_URL%/}/v1/chat/completions" "${CREATED}"
 }
 
 run_task() {

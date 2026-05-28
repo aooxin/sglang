@@ -37,7 +37,7 @@ roles:
     python3 -m sglang.launch_server \
                   --model-path XiaomiMiMo/MiMo-V2-Flash \
                   --served-model-name mimo-v2-flash \
-                  --disaggregation-ib-device ${NCCL_IB_HCA:1} \
+                  --disaggregation-ib-device ${HPN_IB_HCA} \
                   --disaggregation-mode prefill \
                   --log-level-http warning \
                   --enable-cache-report \
@@ -199,7 +199,7 @@ roles:
     python3 -m sglang.launch_server \
                   --model-path XiaomiMiMo/MiMo-V2-Flash \
                   --served-model-name mimo-v2-flash \
-                  --disaggregation-ib-device ${NCCL_IB_HCA:1} \
+                  --disaggregation-ib-device ${HPN_IB_HCA} \
                   --disaggregation-mode decode \
                   --enable-cache-report \
                   --pp-size 1 \

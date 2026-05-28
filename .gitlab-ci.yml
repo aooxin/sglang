@@ -546,6 +546,11 @@ deploy-cloudml-pd:
 # image, timeout, model-specific CLOUDML_SERVICE_ID, runner script and
 # artifact paths.
 #
+# Bypass deploy: set EVAL_URL=<bare-base-url> in pipeline variables
+# to skip the CloudML create/teardown cycle and run the eval against an
+# already-deployed service. CLOUDML_* vars are NOT required in this mode.
+# See deploy_pd.sh's header for details.
+#
 # Requires: release-docker-cu129 (for SGLANG_IMAGE_URL).
 # Requires: CLOUDML_ACCESS_KEY and CLOUDML_SECRET_KEY as masked CI/CD variables.
 
@@ -616,3 +621,69 @@ omni-video-eval:
     PREFILL_NUM: "7"
     DECODE_NUM: "7"
     ENCODER_NUM: "4"
+# SWE-bench accuracy eval against the same Flash deployment as flash-basic-eval.
+#
+# This job lands on the docker-build shell runner (sglang-A800-builder), which
+# is the same runner used by .release-docker-template. The shell executor
+# ignores `image:`, so we explicitly `docker run` mini-swe-agent-ci ourselves
+# with /var/run/docker.sock bind-mounted — mini-swe-agent's
+# environment_class=docker needs a real dockerd to spawn one container per
+# SWE-bench instance, which the K8s shared runner pool cannot provide.
+#
+# Runtime overrides (set these in "Run Pipeline → Variables" for debug runs):
+#   SWE_MAX_SLICE   max SWE-bench instances (default: 500; try 2 for smoke)
+#   SWE_WORKERS     concurrent agents      (default: 50;  try 1 for smoke)
+#   SWE_MODEL_NAME  served-model-name      (default: mimo-v2-flash)
+#   SWE_ENV_CLASS   mini-swe-agent env_class override (default: yaml's docker)
+flash-swe-bench:
+  extends: .eval-base-template
+  tags: [docker-build]
+  # Long-running eval (~3h end-to-end) — refuse interruption by auto-cancel
+  # on redundant pipelines so an unrelated re-run doesn't kill us mid-eval.
+  interruptible: false
+  timeout: 12h
+  variables:
+    CLOUDML_SERVICE_ID: "s-20260508193803-jw56o"
+    SWE_EVAL_IMAGE: "micr.cloud.mioffice.cn/llm-infra/mini-swe-agent-ci:V1"
+  script:
+    - echo "Evaluating image ${SGLANG_IMAGE_URL}"
+    # ci_runner.sh handles everything outside the eval container:
+    # builds an ephemeral image (scripts baked in), runs it, extracts
+    # artifacts via docker cp. Required because this runner's docker CLI
+    # points at a REMOTE daemon (bind mounts don't work).
+    - bash scripts/ci/xiaomi/flash_swe_bench/ci_runner.sh
+  artifacts:
+    paths:
+      - swe_bench_output/
+      - eval_summary_*.md
+
+# tau-bench (telecom domain) accuracy eval against the same Flash deployment.
+#
+# Unlike flash-swe-bench, tau-bench is pure simulation — no per-task containers,
+# no docker socket needed — so this job runs on the K8s shared runner pool with
+# a normal `image:` directive.
+#
+# The image at micr.../tau-bench-ci:V1 bakes /root/tau2-bench/run.sh which
+# itself runs `tau2 run --domain telecom ...` three times in a row (team's
+# eval protocol — averages 3 runs for the headline number). Our run.sh just
+# wires CloudML deployment env vars in and parses the captured stdout.
+#
+# Required masked CI variable:
+#   OPENROUTER_API_KEY   tau-bench user simulator (qwen3-235b on openrouter)
+flash-tau-bench:
+  extends: .eval-base-template
+  image: micr.cloud.mioffice.cn/llm-infra/tau-bench-ci:V1
+  # Three sequential `tau2 run` invocations. The CloudML deploy step waits up
+  # to 1h for readiness (deploy_pd.sh's wait-for-deployment-ready --timeout
+  # 3600), leaving ~2h for the eval itself.
+  interruptible: false
+  timeout: 3h
+  variables:
+    CLOUDML_SERVICE_ID: "s-20260508193803-jw56o"
+  script:
+    - echo "Evaluating image ${SGLANG_IMAGE_URL}"
+    - bash scripts/ci/xiaomi/flash_tau_bench/run.sh --deploy-yaml scripts/ci/xiaomi/flash_eval/flash-1p1d-gm403-hd.yaml
+  artifacts:
+    paths:
+      - tau_bench_output/
+      - eval_summary_*.md

@@ -391,6 +391,7 @@ class PrefillAdder:
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
+        sliding_window_size: int = 0,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -404,16 +405,21 @@ class PrefillAdder:
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
 
+        self.sliding_window_size = sliding_window_size
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= mixed_with_decode_tokens
         self.rem_total_token_offset = mixed_with_decode_tokens
         self.cur_rem_token_offset = mixed_with_decode_tokens
+
+        self.swa_rem_total_token_offset = mixed_with_decode_tokens
+        self.cur_swa_rem_token_offset = mixed_with_decode_tokens
 
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
+        self.log_host_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
 
@@ -423,6 +429,11 @@ class PrefillAdder:
                     self._get_running_request_total_token_offset(r)
                     for r in running_batch.reqs
                 ]
+            )
+            # Each running request in decode phase occupies at most
+            # sliding_window_size tokens in the SWA pool.
+            self.swa_rem_total_token_offset += (
+                len(running_batch.reqs) * self.sliding_window_size
             )
 
         self.is_hybrid_swa = isinstance(
@@ -465,26 +476,15 @@ class PrefillAdder:
             * self.new_token_ratio
         )
 
+    # TODO(yingchun): 跟 cur_rem_tokens 长得很像，可重构
     @property
     def rem_total_tokens(self):
         if self.is_hybrid_swa:
-            if self.is_any_swa_radix_cache:
-                # rem_total_tokens 用来回答“这个 batch 总体上还能不能塞下新的请求”。
-                # 对 SimpleSWARadixCache，放松的是跨 chunk 的 SWA 保留语义，
-                # 不是“当前这一轮 live KV 能立刻分配多少”的约束。
-                # 因此 current-round admission 仍然要同时看 full / swa 两个池子，
-                # 取二者更紧的那个瓶颈。
-                available_and_evictable = min(
-                    self.token_to_kv_pool_allocator.full_available_size()
-                    + self.tree_cache.full_evictable_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size()
-                    + self.tree_cache.swa_evictable_size(),
-                )
-            else:
-                available_and_evictable = (
-                    self.token_to_kv_pool_allocator.full_available_size()
-                    + self.tree_cache.evictable_size()
-                )
+            # only count total full available tokens
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.full_available_size()
+                + self.tree_cache.full_evictable_size()
+            )
         elif self.is_hybrid_ssm_cache:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
@@ -500,28 +500,11 @@ class PrefillAdder:
     @property
     def cur_rem_tokens(self):
         if self.is_hybrid_swa:
-            if self.is_swa_radix_cache:
-                available_and_evictable = min(
-                    self.token_to_kv_pool_allocator.full_available_size()
-                    + self.tree_cache.full_evictable_size(),
-                    self.token_to_kv_pool_allocator.swa_available_size()
-                    + self.tree_cache.swa_evictable_size(),
-                )
-            elif self.is_simple_swa_radix_cache:
-                # cur_rem_tokens 更偏向“当前这次 prefill chunk 能推进多少”。
-                # SimpleSWARadixCache 的核心假设是：窗口外 SWA 会在 chunk 边界被
-                # 及时释放，因此当前 chunk 的 admission 不需要再按“整段剩余请求
-                # 都要占着 SWA”来保守估计，而主要由 full 侧可分配量来约束。
-                available_and_evictable = (
-                    self.token_to_kv_pool_allocator.full_available_size()
-                    + self.tree_cache.evictable_size()
-                )
-            else:
-                available_and_evictable = (
-                    self.token_to_kv_pool_allocator.full_available_size()
-                    + self.tree_cache.evictable_size()
-                )
-
+            # only count cur full available tokens
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.full_available_size()
+                + self.tree_cache.full_evictable_size()
+            )
         elif self.is_hybrid_ssm_cache:
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.available_size()
@@ -535,86 +518,79 @@ class PrefillAdder:
 
         return available_and_evictable - self.cur_rem_token_offset
 
+    @property
+    def rem_swa_total_tokens(self):
+        if self.is_hybrid_swa:
+            # only count total SWA available tokens
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size()
+            )
+        else:
+            raise NotImplementedError()
+
+        return available_and_evictable - self.swa_rem_total_token_offset
+
+    @property
+    def cur_swa_rem_tokens(self):
+        if self.is_hybrid_swa:
+            # only count current SWA available tokens
+            available_and_evictable = (
+                self.token_to_kv_pool_allocator.swa_available_size()
+                + self.tree_cache.swa_evictable_size()
+            )
+        else:
+            raise NotImplementedError()
+
+        return available_and_evictable - self.cur_swa_rem_token_offset
+
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
-
-    def _get_effective_chunk_trunc_len(
-        self, truncation_align_size: Optional[int] = None
-    ) -> int:
-        """Return the schedulable chunk length for the current budget state.
-
-        For SimpleSWARadixCache, the SWA pool only needs to cover the current
-        prefill chunk, not the whole remaining request. We therefore cap the
-        chunk by both ``rem_chunk_tokens`` and the current ``rem_total_tokens``
-        so admission can make progress on very long requests.
-        """
-        if self.rem_chunk_tokens is None:
-            return 0
-
-        # 对 SimpleSWARadixCache，能调度的 chunk 上限同时受两件事约束：
-        # 1. 用户/服务端配置的 chunked_prefill_size；
-        # 2. 当前这一轮在 full/swa 双池语义下还剩多少真实预算。
-        # 两者取 min 才是“现在马上能推得进去”的 chunk 长度。
-        trunc_len = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
-        if trunc_len <= 0:
-            return 0
-
-        trunc_len = trunc_len // self.page_size * self.page_size
-        if trunc_len <= 0:
-            return 0
-
-        if truncation_align_size is not None:
-            if trunc_len < truncation_align_size:
-                return 0
-            trunc_len = truncation_align_size * (trunc_len // truncation_align_size)
-
-        return trunc_len
-
-    def _should_chunk_simple_swa_req(
-        self,
-        input_tokens: int,
-        truncation_align_size: Optional[int] = None,
-    ) -> tuple[bool, int]:
-        """Whether a SimpleSWA request should be admitted via chunked prefill."""
-        if not (self.is_simple_swa_radix_cache and self.rem_chunk_tokens is not None):
-            return False, 0
-
-        trunc_len = self._get_effective_chunk_trunc_len(truncation_align_size)
-        # 返回值含义：
-        # - should_chunk=True：当前请求如果整段塞进来会超过本轮安全预算，
-        #   但裁成 trunc_len 后仍可以推进；
-        # - trunc_len：这轮实际允许它前进的 token 数。
-        #
-        # 例子：输入还剩 6k，当前只剩 2k 的 chunk 预算，则返回 (True, 2k)，
-        # scheduler 会让它先做一段 2k 的 prefill，而不是整条请求直接拒掉。
-        return trunc_len > 0 and input_tokens > trunc_len, trunc_len
 
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
 
-        if self.rem_input_tokens <= 0:
-            return AddReqResult.OTHER
+        # For hybrid models, also check SWA pool budget
+        if self.is_hybrid_swa and self.sliding_window_size > 0:
+            if self.rem_swa_total_tokens <= 0 or self.cur_swa_rem_tokens <= 0:
+                return AddReqResult.NO_TOKEN
 
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
                 return AddReqResult.OTHER
         else:
+            # Soft stop: the per-batch input token budget or chunk token budget is
+            # exhausted (not a hard memory limit). The caller will break out of the
+            # scheduling loop but will NOT set batch_is_full, so the scheduler won't
+            # enter memory-pressure mode on the next cycle.
             if self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
         return AddReqResult.CONTINUE
 
     def _update_prefill_budget(
-        self, prefix_len: int, extend_input_len: int, max_new_tokens: int
+        self,
+        prefix_len: int,
+        host_hit_length: int,
+        extend_input_len: int,
+        max_new_tokens: int,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
+        # Update full attention budget offsets.
         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
         page_overhead = self.page_size
         self.rem_total_token_offset += extend_input_len + max_new_tokens + page_overhead
         self.cur_rem_token_offset += extend_input_len + page_overhead
+
+        # Update SWA budget offsets:
+        self.swa_rem_total_token_offset += (
+            extend_input_len + max_new_tokens + self.sliding_window_size
+        )
+        self.cur_swa_rem_token_offset += extend_input_len + self.sliding_window_size
+
         self.rem_input_tokens -= extend_input_len
 
         if self.dllm_config is not None:
@@ -623,6 +599,7 @@ class PrefillAdder:
             self.rem_chunk_tokens -= extend_input_len
 
         self.log_hit_tokens += prefix_len
+        self.log_host_hit_tokens += host_hit_length
         self.log_input_tokens += extend_input_len
 
     def _get_dllm_remain_tokens(self) -> int:
@@ -651,7 +628,7 @@ class PrefillAdder:
 
         self.can_run_list.append(req)
 
-        self._update_prefill_budget(prefix_len, trunc_len, 0)
+        self._update_prefill_budget(prefix_len, 0, trunc_len, 0)
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
@@ -677,7 +654,7 @@ class PrefillAdder:
             if not truncated
             else 0
         )
-        self._update_prefill_budget(0, req.extend_input_len, max_new_tokens)
+        self._update_prefill_budget(0, 0, req.extend_input_len, max_new_tokens)
 
         # Return based on remaining token availability
         return (
@@ -708,6 +685,7 @@ class PrefillAdder:
         self.can_run_list.append(req)
         self._update_prefill_budget(
             0,
+            0,
             req.extend_input_len,
             (
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
@@ -735,12 +713,38 @@ class PrefillAdder:
                 self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
-        # Early exit if no enough tokens for the input tokens
+        """Add a request with ignore_eos=True using aggressive budget estimation.
+
+        This is a specialized admission path for requests that ignore EOS tokens
+        (i.e., will generate until max_new_tokens). Since these requests consume
+        their full token budget, we use a more conservative estimation approach
+        that tracks all running requests' remaining token demands.
+
+        Key difference from add_one_req():
+        - Uses req_states to track ALL requests' (tokens_left, tokens_occupied)
+        - Simulates future memory pressure by iterating through sorted states
+        - Ensures we don't over-commit memory to requests that will fill their budget
+
+        Args:
+            req: The request with ignore_eos=True
+            has_chunked_req: Whether current batch already has a chunked request
+
+        Returns:
+            AddReqResult: Admission decision
+
+        """
+
+        # Early exit: if input tokens alone exceed current budget, reject immediately
+        # This is a quick check before expensive state tracking
         if self.ceil_paged_tokens(req.extend_input_len) > min(
             self.cur_rem_tokens, self.rem_total_tokens
         ):
             return AddReqResult.NO_TOKEN
 
+        # ──── Inner function: Track request's token state ────
+        # For ignore_eos requests, we need to track how many tokens each request
+        # will still consume (tokens_left) and how much it already occupies.
+        # This allows us to simulate future memory pressure.
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
                 1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
@@ -762,6 +766,9 @@ class PrefillAdder:
                         break
                 self.req_states.insert(i, (tokens_left, tokens_occupied))
 
+        # ──── Initialize or update req_states ────
+        # First call: Build state for ALL requests (running + queued + new)
+        # Subsequent calls: Insert new request into sorted state list
         if self.req_states is None:
             self.req_states = []
             add_req_state(req)
@@ -782,15 +789,22 @@ class PrefillAdder:
                 req.extend_input_len
             )
             tokens_freed = 0
+            # Iterate through requests sorted by tokens_left (ascending)
+            # For each request, simulate: when it finishes, will we have enough memory?
             for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
-                # tokens_left gives a reservative calculation as the last token is not stored
-                bs = len(self.req_states) - i
+                bs = len(self.req_states) - i  # batch size from this point onward
+
+                # min_free_tokens: estimated free tokens after this request finishes
+                # Formula: current_remaining + freed_so_far - (tokens_left * batch_size)
+                # If this goes negative, we're over-committed
                 min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
-                # reserve tokens for corner cases
+
+                # Reserve IGNORE_EOS_RESERVE_TOKENS per request for corner cases (e.g., logit processing)
                 if min_free_tokens <= IGNORE_EOS_RESERVE_TOKENS * bs:
                     return AddReqResult.NO_TOKEN
                 tokens_freed += tokens_occupied
 
+        # ──── Final scheduling decision: chunked vs non-chunked prefill ────
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
                 return AddReqResult.OTHER
@@ -804,11 +818,15 @@ class PrefillAdder:
             self.can_run_list.append(req)
             self._update_prefill_budget(
                 0,
+                0,
                 req.extend_input_len,
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
             )
         else:
             if self.rem_chunk_tokens <= 0:
+                # Chunked prefill path: no chunk tokens remaining, so we cannot
+                # allocate even a minimal chunk for this request. This is a soft
+                # stop (not memory exhaustion), so batch_is_full won't be set.
                 return AddReqResult.OTHER
 
             # Chunked prefill
@@ -818,13 +836,30 @@ class PrefillAdder:
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
             self.new_chunked_req = req
-            self._update_prefill_budget(0, trunc_len, 0)
+            self._update_prefill_budget(0, 0, trunc_len, 0)
 
         return self.budget_state()
 
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        """Add a single request to the prefill batch with budget-aware scheduling.
+        Args:
+            req: The request to be scheduled.
+            has_chunked_req: Whether the current batch already has a chunked request.
+                             Used to prevent multiple SimpleSWA chunks in one batch.
+            truncation_align_size: Optional alignment size for chunk truncation.
+                                   Ensures prefill prefix is multiple of this value
+                                   (e.g., for deterministic inference with flashinfer).
+
+        Returns:
+            AddReqResult: CONTINUE if more requests can be added,
+                          NO_TOKEN if token budget exhausted,
+                          OTHER if stopped for other reasons (e.g., chunk limit).
+        """
+
+        # When ignore_eos is set AND tree cache is disabled, use a simplified
+        # admission path that only checks raw token budgets without prefix caching.
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
@@ -848,11 +883,27 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        reserve_tokens = min(
+        # compute this req full maybe use total_tokens
+        # for start req.extend_input_len = req.host_hit_length + real_input_tokens
+        total_tokens = req.extend_input_len + min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
-        total_tokens = req.extend_input_len + reserve_tokens
+        # compute this req swa maybe use total tokens
+        # SWA needs: cache + real_extend
+        swa_cache_tokens = min(
+            len(req.prefix_indices) + req.host_hit_length, self.sliding_window_size
+        )
+        swa_total_tokens = swa_cache_tokens + (
+                req.extend_input_len - req.host_hit_length
+        )
+        # todo deal with len(req.prefix_indices)=109440 , req.host_hit_length=48768, req.extend_input_len=86327,
+        #  for chunk available_and_evictable=37376, self.token_to_kv_pool_allocator.swa_available_size()=9664, self.tree_cache.swa_evictable_size()=27712,
+        if (
+                self.rem_chunk_tokens is not None
+                and swa_total_tokens > self.rem_chunk_tokens
+        ):
+            swa_total_tokens = min(swa_total_tokens, self.rem_chunk_tokens)
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = req.extend_input_len - req.host_hit_length
@@ -860,30 +911,35 @@ class PrefillAdder:
         input_tokens = self.ceil_paged_tokens(req.extend_input_len)
         prefix_len = len(req.prefix_indices)
 
-        should_chunk_simple_swa, trunc_len = self._should_chunk_simple_swa_req(
-            input_tokens, truncation_align_size
-        )
-        if should_chunk_simple_swa and has_chunked_req:
-            # 当前 batch 已经有一个 chunked req 时，不再并入第二个 simple SWA
-            # chunked 请求，避免两条长请求同时吃掉“本轮本就紧张的 SWA 峰值预算”。
-            return AddReqResult.OTHER
-
-        if not should_chunk_simple_swa and total_tokens >= self.rem_total_tokens:
+        if (
+            total_tokens >= self.rem_total_tokens
+            or swa_total_tokens > self.rem_swa_total_tokens
+        ):
+            if swa_total_tokens > self.rem_swa_total_tokens:
+                logger.warning("swa mem not enough,try to increase swa!!!")
             return AddReqResult.NO_TOKEN
 
-        scheduled_input_tokens = (
-            min(real_input_tokens, trunc_len)
-            if should_chunk_simple_swa
-            else real_input_tokens
-        )
-        if (
-            scheduled_input_tokens >= self.rem_input_tokens
-            and len(self.can_run_list) != 0
-        ):
+        # This request's input tokens exceed the remaining input budget, but the
+        # batch already has at least one schedulable request. Skip this request
+        # without marking the batch as full — subsequent requests in the waiting
+        # queue may still fit if they are smaller (soft stop, not memory pressure).
+        if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
+            # self.rem_total_tokens may decrease after the lock acquisition
+            if (
+                total_tokens >= self.rem_total_tokens
+                or swa_total_tokens > self.rem_swa_total_tokens
+            ):
+                if swa_total_tokens > self.rem_swa_total_tokens:
+                    logger.warning(
+                        "[lock_node] swa mem not enough,try to increase swa!!!"
+                    )
+                return AddReqResult.NO_TOKEN
+
             if req.host_hit_length > 0:
+                # len(req.prefix_indices)=102336, host_hit_len=53504, req.extend_input_len=57630
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         last_host_node=req.last_host_node,
@@ -893,16 +949,11 @@ class PrefillAdder:
                 )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+                # len(req.prefix_indices)=155840, host_hit_len=53504, req.extend_input_len=4126
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
-            should_chunk_simple_swa, trunc_len = self._should_chunk_simple_swa_req(
-                input_tokens, truncation_align_size
-            )
-            if should_chunk_simple_swa and has_chunked_req:
-                return AddReqResult.OTHER
-
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
@@ -914,44 +965,21 @@ class PrefillAdder:
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
 
-            # self.rem_total_tokens may decrease after the lock acquisition
-            if not should_chunk_simple_swa:
-                total_tokens = req.extend_input_len + reserve_tokens
-                if total_tokens >= self.rem_total_tokens:
-                    return AddReqResult.NO_TOKEN
-
-            scheduled_input_tokens = (
-                trunc_len if should_chunk_simple_swa else input_tokens
-            )
-            if (
-                scheduled_input_tokens >= self.rem_input_tokens
-                and len(self.can_run_list) != 0
-            ):
+            # Re-check after acquiring the tree-cache lock (host_hit resolution may
+            # have changed extend_input_len). Same logic as pre-lock check: the
+            # request is too large for the remaining input budget but we already
+            # have requests queued, so soft-stop without setting batch_is_full.
+            if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
 
-            if should_chunk_simple_swa:
-                # SimpleSWARadixCache 的关键收益就在这里：
-                # 当整段输入放不下时，不是整条请求失败，而是把 fill_ids 裁成当前
-                # 安全可执行的 chunk。执行完这一段后，窗口左侧 SWA 会被释放，
-                # 下一轮还能继续推进剩余部分。
-                req.extend_input_len = trunc_len
-                req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
-
-                self.can_run_list.append(req)
-                self.new_chunked_req = req
-                if self.is_hybrid and self.is_swa_radix_cache:
-                    swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
-                    req.swa_uuid_for_lock = swa_uuid_for_lock
-                else:
-                    self.tree_cache.inc_lock_ref(req.last_node)
-                self._update_prefill_budget(prefix_len, trunc_len, 0)
-            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
-                # Non-chunked prefill
+            if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+                # this req is Non-chunked prefill
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
                     prefix_len,
+                    req.host_hit_length,
                     input_tokens,
                     min(
                         req.sampling_params.max_new_tokens,
@@ -963,6 +991,9 @@ class PrefillAdder:
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 
                 if trunc_len <= 0:
+                    # After page-alignment, the remaining chunk tokens cannot form
+                    # even a single full page. Soft stop — no memory pressure, just
+                    # insufficient chunk budget for page-aligned allocation.
                     return AddReqResult.OTHER
 
                 # 这一分支仍然保留“传统 chunked prefill”的处理方式，给非 SimpleSWA
@@ -973,6 +1004,10 @@ class PrefillAdder:
                 # we need the prefill prefix length to be multiple of attention split size
                 if truncation_align_size is not None:
                     if trunc_len < truncation_align_size:
+                        # The truncated chunk length is smaller than the required
+                        # alignment size (e.g., attention split size for deterministic
+                        # inference with flashinfer). Cannot produce a valid aligned
+                        # chunk, so soft-stop without marking the batch as full.
                         return AddReqResult.OTHER
                     else:
                         trunc_len = truncation_align_size * (
@@ -987,7 +1022,9 @@ class PrefillAdder:
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
-                self._update_prefill_budget(prefix_len, trunc_len, 0)
+                self._update_prefill_budget(
+                    prefix_len, req.host_hit_length, trunc_len, 0
+                )
 
         return self.budget_state()
 
@@ -1052,6 +1089,8 @@ class PrefillAdder:
                 self.rem_total_token_offset -= (
                     self._get_running_request_total_token_offset(running_req)
                 )
+                # Release the SWA budget reserved for this running request
+                self.swa_rem_total_token_offset -= self.sliding_window_size
                 release_counter += 1
                 self.running_batch.release_req(
                     i, len(self.running_batch.reqs) - release_counter, server_args

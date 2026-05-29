@@ -17,7 +17,7 @@ import logging
 import threading
 import time
 from queue import Empty, Full, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -262,6 +262,7 @@ class HiCacheController:
         pp_rank: int = 0,
         pp_size: int = 1,
         enable_storage_metrics: bool = False,
+        sliding_window_size: Optional[int] = None,
     ):
         self.tp_group = tp_group
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
@@ -289,6 +290,16 @@ class HiCacheController:
         self.pp_size = pp_size
         self.enable_storage_metrics = enable_storage_metrics
         self.metrics_collector = None
+        self.sliding_window_size = sliding_window_size
+
+        if is_dp_attention_enabled():
+            self.tp_rank = get_attention_tp_rank()
+            self.tp_size = get_attention_tp_size()
+            self.dp_rank = get_attention_dp_rank()
+        else:
+            self.tp_rank = get_tensor_model_parallel_rank()
+            self.tp_size = get_tensor_model_parallel_world_size()
+            self.dp_rank = 0
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -589,15 +600,6 @@ class HiCacheController:
         if storage_backend_extra_config is None:
             storage_backend_extra_config = {}
 
-        if is_dp_attention_enabled():
-            self.tp_rank = get_attention_tp_rank()
-            self.tp_size = get_attention_tp_size()
-            self.dp_rank = get_attention_dp_rank()
-        else:
-            self.tp_rank = get_tensor_model_parallel_rank()
-            self.tp_size = get_tensor_model_parallel_world_size()
-            self.dp_rank = 0
-
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         is_mla_backend = isinstance(self.mem_pool_device, MLATokenToKVPool)
         # Least Common Multiple among heterogeneous tp size
@@ -659,23 +661,47 @@ class HiCacheController:
             self.prefetch_thread.start()
             self.backup_thread.start()
 
+    def alloc_host(
+        self,
+        device_indices: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        swa_device_indices = (
+            self.mem_pool_device_allocator.translate_loc_from_full_to_swa(
+                device_indices
+            )
+        )
+        return self.mem_pool_host.alloc_host(device_indices, swa_device_indices)
+
+    def get_swa_host_indices(
+        self,
+        full_host_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.mem_pool_host.full_to_swa_index_mapping[full_host_indices]
+
+    def get_valid_swa_host_len(
+        self,
+        full_host_indices: torch.Tensor,
+    ) -> int:
+        swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[
+            full_host_indices
+        ]
+        return torch.count_nonzero(swa_host_indices).item()
+
     def write(
         self,
         device_indices: torch.Tensor,
+        host_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
-    ) -> Optional[torch.Tensor]:
+    ):
         """
         Back up KV caches from device memory to host memory.
         """
-        host_indices = self.mem_pool_host.alloc(len(device_indices))
-        if host_indices is None:
-            return None
+        assert host_indices is not None
         self.write_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
         self.start_writing()
-        return host_indices
 
     def start_writing(self) -> None:
         if len(self.write_queue) == 0:
@@ -720,22 +746,45 @@ class HiCacheController:
 
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
+    def alloc_device(
+        self,
+        host_indices: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], int, int]:
+        if self.sliding_window_size is not None and self.sliding_window_size > 0:
+            swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[
+                host_indices
+            ]
+            # TODO(yingchun): this assert has D2H op
+            assert swa_host_indices[-self.sliding_window_size :].min().item() > 0, (
+                f"Last {self.sliding_window_size} SWA slots must be valid, "
+                f"got {swa_host_indices[-self.sliding_window_size:].tolist()}"
+            )
+            discard = host_indices[: -self.sliding_window_size]
+            swa_discard = self.mem_pool_host.full_to_swa_index_mapping[discard]
+            swa_valid = swa_discard.bool()
+            if swa_valid.any():
+                self.mem_pool_host.swa_pool_host.free(swa_discard[swa_valid])
+            self.mem_pool_host.full_to_swa_index_mapping[discard] = 0
+
+        swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[host_indices]
+        return self.mem_pool_device_allocator.alloc_device(
+            host_indices, swa_host_indices
+        )
+
     def load(
         self,
         host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
     ) -> Optional[torch.Tensor]:
         """
         Load KV caches from host memory to device memory.
         """
-        device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
-        if device_indices is None:
-            return None
+        assert device_indices is not None
         self.load_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
-        return device_indices
 
     def move_indices(self, op: CacheOperation):
         host_indices, device_indices = op.host_indices, op.device_indices
@@ -818,9 +867,16 @@ class HiCacheController:
         )
         return producer_id
 
-    def evict_device(self, device_indices: torch.Tensor) -> int:
+    def evict_device(self, device_indices: torch.Tensor) -> Tuple[int, int]:
+        assert device_indices is not None
+        swa_device_indices = (
+            self.mem_pool_device_allocator.translate_loc_from_full_to_swa(
+                device_indices
+            )
+        )
+        swa_freed_size = torch.count_nonzero(swa_device_indices).item()
         self.mem_pool_device_allocator.free(device_indices)
-        return len(device_indices)
+        return len(device_indices), swa_freed_size
 
     def set_draft_kv_pool(
         self,
@@ -838,12 +894,17 @@ class HiCacheController:
             self.mem_pool_device_draft = draft_kv_pool
             self.mem_pool_host_draft = draft_host_kv_pool
 
-    def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
+    def evict_host(
+            self, host_indices: torch.Tensor, backup_only: bool = True
+    ) -> Tuple[int, int]:
+        assert host_indices is not None
         if not backup_only:
             raise ValueError("Other eviction policies are not supported yet.")
 
-        self.mem_pool_host.free(host_indices)
-        return len(host_indices)
+        freed = self.mem_pool_host.free(host_indices)
+        if isinstance(freed, tuple):
+            return int(freed[0]), int(freed[1])
+        return int(freed), 0
 
     def prefetch(
         self,

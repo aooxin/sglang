@@ -386,6 +386,33 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
         return alloc_full_indices
 
+    def alloc_device(
+        self, host_indices: torch.Tensor, swa_host_indices: torch.Tensor
+    ) -> Tuple[Optional[torch.Tensor], int, int]:
+        full_need_size = len(host_indices)
+        assert full_need_size % self.page_size == 0
+        assert len(host_indices) == len(swa_host_indices)
+
+        swa_valid_mask = swa_host_indices != 0
+        swa_need_size = int(swa_valid_mask.sum())
+        assert swa_need_size % self.page_size == 0
+
+        lack_full_size = full_need_size - self.full_attn_allocator.available_size()
+        lack_swa_size = swa_need_size - self.swa_attn_allocator.available_size()
+        if lack_full_size > 0 or lack_swa_size > 0:
+            return None, max(0, lack_full_size), max(0, lack_swa_size)
+
+        full_device_indices = self.full_attn_allocator.alloc(full_need_size)
+        assert full_device_indices is not None
+        swa_mapping = torch.zeros(full_need_size, dtype=torch.int64, device=self.device)
+        if swa_need_size > 0:
+            swa_device_indices = self.swa_attn_allocator.alloc(swa_need_size)
+            assert swa_device_indices is not None
+            swa_mapping[swa_valid_mask] = swa_device_indices
+        self.full_to_swa_index_mapping[full_device_indices] = swa_mapping
+
+        return full_device_indices, 0, 0
+
     def pre_alloc(self, need_size: int, chunked_size: int):
         # Pre-allocate KV cache for decode requests in PD-disaggregation mode.
         if need_size <= 0:
@@ -543,14 +570,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
-    def free_swa(self, free_index: torch.Tensor):
+    def free_swa(self, free_index: torch.Tensor) -> int:
         swa_indices = self.full_to_swa_index_mapping[free_index]
         # 已经被主动缩窗过的 full slot，其 mapping 会被清成 0。
         # 这里只释放 >0 的 live SWA slot，使 evict_swa()/cache_finished_req()
         # 可以重复经过同一个 full_index 而不触发 double free。
-        swa_indices = swa_indices[swa_indices > 0]
-        self.swa_attn_allocator.free(swa_indices)
+        swa_valid = swa_indices.bool()
+        swa_freed = int(swa_valid.sum())
+        if swa_freed > 0:
+            self.swa_attn_allocator.free(swa_indices[swa_valid])
         self.full_to_swa_index_mapping[free_index] = 0
+        return swa_freed
 
     def backup_state(self):
         return [

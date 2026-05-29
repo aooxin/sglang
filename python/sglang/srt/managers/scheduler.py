@@ -723,14 +723,15 @@ class Scheduler(
                 self.tp_worker.get_tokens_per_layer_info()
             )
             if self.enable_hierarchical_cache:
-                if self.tp_rank == 0:
-                    logger.warning(
-                        "Hierarchical cache is not supported with hybrid SWA KV cache. "
-                        "Falling back to SimpleSWARadixCache and disabling HiCache/HiCache storage "
-                        "to avoid SWA OOM and illegal memory access."
-                    )
-                self.enable_hierarchical_cache = False
-                self.enable_hicache_storage = False
+                if server_args.disaggregation_mode != DisaggregationMode.PREFILL.value:
+                    if self.tp_rank == 0:
+                        logger.warning(
+                            "Hierarchical cache is not supported with hybrid SWA KV cache. "
+                            "Falling back to SimpleSWARadixCache and disabling HiCache/HiCache storage "
+                            "to avoid SWA OOM and illegal memory access."
+                        )
+                    self.enable_hierarchical_cache = False
+                    self.enable_hicache_storage = False
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
@@ -797,6 +798,20 @@ class Scheduler(
                     self.tree_cache = HiMambaRadixCache(
                         params=params, server_args=server_args
                     )
+                elif self.is_hybrid_swa:
+                    # hybrid + HiCache: use HiSimpleSWARadixCache for L2/L3 + SWA.
+                    from sglang.srt.mem_cache.hiradix_cache import HiSimpleSWARadixCache
+
+                    self.tree_cache = HiSimpleSWARadixCache(
+                        params=params,
+                        # TODO(yingchun): 不需要 server_args
+                        server_args=server_args,
+                    )
+                    self.tp_worker.register_hicache_layer_transfer_counter(
+                        self.tree_cache.cache_controller.layer_done_counter
+                    )
+                    if self.spec_algorithm.is_eagle():
+                        self._register_draft_kv_pool_for_hicache(server_args)
                 else:
                     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 
@@ -806,10 +821,12 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
-            elif self.is_hybrid_swa and server_args.disaggregation_mode == DisaggregationMode.PREFILL.value:
+            elif self.is_hybrid_swa:
+                # from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+                #
+                # self.tree_cache = SWARadixCache(params=params)
                 self.tree_cache = SimpleSWARadixCache(
                     params=params,
-                    speculative_num_steps=server_args.speculative_num_steps,
                 )
                 if self.spec_algorithm.is_eagle():
                     self._register_draft_kv_pool_for_hicache(server_args)
@@ -1030,6 +1047,7 @@ class Scheduler(
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                device=kv_pool.device,
             )
         else:
             logger.warning(
@@ -2509,6 +2527,7 @@ class Scheduler(
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
+            sliding_window_size=self.sliding_window_size if self.is_hybrid_swa else 0,
         )
 
         if self.chunked_req is not None:

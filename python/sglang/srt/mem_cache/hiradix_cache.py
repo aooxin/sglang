@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import abc
 import atexit
 import heapq
 import json
@@ -43,7 +44,11 @@ from sglang.srt.mem_cache.radix_cache import (
     compute_node_hash_values,
     split_node_hash_value,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.simple_swa_radix_cache import (
+    SimpleSWARadixCache,
+    compute_swa_safe_len,
+)
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.utils import convert_to_steps_key
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 
@@ -53,8 +58,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+"""
+从根到叶，状态严格按照 backuped → device_only → evicted 的顺序排列，每段都可以为空，但不会交替出现。
+具体约束：
+1. evicted 只出现在连续的尾部段（eviction 从叶向根传播）
+2. evicted 节点必有 host backup（无 backup 的节点被 `_evict_regular` 直接删除）
+3. backuped(device+host) 从根部开始连续（祖先 hit_count >= 子孙 hit_count）
+4. device_only 在 backuped 和 evicted 之间（已达到 device 但还没达到 backup 阈值的节点）
 
-class HiRadixCache(RadixCache):
+"""
+
+
+class BaseHiRadixCache(abc.ABC):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
@@ -97,10 +112,11 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
+                device=params.token_to_kv_pool_allocator.device,
                 allocator_type=server_args.hicache_storage_backend,
             )
         else:
-            raise ValueError(f"HiRadixCache only supports MHA, MLA and SWA yet")
+            raise ValueError(f"BaseHiRadixCache only supports MHA, MLA and SWA yet")
 
         self.tp_group = params.tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
@@ -139,6 +155,7 @@ class HiRadixCache(RadixCache):
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             enable_storage_metrics=self.enable_storage_metrics,
+            sliding_window_size=params.sliding_window_size,
         )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -150,6 +167,57 @@ class HiRadixCache(RadixCache):
             enable_storage_metrics=self.enable_storage_metrics,
             extra_metric_labels=self.extra_metric_labels,
         )
+
+        self.enable_hicache_metrics = self._enable_metrics_flag
+        if self.enable_hicache_metrics:
+            from prometheus_client import Counter
+
+            hicache_labels = {
+                "tp_rank": self.cache_controller.tp_rank,
+                "dp_rank": self.cache_controller.dp_rank,
+            }
+            self._hicache_labels = hicache_labels
+
+            self._write_backup_host_full_alloc_retry_total = Counter(
+                name="sglang:write_backup_host_full_alloc_retry_total",
+                documentation="Number of write_backup retries triggered by insufficient full-attention host memory.",
+                labelnames=hicache_labels.keys(),
+            )
+            self._write_backup_host_swa_alloc_retry_total = Counter(
+                name="sglang:write_backup_host_swa_alloc_retry_total",
+                documentation="Number of write_backup retries triggered by insufficient SWA host memory.",
+                labelnames=hicache_labels.keys(),
+            )
+            self._load_back_device_full_alloc_retry_total = Counter(
+                name="sglang:load_back_device_full_alloc_retry_total",
+                documentation="Number of load_back retries triggered by insufficient full-attention device memory.",
+                labelnames=hicache_labels.keys(),
+            )
+            self._load_back_device_swa_alloc_retry_total = Counter(
+                name="sglang:load_back_device_swa_alloc_retry_total",
+                documentation="Number of load_back retries triggered by insufficient SWA device memory.",
+                labelnames=hicache_labels.keys(),
+            )
+            self._write_backup_host_full_alloc_failure_total = Counter(
+                name="sglang:write_backup_host_full_alloc_failure_total",
+                documentation="Number of write_backup failures due to insufficient full-attention host memory.",
+                labelnames=hicache_labels.keys(),
+            )
+            self._write_backup_host_swa_alloc_failure_total = Counter(
+                name="sglang:write_backup_host_swa_alloc_failure_total",
+                documentation="Number of write_backup failures due to insufficient SWA host memory.",
+                labelnames=hicache_labels.keys(),
+            )
+            self._load_back_device_full_alloc_failure_total = Counter(
+                name="sglang:load_back_device_full_alloc_failure_total",
+                documentation="Number of load_back failures due to insufficient full-attention device memory.",
+                labelnames=hicache_labels.keys(),
+            )
+            self._load_back_device_swa_alloc_failure_total = Counter(
+                name="sglang:load_back_device_swa_alloc_failure_total",
+                documentation="Number of load_back failures due to insufficient SWA device memory.",
+                labelnames=hicache_labels.keys(),
+            )
 
         # record the nodes with ongoing write through
         self.ongoing_write_through = {}
@@ -620,33 +688,101 @@ class HiRadixCache(RadixCache):
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
 
+    def _log_write_backup_host_alloc_retry(
+        self, lack_full: bool, lack_swa: bool
+    ) -> None:
+        if lack_full:
+            self._write_backup_host_full_alloc_retry_total.labels(
+                **self._hicache_labels
+            ).inc(1)
+        if lack_swa:
+            self._write_backup_host_swa_alloc_retry_total.labels(
+                **self._hicache_labels
+            ).inc(1)
+
+    def _log_write_backup_host_alloc_failure(
+        self, lack_full: bool, lack_swa: bool
+    ) -> None:
+        if lack_full:
+            self._write_backup_host_full_alloc_failure_total.labels(
+                **self._hicache_labels
+            ).inc(1)
+        if lack_swa:
+            self._write_backup_host_swa_alloc_failure_total.labels(
+                **self._hicache_labels
+            ).inc(1)
+
+    def _log_load_back_device_alloc_retry(
+        self, lack_full: bool, lack_swa: bool
+    ) -> None:
+        if lack_full:
+            self._load_back_device_full_alloc_retry_total.labels(
+                **self._hicache_labels
+            ).inc(1)
+        if lack_swa:
+            self._load_back_device_swa_alloc_retry_total.labels(
+                **self._hicache_labels
+            ).inc(1)
+
+    def _log_load_back_device_alloc_failure(
+        self, lack_full: bool, lack_swa: bool
+    ) -> None:
+        if lack_full:
+            self._load_back_device_full_alloc_failure_total.labels(
+                **self._hicache_labels
+            ).inc(1)
+        if lack_swa:
+            self._load_back_device_swa_alloc_failure_total.labels(
+                **self._hicache_labels
+            ).inc(1)
+
     def write_backup(self, node: TreeNode, write_back=False):
-        host_indices = self.cache_controller.write(
+        full_host_indices, lack_full_size, lack_swa_size = (
+            self.cache_controller.alloc_host(
+                device_indices=node.value,
+            )
+        )
+        if full_host_indices is None:
+            assert lack_full_size > 0 or lack_swa_size > 0
+            if self.enable_hicache_metrics:
+                self._log_write_backup_host_alloc_retry(
+                    lack_full=lack_full_size > 0,
+                    lack_swa=lack_swa_size > 0,
+                )
+            self.evict_host(lack_full_size, lack_swa_size)
+            full_host_indices, lack_full_size, lack_swa_size = (
+                self.cache_controller.alloc_host(
+                    device_indices=node.value,
+                )
+            )
+        if full_host_indices is None:
+            if self.enable_hicache_metrics:
+                self._log_write_backup_host_alloc_failure(
+                    lack_full=lack_full_size > 0,
+                    lack_swa=lack_swa_size > 0,
+                )
+            return 0, 0
+
+        self.cache_controller.write(
             device_indices=node.value,
+            host_indices=full_host_indices,
             node_id=node.id,
         )
-        if host_indices is None:
-            self.evict_host(len(node.value))
-            host_indices = self.cache_controller.write(
-                device_indices=node.value,
-                node_id=node.id,
-            )
-        if host_indices is not None:
-            node.host_value = host_indices.clone()
-            assert len(node.host_value) > 0
-            self.ongoing_write_through[node.id] = {
-                "node": node,
-                "key": RadixKey(token_ids=node.key.token_ids),
-                "hash_value": list(node.hash_value) if node.hash_value else None,
-                "host_value": host_indices,
-            }
-            if not write_back:
-                # no need to lock nodes if write back
-                self.inc_lock_ref(node)
-        else:
-            return 0
+        node.host_value = full_host_indices
+        assert len(node.host_value) > 0
+        self.ongoing_write_through[node.id] = {
+            "node": node,
+            "key": RadixKey(token_ids=node.key.token_ids),
+            "hash_value": list(node.hash_value) if node.hash_value else None,
+            "host_value": full_host_indices,
+        }
+        if not write_back:
+            # no need to lock nodes if write back
+            self.inc_lock_ref(node)
 
-        return len(host_indices)
+        return len(full_host_indices), self.cache_controller.get_valid_swa_host_len(
+            full_host_indices
+        )
 
     def write_backup_storage(self, node: TreeNode):
         prefix_keys = (
@@ -814,16 +950,20 @@ class HiRadixCache(RadixCache):
 
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
-        num_tokens = params.num_tokens
+        full_num_tokens = params.num_tokens
+        swa_num_tokens = params.swa_num_tokens
         leaves = list(self.evictable_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
-        num_evicted = 0
+        full_evicted = 0
+        swa_evicted = 0
         write_back_nodes = []
-        while num_evicted < num_tokens and len(eviction_heap):
+        while (full_evicted < full_num_tokens or swa_evicted < swa_num_tokens) and len(
+            eviction_heap
+        ):
             _priority, x = heapq.heappop(eviction_heap)
 
             if x.lock_ref > 0:
@@ -832,12 +972,18 @@ class HiRadixCache(RadixCache):
             if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
-                    num_evicted += self.write_backup(x, write_back=True)
+                    freed_full, freed_swa = self.write_backup(x, write_back=True)
+                    full_evicted += freed_full
+                    swa_evicted += freed_swa
                     write_back_nodes.append(x)
                 else:
-                    num_evicted += self._evict_regular(x)
+                    freed_full, freed_swa = self._evict_regular(x)
+                    full_evicted += freed_full
+                    swa_evicted += freed_swa
             else:
-                num_evicted += self._evict_backuped(x)
+                freed_full, freed_swa = self._evict_backuped(x)
+                full_evicted += freed_full
+                swa_evicted += freed_swa
 
             for child in x.parent.children.values():
                 if child in write_back_nodes:
@@ -855,42 +1001,61 @@ class HiRadixCache(RadixCache):
                 assert node.backuped
                 self._evict_backuped(node)
 
-        self.update_eviction_metrics(num_evicted, start_time)
-        return EvictResult(num_tokens_evicted=num_evicted)
+        if full_evicted < full_num_tokens or swa_evicted < swa_num_tokens:
+            logger.info(
+                f"Evicted {full_evicted}/{full_num_tokens} full tokens and "
+                f"{swa_evicted}/{swa_num_tokens} swa tokens from device cache"
+            )
+
+        self.update_eviction_metrics(full_evicted + swa_evicted, start_time)
+        return EvictResult(
+            num_tokens_evicted=full_evicted, swa_num_tokens_evicted=swa_evicted
+        )
 
     def _evict_backuped(self, node: TreeNode):
         # GPU -> CPU demotion: no BlockRemoved since block is still reachable via load_back
-        num_evicted = self.cache_controller.evict_device(node.value)
-        assert num_evicted > 0
-        self.evictable_size_ -= num_evicted
+        full_evicted, swa_evicted = self.cache_controller.evict_device(node.value)
+        assert full_evicted > 0
+        self.evictable_size_ -= full_evicted
+        # TODO(yingchun): swa_evictable_size 是在 SimpleSWARadixCache 的 _collect_swa_sizes() 中动态计算的，那里的实时计算会更费一些。这里可以优化？
         node.value = None
         self._update_leaf_status(node)
         self._update_host_leaf_status(node)
         # update leaf status for the parent because the node is evicted
         self._update_leaf_status(node.parent)
-        return num_evicted
+        return full_evicted, swa_evicted
 
     def _evict_regular(self, node: TreeNode):
         # evict a node not initiated write to host -- emit BlockRemoved
         self._record_remove_event(node)
+        # TODO(yingchun): 使用 cache_controller.evict_device() 重构
+        swa_device_indices = (
+            self.cache_controller.mem_pool_device_allocator.translate_loc_from_full_to_swa(
+                node.value
+            )
+        )
         self.cache_controller.mem_pool_device_allocator.free(node.value)
-        num_evicted = len(node.value)
+        full_evicted = len(node.value)
+        swa_evicted = torch.count_nonzero(swa_device_indices).item()
         self._delete_leaf(node)
-        return num_evicted
+        return full_evicted, swa_evicted
 
-    def evict_host(self, num_tokens: int):
+    def evict_host(self, full_num_tokens: int, swa_num_tokens: int = 0):
         leaves = list(self.evictable_host_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
-        num_evicted = 0
-        while num_evicted < num_tokens and len(eviction_heap):
+        full_evicted = 0
+        swa_evicted = 0
+        while (full_evicted < full_num_tokens or swa_evicted < swa_num_tokens) and len(
+            eviction_heap
+        ):
             _priority, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
                 break
-            # only evict the host value of evicted nodes
+            # only evict host value of already-evicted nodes
             if not x.evicted:
                 continue
 
@@ -900,7 +1065,9 @@ class HiRadixCache(RadixCache):
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit BlockRemoved so the router removes this block from its index.
             self._record_remove_event(x)
-            num_evicted += self.cache_controller.evict_host(x.host_value)
+            freed_full, freed_swa = self.cache_controller.evict_host(x.host_value)
+            full_evicted += freed_full
+            swa_evicted += freed_swa
 
             key = self.get_child_key_fn(x.key)
             v = x.parent.children.pop(key, None)
@@ -927,10 +1094,10 @@ class HiRadixCache(RadixCache):
             nodes_to_load.insert(0, node)
             node = node.parent
         else:
-            ancester_node = node
+            ancestor_node = node
 
         # protect the ancestor nodes from eviction
-        result = self.inc_lock_ref(ancester_node)
+        result = self.inc_lock_ref(ancestor_node)
         delta = result.delta
 
         # load it all or not at all
@@ -939,20 +1106,36 @@ class HiRadixCache(RadixCache):
             len(host_indices) > mem_quota + delta if mem_quota is not None else False
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
-            self.dec_lock_ref(ancester_node)
+            self.dec_lock_ref(ancestor_node)
             return None
 
-        device_indices = self.cache_controller.load(
-            host_indices=host_indices, node_id=last_hit_node.id
-        )
-        if device_indices is None:
-            self.evict(EvictParams(num_tokens=len(host_indices)))
-            device_indices = self.cache_controller.load(
-                host_indices=host_indices, node_id=last_hit_node.id
+        full_device_indices, lack_full_size, lack_swa_size = (
+            self.cache_controller.alloc_device(
+                host_indices=host_indices,
             )
-        self.dec_lock_ref(ancester_node)
-        if device_indices is None:
-            # no sufficient GPU memory to load back KV caches
+        )
+        if full_device_indices is None:
+            assert lack_full_size > 0 or lack_swa_size > 0
+            if self.enable_hicache_metrics:
+                self._log_load_back_device_alloc_retry(
+                    lack_full=lack_full_size > 0,
+                    lack_swa=lack_swa_size > 0,
+                )
+            self.evict(EvictParams(num_tokens=lack_full_size, swa_num_tokens=lack_swa_size))
+            full_device_indices, lack_full_size, lack_swa_size = (
+                self.cache_controller.alloc_device(
+                    host_indices=host_indices,
+                )
+            )
+
+        # no sufficient GPU memory to load back KV caches
+        if full_device_indices is None:
+            if self.enable_hicache_metrics:
+                self._log_load_back_device_alloc_failure(
+                    lack_full=lack_full_size > 0,
+                    lack_swa=lack_swa_size > 0,
+                )
+            self.dec_lock_ref(ancestor_node)
             logger.warning(
                 "load_back: FAILED to load %d tokens for node %d "
                 "even after eviction (evictable_size=%d)",
@@ -962,21 +1145,33 @@ class HiRadixCache(RadixCache):
             )
             return None
 
+        self.cache_controller.load(
+            host_indices=host_indices,
+            device_indices=full_device_indices,
+            node_id=last_hit_node.id,
+        )
+        self.dec_lock_ref(ancestor_node)
+
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
         for node in nodes_to_load:
-            node.value = device_indices[offset : offset + len(node.host_value)].clone()
+            node.value = full_device_indices[
+                offset : offset + len(node.host_value)
+            ].clone()
             offset += len(node.host_value)
-        self.evictable_size_ += len(device_indices)
+        self.evictable_size_ += len(full_device_indices)
+        # TODO(yingchun): swa_evictable_size 同上
         self.inc_lock_ref(last_hit_node)
 
         if self.metrics_collector is not None:
             self.metrics_collector.observe_load_back_duration(
                 time.perf_counter() - start_time
             )
-            self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
+            self.metrics_collector.increment_load_back_num_tokens(
+                len(full_device_indices)
+            )
 
-        return device_indices
+        return full_device_indices
 
     def init_load_back(
         self,
@@ -1201,17 +1396,21 @@ class HiRadixCache(RadixCache):
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
+        # 在 tree 上 (device and/or host) 匹配前缀，得到 device 上的命中结果和最后一个匹配的 node（可能是 evicted 状态，即仅 host 上有）
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
             value = torch.cat(value)
         else:
             value = empty_value
 
+        # (无 device + 有 host) 的情况，需要从 host 上数有多少 token 是命中的
         host_hit_length = 0
         last_host_node = last_node
+        # 从 tree 上匹配到的节点向 root 回溯，找出需要从 host 上 load back 的长度（host_hit_length），更新在 device 上的最后一个节点（last_node）
         while last_node.evicted:
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
+        # 从 tree 上匹配到的节点向 root 回溯，找出已在 host 上 backuped 的最后一个节点（last_host_node）
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
 
@@ -1310,6 +1509,7 @@ class HiRadixCache(RadixCache):
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
         child_key = self.get_child_key_fn(key)
+        # 收集的是 device 上的数据
         value = []
 
         while len(key) > 0 and child_key in node.children.keys():
@@ -1463,3 +1663,272 @@ class HiRadixCache(RadixCache):
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+
+
+def _collect_evicted_host_indices(
+    last_host_node: TreeNode, last_device_node: TreeNode
+) -> torch.Tensor:
+    """
+    Collect host_value indices from evicted nodes on the matched path.
+
+    When ``host_hit_length > 0``, ``last_host_node`` in the MatchResult is
+    the actual match endpoint (deepest matched node, which is evicted and
+    therefore always backuped). ``last_device_node`` is the first non-evicted
+    ancestor found by walking up.
+
+    We walk UP from ``last_host_node`` to ``last_device_node``, collecting
+    each evicted node's ``host_value`` in reverse, then reverse the list to
+    get root-to-leaf order. This avoids the ambiguity of walking DOWN through
+    potentially branching children.
+    """
+
+    host_values = []
+    node = last_host_node
+    while node is not last_device_node:
+        assert node.evicted, "Only evicted nodes should be traversed for host indices"
+        assert node.backuped, "Evicted node must have host backup"
+        host_values.append(node.host_value)
+        node = node.parent
+
+    if not host_values:
+        raise RuntimeError(
+            "_collect_evicted_host_indices called with last_host_node == "
+            "last_device_node; expected at least one evicted node in between."
+        )
+
+    # Reverse to get root-to-leaf order
+    host_values.reverse()
+    return torch.cat(host_values)
+
+
+class HiRadixCache(BaseHiRadixCache, RadixCache):
+    pass
+
+
+class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
+    """
+    BaseHiRadixCache with SWA-aware prefix matching.
+
+    Combines BaseHiRadixCache's hierarchical (device → host → storage) KV cache
+    management with SimpleSWARadixCache's SWA safety checking.
+
+    For a matched prefix to be reusable, the SWA (Sliding Window Attention)
+    mappings in the tail window must all be valid (non-zero). This applies to
+    both:
+    - **Device-resident** portion: checked via the device allocator's
+      ``full_to_swa_index_mapping``.
+    - **Host-resident** portion (evicted nodes to be loaded back): checked via
+      the host pool's ``full_to_swa_index_mapping``, since ``alloc_device()``
+      will restore SWA mappings from the host mapping during load-back.
+    """
+
+    def __init__(
+        self,
+        params: CacheInitParams,
+        server_args: ServerArgs,
+    ):
+        # Validate SWA-specific preconditions before BaseHiRadixCache initialization
+        # (BaseHiRadixCache will allocate host pool / cache controller; we want to
+        # fail fast if the allocator type is wrong).
+        assert isinstance(
+            params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+        ), (
+            f"HiSimpleSWARadixCache requires SWATokenToKVPoolAllocator, "
+            f"got {type(params.token_to_kv_pool_allocator)}"
+        )
+        assert (
+            params.sliding_window_size is not None and params.sliding_window_size > 0
+        ), f"sliding_window_size must be positive, got {params.sliding_window_size}"
+
+        # Initialize BaseHiRadixCache (which initializes RadixCache via super()).
+        # We don't chain through SimpleSWARadixCache.__init__ because it would
+        # re-invoke RadixCache.__init__ via its own super(); instead we set the
+        # SimpleSWA-specific fields manually below to avoid double init.
+        BaseHiRadixCache.__init__(self, params, server_args)
+
+        # SimpleSWA-specific state mirrored from SimpleSWARadixCache.__init__.
+        self.sliding_window_size = params.sliding_window_size
+        self.swa_active_freed_tokens: int = 0
+        self.swa_evicted_from_tree: int = 0
+        self.full_evicted_from_tree: int = 0
+        self._last_raw_match_len: int = 0
+
+        # Force load_back_threshold to 0 for SWA mode: any host-resident hit
+        # must be loaded back to device before it can be safely reused, since
+        # SWA validity is checked across the combined device+host prefix.
+        self.load_back_threshold = 0
+        logger.warning(
+            "Initializing HiSimpleSWARadixCache and force set load_back_threshold = 0"
+        )
+
+    def _compute_safe_prefix_len(
+        self, full_matched_result: MatchResult
+    ) -> tuple[int, int]:
+        """Compute the SWA-safe prefix length for both device and host portions.
+
+        The full matched prefix consists of two contiguous parts:
+          [device_indices (on GPU)] [host-only evicted nodes (to be loaded back)]
+
+        For the combined prefix of length ``total_len = device_len + host_len``,
+        the tail window ``[max(0, total_len - sliding_window_size), total_len)``
+        must have valid SWA mappings. Delegates to ``compute_swa_safe_len()``
+        for the core sliding-window validity check.
+
+        Returns:
+            A tuple ``(swa_safe_device_len, swa_safe_host_len)`` where:
+
+            - **swa_safe_device_len** (int): Number of leading device_indices
+              that are SWA-safe.  Always ``<= device_len``.
+            - **swa_safe_host_len** (int):
+              - ``int >= 0`` — the number of host tokens (counted from the
+                device/host boundary toward the leaf) that are SWA-safe.
+                ``0`` means no host portion is usable.  Note that when
+                ``swa_safe_device_len < device_len``, ``swa_safe_host_len``
+                will always be ``0`` because trimming the device portion
+                invalidates the host portion as well.
+        """
+        device_indices = full_matched_result.device_indices
+        device_len = len(device_indices)
+        host_hit_length = full_matched_result.host_hit_length
+        total_len = device_len + host_hit_length
+
+        # 1. Fast path: nothing matched, return immediately without any SWA checks
+        if total_len == 0:
+            assert (
+                device_len == 0 and host_hit_length == 0
+            ), f"{device_len=}, {host_hit_length=}"
+            return 0, 0
+
+        # 2. Build the combined SWA index vector for the full matched prefix.
+        swa_parts = []
+
+        # 2.1 Device portion: lookup from device allocator's mapping.
+        if device_len > 0:
+            device_swa = self.token_to_kv_pool_allocator.full_to_swa_index_mapping[
+                device_indices
+            ]
+            swa_parts.append(device_swa)
+
+        # 2.2 Host portion: lookup from host pool's mapping (keyed by host_value indices).
+        if host_hit_length > 0:
+            # Collect host_value indices from the evicted tail nodes.
+            # When host_hit_length > 0, last_host_node is the actual match
+            # endpoint (deepest evicted node), and last_device_node is the
+            # first non-evicted ancestor. Walk UP from last_host_node to
+            # last_device_node to collect host_indices.
+            host_indices = _collect_evicted_host_indices(
+                full_matched_result.last_host_node,
+                full_matched_result.last_device_node,
+            )
+            assert (
+                host_hit_length == host_indices.numel()
+            ), f"{host_hit_length=}, {host_indices.numel()=}"
+            host_swa = self.cache_controller.get_swa_host_indices(host_indices)
+            swa_parts.append(host_swa)
+
+        swa_indices = torch.cat(swa_parts) if len(swa_parts) > 1 else swa_parts[0]
+        assert len(swa_indices) == total_len, f"{len(swa_indices)=}, {total_len=}"
+
+        # 3. Delegate to the shared SWA safety check algorithm.
+        safe_total_len = compute_swa_safe_len(swa_indices, self.sliding_window_size)
+        assert safe_total_len <= total_len, f"{safe_total_len=}, {total_len=}"
+
+        # 4. Split the safe length back into device and host portions.
+        safe_device_len = min(safe_total_len, device_len)
+        safe_host_len = max(0, safe_total_len - device_len)
+        return safe_device_len, safe_host_len
+
+    def match_prefix(self, params):
+        """SWA-aware match: trim either device or host portion based on SWA validity.
+
+        ``params`` is a ``MatchPrefixParams`` (current API). We delegate to
+        ``BaseHiRadixCache.match_prefix`` for the raw tree match (which returns a
+        ``MatchResult`` with possibly-non-empty ``host_hit_length``), then apply
+        SWA safety checks to trim either the device portion or the host portion.
+        """
+        assert self.load_back_threshold == 0
+
+        full_matched_result = BaseHiRadixCache.match_prefix(self, params)
+
+        device_len = len(full_matched_result.device_indices)
+        host_hit_length = full_matched_result.host_hit_length
+
+        if device_len + host_hit_length == 0:
+            assert (
+                device_len == 0 and host_hit_length == 0
+            ), f"{device_len=}, {host_hit_length=}"
+            return full_matched_result
+
+        swa_safe_device_len, swa_safe_host_len = self._compute_safe_prefix_len(
+            full_matched_result
+        )
+
+        # Trim device_indices if needed.
+        if swa_safe_device_len < device_len:
+            assert (
+                swa_safe_host_len == 0
+            ), f"When device needs trimming, host must be 0: {swa_safe_host_len=}"
+            if swa_safe_device_len == 0:
+                # Nothing is SWA-safe — return empty match at root.
+                return MatchResult(
+                    device_indices=torch.empty(
+                        (0,), dtype=torch.int64, device=self.device
+                    ),
+                    last_device_node=self.root_node,
+                    last_host_node=self.root_node,
+                    host_hit_length=0,
+                )
+            else:
+                # Re-match with the safe token length to get correct
+                # last_device_node and last_host_node references.
+                if self.is_eagle:
+                    safe_token_len = swa_safe_device_len + self.speculative_num_steps
+                else:
+                    safe_token_len = swa_safe_device_len
+                key = params.key
+                safe_params = MatchPrefixParams(
+                    key=RadixKey(list(key.token_ids)[:safe_token_len], key.extra_key),
+                    req=params.req,
+                )
+                # TODO(yingchun): 优化这个二次 match_prefix
+                return BaseHiRadixCache.match_prefix(self, safe_params)
+        else:
+            assert (
+                swa_safe_device_len == device_len
+            ), f"{swa_safe_device_len=}, {device_len=}"
+            # Device portion is fully safe; trim the host portion.
+            assert (
+                0 <= swa_safe_host_len <= host_hit_length
+            ), f"{swa_safe_host_len=} must be in [0, {host_hit_length=}]"
+            # Walk UP from the match endpoint (last_host_node) to find the
+            # correct cutoff. Accumulate host_value lengths from the leaf end;
+            # the amount to to_discard is (host_hit_length - swa_safe_host_len).
+            to_discard = host_hit_length - swa_safe_host_len
+            new_last_host_node = full_matched_result.last_host_node
+            discarded = 0
+            adjusted_host_len = swa_safe_host_len
+            while discarded < to_discard:
+                assert new_last_host_node.evicted
+                node_len = len(new_last_host_node.host_value)
+                if discarded + node_len <= to_discard:
+                    discarded += node_len
+                    new_last_host_node = new_last_host_node.parent
+                else:
+                    # Safe boundary falls within this node. We can't
+                    # partially use a node's host_value, so round the
+                    # safe length down to the previous node boundary.
+                    adjusted_host_len -= to_discard - discarded
+                    new_last_host_node = new_last_host_node.parent
+                    break
+
+            new_host_hit = adjusted_host_len
+            return MatchResult(
+                device_indices=full_matched_result.device_indices,
+                last_device_node=full_matched_result.last_device_node,
+                last_host_node=(
+                    new_last_host_node
+                    if new_host_hit > 0
+                    else full_matched_result.last_device_node
+                ),
+                host_hit_length=new_host_hit,
+            )

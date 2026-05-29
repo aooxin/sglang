@@ -52,6 +52,7 @@ class PrefillStats:
 
     log_input_tokens: int
     log_hit_tokens: int
+    log_host_hit_tokens: int
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
@@ -66,6 +67,7 @@ class PrefillStats:
         return cls(
             log_input_tokens=adder.log_input_tokens,
             log_hit_tokens=adder.log_hit_tokens,
+            log_host_hit_tokens=getattr(adder, "log_host_hit_tokens", 0),
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
@@ -398,6 +400,7 @@ class SchedulerMetricsMixin:
             f"#new-seq: {prefill_stats.num_new_seqs}, "
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
+            f"[ host-hit-token: {prefill_stats.log_host_hit_tokens}, device-hit-token:{prefill_stats.log_hit_tokens - prefill_stats.log_host_hit_tokens}] "
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.waiting_queue)}, "

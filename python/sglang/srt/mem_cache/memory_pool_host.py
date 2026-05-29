@@ -127,7 +127,7 @@ def alloc_with_host_register(
     if dims is not None:
         assert k_dims is None
         assert v_dims is None
-        buffer = allocator.allocate(dims, dtype=dtype, device=device)
+        buffer = allocator.allocate(dims, dtype=dtype, device="cpu")
         if pin_memory:
             torch.cuda.cudart().cudaHostRegister(
                 buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
@@ -135,8 +135,8 @@ def alloc_with_host_register(
     else:
         assert k_dims is not None
         assert v_dims is not None
-        k_buffer = allocator.allocate(k_dims, dtype=dtype, device=device)
-        v_buffer = allocator.allocate(v_dims, dtype=dtype, device=device)
+        k_buffer = allocator.allocate(k_dims, dtype=dtype, device="cpu")
+        v_buffer = allocator.allocate(v_dims, dtype=dtype, device="cpu")
         buffer = [k_buffer, v_buffer]
         if pin_memory:
             for cache in buffer:
@@ -287,10 +287,23 @@ class HostKVCache(abc.ABC):
         self.mem_state = torch.zeros(
             (self.size,), dtype=torch.uint8, device=self.device
         )
-        self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        # Pre-allocate a fixed-size buffer for free slot management.
+        # Instead of using torch.cat on every free() call (which allocates a
+        # new tensor each time and causes GPU memory fragmentation / OOM),
+        # we keep a fixed buffer and track head/tail pointers.  alloc() takes
+        # from the head, free() appends to the tail — both are in-place
+        # writes with zero allocation.
+        self._free_slots_buf = torch.arange(
+            self.page_size,
+            self.size + self.page_size,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._free_slots_head = 0
+        self._free_slots_tail = len(self._free_slots_buf)
 
     def available_size(self):
-        return len(self.free_slots)
+        return self._free_slots_tail - self._free_slots_head
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
@@ -300,15 +313,33 @@ class HostKVCache(abc.ABC):
         if need_size > self.available_size():
             return None
 
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
+        select_index = self._free_slots_buf[
+            self._free_slots_head : self._free_slots_head + need_size
+        ].clone()
+        self._free_slots_head += need_size
 
         return select_index
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        self.free_slots = torch.cat([self.free_slots, indices.cpu()])
-        return len(indices)
+        n = len(indices)
+        if n == 0:
+            return 0
+        # If tail would exceed buffer capacity, compact by shifting the
+        # live region back to the front.  This happens rarely (only when
+        # cumulative alloc+free cycles exhaust the index space).
+        if self._free_slots_tail + n > len(self._free_slots_buf):
+            live = self._free_slots_tail - self._free_slots_head
+            if live > 0:
+                self._free_slots_buf[:live] = self._free_slots_buf[
+                    self._free_slots_head : self._free_slots_tail
+                ].clone()
+            self._free_slots_head = 0
+            self._free_slots_tail = live
+        # Append freed indices to the tail (in-place, no alloc).
+        self._free_slots_buf[self._free_slots_tail : self._free_slots_tail + n] = indices
+        self._free_slots_tail += n
+        return n
 
 
 class MHATokenToKVPoolHost(HostKVCache):
@@ -417,13 +448,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             dims = None
             if self.layout == "page_first":
                 k_dims = (
-                    self.size,
+                    self.size + self.page_size,
                     self.layer_num,
                     self.head_num,
                     self.head_dim,
                 )
                 v_dims = (
-                    self.size,
+                    self.size + self.page_size,
                     self.layer_num,
                     self.head_num,
                     self.v_head_dim,
@@ -715,7 +746,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         return torch.zeros(
             (2, self.layer_num, self.page_size, self.head_num, self.head_dim),
             dtype=self.dtype,
-            device=self.device,
+            device="cpu",
             pin_memory=self.pin_memory,
         ).flatten()
 
@@ -1237,7 +1268,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                 self.kv_cache_dim,
             ),
             dtype=self.dtype,
-            device=self.device,
+            device="cpu",
             pin_memory=self.pin_memory,
         ).flatten()
 
@@ -2101,7 +2132,7 @@ class SWATokenToKVPoolHost:
             page_size=page_size,
             layout=layout,
             pin_memory=pin_memory,
-            device=device,
+            device=self.device,
             allocator_type=allocator_type,
         )
 
@@ -2113,8 +2144,25 @@ class SWATokenToKVPoolHost:
             page_size=page_size,
             layout=layout,
             pin_memory=pin_memory,
-            device=device,
+            device=self.device,
             allocator_type=allocator_type,
+        )
+        # TODO(yingchun): 从 SWATokenToKVPoolAllocator 拷过来的，还不确定最后的 -1 的意义
+        # Note: append one more item of value -1 in the end so -1 maps to -1.
+        # It is needed for the last_loc in alloc_extend, where the first full_last_loc
+        # is -1, and we need to map it to swa_last_loc -1 as well.
+        # Mapping must be sized by the ACTUAL host pool capacity (self.full_pool_host.size),
+        # not the raw host_size argument. host_size may be interpreted as bytes/GB in
+        # HostKVCache and converted to token slots, so using raw host_size can under-allocate.
+        self.full_to_swa_index_mapping = torch.cat(
+            [
+                torch.zeros(
+                    self.full_pool_host.size + self.page_size,
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                torch.tensor([-1], dtype=torch.int64, device=device),
+            ]
         )
         # {global_layer_id: (pool_layer_id, is_swa_layer)}
         self.layers_mapping = self.device_pool.layers_mapping
@@ -2135,32 +2183,84 @@ class SWATokenToKVPoolHost:
         return self.full_pool_host.available_size()
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        full_select_index = self.full_pool_host.alloc(need_size)
-        swa_select_index = self.swa_pool_host.alloc(need_size)
-        assert (full_select_index is None) == (swa_select_index is None)
-        if full_select_index is not None:
-            assert len(full_select_index) == need_size
-            assert len(swa_select_index) == need_size
-        return full_select_index
+        # Legacy alloc API is no longer valid for SWA host pool: full and SWA
+        # sub-pools are now coupled through full_to_swa_index_mapping and must
+        # be allocated together via alloc_host(). Direct alloc() callers
+        # would skip mapping setup and break SWA load/backup paths.
+        assert False, (
+            "SWATokenToKVPoolHost.alloc() is not supported; "
+            "use alloc_host(full_device_indices, swa_device_indices) instead."
+        )
+        # full_select_index = self.full_pool_host.alloc(need_size)
+        # swa_select_index = self.swa_pool_host.alloc(need_size)
+        # assert (full_select_index is None) == (swa_select_index is None)
+        # if full_select_index is not None:
+        #     assert len(full_select_index) == need_size
+        #     assert len(swa_select_index) == need_size
+        # return full_select_index
 
-    def free(self, indices: torch.Tensor) -> int:
-        self.full_pool_host.free(indices)
-        self.swa_pool_host.free(indices)
-        return len(indices)
+    def alloc_host(
+        self,
+        full_device_indices: torch.Tensor,
+        swa_device_indices: torch.Tensor,
+    ) -> tuple[Optional[torch.Tensor], int, int]:
+        full_need_size = len(full_device_indices)
+        assert full_need_size % self.page_size == 0
+        assert len(full_device_indices) == len(swa_device_indices)
+
+        swa_valid_mask = swa_device_indices != 0
+        swa_need_size = int(swa_valid_mask.sum())
+        assert swa_need_size % self.page_size == 0
+
+        lack_full_size = full_need_size - self.full_pool_host.available_size()
+        lack_swa_size = swa_need_size - self.swa_pool_host.available_size()
+        if lack_full_size > 0 or lack_swa_size > 0:
+            return None, max(0, lack_full_size), max(0, lack_swa_size)
+
+        full_host_indices = self.full_pool_host.alloc(full_need_size)
+        assert full_host_indices is not None
+        swa_mapping = torch.zeros(full_need_size, dtype=torch.int64, device=self.device)
+        if swa_need_size > 0:
+            swa_host_indices = self.swa_pool_host.alloc(swa_need_size)
+            assert swa_host_indices is not None
+            swa_mapping[swa_valid_mask] = swa_host_indices
+        self.full_to_swa_index_mapping[full_host_indices] = swa_mapping
+
+        return full_host_indices, 0, 0
+
+    def free(self, full_host_indices: torch.Tensor) -> tuple[int, int]:
+        if full_host_indices.numel() == 0:
+            return 0, 0
+
+        self.full_pool_host.free(full_host_indices)
+        swa_host_indices = self.full_to_swa_index_mapping[full_host_indices]
+        swa_valid = swa_host_indices.bool()
+        swa_freed = int(swa_valid.sum())
+        if swa_freed > 0:
+            self.swa_pool_host.free(swa_host_indices[swa_valid])
+        self.full_to_swa_index_mapping[full_host_indices] = 0
+
+        return int(full_host_indices.numel()), swa_freed
 
     def clear(self):
         self.full_pool_host.clear()
         self.swa_pool_host.clear()
+        # Note: the last item is -1, we don't clear it, see the comment in __init__
+        self.full_to_swa_index_mapping[:-1].fill_(0)
 
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
         layer_id_pool, is_swa = self.device_pool.layers_mapping[layer_id]
         if is_swa:
+            swa_host_indices = self.full_to_swa_index_mapping[host_indices]
+            swa_device_indices = self.device_pool.full_to_swa_index_mapping[
+                device_indices
+            ]
             self.swa_pool_host.load_to_device_per_layer(
                 self.device_pool.swa_kv_pool,
-                host_indices,
-                device_indices,
+                swa_host_indices,
+                swa_device_indices,
                 layer_id_pool,
                 io_backend,
             )
@@ -2191,13 +2291,16 @@ class SWATokenToKVPoolHost:
             v_dst_layout_dim=self.full_pool_host.v_layout_dim,
             num_layers=self.device_pool.full_layer_nums,
         )
+        # Backup SWA KV cache.
+        swa_host_indices = self.full_to_swa_index_mapping[host_indices]
+        swa_device_indices = device_pool.full_to_swa_index_mapping[device_indices]
         transfer_kv_all_layer_fuse_lf_pf(
             src_k_layers=device_pool.swa_kv_pool.k_data_ptrs,
             dst_k=self.swa_pool_host.k_buffer,
             src_v_layers=device_pool.swa_kv_pool.v_data_ptrs,
             dst_v=self.swa_pool_host.v_buffer,
-            src_indices=device_indices,
-            dst_indices=host_indices,
+            src_indices=swa_device_indices,
+            dst_indices=swa_host_indices,
             item_size=self.swa_pool_host.token_stride_size,
             dst_layout_dim=self.swa_pool_host.layout_dim,
             v_item_size=self.swa_pool_host.v_token_stride_size,

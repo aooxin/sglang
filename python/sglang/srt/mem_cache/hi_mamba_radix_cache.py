@@ -647,7 +647,7 @@ class HiMambaRadixCache(MambaRadixCache):
             node.host_mamba_ref_counter == 0
         ), f"host mamba in use, {node.id=} {node.host_mamba_ref_counter=}"
 
-        full_num_evicted = self.cache_controller.evict_host(node.host_value)
+        full_num_evicted, _ = self.cache_controller.evict_host(node.host_value)
         node.host_value = None
 
         if node.mamba_host_value is not None:

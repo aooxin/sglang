@@ -29,6 +29,7 @@ Safety:
 """
 
 import heapq
+import logging
 import time
 from typing import TYPE_CHECKING, Optional
 
@@ -43,9 +44,57 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+
+
+logger = logging.getLogger(__name__)
+
+
+def compute_swa_safe_len(swa_indices: torch.Tensor, sliding_window_size: int) -> int:
+    """
+    Find the longest prefix whose SWA tail window has all non-zero indices.
+
+    For a candidate prefix length ``L`` (i.e. reuse tokens ``[0, L)``),
+    the sliding window tail ``[max(0, L - sliding_window_size), L)`` must all
+    be non-zero. A zero slot means the SWA state is freed/invalid.
+
+    Args:
+        swa_indices: 1-D tensor of SWA index mappings (>= 0).
+            Non-zero = valid; zero = freed/invalid.
+        sliding_window_size: The SWA window size.
+
+    Returns:
+        The maximum SWA-safe prefix length (0 means nothing is reusable,
+        ``len(swa_indices)`` means the entire prefix is safe).
+    """
+    matched_len = len(swa_indices)
+    if matched_len == 0:
+        return 0
+
+    # TODO(yingchun): this assert has D2H op
+    assert (swa_indices >= 0).all(), "swa_indices must be non-negative"
+
+    # --- Fast path: if the tail window is all valid, the entire prefix is safe.
+    tail_start = max(0, matched_len - sliding_window_size)
+    if swa_indices[tail_start:].all():
+        return matched_len
+
+    # --- Slow path: some slots are freed; find the longest safe prefix. ---
+    bad = (swa_indices == 0).to(torch.int32)
+    prefix_bad = torch.nn.functional.pad(torch.cumsum(bad, dim=0), (1, 0))
+
+    lens = torch.arange(1, matched_len + 1, device=swa_indices.device)
+    starts = torch.clamp(lens - sliding_window_size, min=0)
+    bad_count = prefix_bad[lens] - prefix_bad[starts]
+    valid = bad_count == 0
+
+    if not torch.any(valid):
+        return 0
+
+    return int(torch.nonzero(valid, as_tuple=False)[-1].item() + 1)
 
 
 class SimpleSWARadixCache(RadixCache):
@@ -66,8 +115,6 @@ class SimpleSWARadixCache(RadixCache):
     def __init__(
         self,
         params: CacheInitParams,
-        # TODO(yingchun): consider move speculative_num_steps to CacheInitParams
-        speculative_num_steps: Optional[int] = None,
     ):
         assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator), (
             f"SimpleSWARadixCache requires SWATokenToKVPoolAllocator, "
@@ -79,7 +126,6 @@ class SimpleSWARadixCache(RadixCache):
 
         super().__init__(params)
         self.sliding_window_size = params.sliding_window_size
-        self.speculative_num_steps = speculative_num_steps
 
         # Cumulative counters for metrics.
         # Updated in evict_swa() and evict(); read by the scheduler to compute
@@ -88,6 +134,8 @@ class SimpleSWARadixCache(RadixCache):
         self.swa_evicted_from_tree: int = 0
         self.full_evicted_from_tree: int = 0
 
+        # Cached length of the most recent raw prefix-tree match (before SWA
+        # safety trim) used by callers for diagnostics. Updated in match_prefix().
         self._last_raw_match_len: int = 0
 
     ##### Public API #####
@@ -118,7 +166,7 @@ class SimpleSWARadixCache(RadixCache):
         prelen: int,
         attention_chunk_size: int,
         tree_prefix_len: int = 0,
-    ):
+    ) -> int:
         """Free SWA KV cache for tokens outside the sliding window.
 
         SimpleSWARadixCache performs real SWA shrinking only after a prefill
@@ -164,22 +212,17 @@ class SimpleSWARadixCache(RadixCache):
             effective_start = (
                 (effective_start + self.page_size - 1) // self.page_size
             ) * self.page_size
+        freed_swa_size = 0
         if swa_free_end > effective_start:
             free_slots = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx,
                 effective_start:swa_free_end,
             ]
-            freed_swa_size = int(
-                torch.count_nonzero(
-                    self.token_to_kv_pool_allocator.full_to_swa_index_mapping[
-                        free_slots
-                    ]
-                ).item()
-            )
-            self.token_to_kv_pool_allocator.free_swa(free_slots)
+            freed_swa_size = self.token_to_kv_pool_allocator.free_swa(free_slots)
             self.swa_active_freed_tokens += freed_swa_size
         if swa_free_end > req.swa_evicted_seqlen:
             req.swa_evicted_seqlen = swa_free_end
+        return freed_swa_size
 
     def _count_live_swa_tokens(self, value: torch.Tensor | None) -> int:
         if value is None or value.numel() == 0:
@@ -188,23 +231,41 @@ class SimpleSWARadixCache(RadixCache):
         mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
         return int(torch.count_nonzero(mapping[value]).item())
 
-    # TODO(yingchun): 每次请求 admission 触发多次全树遍历+GPU sync，后续会优化
+    def _batch_count_live_swa(self, values: list[torch.Tensor]) -> int:
+        """Count live SWA tokens across multiple value tensors in one GPU op."""
+        if not values:
+            return 0
+        all_indices = torch.cat(values)
+        if all_indices.numel() == 0:
+            return 0
+        mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+        return int(torch.count_nonzero(mapping[all_indices]).item())
+
+    # TODO(yingchun): _collect_swa_sizes is expensive, reduce call times in hot path
     def _collect_swa_sizes(self) -> tuple[int, int]:
-        """Return live SWA sizes split by evictable/protected ownership."""
-        swa_evictable = 0
-        swa_protected = 0
+        """Return live SWA sizes split by evictable/protected ownership.
+
+        Batches GPU operations to minimize CPU-GPU sync points.
+        Instead of N per-node .item() calls (each forcing a GPU sync),
+        we collect all value tensors first, then do at most 2 batched
+        GPU operations.
+        """
+        evictable_values: list[torch.Tensor] = []
+        protected_values: list[torch.Tensor] = []
         stack = [self.root_node]
 
         while stack:
             node = stack.pop()
             for child in node.children.values():
-                live_swa = self._count_live_swa_tokens(child.value)
-                if child.lock_ref > 0:
-                    swa_protected += live_swa
-                else:
-                    swa_evictable += live_swa
+                if child.value is not None:
+                    if child.lock_ref > 0:
+                        protected_values.append(child.value)
+                    else:
+                        evictable_values.append(child.value)
                 stack.append(child)
 
+        swa_evictable = self._batch_count_live_swa(evictable_values)
+        swa_protected = self._batch_count_live_swa(protected_values)
         return swa_evictable, swa_protected
 
     def full_evictable_size(self) -> int:
@@ -278,76 +339,68 @@ class SimpleSWARadixCache(RadixCache):
             swa_num_tokens_evicted=swa_num_evicted,
         )
 
-    def _compute_safe_prefix_len(self, swa_indices: torch.Tensor) -> int:
-        """Compute the maximum prefix length that is SWA-safe.
+    def _compute_safe_prefix_len(
+        self, full_matched_result: MatchResult
+    ) -> tuple[int, Optional[int]]:
+        """Compute the maximum device prefix length that is SWA-safe.
 
-        For a candidate prefix length ``L``, the tail window
-        ``[max(0, L-window), L)`` must all have valid SWA indices (> 0).
+        Looks up SWA indices from the device allocator's mapping and delegates
+        to the shared ``compute_swa_safe_len()`` for the actual check.
+
+        Returns:
+            (safe_len, None): safe_len is the longest SWA-safe device prefix
+            length. The second element is always None (no host portion).
         """
-        matched_len = len(swa_indices)
-        if matched_len == 0:
-            return 0
-
-        window = self.sliding_window_size
-        tail_start = max(0, matched_len - window)
-        if torch.all(swa_indices[tail_start:] > 0):
-            return matched_len
-
-        bad = (swa_indices <= 0).to(torch.int32)
-        prefix_bad = torch.nn.functional.pad(torch.cumsum(bad, dim=0), (1, 0))
-
-        lens = torch.arange(1, matched_len + 1, device=swa_indices.device)
-        starts = torch.clamp(lens - window, min=0)
-        bad_count = prefix_bad[lens] - prefix_bad[starts]
-
-        valid = bad_count == 0
-        if not torch.any(valid):
-            return 0
-        return int(torch.nonzero(valid, as_tuple=False)[-1].item() + 1)
+        swa_indices = self.token_to_kv_pool_allocator.full_to_swa_index_mapping[
+            full_matched_result.device_indices
+        ]
+        assert len(swa_indices) == len(full_matched_result.device_indices)
+        safe_len = compute_swa_safe_len(swa_indices, self.sliding_window_size)
+        return safe_len, None
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        """Find the longest prefix whose SWA tail window is valid.
+        """
+        Find the longest prefix whose SWA tail window is valid.
 
         `RadixCache.match_prefix()` only matches token path in the tree and is
         unaware of SWA indices already freed to 0. For hybrid SWA, we must make
         sure the matched tail window still maps to live SWA slots.
         """
+        # TODO(yingchun): 需要保证/能保证 page size > 1 的情况吗？
         key = params.key
         # Use a copy to avoid mutating caller-provided key object.
         raw_params = MatchPrefixParams(
             key=RadixKey(list(key.token_ids), key.extra_key),
             req=params.req,
         )
-        base_result = super().match_prefix(raw_params)
+        full_matched_result = super().match_prefix(raw_params)
 
-        matched_indices = base_result.device_indices
-        matched_len = len(matched_indices)
-        self._last_raw_match_len = matched_len
-        if matched_len == 0:
-            return base_result
+        full_matched_indices = full_matched_result.device_indices
+        full_matched_len = len(full_matched_indices)
+        self._last_raw_match_len = full_matched_len
+        if full_matched_len == 0:
+            return full_matched_result
 
         # 仅有 token path 命中还不够。对于 hybrid SWA，前缀想真正可复用，还必须
-        # 满足“这个前缀尾部窗口里的 SWA mapping 仍然活着”。
-        # 否则 decode/prefill 虽然能在树上找到 full index，但一旦要访问 SWA state
+        # 满足"这个前缀尾部窗口里的 SWA mapping 仍然活着"。
+        # 否则 prefill 虽然能在树上找到 full index，但一旦要访问 SWA state
         # 就会发现对应 mapping 已经被置 0。
-        swa_indices = self.token_to_kv_pool_allocator.full_to_swa_index_mapping[
-            matched_indices
-        ]
-        safe_len = self._compute_safe_prefix_len(swa_indices)
-        if safe_len >= matched_len:
-            return base_result
+        swa_matched_len, _ = self._compute_safe_prefix_len(full_matched_result)
+        if swa_matched_len >= full_matched_len:
+            return full_matched_result
 
         if self.is_eagle:
             safe_token_len = (
-                safe_len + self.speculative_num_steps if safe_len > 0 else 0
+                swa_matched_len + self.speculative_num_steps
+                if swa_matched_len > 0
+                else 0
             )
         else:
-            safe_token_len = safe_len
+            safe_token_len = swa_matched_len
         safe_params = MatchPrefixParams(
             key=RadixKey(list(key.token_ids)[:safe_token_len], key.extra_key),
             req=params.req,
         )
-        # TODO(yingchun): 直接对首次结果做切片复用，避免 double walk
         return super().match_prefix(safe_params)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
@@ -369,12 +422,16 @@ class SimpleSWARadixCache(RadixCache):
             # Free SWA KV outside the sliding window.  tree_prefix_len protects
             # positions shared with the radix tree (from the initial match) so
             # they are not freed here.
-            self.evict_swa(
+            freed_swa_size = self.evict_swa(
                 req,
                 seq_len,
                 self.sliding_window_size,
                 tree_prefix_len=req.cache_protected_len,
             )
+            if freed_swa_size > 0:
+                log_info_on_rank0(
+                    logger, f"cache_unfinished_req chunked: free SWA: {freed_swa_size}"
+                )
 
             # Save kv_indices as prefix_indices for the next chunk / scheduling
             # round.  No tree insertion, lock-ref update, or req_to_token rewrite
@@ -395,12 +452,16 @@ class SimpleSWARadixCache(RadixCache):
         # Free SWA KV outside the sliding window.  tree_prefix_len protects
         # positions shared with the radix tree (from the initial match) so
         # they are not freed here.
-        self.evict_swa(
+        freed_swa_size = self.evict_swa(
             req,
             actual_kv_len,
             self.sliding_window_size,
             tree_prefix_len=req.cache_protected_len,
         )
+        if freed_swa_size > 0:
+            log_info_on_rank0(
+                logger, f"cache_unfinished_req unchunked: free SWA: {freed_swa_size}"
+            )
 
         # Save kv_indices as prefix_indices for the next chunk / scheduling
         # round.  No tree insertion, lock-ref update, or req_to_token rewrite
@@ -433,11 +494,13 @@ class SimpleSWARadixCache(RadixCache):
 
         tree_prefix_len = req.cache_protected_len
 
-        self.evict_swa(
+        freed_swa_size = self.evict_swa(
             req,
             page_aligned_len,
             self.sliding_window_size,
             tree_prefix_len=tree_prefix_len,
         )
+        if freed_swa_size > 0:
+            log_info_on_rank0(logger, f"cache_finished_req: free SWA: {freed_swa_size}")
 
         super().cache_finished_req(req, is_insert)

@@ -1852,6 +1852,7 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
 
         device_len = len(full_matched_result.device_indices)
         host_hit_length = full_matched_result.host_hit_length
+        self._last_raw_match_len = device_len + host_hit_length
 
         if device_len + host_hit_length == 0:
             assert (

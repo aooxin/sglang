@@ -1704,7 +1704,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if not req.retracted_stain:
                 new_cached = pre_len - req.already_computed
                 req.cached_tokens += new_cached
-                req.raw_cached_tokens += req.raw_prefix_len - req.already_computed
+                req.raw_cached_tokens += max(
+                    min(req.raw_prefix_len, seq_len) - req.already_computed, 0
+                )
 
                 # Calculate detailed breakdown of cached tokens by source (for HiCache)
                 # Only compute once on FIRST chunk - subsequent chunks in chunked prefill

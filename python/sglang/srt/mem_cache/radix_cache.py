@@ -312,6 +312,12 @@ class RadixCache(BasePrefixCache):
             self.key_match_fn = partial(_key_match_paged, page_size=self.page_size)
             self.get_child_key_fn = partial(get_child_key, page_size=self.page_size)
 
+        self.debug_mode = (
+            self.token_to_kv_pool_allocator.debug_mode
+            if self.token_to_kv_pool_allocator is not None
+            else False
+        )
+
         if self.eviction_policy == "lru":
             self.eviction_strategy: EvictionStrategy = LRUStrategy()
         elif self.eviction_policy == "lfu":

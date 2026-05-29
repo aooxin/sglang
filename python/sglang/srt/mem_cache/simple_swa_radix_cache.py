@@ -31,10 +31,11 @@ Safety:
 import heapq
 import logging
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -112,6 +113,66 @@ class SimpleSWARadixCache(RadixCache):
             last ``sliding_window_size`` tokens' SWA KV are kept alive.
     """
 
+    @classmethod
+    def _parse_reserved_points(cls, raw_points: str) -> list[int]:
+        raw_points = raw_points.strip()
+        if not raw_points:
+            return []
+
+        try:
+            points = [int(point.strip()) for point in raw_points.split(",")]
+        except ValueError as exc:
+            raise ValueError(
+                "SGLANG_SIMPLE_SWA_RESERVED_POINTS must be a comma-separated integer list"
+            ) from exc
+
+        if any(point <= 0 for point in points):
+            raise ValueError(
+                "SGLANG_SIMPLE_SWA_RESERVED_POINTS must contain positive integers"
+            )
+        if len(points) != len(set(points)):
+            raise ValueError(
+                "SGLANG_SIMPLE_SWA_RESERVED_POINTS must not contain duplicates"
+            )
+        if points != sorted(points):
+            raise ValueError(
+                "SGLANG_SIMPLE_SWA_RESERVED_POINTS must be sorted in ascending order"
+            )
+
+        return points
+
+    @classmethod
+    def _load_swa_reserved_config(
+        cls, sliding_window_size: int, page_size: int
+    ) -> tuple[list[int], int, int]:
+        reserved_points = cls._parse_reserved_points(
+            envs.SGLANG_SIMPLE_SWA_RESERVED_POINTS.get()
+        )
+        reserved_chunk = envs.SGLANG_SIMPLE_SWA_RESERVED_CHUNK.get()
+        reserved_max_point = envs.SGLANG_SIMPLE_SWA_RESERVED_MAX_POINT.get()
+
+        if reserved_chunk <= 0:
+            raise ValueError("SGLANG_SIMPLE_SWA_RESERVED_CHUNK must be positive")
+        if reserved_chunk % page_size != 0:
+            raise ValueError(
+                "SGLANG_SIMPLE_SWA_RESERVED_CHUNK must be a multiple of page_size"
+            )
+        if reserved_max_point < 0:
+            raise ValueError(
+                "SGLANG_SIMPLE_SWA_RESERVED_MAX_POINT must be non-negative"
+            )
+        if reserved_max_point % page_size != 0:
+            raise ValueError(
+                "SGLANG_SIMPLE_SWA_RESERVED_MAX_POINT must be a multiple of page_size"
+            )
+        if any(point % sliding_window_size != 0 for point in reserved_points):
+            raise ValueError(
+                "SGLANG_SIMPLE_SWA_RESERVED_POINTS must be multiples of "
+                "sliding_window_size"
+            )
+
+        return reserved_points, reserved_chunk, reserved_max_point
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -126,6 +187,11 @@ class SimpleSWARadixCache(RadixCache):
 
         super().__init__(params)
         self.sliding_window_size = params.sliding_window_size
+        (
+            self.swa_reserved_points,
+            self.swa_reserved_chunk,
+            self.swa_reserved_max_point,
+        ) = self._load_swa_reserved_config(self.sliding_window_size, params.page_size)
 
         # Cumulative counters for metrics.
         # Updated in evict_swa() and evict(); read by the scheduler to compute
@@ -159,6 +225,53 @@ class SimpleSWARadixCache(RadixCache):
             f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
             f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
         )
+
+    def _filter_swa_free_slots_before_free(
+        self,
+        free_slots: torch.Tensor,  # read-only here
+        effective_start: int,
+        swa_free_end: int,
+        tree_prefix_len: int,
+    ) -> List[torch.Tensor]:
+        """
+        Filter out SWA pages to free that are explicit reserved
+        """
+
+        # 如果 swa_free_end>>effective_start 且 effective_start>>tree_prefix_len，则保留effective_start附近的swa
+        if (
+            swa_free_end - effective_start >= self.swa_reserved_chunk
+            and effective_start - tree_prefix_len >= self.swa_reserved_chunk
+            and effective_start + self.sliding_window_size < self.swa_reserved_max_point
+        ):
+            effective_start += self.sliding_window_size
+            free_slots = free_slots[self.sliding_window_size :]
+
+        if not self.swa_reserved_points:
+            return [free_slots]
+
+        # 如果和 reserved points 没有交集
+        if (
+            effective_start >= self.swa_reserved_points[-1]
+            or swa_free_end <= self.swa_reserved_points[0] - self.sliding_window_size
+        ):
+            return [free_slots]
+
+        result = []
+        last_wend = effective_start
+        # 如果一个point的起点和free_slots有交集，则以它为分割点，添加last_wend到point起点之前的片段
+        # 特殊情况：如果swa_free_end在第一个point的窗口内，则不满足任何条件，全部可free
+        for wend in self.swa_reserved_points:
+            wbegin = wend - self.sliding_window_size
+            if wbegin <= swa_free_end and last_wend < wbegin:
+                result.append(
+                    free_slots[last_wend - effective_start : wbegin - effective_start]
+                )
+                last_wend = wend
+        # 添加最后剩下的片段
+        if last_wend < swa_free_end:
+            result.append(free_slots[last_wend - effective_start :])
+
+        return result
 
     def evict_swa(
         self,
@@ -218,7 +331,16 @@ class SimpleSWARadixCache(RadixCache):
                 req.req_pool_idx,
                 effective_start:swa_free_end,
             ]
-            freed_swa_size = self.token_to_kv_pool_allocator.free_swa(free_slots)
+            # freed_swa_size = self.token_to_kv_pool_allocator.free_swa(free_slots)
+            freed_swa_size = 0
+            filtered_free_slots = self._filter_swa_free_slots_before_free(
+                free_slots, effective_start, swa_free_end, tree_prefix_len
+            )
+            # TODO(yingchun): 先 torch.cat 合并再统一释放
+            for one_free_slots in filtered_free_slots:
+                freed_swa_size += self.token_to_kv_pool_allocator.free_swa(
+                    one_free_slots
+                )
             self.swa_active_freed_tokens += freed_swa_size
         if swa_free_end > req.swa_evicted_seqlen:
             req.swa_evicted_seqlen = swa_free_end
@@ -428,7 +550,7 @@ class SimpleSWARadixCache(RadixCache):
                 self.sliding_window_size,
                 tree_prefix_len=req.cache_protected_len,
             )
-            if freed_swa_size > 0:
+            if self.debug_mode and freed_swa_size > 0:
                 log_info_on_rank0(
                     logger, f"cache_unfinished_req chunked: free SWA: {freed_swa_size}"
                 )
@@ -458,7 +580,7 @@ class SimpleSWARadixCache(RadixCache):
             self.sliding_window_size,
             tree_prefix_len=req.cache_protected_len,
         )
-        if freed_swa_size > 0:
+        if self.debug_mode and freed_swa_size > 0:
             log_info_on_rank0(
                 logger, f"cache_unfinished_req unchunked: free SWA: {freed_swa_size}"
             )
@@ -500,7 +622,7 @@ class SimpleSWARadixCache(RadixCache):
             self.sliding_window_size,
             tree_prefix_len=tree_prefix_len,
         )
-        if freed_swa_size > 0:
+        if self.debug_mode and freed_swa_size > 0:
             log_info_on_rank0(logger, f"cache_finished_req: free SWA: {freed_swa_size}")
 
         super().cache_finished_req(req, is_insert)

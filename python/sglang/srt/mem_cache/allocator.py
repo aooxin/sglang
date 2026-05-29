@@ -26,7 +26,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
+from sglang.srt.environ import envs
+from sglang.srt.utils import get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -51,7 +52,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self._kvcache = kvcache
         self.need_sort = need_sort
         self.pool_label = pool_label
-        self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        self.debug_mode = envs.SGLANG_DEBUG_MEMORY_POOL.get()
 
         # Allocation bitmap is debug-only because touching it in every alloc/free
         # introduces extra synchronization on the hot path.

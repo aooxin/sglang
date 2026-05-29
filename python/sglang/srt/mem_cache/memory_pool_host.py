@@ -2252,6 +2252,7 @@ class SWATokenToKVPoolHost:
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
         layer_id_pool, is_swa = self.device_pool.layers_mapping[layer_id]
+        assert len(host_indices) == len(device_indices)
         if is_swa:
             swa_host_indices = self.full_to_swa_index_mapping[host_indices]
             swa_device_indices = self.device_pool.full_to_swa_index_mapping[

@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.cache_controller import LayerDoneCounter
 from sglang.srt.mem_cache.allocator import (
@@ -316,6 +317,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.debug_mode = envs.SGLANG_DEBUG_MEMORY_POOL.get()
 
         self.clear()
         self._kvcache = kvcache
@@ -387,13 +389,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return alloc_full_indices
 
     def alloc_device(
-        self, host_indices: torch.Tensor, swa_host_indices: torch.Tensor
+        self, host_indices: torch.Tensor, swa_valid_mask: torch.Tensor
     ) -> Tuple[Optional[torch.Tensor], int, int]:
         full_need_size = len(host_indices)
         assert full_need_size % self.page_size == 0
-        assert len(host_indices) == len(swa_host_indices)
+        assert len(host_indices) == len(swa_valid_mask)
 
-        swa_valid_mask = swa_host_indices != 0
         swa_need_size = int(swa_valid_mask.sum())
         assert swa_need_size % self.page_size == 0
 

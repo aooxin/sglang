@@ -986,6 +986,8 @@ class Req(ReqDllmMixin):
                 self.cache_protected_len, preserved_prefix_len
             )
             self.extend_input_len = input_len - preserved_prefix_len
+            # TODO(yingchun): remove the log
+            logger.info(f"init_next_round_input: {self.last_matched_prefix_len=}")
             return
 
         if tree_cache is None:

@@ -1029,14 +1029,12 @@ class BaseHiRadixCache(abc.ABC):
         # evict a node not initiated write to host -- emit BlockRemoved
         self._record_remove_event(node)
         # TODO(yingchun): 使用 cache_controller.evict_device() 重构
-        swa_device_indices = (
-            self.cache_controller.mem_pool_device_allocator.translate_loc_from_full_to_swa(
-                node.value
-            )
+        swa_device_indices = self.cache_controller.mem_pool_device_allocator.translate_loc_from_full_to_swa(
+            node.value
         )
-        self.cache_controller.mem_pool_device_allocator.free(node.value)
         full_evicted = len(node.value)
         swa_evicted = torch.count_nonzero(swa_device_indices).item()
+        self.cache_controller.mem_pool_device_allocator.free(node.value)
         self._delete_leaf(node)
         return full_evicted, swa_evicted
 
@@ -1121,7 +1119,17 @@ class BaseHiRadixCache(abc.ABC):
                     lack_full=lack_full_size > 0,
                     lack_swa=lack_swa_size > 0,
                 )
+            if self.debug_mode:
+                self.cache_controller.assert_host_indices(
+                    host_indices=host_indices,
+                    host_hit_length=self.sliding_window_size,
+                )
             self.evict(EvictParams(num_tokens=lack_full_size, swa_num_tokens=lack_swa_size))
+            if self.debug_mode:
+                self.cache_controller.assert_host_indices(
+                    host_indices=host_indices,
+                    host_hit_length=self.sliding_window_size,
+                )
             full_device_indices, lack_full_size, lack_swa_size = (
                 self.cache_controller.alloc_device(
                     host_indices=host_indices,
@@ -1159,6 +1167,8 @@ class BaseHiRadixCache(abc.ABC):
                 offset : offset + len(node.host_value)
             ].clone()
             offset += len(node.host_value)
+            assert len(node.value) == len(node.host_value)
+        assert offset == len(full_device_indices)
         self.evictable_size_ += len(full_device_indices)
         # TODO(yingchun): swa_evictable_size 同上
         self.inc_lock_ref(last_hit_node)
@@ -1396,7 +1406,7 @@ class BaseHiRadixCache(abc.ABC):
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
-        # 在 tree 上 (device and/or host) 匹配前缀，得到 device 上的命中结果和最后一个匹配的 node（可能是 evicted 状态，即仅 host 上有）
+        # 在 tree 上 (device and/or host) 匹配前缀，得到 device 上的命中结果``value``和最后一个匹配的 node ``last_node``（可能是 evicted 状态，即仅 host 上有）
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
             value = torch.cat(value)
@@ -1539,6 +1549,8 @@ class BaseHiRadixCache(abc.ABC):
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
+        # FIXME(yingchun): 不能赋值！
+        new_node.host_ref_counter = child.host_ref_counter
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
 
@@ -1849,27 +1861,29 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
         assert self.load_back_threshold == 0
 
         full_matched_result = BaseHiRadixCache.match_prefix(self, params)
+        full_matched_device_len = len(full_matched_result.device_indices)
+        full_matched_host_len = full_matched_result.host_hit_length
+        self._last_raw_match_len = full_matched_device_len + full_matched_host_len
 
-        device_len = len(full_matched_result.device_indices)
-        host_hit_length = full_matched_result.host_hit_length
-        self._last_raw_match_len = device_len + host_hit_length
-
-        if device_len + host_hit_length == 0:
+        if full_matched_device_len + full_matched_host_len == 0:
             assert (
-                device_len == 0 and host_hit_length == 0
-            ), f"{device_len=}, {host_hit_length=}"
+                full_matched_device_len == 0 and full_matched_host_len == 0
+            ), f"{full_matched_device_len=}, {full_matched_host_len=}"
             return full_matched_result
 
-        swa_safe_device_len, swa_safe_host_len = self._compute_safe_prefix_len(
+        swa_matched_device_len, swa_matched_host_len = self._compute_safe_prefix_len(
             full_matched_result
+        )
+        logger.debug(
+            f"{full_matched_device_len=}, {full_matched_host_len=}, {swa_matched_device_len=}, {swa_matched_host_len=}"
         )
 
         # Trim device_indices if needed.
-        if swa_safe_device_len < device_len:
+        if swa_matched_device_len < full_matched_device_len:
             assert (
-                swa_safe_host_len == 0
-            ), f"When device needs trimming, host must be 0: {swa_safe_host_len=}"
-            if swa_safe_device_len == 0:
+                swa_matched_host_len == 0
+            ), f"When device needs trimming, host must be 0: {swa_matched_host_len=}"
+            if swa_matched_device_len == 0:
                 # Nothing is SWA-safe — return empty match at root.
                 return MatchResult(
                     device_indices=torch.empty(
@@ -1879,57 +1893,47 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
                     last_host_node=self.root_node,
                     host_hit_length=0,
                 )
-            else:
-                # Re-match with the safe token length to get correct
-                # last_device_node and last_host_node references.
-                if self.is_eagle:
-                    safe_token_len = swa_safe_device_len + self.speculative_num_steps
-                else:
-                    safe_token_len = swa_safe_device_len
-                key = params.key
-                safe_params = MatchPrefixParams(
-                    key=RadixKey(list(key.token_ids)[:safe_token_len], key.extra_key),
-                    req=params.req,
-                )
-                # TODO(yingchun): 优化这个二次 match_prefix
-                return BaseHiRadixCache.match_prefix(self, safe_params)
         else:
             assert (
-                swa_safe_device_len == device_len
-            ), f"{swa_safe_device_len=}, {device_len=}"
-            # Device portion is fully safe; trim the host portion.
+                swa_matched_device_len == full_matched_device_len
+            ), f"{swa_matched_device_len=}, {full_matched_device_len=}"
             assert (
-                0 <= swa_safe_host_len <= host_hit_length
-            ), f"{swa_safe_host_len=} must be in [0, {host_hit_length=}]"
-            # Walk UP from the match endpoint (last_host_node) to find the
-            # correct cutoff. Accumulate host_value lengths from the leaf end;
-            # the amount to to_discard is (host_hit_length - swa_safe_host_len).
-            to_discard = host_hit_length - swa_safe_host_len
-            new_last_host_node = full_matched_result.last_host_node
-            discarded = 0
-            adjusted_host_len = swa_safe_host_len
-            while discarded < to_discard:
-                assert new_last_host_node.evicted
-                node_len = len(new_last_host_node.host_value)
-                if discarded + node_len <= to_discard:
-                    discarded += node_len
-                    new_last_host_node = new_last_host_node.parent
-                else:
-                    # Safe boundary falls within this node. We can't
-                    # partially use a node's host_value, so round the
-                    # safe length down to the previous node boundary.
-                    adjusted_host_len -= to_discard - discarded
-                    new_last_host_node = new_last_host_node.parent
-                    break
+                0 <= swa_matched_host_len <= full_matched_host_len
+            ), f"{swa_matched_host_len=} must be in [0, {full_matched_host_len=}]"
 
-            new_host_hit = adjusted_host_len
-            return MatchResult(
-                device_indices=full_matched_result.device_indices,
-                last_device_node=full_matched_result.last_device_node,
-                last_host_node=(
-                    new_last_host_node
-                    if new_host_hit > 0
-                    else full_matched_result.last_device_node
-                ),
-                host_hit_length=new_host_hit,
+        swa_matched_total_len = swa_matched_device_len + swa_matched_host_len
+        if self.is_eagle:
+            swa_matched_total_len = (
+                (swa_matched_total_len + self.speculative_num_steps)
+                if swa_matched_total_len > 0
+                else 0
             )
+        key = params.key
+        swa_matched_params = MatchPrefixParams(
+            key=RadixKey(key.token_ids[:swa_matched_total_len], key.extra_key),
+            req=params.req,
+        )
+        # TODO(yingchun): 需要做优化避免此处的二次 match_prefix
+        swa_rematched_result = BaseHiRadixCache.match_prefix(self, swa_matched_params)
+        logger.debug(
+            f"{len(swa_rematched_result.device_indices)=}, {swa_rematched_result.host_hit_length=}"
+        )
+        assert (
+            swa_rematched_result.host_hit_length
+            + len(swa_rematched_result.device_indices)
+            == swa_matched_device_len + swa_matched_host_len
+        ), f"{swa_rematched_result.host_hit_length=} + {len(swa_rematched_result.device_indices)=} != {swa_matched_device_len=} + {swa_matched_host_len=}"
+        if self.debug_mode:
+            if len(swa_rematched_result.last_host_node.host_value) == 0:
+                assert (
+                    swa_rematched_result.host_hit_length == 0
+                    and swa_rematched_result.last_host_node
+                    is swa_rematched_result.last_device_node
+                ), f"{swa_rematched_result.host_hit_length=}, {swa_rematched_result.last_host_node=}, {swa_rematched_result.last_device_node=}"
+            elif swa_rematched_result.host_hit_length > 0:
+                self.cache_controller.assert_host_indices(
+                    swa_rematched_result.last_host_node.host_value,
+                    swa_rematched_result.host_hit_length,
+                )
+
+        return swa_rematched_result

@@ -746,30 +746,39 @@ class HiCacheController:
 
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
+    def assert_host_indices(
+        self,
+        host_indices: torch.Tensor,
+        host_hit_length: int,
+    ):
+        assert self.sliding_window_size is not None and self.sliding_window_size > 0
+        # TODO(yingchun): swa_host_indices 与调用者重复计算，可传入参数直接用
+        swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[host_indices]
+        ensure_swa_length = min(host_hit_length, self.sliding_window_size)
+        # TODO(yingchun): this assert has D2H op
+        assert swa_host_indices[-ensure_swa_length:].min().item() > 0, (
+            f"Last {ensure_swa_length} SWA slots must be valid, "
+            f"got {swa_host_indices[-ensure_swa_length :].tolist()}"
+        )
+
     def alloc_device(
         self,
         host_indices: torch.Tensor,
     ) -> Tuple[Optional[torch.Tensor], int, int]:
-        if self.sliding_window_size is not None and self.sliding_window_size > 0:
-            swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[
-                host_indices
-            ]
-            # TODO(yingchun): this assert has D2H op
-            assert swa_host_indices[-self.sliding_window_size :].min().item() > 0, (
-                f"Last {self.sliding_window_size} SWA slots must be valid, "
-                f"got {swa_host_indices[-self.sliding_window_size:].tolist()}"
-            )
-            discard = host_indices[: -self.sliding_window_size]
-            swa_discard = self.mem_pool_host.full_to_swa_index_mapping[discard]
-            swa_valid = swa_discard.bool()
-            if swa_valid.any():
-                self.mem_pool_host.swa_pool_host.free(swa_discard[swa_valid])
-            self.mem_pool_host.full_to_swa_index_mapping[discard] = 0
-
         swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[host_indices]
-        return self.mem_pool_device_allocator.alloc_device(
-            host_indices, swa_host_indices
-        )
+        swa_valid_mask = swa_host_indices != 0
+        if self.sliding_window_size is not None and self.sliding_window_size > 0:
+            self.assert_host_indices(host_indices, self.sliding_window_size)
+            # discard = host_indices[: -self.sliding_window_size]
+            # swa_discard = self.mem_pool_host.full_to_swa_index_mapping[discard]
+            # swa_valid = swa_discard.bool()
+            # if swa_valid.any():
+            #     self.mem_pool_host.swa_pool_host.free(swa_discard[swa_valid])
+            # self.mem_pool_host.full_to_swa_index_mapping[discard] = 0
+            swa_valid_mask[: -self.sliding_window_size] = False
+
+        # swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[host_indices]
+        return self.mem_pool_device_allocator.alloc_device(host_indices, swa_valid_mask)
 
     def load(
         self,

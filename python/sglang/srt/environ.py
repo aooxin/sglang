@@ -484,6 +484,13 @@ class Envs:
     # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
 
+    # Memory cache (Simple SWA reserved points)
+    SGLANG_SIMPLE_SWA_RESERVED_POINTS = EnvStr(
+        "512,1024,2048,4096,8192,12288,16384,24576,32768"
+    )
+    SGLANG_SIMPLE_SWA_RESERVED_CHUNK = EnvInt(14 * 1024)
+    SGLANG_SIMPLE_SWA_RESERVED_MAX_POINT = EnvInt(128 * 1024)
+
     # Warmup
     SGLANG_WARMUP_TIMEOUT = EnvFloat(-1) # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
 

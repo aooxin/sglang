@@ -14,6 +14,8 @@ limitations under the License.
 """
 
 import logging
+import os
+import random
 import threading
 import time
 from queue import Empty, Full, Queue
@@ -270,6 +272,231 @@ class PrefetchOperation(StorageOperation):
             if self.io_start_time == 0.0 or self.io_finish_time == 0.0:
                 return None
             return self.io_finish_time - self.io_start_time
+
+
+class FaultInjector:
+    """L3 TP mismatch fault injection for testing.
+
+    Provides three independent fault injection points controlled by environment
+    variables (all default to 0.0 = disabled):
+
+    - SGLANG_TEST_GCACHE_FI_EXISTS_PROB:
+        Injection site: _storage_hit_query(), before results are returned.
+        Effect: current rank reports a smaller storage_hit_count; for hybrid
+        models, randomly flips some swa_valid_per_page entries to False.
+        Test target: all_reduce(MIN) alignment in prefetch_thread_func.
+
+    - SGLANG_TEST_GCACHE_FI_TRANSFER_PROB:
+        Injection site: _page_get_zero_copy(), before operation.increment(inc).
+        Effect: current rank under-reports completed tokens by dropping some
+        pages from the reported increment.
+        Test target: all_reduce(MIN) alignment in check_prefetch_progress.
+
+    - SGLANG_TEST_GCACHE_FI_TIMEOUT_PROB:
+        Injection site: _page_transfer() batch loop, before page_get_func.
+        Effect: current rank sleeps SGLANG_TEST_GCACHE_FI_TIMEOUT_SLEEP_S
+        seconds (default 5.0s), simulating GCache IO timeout.
+        Test target: is_prefetch_timeout detection and all_reduce(MAX, states)
+        broadcast in can_terminate_prefetch.
+
+    Each TP rank rolls dice independently so different ranks may trigger
+    differently, accurately simulating real-world TP inconsistency.
+    """
+
+    def __init__(
+        self,
+        tp_rank: int,
+        tp_world_size: int,
+        page_size: int,
+        is_hybrid: bool,
+    ):
+        from sglang.srt.environ import envs
+
+        self.tp_rank = tp_rank
+        self.tp_world_size = tp_world_size
+        self.page_size = page_size
+        self.is_hybrid = is_hybrid
+
+        self._fi_exists_prob = envs.SGLANG_TEST_GCACHE_FI_EXISTS_PROB.get()
+        self._fi_transfer_prob = envs.SGLANG_TEST_GCACHE_FI_TRANSFER_PROB.get()
+        self._fi_timeout_prob = envs.SGLANG_TEST_GCACHE_FI_TIMEOUT_PROB.get()
+        self._fi_timeout_sleep_s = (
+            envs.SGLANG_TEST_GCACHE_FI_TIMEOUT_SLEEP_S.get()
+            if self._fi_timeout_prob > 0.0
+            else 0.0
+        )
+
+        # Each injection point uses a dedicated RNG pair to avoid cross-thread
+        # contention. The prefetch thread calls maybe_inject_exists_fault while
+        # the IO aux thread calls maybe_inject_transfer_fault/maybe_inject_timeout_fault.
+        _seed_base = self.tp_rank * 10007 + os.getpid() + int(time.monotonic() * 1e6)
+        self._exists_trigger_rng = random.Random(_seed_base)
+        self._exists_amount_rng = random.Random(_seed_base + 1)
+        self._transfer_trigger_rng = random.Random(_seed_base + 2)
+        self._transfer_amount_rng = random.Random(_seed_base + 3)
+        self._timeout_trigger_rng = random.Random(_seed_base + 4)
+
+        # Track operations that have already triggered timeout injection (at most once per operation)
+        self._fi_timeout_triggered: set = set()
+
+        self.enabled = (
+            self._fi_exists_prob > 0.0
+            or self._fi_transfer_prob > 0.0
+            or self._fi_timeout_prob > 0.0
+        )
+
+        if self.enabled:
+            logger.warning(
+                "[FaultInjection] L3 TP mismatch simulation ENABLED — "
+                "exists_prob=%s, transfer_prob=%s, timeout_prob=%s, "
+                "timeout_sleep_s=%s, tp_rank=%d, tp_world_size=%d",
+                self._fi_exists_prob,
+                self._fi_transfer_prob,
+                self._fi_timeout_prob,
+                self._fi_timeout_sleep_s,
+                self.tp_rank,
+                self.tp_world_size,
+            )
+
+    def maybe_inject_transfer_fault(self, inc: int) -> int:
+        """Fault injection for the IO-transfer stage.
+
+        Each TP rank rolls dice independently. When triggered, the current rank
+        under-reports the completed token count for this batch, simulating an
+        RDMA transfer interruption.
+
+        Prerequisites:
+        - _fi_transfer_prob > 0
+        - TP world size > 1 (single-GPU has no all_reduce to test)
+        - At least 2 pages completed in this batch (trimming < 2 pages is meaningless)
+
+        Returns:
+            The (possibly reduced) ``inc`` value.
+        """
+        if (
+            self._fi_transfer_prob > 0.0
+            and self.tp_world_size > 1
+            and inc >= 2 * self.page_size
+            and self._transfer_trigger_rng.random() < self._fi_transfer_prob
+        ):
+            orig_inc = inc
+            drop_pages = self._transfer_amount_rng.randint(
+                1, max(1, (inc // self.page_size) // 2)
+            )
+            inc -= drop_pages * self.page_size
+
+            logger.warning(
+                "[FaultInjection][transfer] tp_rank=%d: "
+                "completed_tokens inc %d -> %d (%d pages dropped)",
+                self.tp_rank,
+                orig_inc,
+                inc,
+                drop_pages,
+            )
+        return inc
+
+    def maybe_inject_timeout_fault(self, operation_id: int):
+        """Fault injection for the transfer thread: simulate IO timeout.
+
+        Triggers at most once per operation. When triggered, the current rank
+        sleeps for ``_fi_timeout_sleep_s`` seconds, simulating a GCache IO hang.
+
+        Prerequisites:
+        - _fi_timeout_prob > 0
+        - TP world size > 1 (single-GPU has no cross-rank timeout propagation to test)
+        - This operation has not been injected before
+        """
+        if (
+            self._fi_timeout_prob > 0.0
+            and self.tp_world_size > 1
+            and operation_id not in self._fi_timeout_triggered
+            and self._timeout_trigger_rng.random() < self._fi_timeout_prob
+        ):
+            self._fi_timeout_triggered.add(operation_id)
+            logger.warning(
+                "[FaultInjection][timeout] tp_rank=%d: operation_id=%d, "
+                "sleeping %.1fs to simulate IO timeout",
+                self.tp_rank,
+                operation_id,
+                self._fi_timeout_sleep_s,
+            )
+            time.sleep(self._fi_timeout_sleep_s)
+            logger.warning(
+                "[FaultInjection][timeout] tp_rank=%d: operation_id=%d, "
+                "sleep finished, resuming remaining batches",
+                self.tp_rank,
+                operation_id,
+            )
+
+    def maybe_inject_exists_fault(
+        self,
+        hash_values: list,
+        storage_query_count: int,
+        swa_valid_per_page: list,
+    ) -> tuple:
+        """Fault injection for the exists (metadata-query) stage.
+
+        Each TP rank rolls dice independently. When triggered, the current rank
+        reports a smaller storage_hit_count and optionally degrades some
+        swa_valid_per_page entries to False.
+
+        Prerequisites:
+        - _fi_exists_prob > 0
+        - TP world size > 1
+        - At least 2 pages hit (trimming below 2 may trigger threshold revocation
+          and mask bugs in the all_reduce logic itself)
+
+        Returns:
+            Tuple of (hash_values, storage_query_count, swa_valid_per_page).
+        """
+        if (
+            self._fi_exists_prob > 0.0
+            and self.tp_world_size > 1
+            and len(hash_values) >= 2
+            and self._fi_trigger_rng.random() < self._fi_exists_prob
+        ):
+            drop_pages = self._exists_amount_rng.randint(
+                1, max(1, len(hash_values) // 2)
+            )
+            orig_count = storage_query_count
+            orig_pages = len(hash_values)
+
+            hash_values = hash_values[: orig_pages - drop_pages]
+            storage_query_count = len(hash_values) * self.page_size
+
+            # Hybrid model: sync-trim swa_valid_per_page and randomly flip some
+            # entries to False, simulating partial SWA data missing in GCache on
+            # this rank while other ranks still report valid.
+            if self.is_hybrid and swa_valid_per_page:
+                swa_valid_per_page = swa_valid_per_page[: len(hash_values)]
+                flip_count = self._exists_amount_rng.randint(
+                    0, max(0, len(swa_valid_per_page) // 2)
+                )
+                if flip_count > 0:
+                    flip_indices = self._exists_amount_rng.sample(
+                        range(len(swa_valid_per_page)), flip_count
+                    )
+                    for idx in flip_indices:
+                        swa_valid_per_page[idx] = False
+
+            logger.warning(
+                "[FaultInjection][exists] tp_rank=%d: "
+                "storage_hit_count %d -> %d (%d pages dropped)%s",
+                self.tp_rank,
+                orig_count,
+                storage_query_count,
+                drop_pages,
+                (
+                    f", swa_valid_per_page={swa_valid_per_page}"
+                    if self.is_hybrid
+                    else ""
+                ),
+            )
+        return hash_values, storage_query_count, swa_valid_per_page
+
+    def cleanup_timeout_tracking(self, operation_id: int):
+        """Remove a completed operation from the timeout-injection tracking set."""
+        self._fi_timeout_triggered.discard(operation_id)
 
 
 class HiCacheController:
@@ -545,6 +772,14 @@ class HiCacheController:
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
             self._start_storage_threads()
+
+            # Fault injection for L3 TP mismatch simulation (test only)
+            self._fault_injector = FaultInjector(
+                tp_rank=self.tp_rank,
+                tp_world_size=self.tp_world_size,
+                page_size=self.page_size,
+                is_hybrid=self.is_hybrid_swa,
+            )
         except Exception:
             # Best-effort cleanup for partial init.
             try:
@@ -1033,6 +1268,8 @@ class HiCacheController:
                 )
                 break
             inc += self.page_size
+        if self._fault_injector.enabled:
+            inc = self._fault_injector.maybe_inject_transfer_fault(inc)
         operation.increment(inc)
 
     # todo: deprecate
@@ -1076,6 +1313,9 @@ class HiCacheController:
                         i : i + len(batch_hashes)
                     ]
 
+                if self._fault_injector.enabled:
+                    self._fault_injector.maybe_inject_timeout_fault(operation.id)
+
                 # Get one batch token, and update the completed_tokens if succeed
                 t0_io = time.perf_counter()
                 self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
@@ -1110,6 +1350,8 @@ class HiCacheController:
                 self.append_full_and_swa_mem_release_separately(
                     operation.host_indices[operation.completed_tokens :]
                 )
+                if self._fault_injector.enabled:
+                    self._fault_injector.cleanup_timeout_tracking(operation.id)
             except Empty:
                 continue
 
@@ -1213,6 +1455,15 @@ class HiCacheController:
                 break
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
+
+        if self._fault_injector.enabled:
+            hash_values, storage_query_count, swa_valid_per_page = (
+                self._fault_injector.maybe_inject_exists_fault(
+                    hash_values,
+                    storage_query_count,
+                    swa_valid_per_page,
+                )
+            )
 
         if self.is_hybrid_swa:
             # 对于 hybrid 模型，需要裁剪到 SWA 安全的部分

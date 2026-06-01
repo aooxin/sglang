@@ -210,6 +210,12 @@ class Envs:
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
     SGLANG_NATIVE_MOVE_KV_CACHE = EnvBool(False)
+
+    # Hi-Cache: L3 TP mismatch fault injection (test only, default disabled)
+    SGLANG_TEST_GCACHE_FI_EXISTS_PROB = EnvFloat(0.0)
+    SGLANG_TEST_GCACHE_FI_TRANSFER_PROB = EnvFloat(0.0)
+    SGLANG_TEST_GCACHE_FI_TIMEOUT_PROB = EnvFloat(0.0)
+    SGLANG_TEST_GCACHE_FI_TIMEOUT_SLEEP_S = EnvFloat(5.0)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
 
     # Scheduler: memory leak test

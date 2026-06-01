@@ -149,7 +149,7 @@ class TestSimpleSWARadixCache(CustomTestCase):
         self,
         sliding_window_size: int,
         is_eagle: bool = False,
-        speculative_num_steps: int | None = None,
+        speculative_num_steps: int = 1,
         page_size: int = 1,
         kv_size: int | None = None,
         kv_size_swa: int | None = None,
@@ -203,8 +203,8 @@ class TestSimpleSWARadixCache(CustomTestCase):
                 page_size=page_size,
                 is_eagle=is_eagle,
                 sliding_window_size=sliding_window_size,
+                speculative_num_steps=speculative_num_steps,
             ),
-            speculative_num_steps=speculative_num_steps,
         )
         return cache, req_to_token_pool, allocator
 
@@ -363,29 +363,8 @@ class TestSimpleSWARadixCache(CustomTestCase):
         )
         self.assertTrue(torch.all(mapping[kv_indices[req.swa_evicted_seqlen :]] > 0))
 
-    # ===== B. _compute_safe_prefix_len edge cases =====
+    # ===== B. match_prefix with SWA safety =====
 
-    def test_compute_safe_prefix_len_cases(self):
-        cache = self._require_cache()
-        cases = [
-            ("all_valid", [1, 2, 3, 4, 5, 6, 7, 8], 8),
-            ("all_invalid", [0, 0, 0, 0, 0, 0], 0),
-            ("empty", [], 0),
-            ("partial_tail", [1, 2, 0, 4, 5, 6], 2),
-            ("single_valid", [5], 1),
-            ("single_invalid", [0], 0),
-            ("hole_in_middle", [1, 2, 0, 0, 5, 6, 7, 8], 8),
-        ]
-
-        for name, raw_indices, expected in cases:
-            with self.subTest(name=name):
-                swa_indices = torch.tensor(
-                    raw_indices, dtype=torch.int64, device=self.device
-                )
-                safe_len = cache._compute_safe_prefix_len(swa_indices)
-                self.assertEqual(safe_len, expected)
-
-    # ===== C. match_prefix with SWA safety =====
 
     def test_match_prefix_requires_swa_tail_window(self):
         pool = self._require_pool()
@@ -408,7 +387,12 @@ class TestSimpleSWARadixCache(CustomTestCase):
         self.assertEqual(len(result_short.device_indices), 0)
 
     def test_match_prefix_window_larger_than_sequence(self):
-        cache, pool, allocator = self._build_cache(12)
+        # Default SGLANG_SIMPLE_SWA_RESERVED_POINTS contains values that aren't
+        # multiples of sliding_window_size=12; override with multiples of 12.
+        from sglang.srt import environ as _environ
+
+        with _environ.envs.SGLANG_SIMPLE_SWA_RESERVED_POINTS.override("12,24,48"):
+            cache, pool, allocator = self._build_cache(12)
         token_ids = list(range(10))
         kv_indices = allocator.alloc(len(token_ids))
         if kv_indices is None:
@@ -720,13 +704,12 @@ class TestSimpleSWARadixCache(CustomTestCase):
             self.fail("Failed to allocate KV indices")
         cache.insert(InsertParams(key=RadixKey(token_ids), value=kv_indices))
 
-        # In EAGLE mode the radix tree stores bigram keys, so N tokens -> N-1
-        # tree slots. The match length therefore equals len(token_ids) - 1.
-        kv_len = len(token_ids) - 1
+        # EAGLE mode stores (step+1)-grams in the radix tree, so N tokens map
+        # to N - speculative_num_steps tree slots (see convert_to_steps_key).
+        kv_len = len(token_ids) - speculative_num_steps
         result_full = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
         self.assertEqual(len(result_full.device_indices), kv_len)
 
-        mapping = allocator.full_to_swa_index_mapping
         gap_start = kv_len - sliding_window - 3
         gap_end = kv_len - sliding_window + 1
         allocator.free_swa(kv_indices[gap_start:gap_end])

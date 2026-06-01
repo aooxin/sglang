@@ -44,6 +44,8 @@ class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):
         "--enable-multi-layer-eagle",
         "--model-loader-extra-config",
         '{"enable_multithread_load": true,"num_threads": 64}',
+        "--hicache-mem-layout",
+        "page_first",
     ]
 
     bs_1_speed_thres = 170
@@ -63,6 +65,8 @@ MIMO_V2_5_OTHER_ARGS = [
     "fa3",
     "--mm-attention-backend",
     "fa3",
+    "--hicache-mem-layout",
+    "page_first",
 ]
 MIMO_V2_5_MTP_OTHER_ARGS = MIMO_V2_5_OTHER_ARGS + [
     "--speculative-algorithm",

@@ -154,6 +154,8 @@ stage-a-test-cpu:
       optional: true
   script:
     - pip install --no-cache-dir --no-deps -e "python/[test]"
+    # TODO(yingchun): remove this once the transfer kernel is included in the base image
+    - pip install https://cnbj1-fds.api.xiaomi.net/aie-shared-objects/20260514/transfer_kernel-0.4.1-cp310-abi3-linux_x86_64.whl --force-reinstall
     - cd test/
     - python3 run_suite.py --hw cpu --suite stage-a-test-cpu --enable-retry --max-attempts 2
   rules:
@@ -198,6 +200,8 @@ stage-a-test-1-gpu-small:
       # scoped). exit 75 (mapped via retry.exit_codes) lets GitLab reschedule
       # us onto a clean runner if memory still >10% after retries.
       python3 python/sglang/cli/killall.py || exit 75
+    # TODO(yingchun): remove this once the transfer kernel is included in the base image
+    - pip install https://cnbj1-fds.api.xiaomi.net/aie-shared-objects/20260514/transfer_kernel-0.4.1-cp310-abi3-linux_x86_64.whl --force-reinstall
   after_script:
     - |
       if [ -d "$SGLANG_CUDA_COREDUMP_DIR" ] && [ "$(ls -A $SGLANG_CUDA_COREDUMP_DIR 2>/dev/null)" ]; then

@@ -883,39 +883,39 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        # compute this req full maybe use total_tokens
         # for start req.extend_input_len = req.host_hit_length + real_input_tokens
         total_tokens = req.extend_input_len + min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
-        # compute this req swa maybe use total tokens
-        # SWA needs: cache + real_extend
-        swa_cache_tokens = min(
-            len(req.prefix_indices) + req.host_hit_length, self.sliding_window_size
-        )
-        swa_total_tokens = swa_cache_tokens + (
+
+        if self.is_hybrid_swa:
+            # SWA needs: cache + real_extend
+            swa_cache_tokens = min(
+                len(req.prefix_indices) + req.host_hit_length,
+                self.sliding_window_size,
+            )
+            swa_total_tokens = swa_cache_tokens + (
                 req.extend_input_len - req.host_hit_length
-        )
-        # todo deal with len(req.prefix_indices)=109440 , req.host_hit_length=48768, req.extend_input_len=86327,
-        #  for chunk available_and_evictable=37376, self.token_to_kv_pool_allocator.swa_available_size()=9664, self.tree_cache.swa_evictable_size()=27712,
-        if (
+            )
+            if (
                 self.rem_chunk_tokens is not None
                 and swa_total_tokens > self.rem_chunk_tokens
-        ):
-            swa_total_tokens = min(swa_total_tokens, self.rem_chunk_tokens)
+            ):
+                swa_total_tokens = self.rem_chunk_tokens
+        else:
+            swa_total_tokens = 0
 
-        # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         input_tokens = self.ceil_paged_tokens(req.extend_input_len)
         prefix_len = len(req.prefix_indices)
 
-        if (
-            total_tokens >= self.rem_total_tokens
-            or swa_total_tokens > self.rem_swa_total_tokens
-        ):
-            if swa_total_tokens > self.rem_swa_total_tokens:
+        swa_over_budget = (
+            self.is_hybrid_swa and swa_total_tokens > self.rem_swa_total_tokens
+        )
+        if total_tokens >= self.rem_total_tokens or swa_over_budget:
+            if swa_over_budget:
                 logger.warning("swa mem not enough,try to increase swa!!!")
             return AddReqResult.NO_TOKEN
 
@@ -928,11 +928,11 @@ class PrefillAdder:
 
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
-            if (
-                total_tokens >= self.rem_total_tokens
-                or swa_total_tokens > self.rem_swa_total_tokens
-            ):
-                if swa_total_tokens > self.rem_swa_total_tokens:
+            swa_over_budget = (
+                self.is_hybrid_swa and swa_total_tokens > self.rem_swa_total_tokens
+            )
+            if total_tokens >= self.rem_total_tokens or swa_over_budget:
+                if swa_over_budget:
                     logger.warning(
                         "[lock_node] swa mem not enough,try to increase swa!!!"
                     )

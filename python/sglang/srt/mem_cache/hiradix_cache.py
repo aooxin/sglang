@@ -1563,6 +1563,23 @@ class BaseHiRadixCache(abc.ABC):
             host_hit_length=host_hit_length,
         )
 
+    def _alloc_prefetch_host_indices(self, prefetch_length: int):
+        """Allocate host indices for a prefetch operation.
+
+        Returns ``(full_host_indices, swa_host_indices, lack_full, lack_swa)``.
+        For non-SWA HiCache, swa_host_indices and lack_swa are always None / 0.
+        """
+        # TODO(yingchun): 尽量通过 cache_controller 访问 pool
+        mem_pool_host = self.cache_controller.mem_pool_host
+        if self.cache_controller.is_hybrid_swa:
+            return mem_pool_host.alloc_unmapped_host_by_len(prefetch_length)
+
+        full_host_indices = mem_pool_host.alloc(prefetch_length)
+        if full_host_indices is None:
+            lack_full = prefetch_length - mem_pool_host.available_size()
+            return None, None, max(0, lack_full), 0
+        return full_host_indices, None, 0, 0
+
     def prefetch_from_storage(
         self,
         req_id: str,
@@ -1590,17 +1607,13 @@ class BaseHiRadixCache(abc.ABC):
 
         last_host_node.protect_host()
         full_host_indices, swa_host_indices, lack_full_size, lack_swa_size = (
-            self.cache_controller.mem_pool_host.alloc_unmapped_host_by_len(
-                prefetch_length
-            )
+            self._alloc_prefetch_host_indices(prefetch_length)
         )
         if full_host_indices is None:
             assert lack_full_size > 0 or lack_swa_size > 0
             self.evict_host(lack_full_size, lack_swa_size)
             full_host_indices, swa_host_indices, _, _ = (
-                self.cache_controller.mem_pool_host.alloc_unmapped_host_by_len(
-                    prefetch_length
-                )
+                self._alloc_prefetch_host_indices(prefetch_length)
             )
         if full_host_indices is None:
             assert swa_host_indices is None

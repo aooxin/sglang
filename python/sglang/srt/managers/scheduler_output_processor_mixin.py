@@ -1253,6 +1253,8 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens=prompt_tokens,
                 cached_tokens=cached_tokens,
                 raw_cached_tokens=raw_cached_tokens,
+                storage_full_hit_tokens=storage_full_hit_tokens,
+                storage_swa_hit_tokens=storage_swa_hit_tokens,
                 cached_tokens_details=cached_tokens_details,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,

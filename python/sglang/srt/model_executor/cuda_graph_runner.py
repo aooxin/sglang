@@ -273,7 +273,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
-            self.out_cache_loc_swa.zero_()
+            if forward_batch.out_cache_loc_swa is not None:
+                self.out_cache_loc_swa.zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
@@ -285,7 +286,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
             self.req_pool_indices[:raw_bs],
             self.seq_lens[:raw_bs],
             self.out_cache_loc[:raw_num_token],
-            self.out_cache_loc_swa[:raw_num_token],
             self.positions[:raw_num_token],
         ]
         srcs = [
@@ -293,9 +293,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             forward_batch.out_cache_loc,
-            forward_batch.out_cache_loc_swa,
             forward_batch.positions,
         ]
+        if forward_batch.out_cache_loc_swa is not None:
+            dsts.append(self.out_cache_loc_swa[:raw_num_token])
+            srcs.append(forward_batch.out_cache_loc_swa)
 
         if self.ngram_embedding_info is not None:
             ngram_embedding_info = forward_batch.ngram_embedding_info

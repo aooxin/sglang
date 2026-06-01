@@ -2,6 +2,10 @@ ARG BASE_IMAGE_VERSION=v0.5.10
 FROM micr.cloud.mioffice.cn/llm-infra/sglang:${BASE_IMAGE_VERSION}
 ENV PIP_INDEX_URL "https://pkgs.d.xiaomi.net/artifactory/api/pypi/pypi-virtual/simple"
 ENV PIP_TRUSTED_HOST "pkgs.d.xiaomi.net"
+ENV UV_BREAK_SYSTEM_PACKAGES=1
+
+# Set pip index url
+RUN python3 -m pip config set global.index-url ${PIP_INDEX_URL}
 
 # System deps: git (required by pre-commit), clang-format-20 (C++/CUDA lint)
 RUN apt-get update \
@@ -33,5 +37,8 @@ RUN apt-get update \
 RUN mkdir -p ~/.claude/skills/ \
     && git clone git@git.n.xiaomi.com:ai-studio/cloudml-service-deploy-skill.git \
   ~/.claude/skills/cloudml-service-deploy
+
+RUN python3 -m pip install https://cnbj1-fds.api.xiaomi.net/aie-shared-objects/20260514/transfer_kernel-0.4.1-cp310-abi3-linux_x86_64.whl \
+    --no-cache-dir --force-reinstall
 
 WORKDIR /

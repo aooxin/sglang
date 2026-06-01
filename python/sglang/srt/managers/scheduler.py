@@ -829,8 +829,6 @@ class Scheduler(
                 self.tree_cache = SimpleSWARadixCache(
                     params=params,
                 )
-                if self.spec_algorithm.is_eagle():
-                    self._register_draft_kv_pool_for_hicache(server_args)
             elif self.is_hybrid_ssm:
                 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 

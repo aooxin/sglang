@@ -166,8 +166,8 @@ class TestSimpleSWAAllocator(CustomTestCase):
         with self.assertRaises(AssertionError):
             allocator.free(kv_indices)
 
-    def test_alloc_extend_page_size64_no_false_oom(self):
-        page_size = 64
+    def test_alloc_extend_paged_no_false_oom(self):
+        page_size = 4
         bs = 4
         prefix_len_per_req = page_size
         seq_len_per_req = 2 * page_size

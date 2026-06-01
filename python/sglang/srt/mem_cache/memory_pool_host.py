@@ -46,22 +46,42 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
 if not (_is_npu or _is_xpu or _is_mps):
-    from transfer_kernel.kvcacheio import (
-        transfer_kv_all_layer,
-        transfer_kv_all_layer_direct_lf_pf,
-        transfer_kv_all_layer_fuse_lf_pf,
-        transfer_kv_all_layer_lf_pf,
-        transfer_kv_all_layer_lf_ph,
-        transfer_kv_all_layer_mla,
-        transfer_kv_all_layer_mla_lf_pf,
-        transfer_kv_direct,
-        transfer_kv_per_layer,
-        transfer_kv_per_layer_direct_pf_lf,
-        transfer_kv_per_layer_mla,
-        transfer_kv_per_layer_mla_pf_lf,
-        transfer_kv_per_layer_pf_lf,
-        transfer_kv_per_layer_ph_lf,
-    )
+    try:
+        from transfer_kernel.kvcacheio import (
+            transfer_kv_all_layer,
+            transfer_kv_all_layer_direct_lf_pf,
+            transfer_kv_all_layer_fuse_lf_pf,
+            transfer_kv_all_layer_lf_pf,
+            transfer_kv_all_layer_lf_ph,
+            transfer_kv_all_layer_mla,
+            transfer_kv_all_layer_mla_lf_pf,
+            transfer_kv_direct,
+            transfer_kv_per_layer,
+            transfer_kv_per_layer_direct_pf_lf,
+            transfer_kv_per_layer_mla,
+            transfer_kv_per_layer_mla_pf_lf,
+            transfer_kv_per_layer_pf_lf,
+            transfer_kv_per_layer_ph_lf,
+        )
+    except ImportError:
+        # transfer_kernel is a GPU-only native extension. Allow CPU/import-only
+        # contexts (unit tests, docs builds) to load this module; any code that
+        # actually invokes these symbols will get a NameError at call time,
+        # which is the right failure mode for a missing GPU runtime dep.
+        transfer_kv_all_layer = None
+        transfer_kv_all_layer_direct_lf_pf = None
+        transfer_kv_all_layer_fuse_lf_pf = None
+        transfer_kv_all_layer_lf_pf = None
+        transfer_kv_all_layer_lf_ph = None
+        transfer_kv_all_layer_mla = None
+        transfer_kv_all_layer_mla_lf_pf = None
+        transfer_kv_direct = None
+        transfer_kv_per_layer = None
+        transfer_kv_per_layer_direct_pf_lf = None
+        transfer_kv_per_layer_mla = None
+        transfer_kv_per_layer_mla_pf_lf = None
+        transfer_kv_per_layer_pf_lf = None
+        transfer_kv_per_layer_ph_lf = None
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 

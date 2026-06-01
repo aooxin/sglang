@@ -938,24 +938,36 @@ class HiCacheController:
     def alloc_host(
         self,
         device_indices: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        swa_device_indices = (
-            self.mem_pool_device_allocator.translate_loc_from_full_to_swa(
-                device_indices
+    ) -> tuple[Optional[torch.Tensor], int, int]:
+        if self.is_hybrid_swa:
+            swa_device_indices = (
+                self.mem_pool_device_allocator.translate_loc_from_full_to_swa(
+                    device_indices
+                )
             )
-        )
-        return self.mem_pool_host.alloc_host(device_indices, swa_device_indices)
+            return self.mem_pool_host.alloc_host(device_indices, swa_device_indices)
+
+        need_size = len(device_indices)
+        host_indices = self.mem_pool_host.alloc(need_size)
+        if host_indices is None:
+            lack_full_size = need_size - self.mem_pool_host.available_size()
+            return None, max(0, lack_full_size), 0
+        return host_indices, 0, 0
 
     def get_swa_host_indices(
         self,
         full_host_indices: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
+        if not self.is_hybrid_swa:
+            return None
         return self.mem_pool_host.full_to_swa_index_mapping[full_host_indices]
 
     def get_valid_swa_host_len(
         self,
         full_host_indices: torch.Tensor,
     ) -> int:
+        if not self.is_hybrid_swa:
+            return 0
         swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[
             full_host_indices
         ]
@@ -1025,6 +1037,8 @@ class HiCacheController:
         host_indices: torch.Tensor,
         host_hit_length: int,
     ):
+        if not self.is_hybrid_swa:
+            return
         assert self.sliding_window_size is not None and self.sliding_window_size > 0
         # TODO(yingchun): swa_host_indices 与调用者重复计算，可传入参数直接用
         swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[host_indices]
@@ -1039,19 +1053,22 @@ class HiCacheController:
         self,
         host_indices: torch.Tensor,
     ) -> Tuple[Optional[torch.Tensor], int, int]:
+        if not self.is_hybrid_swa:
+            need_size = len(host_indices)
+            device_indices = self.mem_pool_device_allocator.alloc(need_size)
+            if device_indices is None:
+                lack_full_size = (
+                    need_size - self.mem_pool_device_allocator.available_size()
+                )
+                return None, max(0, lack_full_size), 0
+            return device_indices, 0, 0
+
         swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[host_indices]
         swa_valid_mask = swa_host_indices != 0
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             self.assert_host_indices(host_indices, self.sliding_window_size)
-            # discard = host_indices[: -self.sliding_window_size]
-            # swa_discard = self.mem_pool_host.full_to_swa_index_mapping[discard]
-            # swa_valid = swa_discard.bool()
-            # if swa_valid.any():
-            #     self.mem_pool_host.swa_pool_host.free(swa_discard[swa_valid])
-            # self.mem_pool_host.full_to_swa_index_mapping[discard] = 0
             swa_valid_mask[: -self.sliding_window_size] = False
 
-        # swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[host_indices]
         return self.mem_pool_device_allocator.alloc_device(host_indices, swa_valid_mask)
 
     def load(
@@ -1152,6 +1169,10 @@ class HiCacheController:
 
     def evict_device(self, device_indices: torch.Tensor) -> Tuple[int, int]:
         assert device_indices is not None
+        if not self.is_hybrid_swa:
+            self.mem_pool_device_allocator.free(device_indices)
+            return len(device_indices), 0
+
         swa_device_indices = (
             self.mem_pool_device_allocator.translate_loc_from_full_to_swa(
                 device_indices
@@ -1226,8 +1247,11 @@ class HiCacheController:
     def append_swa_only_host_mem_release(
         self, swa_only_to_release: Optional[torch.Tensor]
     ):
-        assert swa_only_to_release is not None
-        # swa_only_to_release 是 SWATokenToKVPoolHost 中未与 full 做 mapping 的 SWA indices，需要单独释放
+        if swa_only_to_release is None:
+            assert (
+                not self.is_hybrid_swa
+            ), "swa_only_to_release must not be None in SWA mode"
+            return
         if swa_only_to_release.numel() == 0:
             return
 

@@ -536,6 +536,10 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
+        is_swa_layer = (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+        )
         if k is not None:
             assert v is not None
 
@@ -552,11 +556,7 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    # TODO(yingchun): can we use is_swa_layer below?
-                    _, is_swa = forward_batch.token_to_kv_pool.layers_mapping[
-                        layer.layer_id
-                    ]
-                    if is_swa:
+                    if is_swa_layer:
                         forward_batch.token_to_kv_pool.set_kv_buffer(
                             layer,
                             forward_batch.out_cache_loc_swa,
@@ -587,9 +587,6 @@ class FlashAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
-        is_swa_layer = (
-            layer.sliding_window_size is not None and layer.sliding_window_size > -1
-        )
         window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
@@ -927,6 +924,9 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        is_swa_layer = (
+            layer.sliding_window_size is not None and layer.sliding_window_size > -1
+        )
         if k is not None:
             assert v is not None
             if save_kv_cache:
@@ -936,11 +936,7 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    # TODO(yingchun): can we use is_swa_layer below?
-                    _, is_swa = forward_batch.token_to_kv_pool.layers_mapping[
-                        layer.layer_id
-                    ]
-                    if is_swa:
+                    if is_swa_layer:
                         forward_batch.token_to_kv_pool.set_kv_buffer(
                             layer,
                             forward_batch.out_cache_loc_swa,
@@ -979,9 +975,6 @@ class FlashAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
-        is_swa_layer = (
-            layer.sliding_window_size is not None and layer.sliding_window_size > -1
-        )
         window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
 
         causal = True

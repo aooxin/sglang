@@ -117,6 +117,16 @@ class RequestStage:
         # equal to "observe_queue_time"
         metrics_is_observed=False,
     )
+    HICACHE_PREFETCH_WAIT = RequestStageConfig(
+        "hicache_prefetch_wait",
+        level=1,
+        metrics_is_observed=True,
+    )
+    HICACHE_PREFETCH_IO = RequestStageConfig(
+        "hicache_prefetch_io",
+        level=1,
+        metrics_is_observed=True,
+    )
     DECODE_FORWARD = RequestStageConfig(
         "decode_forward",
         level=1,
@@ -548,6 +558,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     last_forward_entry_time: float = 0.0
     last_prefill_finished_time: float = 0.0
 
+    # hicache prefetch timing
+    hicache_prefetch_wait_start_time: float = 0.0
+    hicache_prefetch_wait_total_duration: float = 0.0
+    hicache_prefetch_io_total_duration: float = 0.0
+    hicache_prefetch_count: int = 0
+
     # other
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
@@ -625,7 +641,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 else:
                     stage = RequestStage.PREFILL_WAITING
                 slice_start_time = self.wait_queue_entry_time
-
                 self.observe_per_stage_req_latency(stage, ts - slice_start_time)
                 self.trace_slice(stage, slice_start_time, ts)
 
@@ -762,6 +777,30 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
         if forward_mode.is_decode():
             self.last_decode_scheduled_time = ts
+
+    def set_hicache_prefetch_wait_start_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        if self.hicache_prefetch_wait_start_time == 0.0:
+            self.hicache_prefetch_wait_start_time = ts
+            self.hicache_prefetch_count += 1
+
+    def set_hicache_prefetch_wait_finish_time(self, ts=None):
+        if self.hicache_prefetch_wait_start_time == 0.0:
+            return None
+        if ts is None:
+            ts = time.perf_counter()
+        duration = ts - self.hicache_prefetch_wait_start_time
+        if duration < 0:
+            return None
+        self.hicache_prefetch_wait_total_duration += duration
+        self.hicache_prefetch_wait_start_time = 0.0
+        return duration
+
+    def add_hicache_prefetch_io_duration(self, duration):
+        if duration is None or duration < 0:
+            return
+        self.hicache_prefetch_io_total_duration += duration
 
     def set_completion_time(self, ts=None):
         if ts is None:
@@ -916,7 +955,31 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             return self.prefill_run_batch_end_time - self.prefill_run_batch_start_time
         return None
 
+    def _get_hicache_prefetch_msg(self) -> str:
+        hicache_prefetch_msg = ""
+        wait_dur = (
+            self.hicache_prefetch_wait_total_duration
+            if self.hicache_prefetch_count > 0
+            else None
+        )
+        io_dur = (
+            self.hicache_prefetch_io_total_duration
+            if self.hicache_prefetch_io_total_duration > 0
+            else None
+        )
+        if wait_dur is not None or io_dur is not None:
+            wait_msg = self.format_duration(wait_dur) if wait_dur is not None else "NA"
+            io_msg = self.format_duration(io_dur) if io_dur is not None else "NA"
+            hicache_prefetch_msg = (
+                f", hicache_prefetch_wait={wait_msg}"
+                f", hicache_prefetch_io={io_msg}"
+                f", hicache_prefetch_count={self.hicache_prefetch_count}"
+            )
+        return hicache_prefetch_msg
+
     def convert_to_duration(self) -> str:
+        hicache_prefetch_msg = self._get_hicache_prefetch_msg()
+
         if self.disagg_mode == DisaggregationMode.NULL:
             queue_duration = self.forward_entry_time - self.wait_queue_entry_time
             forward_duration = self.completion_time - self.forward_entry_time
@@ -926,7 +989,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     queue_duration >= 0 and forward_duration >= 0
                 ), f"queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
 
-            return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.wait_queue_entry_time:.3f}"
+            return (
+                f"queue_duration={self.format_duration(queue_duration)}, "
+                f"forward_duration={self.format_duration(forward_duration)}, "
+                f"start_time={self.wait_queue_entry_time:.3f}"
+                f"{hicache_prefetch_msg}"
+            )
         elif self.disagg_mode == DisaggregationMode.PREFILL:
             bootstrap_queue_duration = (
                 self.wait_queue_entry_time - self.prefill_bootstrap_queue_entry_time
@@ -970,6 +1038,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 f"transfer_speed={self.transfer_speed_gb_s:.2f}GB/s, "
                 f"transfer_total={self.transfer_total_mb:.2f}MB, "
                 f"#retries={self.prefill_retry_count}"
+                f"{hicache_prefetch_msg}"
             )
         elif self.disagg_mode == DisaggregationMode.DECODE:
             prealloc_duration = (
@@ -1017,6 +1086,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
                 f"start={self.decode_prealloc_queue_entry_time:.3f}"
+                f"{hicache_prefetch_msg}"
             )
         else:
             return "Unknown Time Stats"

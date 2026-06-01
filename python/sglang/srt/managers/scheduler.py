@@ -190,6 +190,7 @@ from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.observability.req_time_stats import (
+    RequestStage,
     real_time,
     set_schedule_time_batch,
     set_time_batch,
@@ -2061,13 +2062,15 @@ class Scheduler(
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                self.tree_cache.prefetch_from_storage(
+                prefetch_started = self.tree_cache.prefetch_from_storage(
                     req.rid,
                     last_host_node,
                     new_input_tokens,
                     last_hash,
                     prefix_keys,
                 )
+                if prefetch_started:
+                    req.time_stats.set_hicache_prefetch_wait_start_time()
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
@@ -2580,6 +2583,25 @@ class Scheduler(
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
                 )
+                hicache_prefetch_wait_duration = (
+                    req.time_stats.set_hicache_prefetch_wait_finish_time()
+                )
+                hicache_prefetch_io_duration = (
+                    self.tree_cache.pop_prefetch_io_duration(req.rid)
+                )
+                req.time_stats.add_hicache_prefetch_io_duration(
+                    hicache_prefetch_io_duration
+                )
+                if hicache_prefetch_wait_duration is not None:
+                    req.time_stats.observe_per_stage_req_latency(
+                        RequestStage.HICACHE_PREFETCH_WAIT,
+                        hicache_prefetch_wait_duration,
+                    )
+                if hicache_prefetch_io_duration is not None:
+                    req.time_stats.observe_per_stage_req_latency(
+                        RequestStage.HICACHE_PREFETCH_IO,
+                        hicache_prefetch_io_duration,
+                    )
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(

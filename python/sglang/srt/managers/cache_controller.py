@@ -230,6 +230,8 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
+        self.io_start_time = 0.0
+        self.io_finish_time = 0.0
 
         super().__init__(
             host_indices,
@@ -252,6 +254,22 @@ class PrefetchOperation(StorageOperation):
 
     def is_terminated(self) -> bool:
         return self._terminated_flag
+
+    def mark_io_start(self):
+        with self._lock:
+            if self.io_start_time == 0.0:
+                self.io_start_time = time.monotonic()
+
+    def mark_io_finish(self):
+        with self._lock:
+            if self.io_start_time > 0.0 and self.io_finish_time == 0.0:
+                self.io_finish_time = time.monotonic()
+
+    def get_io_duration(self) -> Optional[float]:
+        with self._lock:
+            if self.io_start_time == 0.0 or self.io_finish_time == 0.0:
+                return None
+            return self.io_finish_time - self.io_start_time
 
 
 class HiCacheController:
@@ -1041,38 +1059,42 @@ class HiCacheController:
                 break  # Operation terminated by controller
 
     def _page_transfer(self, operation):
-        # Transfer batch by batch
-        prefix_keys = operation.prefix_keys
-        for i in range(0, len(operation.hash_value), self.storage_batch_size):
-            batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
-            batch_host_indices = operation.host_indices[
-                i * self.page_size : (i + len(batch_hashes)) * self.page_size
-            ]
-            prev_completed_tokens = operation.completed_tokens
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            # 使用 swa_valid_mask 过滤需要 batch get 的 SWA KV cache
-            if self.is_hybrid_swa and operation.swa_valid_mask is not None:
-                extra_info.swa_needed_per_page = operation.swa_valid_mask[
-                    i : i + len(batch_hashes)
+        operation.mark_io_start()
+        try:
+            # Transfer batch by batch
+            prefix_keys = operation.prefix_keys
+            for i in range(0, len(operation.hash_value), self.storage_batch_size):
+                batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
+                batch_host_indices = operation.host_indices[
+                    i * self.page_size : (i + len(batch_hashes)) * self.page_size
                 ]
+                prev_completed_tokens = operation.completed_tokens
+                extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+                # 使用 swa_valid_mask 过滤需要 batch get 的 SWA KV cache
+                if self.is_hybrid_swa and operation.swa_valid_mask is not None:
+                    extra_info.swa_needed_per_page = operation.swa_valid_mask[
+                        i : i + len(batch_hashes)
+                    ]
 
-            # Get one batch token, and update the completed_tokens if succeed
-            t0_io = time.perf_counter()
-            self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
-            if self.metrics_collector is not None:
-                self.metrics_collector.log_prefetch_io_latency(
-                    time.perf_counter() - t0_io
-                )
-            # Check termination
-            if (
-                operation.completed_tokens
-                != prev_completed_tokens + len(batch_hashes) * self.page_size
-            ):
-                operation.mark_terminate()
-                break  # Some operations fail or operation terminated by controller
+                # Get one batch token, and update the completed_tokens if succeed
+                t0_io = time.perf_counter()
+                self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
+                if self.metrics_collector is not None:
+                    self.metrics_collector.log_prefetch_io_latency(
+                        time.perf_counter() - t0_io
+                    )
+                # Check termination
+                if (
+                    operation.completed_tokens
+                    != prev_completed_tokens + len(batch_hashes) * self.page_size
+                ):
+                    operation.mark_terminate()
+                    break  # Some operations fail or operation terminated by controller
 
-            if prefix_keys and len(prefix_keys) > 0:
-                prefix_keys += batch_hashes
+                if prefix_keys and len(prefix_keys) > 0:
+                    prefix_keys += batch_hashes
+        finally:
+            operation.mark_io_finish()
 
     def prefetch_io_aux_func(self):
         """

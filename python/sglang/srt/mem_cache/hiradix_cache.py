@@ -226,6 +226,7 @@ class BaseHiRadixCache(abc.ABC):
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
+        self.prefetch_io_duration_by_reqid = {}
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -544,6 +545,7 @@ class BaseHiRadixCache(abc.ABC):
 
         def _drain_revoke():
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
+                self.prefetch_io_duration_by_reqid.pop(req_id, None)
                 info = self.ongoing_prefetch.pop(req_id, None)
                 if info is not None:
                     last_host_node, token_ids, _, _ = info
@@ -669,6 +671,7 @@ class BaseHiRadixCache(abc.ABC):
         TreeNode.counter = 0
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
+        self.prefetch_io_duration_by_reqid.clear()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
@@ -1469,6 +1472,7 @@ class BaseHiRadixCache(abc.ABC):
             host_indices[min_completed_tokens:completed_tokens]
         )
         last_host_node.release_host()
+        self.prefetch_io_duration_by_reqid[req_id] = operation.get_io_duration()
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
@@ -1499,6 +1503,9 @@ class BaseHiRadixCache(abc.ABC):
         This should be called after check_prefetch_progress() returns True.
         """
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
+
+    def pop_prefetch_io_duration(self, req_id: str) -> Optional[float]:
+        return self.prefetch_io_duration_by_reqid.pop(req_id, None)
 
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
@@ -1549,7 +1556,7 @@ class BaseHiRadixCache(abc.ABC):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
-    ):
+    ) -> bool:
         new_input_tokens = (
             convert_to_steps_key(new_input_tokens, self.speculative_num_steps)
             if self.is_eagle
@@ -1565,7 +1572,7 @@ class BaseHiRadixCache(abc.ABC):
             or prefetch_length < self.prefetch_threshold
             or self.cache_controller.prefetch_rate_limited()
         ):
-            return
+            return False
 
         last_host_node.protect_host()
         full_host_indices, swa_host_indices, lack_full_size, lack_swa_size = (
@@ -1585,7 +1592,7 @@ class BaseHiRadixCache(abc.ABC):
             assert swa_host_indices is None
             last_host_node.release_host()
             # no sufficient host memory for prefetch
-            return
+            return False
         operation = self.cache_controller.prefetch(
             req_id,
             full_host_indices,
@@ -1601,6 +1608,7 @@ class BaseHiRadixCache(abc.ABC):
             operation,
         )
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
+        return True
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
@@ -1785,6 +1793,7 @@ class BaseHiRadixCache(abc.ABC):
 
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request
+        self.prefetch_io_duration_by_reqid.pop(rid, None)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
 
         if rid not in self.ongoing_prefetch:

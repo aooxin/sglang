@@ -810,6 +810,8 @@ class Req(ReqDllmMixin):
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0
         self.raw_cached_tokens = 0
+        self.storage_full_hit_tokens = 0
+        self.storage_swa_hit_tokens = 0
         self.raw_prefix_len = 0
         self.already_computed = 0
 

@@ -227,6 +227,8 @@ class BaseHiRadixCache(abc.ABC):
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
         self.prefetch_io_duration_by_reqid = {}
+        self.storage_full_hit_by_reqid = {}
+        self.storage_swa_hit_by_reqid = {}
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -546,6 +548,8 @@ class BaseHiRadixCache(abc.ABC):
         def _drain_revoke():
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
                 self.prefetch_io_duration_by_reqid.pop(req_id, None)
+                self.storage_full_hit_by_reqid.pop(req_id, None)
+                self.storage_swa_hit_by_reqid.pop(req_id, None)
                 info = self.ongoing_prefetch.pop(req_id, None)
                 if info is not None:
                     last_host_node, token_ids, _, _ = info
@@ -672,6 +676,8 @@ class BaseHiRadixCache(abc.ABC):
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
         self.prefetch_io_duration_by_reqid.clear()
+        self.storage_full_hit_by_reqid.clear()
+        self.storage_swa_hit_by_reqid.clear()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
@@ -1473,6 +1479,8 @@ class BaseHiRadixCache(abc.ABC):
         )
         last_host_node.release_host()
         self.prefetch_io_duration_by_reqid[req_id] = operation.get_io_duration()
+        self.storage_full_hit_by_reqid[req_id] = operation.full_hit_count
+        self.storage_swa_hit_by_reqid[req_id] = operation.swa_hit_count
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
 
@@ -1506,6 +1514,12 @@ class BaseHiRadixCache(abc.ABC):
 
     def pop_prefetch_io_duration(self, req_id: str) -> Optional[float]:
         return self.prefetch_io_duration_by_reqid.pop(req_id, None)
+
+    def pop_storage_full_hit(self, req_id: str) -> int:
+        return self.storage_full_hit_by_reqid.pop(req_id, 0)
+
+    def pop_storage_swa_hit(self, req_id: str) -> int:
+        return self.storage_swa_hit_by_reqid.pop(req_id, 0)
 
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
@@ -1794,6 +1808,8 @@ class BaseHiRadixCache(abc.ABC):
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request
         self.prefetch_io_duration_by_reqid.pop(rid, None)
+        self.storage_full_hit_by_reqid.pop(rid, None)
+        self.storage_swa_hit_by_reqid.pop(rid, None)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
 
         if rid not in self.ongoing_prefetch:

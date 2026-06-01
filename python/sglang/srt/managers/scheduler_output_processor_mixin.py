@@ -949,6 +949,8 @@ class SchedulerOutputProcessorMixin:
         completion_tokens = []
         cached_tokens = []
         raw_cached_tokens = []
+        storage_full_hit_tokens = []
+        storage_swa_hit_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
         spec_verify_ct = []
         spec_accepted_tokens = []
@@ -1051,6 +1053,8 @@ class SchedulerOutputProcessorMixin:
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
                 raw_cached_tokens.append(req.raw_cached_tokens)
+                storage_full_hit_tokens.append(req.storage_full_hit_tokens)
+                storage_swa_hit_tokens.append(req.storage_swa_hit_tokens)
 
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self._get_cached_tokens_details(req))
@@ -1182,6 +1186,8 @@ class SchedulerOutputProcessorMixin:
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
                     raw_cached_tokens=raw_cached_tokens,
+                    storage_full_hit_tokens=storage_full_hit_tokens,
+                    storage_swa_hit_tokens=storage_swa_hit_tokens,
                     cached_tokens_details=cached_tokens_details,
                     input_token_logprobs_val=input_token_logprobs_val,
                     input_token_logprobs_idx=input_token_logprobs_idx,
@@ -1216,6 +1222,8 @@ class SchedulerOutputProcessorMixin:
         prompt_tokens = []
         cached_tokens = []
         raw_cached_tokens = []
+        storage_full_hit_tokens = []
+        storage_swa_hit_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
         time_stats = []
         retraction_counts = []
@@ -1228,6 +1236,8 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 cached_tokens.append(req.cached_tokens)
                 raw_cached_tokens.append(req.raw_cached_tokens)
+                storage_full_hit_tokens.append(req.storage_full_hit_tokens)
+                storage_swa_hit_tokens.append(req.storage_swa_hit_tokens)
 
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self._get_cached_tokens_details(req))

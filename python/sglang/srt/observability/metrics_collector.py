@@ -1300,6 +1300,18 @@ class TokenizerMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        self.storage_full_hit_tokens_total = Counter(
+            name="sglang:storage_full_hit_tokens_total",
+            documentation="Cumulative full-attention L3 storage hit tokens per request.",
+            labelnames=labels.keys(),
+        )
+
+        self.storage_swa_hit_tokens_total = Counter(
+            name="sglang:storage_swa_hit_tokens_total",
+            documentation="Cumulative SWA-safe L3 storage hit tokens per request.",
+            labelnames=labels.keys(),
+        )
+
         self.num_requests_total = Counter(
             name="sglang:num_requests_total",
             documentation="Number of requests processed.",
@@ -1456,6 +1468,8 @@ class TokenizerMetricsCollector:
         generation_tokens: int,
         cached_tokens: int,
         raw_cached_tokens: int,
+        storage_full_hit_tokens: int,
+        storage_swa_hit_tokens: int,
         e2e_latency: float,
         has_grammar: bool,
         retraction_count: int,
@@ -1491,6 +1505,14 @@ class TokenizerMetricsCollector:
 
         if raw_cached_tokens > 0:
             self.raw_cached_tokens_total.labels(**labels).inc(raw_cached_tokens)
+        if storage_full_hit_tokens > 0:
+            self.storage_full_hit_tokens_total.labels(**labels).inc(
+                storage_full_hit_tokens
+            )
+        if storage_swa_hit_tokens > 0:
+            self.storage_swa_hit_tokens_total.labels(**labels).inc(
+                storage_swa_hit_tokens
+            )
         self.num_requests_total.labels(**labels).inc(1)
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)
@@ -1600,6 +1622,12 @@ class StorageMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        self.revoke_tokens_total = Counter(
+            name="sglang:revoke_tokens_total",
+            documentation="Number of pre-allocated host tokens revoked due to insufficient L3 hits.",
+            labelnames=labels.keys(),
+        )
+
         self.backuped_tokens_total = Counter(
             name="sglang:backuped_tokens_total",
             documentation="Number of backuped tokens.",
@@ -1688,6 +1716,10 @@ class StorageMetricsCollector:
     def log_prefetch_dropped_tokens(self, dropped_tokens: int):
         if dropped_tokens > 0:
             self.prefetch_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
+
+    def log_revoke_tokens(self, revoke_tokens: int):
+        if revoke_tokens > 0:
+            self.revoke_tokens_total.labels(**self.labels).inc(revoke_tokens)
 
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:

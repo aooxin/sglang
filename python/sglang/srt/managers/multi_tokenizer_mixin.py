@@ -149,6 +149,8 @@ def _handle_output_by_index(output, i):
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             raw_cached_tokens=_extract_field_by_index(output, "raw_cached_tokens", i),
+            storage_full_hit_tokens=_extract_field_by_index(output, "storage_full_hit_tokens", i),
+            storage_swa_hit_tokens=_extract_field_by_index(output, "storage_swa_hit_tokens", i),
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
@@ -208,6 +210,8 @@ def _handle_output_by_index(output, i):
             prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             raw_cached_tokens=_extract_field_by_index(output, "raw_cached_tokens", i),
+            storage_full_hit_tokens=_extract_field_by_index(output, "storage_full_hit_tokens", i),
+            storage_swa_hit_tokens=_extract_field_by_index(output, "storage_swa_hit_tokens", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
         )
@@ -230,6 +234,8 @@ def _handle_output_by_index(output, i):
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
             raw_cached_tokens=_extract_field_by_index(output, "raw_cached_tokens", i),
+            storage_full_hit_tokens=_extract_field_by_index(output, "storage_full_hit_tokens", i),
+            storage_swa_hit_tokens=_extract_field_by_index(output, "storage_swa_hit_tokens", i),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),

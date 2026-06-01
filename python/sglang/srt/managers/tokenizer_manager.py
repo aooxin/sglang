@@ -2025,12 +2025,26 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 if recv_obj.raw_cached_tokens and i < len(recv_obj.raw_cached_tokens)
                 else 0
             )
+            storage_full_hit = (
+                recv_obj.storage_full_hit_tokens[i]
+                if getattr(recv_obj, "storage_full_hit_tokens", None)
+                and i < len(recv_obj.storage_full_hit_tokens)
+                else 0
+            )
+            storage_swa_hit = (
+                recv_obj.storage_swa_hit_tokens[i]
+                if getattr(recv_obj, "storage_swa_hit_tokens", None)
+                and i < len(recv_obj.storage_swa_hit_tokens)
+                else 0
+            )
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
                 completion_tokens,
                 recv_obj.cached_tokens[i],
                 raw_cached,
+                storage_full_hit,
+                storage_swa_hit,
                 state.time_stats.get_e2e_latency(),
                 self._request_has_grammar(state.obj),
                 retraction_count,

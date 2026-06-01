@@ -228,6 +228,8 @@ class PrefetchOperation(StorageOperation):
     ):
         self.request_id = request_id
         self.swa_valid_mask: Optional[torch.Tensor] = None
+        self.full_hit_count: int = 0
+        self.swa_hit_count: int = 0
 
         self._lock = threading.Lock()
         self._terminated_flag = False
@@ -1409,7 +1411,7 @@ class HiCacheController:
 
     def _storage_hit_query(
         self, operation
-    ) -> Tuple[list[str], int, Optional[torch.Tensor]]:
+    ) -> Tuple[list[str], int, int, Optional[torch.Tensor]]:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
@@ -1476,10 +1478,11 @@ class HiCacheController:
             return (
                 hash_values[:swa_valid_len],
                 swa_valid_len * self.page_size,
+                storage_query_count,
                 swa_valid_mask[:swa_valid_len],
             )
         else:
-            return hash_values, storage_query_count, None
+            return hash_values, storage_query_count, storage_query_count, None
 
     def prefetch_thread_func(self):
         """
@@ -1497,10 +1500,15 @@ class HiCacheController:
                     continue
 
                 # 通过 batch_exists 查看 storage 上存在的 KV cache（含 SWA 的有效区间 mask）
-                hash_value, storage_hit_count, valid_swa_mask = self._storage_hit_query(
-                    operation
-                )
+                (
+                    hash_value,
+                    storage_hit_count,
+                    full_query_count,
+                    valid_swa_mask,
+                ) = self._storage_hit_query(operation)
                 hit_pages = storage_hit_count // self.page_size
+                operation.full_hit_count = full_query_count
+                operation.swa_hit_count = storage_hit_count if self.is_hybrid_swa else 0
                 assert (
                     len(hash_value) * self.page_size == storage_hit_count
                 ), f"{len(hash_value)=}, {storage_hit_count=}"
@@ -1542,8 +1550,11 @@ class HiCacheController:
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
+                    revoke_tokens = len(operation.host_indices)
                     self.append_host_mem_release(operation.host_indices)
                     self.append_swa_only_host_mem_release(operation.swa_host_indices)
+                    if self.metrics_collector is not None:
+                        self.metrics_collector.log_revoke_tokens(revoke_tokens)
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
@@ -1559,10 +1570,13 @@ class HiCacheController:
                     )
                     if swa_valid_len < self.sliding_window_pages:
                         self.prefetch_revoke_queue.put(operation.request_id)
+                        revoke_tokens = len(operation.host_indices)
                         self.append_host_mem_release(operation.host_indices)
                         self.append_swa_only_host_mem_release(
                             operation.swa_host_indices
                         )
+                        if self.metrics_collector is not None:
+                            self.metrics_collector.log_revoke_tokens(revoke_tokens)
                         logger.debug(
                             f"Revoking prefetch for request {operation.request_id} due to insufficient SWA hits ({swa_valid_len})."
                         )

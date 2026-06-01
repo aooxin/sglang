@@ -978,6 +978,8 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     completion_tokens: List[int]
     cached_tokens: List[int]
     raw_cached_tokens: Optional[List[int]]
+    storage_full_hit_tokens: Optional[List[int]]
+    storage_swa_hit_tokens: Optional[List[int]]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -1041,6 +1043,8 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     reasoning_tokens: List[int]
     cached_tokens: List[int]
     raw_cached_tokens: Optional[List[int]]
+    storage_full_hit_tokens: Optional[List[int]]
+    storage_swa_hit_tokens: Optional[List[int]]
 
     # Logprobs
     input_token_logprobs_val: List[float]
@@ -1100,6 +1104,8 @@ class BatchEmbeddingOutput(BaseBatchReq):
     prompt_tokens: List[int]
     cached_tokens: List[int]
     raw_cached_tokens: Optional[List[int]]
+    storage_full_hit_tokens: Optional[List[int]]
+    storage_swa_hit_tokens: Optional[List[int]]
     # Placeholder token info
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]

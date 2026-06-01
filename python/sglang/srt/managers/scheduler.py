@@ -2602,6 +2602,12 @@ class Scheduler(
                         RequestStage.HICACHE_PREFETCH_IO,
                         hicache_prefetch_io_duration,
                     )
+                req.storage_full_hit_tokens = self.tree_cache.pop_storage_full_hit(
+                    req.rid
+                )
+                req.storage_swa_hit_tokens = self.tree_cache.pop_storage_swa_hit(
+                    req.rid
+                )
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(

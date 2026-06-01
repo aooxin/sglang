@@ -187,6 +187,7 @@ from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.observability.req_time_stats import (
     real_time,
     set_schedule_time_batch,
@@ -1420,6 +1421,7 @@ class Scheduler(
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
+    @nvtx_annotated_method("scheduler.recv_requests")
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
@@ -1594,6 +1596,7 @@ class Scheduler(
         ]
         return work_reqs, control_reqs
 
+    @nvtx_annotated_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
@@ -2182,6 +2185,7 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
+    @nvtx_annotated_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
@@ -2552,6 +2556,7 @@ class Scheduler(
 
         return new_batch
 
+    @nvtx_annotated_method("scheduler.update_running_batch")
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
@@ -2641,6 +2646,7 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
+    @nvtx_annotated_method("scheduler.run_batch")
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -2791,6 +2797,7 @@ class Scheduler(
 
         return ret
 
+    @nvtx_annotated_method("scheduler.launch_batch_sample_if_needed")
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult
     ) -> Union[GenerationBatchResult]:
@@ -2816,6 +2823,7 @@ class Scheduler(
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
 
+    @nvtx_annotated_method("scheduler.process_batch_result")
     def process_batch_result(
         self,
         batch: ScheduleBatch,

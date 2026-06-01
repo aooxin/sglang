@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
 
 class ScheduleBatchDisaggregationDecodeMixin:
 
+    @nvtx_annotated_method("schedulebatch.prepare_for_prebuilt")
     def prepare_for_prebuilt(self: ScheduleBatch):
         """
         Prepare a prebuilt extend by populate metadata
@@ -100,6 +102,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             self.model_config.vocab_size,
         )
 
+    @nvtx_annotated_method("decode_schedule_batch.process_prebuilt")
     def process_prebuilt(
         self: ScheduleBatch,
         server_args: ServerArgs,

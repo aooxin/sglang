@@ -28,6 +28,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -317,6 +318,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
             )
 
+    @nvtx_annotated_method("eagle_draft_worker.draft")
     def draft(self, model_worker_batch: ModelWorkerBatch):
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
@@ -396,6 +398,7 @@ class EagleDraftWorker(BaseDraftWorker):
             seq_lens_cpu=None,
         )
 
+    @nvtx_annotated_method("eagle_draft_worker.draft_forward")
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
@@ -544,6 +547,7 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input.hidden_states = logits_output.hidden_states
         return next_draft_input
 
+    @nvtx_annotated_method("eagle_draft_worker._draft_extend_for_decode")
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
@@ -687,6 +691,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
+    @nvtx_annotated_method("eagle_worker_v2.forward_batch_generation")
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
         if (
             model_worker_batch.forward_mode.is_extend()
@@ -738,6 +743,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
             return batch_output
 
+    @nvtx_annotated_method("eagle_worker_v2.verify")
     def verify(self, batch: ModelWorkerBatch):
         # Since batch.seq_lens is allocated in another stream, we need
         # record_stream() to prevent pytorch gc and reuse the gpu memory

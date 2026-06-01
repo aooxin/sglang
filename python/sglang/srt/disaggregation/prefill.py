@@ -52,6 +52,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
 if TYPE_CHECKING:
@@ -454,6 +455,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Update last_batch
             self.last_batch = batch
 
+    @nvtx_annotated_method("scheduler.process_batch_result_disagg_prefill")
     def process_batch_result_disagg_prefill(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -575,6 +577,7 @@ class SchedulerDisaggregationPrefillMixin:
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
+    @nvtx_annotated_method("scheduler.process_disagg_prefill_inflight_queue")
     def process_disagg_prefill_inflight_queue(
         self: Scheduler, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:

@@ -75,6 +75,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.observability.metrics_collector import (
     DPCooperationInfo,
     SchedulerMetricsCollector,
@@ -2059,6 +2060,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert not ret or self.spec_algorithm.supports_spec_v2()
         return ret
 
+    @nvtx_annotated_method("scheduler.schedule_batch.prepare_for_decode")
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
@@ -2172,12 +2174,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .to(device=self.device, non_blocking=True)
             )
 
+    @nvtx_annotated_method("scheduler.schedule_batch.maybe_wait_verify_done")
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
 
+    @nvtx_annotated_method("scheduler.schedule_batch.filter_batch")
     def filter_batch(
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,

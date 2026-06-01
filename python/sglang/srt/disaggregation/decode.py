@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -1136,6 +1137,7 @@ class DecodeTransferQueue:
 class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
+    @nvtx_annotated_method("scheduler.disagg_decode.event_loop_normal")
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
 
@@ -1162,6 +1164,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.last_batch = batch
 
     @torch.no_grad()
+    @nvtx_annotated_method("scheduler.disagg_decode.event_loop_overlap")
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
@@ -1209,6 +1212,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         return GenerationBatchResult()
 
+    @nvtx_annotated_method("scheduler.disagg_decode.get_next_batch")
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
@@ -1241,6 +1245,7 @@ class SchedulerDisaggregationDecodeMixin:
             set_schedule_time_batch(ret)
         return ret
 
+    @nvtx_annotated_method("scheduler.disagg_decode.get_new_prebuilt_batch")
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
         """Create a schedulebatch for fake completed prefill"""
         if self.grammar_manager.has_waiting_grammars():
@@ -1293,6 +1298,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         return new_batch
 
+    @nvtx_annotated_method("scheduler.disagg_decode.process_decode_queue")
     def process_decode_queue(self: Scheduler):
         if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()

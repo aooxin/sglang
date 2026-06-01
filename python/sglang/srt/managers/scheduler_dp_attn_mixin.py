@@ -10,6 +10,7 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.utils.common import require_mlp_tp_gather
 
@@ -226,6 +227,7 @@ def prepare_mlp_sync_batch_raw(
 
 
 class SchedulerDPAttnMixin:
+    @nvtx_annotated_method("scheduler.prepare_mlp_sync_batch")
     def prepare_mlp_sync_batch(self: Scheduler, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(
             local_batch,

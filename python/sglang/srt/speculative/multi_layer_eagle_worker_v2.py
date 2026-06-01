@@ -24,6 +24,7 @@ from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -214,6 +215,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 forward_batch, batch_result
             )
 
+    @nvtx_annotated_method("multi_layer_eagle_draft_worker.draft")
     def draft(self, model_worker_batch: ModelWorkerBatch):
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
@@ -278,6 +280,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             seq_lens_cpu=None,
         )
 
+    @nvtx_annotated_method("multi_layer_eagle_draft_worker.draft_forward")
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
@@ -351,6 +354,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
     def draft_extend(self):
         pass
 
+    @nvtx_annotated_method("multi_layer_eagle_draft_worker._draft_extend_for_prefill")
     def _draft_extend_for_prefill(
         self,
         batch: ModelWorkerBatch,
@@ -436,6 +440,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             )
         return next_draft_input
 
+    @nvtx_annotated_method("multi_layer_eagle_draft_worker._draft_extend_for_decode")
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
@@ -661,6 +666,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
             return batch_output
 
+    @nvtx_annotated_method("multi_layer_eagle_worker_v2.verify")
     def verify(
         self,
         batch: ModelWorkerBatch,

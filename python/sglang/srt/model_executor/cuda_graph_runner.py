@@ -65,6 +65,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
+from sglang.srt.nvtx_utils import nvtx_range
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
@@ -1147,7 +1148,8 @@ class CudaGraphRunner:
         self.deepep_adapter.replay()
 
         if not skip_attn_backend_init:
-            self.replay_prepare(forward_batch, pp_proxy_tensors)
+            with nvtx_range("cuda_graph_runner.replay_prepare"):
+                self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
@@ -1158,7 +1160,8 @@ class CudaGraphRunner:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
-        self.graphs[graph_key].replay()
+        with nvtx_range("cuda_graph_runner.replay"):
+            self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):

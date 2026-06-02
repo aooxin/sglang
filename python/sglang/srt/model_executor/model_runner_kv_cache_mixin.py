@@ -365,6 +365,26 @@ class ModelRunnerKVCacheMixin:
         full_tokens = align_page_size(int(total_memory / denominator))
         swa_tokens = align_page_size(int(full_tokens * swa_full_tokens_ratio))
 
+        # In disaggregated prefill mode, the SWA pool must be large enough to
+        # hold at least 3x chunked_prefill_size tokens.  During chunked prefill
+        # the SWA layers need the current chunk plus up to two preceding windows
+        # of KV entries; if the pool is smaller, allocation will fail mid-flight.
+        chunked_prefill_size = self.server_args.chunked_prefill_size
+        if (
+            self.server_args.disaggregation_mode == "prefill"
+            and chunked_prefill_size is not None
+            and chunked_prefill_size > 0
+        ):
+            min_swa_tokens = chunked_prefill_size * 3
+            if swa_tokens < min_swa_tokens:
+                raise RuntimeError(
+                    f"SWA pool size ({swa_tokens}) is too small for chunked prefill "
+                    f"(requires >= chunked_prefill_size * 3 = {min_swa_tokens}). "
+                    f"Please increase --swa-full-tokens-ratio "
+                    f"(current: {swa_full_tokens_ratio}) or increase "
+                    f"--mem-fraction-static to enlarge the SWA pool capacity."
+                )
+
         logger.info(
             f"Use sliding window memory pool. full_layer_tokens={full_tokens}, swa_layer_tokens={swa_tokens}"
         )

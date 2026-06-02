@@ -2169,6 +2169,14 @@ class SWATokenToKVPoolHost:
             device=self.device,
             allocator_type=allocator_type,
         )
+        # Validate host pool capacities: in disaggregated prefill mode the
+        # host pools buffer KV data evicted from the device before transfer to
+        # the decode node.  If the host pool is smaller than 1.5x the device
+        # pool, eviction may stall because there is nowhere to offload.
+        self._validate_host_pool_sizes(
+            host_to_device_ratio, host_size, host_to_device_ratio_swa, host_size_swa
+        )
+
         # TODO(yingchun): 从 SWATokenToKVPoolAllocator 拷过来的，还不确定最后的 -1 的意义
         # Note: append one more item of value -1 in the end so -1 maps to -1.
         # It is needed for the last_loc in alloc_extend, where the first full_last_loc
@@ -2192,6 +2200,48 @@ class SWATokenToKVPoolHost:
         self.layer_num = self.device_pool.layer_num
         self.reserve_swa_size = envs.SGLANG_RESERVE_SWA_SIZE_BEFORE_PREFETCHING.get()
         assert self.reserve_swa_size % self.page_size == 0
+
+    def _validate_host_pool_sizes(
+        self,
+        host_to_device_ratio: float,
+        host_size: int,
+        host_to_device_ratio_swa: float,
+        host_size_swa: int,
+    ) -> None:
+        """Ensure host pools are large enough relative to device pools.
+
+        In disaggregated prefill mode, KV data is offloaded from the device to
+        the host before being transferred to the decode node. The host pool
+        must be at least 1.5x the device pool to avoid back-pressure when the
+        device pool is fully utilized.
+        """
+        _HOST_MIN_RATIO = 1.5
+
+        device_full_size = self.device_pool.full_kv_pool.size
+        host_full_size = self.full_pool_host.size
+        min_host_full_size = int(device_full_size * _HOST_MIN_RATIO)
+        if host_full_size < min_host_full_size:
+            raise RuntimeError(
+                f"Host Full pool size ({host_full_size}) must be at least "
+                f"{_HOST_MIN_RATIO}x the device Full pool size ({device_full_size}), "
+                f"i.e. >= {min_host_full_size}. "
+                f"Please increase --hicache-ratio (current: {host_to_device_ratio}) "
+                f"or set a larger --hicache-size (current: {host_size} GB) "
+                f"to enlarge the host Full pool capacity."
+            )
+
+        device_swa_size = self.device_pool.swa_kv_pool.size
+        host_swa_size = self.swa_pool_host.size
+        min_host_swa_size = int(device_swa_size * _HOST_MIN_RATIO)
+        if host_swa_size < min_host_swa_size:
+            raise RuntimeError(
+                f"Host SWA pool size ({host_swa_size}) must be at least "
+                f"{_HOST_MIN_RATIO}x the device SWA pool size ({device_swa_size}), "
+                f"i.e. >= {min_host_swa_size}. "
+                f"Please increase --hicache-ratio (current: {host_to_device_ratio_swa}) "
+                f"or set a larger --hicache-size (current: {host_size_swa} GB) "
+                f"to enlarge the host SWA pool capacity."
+            )
 
     # full 和 swa 两个子池容量恒等（构造时 host_size==host_size_swa），全程也按相同
     # need_size 一起 alloc/free（见 alloc/free），所以 size / available_size 直接代理

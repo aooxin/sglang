@@ -456,7 +456,7 @@ class FaultInjector:
             self._fi_exists_prob > 0.0
             and self.tp_world_size > 1
             and len(hash_values) >= 2
-            and self._fi_trigger_rng.random() < self._fi_exists_prob
+            and self._exists_trigger_rng.random() < self._fi_exists_prob
         ):
             drop_pages = self._exists_amount_rng.randint(
                 1, max(1, len(hash_values) // 2)

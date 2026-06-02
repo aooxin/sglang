@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
+from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -2227,11 +2228,11 @@ class SWATokenToKVPoolHost:
     # - 对于后续已做 mapping 的部分，使用 free 即可释放 full + swa
     # - 对于后续未做 mapping 的部分，使用 free 可释放 full，使用 free_swa_only 可释放 swa
     def alloc_unmapped_host_by_len(
-        self,
-        full_need_size: int,
+        self, full_need_size: int, swa_need_size: int = None
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, int]:
         assert full_need_size % self.page_size == 0
-        swa_need_size = min(full_need_size, self.reserve_swa_size)
+        if swa_need_size is None:
+            swa_need_size = min(full_need_size, self.reserve_swa_size)
         assert swa_need_size % self.page_size == 0
 
         lack_full_size = full_need_size - self.full_pool_host.available_size()
@@ -2302,9 +2303,6 @@ class SWATokenToKVPoolHost:
         swa_valid_mask from tail.  When SWA pages are insufficient the
         frontmost True entries are trimmed; when surplus, leftover SWA
         indices are returned from the head of swa_host_indices.
-
-        This implementation replaces the Python for-loop with pure tensor
-        operations for better performance on large inputs.
         """
         ps = self.page_size
         num_pages = len(swa_valid_mask)
@@ -2361,6 +2359,49 @@ class SWATokenToKVPoolHost:
         # 返回悬垂的 SWA，供 caller 释放
         return swa_host_indices
 
+    # TODO(yingchun): 与 SWATokenToKVPoolAllocator 中的 splice_swa_mapping 实现基本一样，可重构
+    def splice_swa_mapping(
+        self,
+        tgt_full_indices: torch.Tensor,
+        src_full_indices: torch.Tensor,
+    ) -> int:
+        """
+        Transfer SWA host slots from src to tgt where tgt lacks SWA but src has it.
+
+        Analogous to SWATokenToKVPoolAllocator.splice_swa_mapping on the device
+        side, but operates on the host-side full_to_swa_index_mapping.
+
+        For each position i where tgt has no SWA (mapping == 0) and src does
+        (mapping != 0), the SWA slot ownership is moved: tgt gets the SWA index,
+        src's mapping is zeroed out.  The SWA KV data already resides in the host
+        pool buffer, so no data copy is needed — only the mapping pointer changes.
+
+        tgt_full_indices may contain -1 placeholders for non-backuped tree nodes
+        (write_back mode); those positions are skipped automatically.
+
+        Returns the number of tokens whose SWA mapping was transferred.
+        """
+        assert len(tgt_full_indices) == len(src_full_indices)
+        # tgt_full_indices may contain -1 placeholders for non-backuped tree
+        # nodes (write_back mode). Skip those positions entirely.
+        valid_mask = tgt_full_indices >= 0
+        if not valid_mask.all():
+            tgt_full_indices = tgt_full_indices[valid_mask]
+            src_full_indices = src_full_indices[valid_mask]
+        if len(tgt_full_indices) == 0:
+            return 0
+        tgt_swa = self.full_to_swa_index_mapping[tgt_full_indices]
+        src_swa = self.full_to_swa_index_mapping[src_full_indices]
+        transfer_mask: torch.Tensor = (tgt_swa == 0) & (src_swa != 0)
+        num_transferred = int(transfer_mask.count_nonzero())
+        if num_transferred > 0:
+            assert num_transferred % self.page_size == 0
+            self.full_to_swa_index_mapping[tgt_full_indices[transfer_mask]] = src_swa[
+                transfer_mask
+            ]
+            self.full_to_swa_index_mapping[src_full_indices[transfer_mask]] = 0
+        return num_transferred
+
     def free_swa_only(self, swa_indices: torch.Tensor) -> int:
         """Free raw SWA indices that were never mapped to any full index."""
         if swa_indices.numel() == 0:
@@ -2376,16 +2417,20 @@ class SWATokenToKVPoolHost:
         self.full_to_swa_index_mapping[:-1].fill_(0)
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        swa_host_indices: torch.Tensor,
+        swa_device_indices: torch.Tensor,
     ):
         layer_id_pool, is_swa = self.device_pool.layers_mapping[layer_id]
         assert len(host_indices) == len(device_indices)
         if is_swa:
-            swa_host_indices = self.full_to_swa_index_mapping[host_indices]
-            swa_device_indices = self.device_pool.full_to_swa_index_mapping[
-                device_indices
-            ]
-            # TODO(yingchun): 0 的位置直接跳过
+            assert swa_host_indices is not None
+            assert swa_device_indices is not None
             self.swa_pool_host.load_to_device_per_layer(
                 self.device_pool.swa_kv_pool,
                 swa_host_indices,
@@ -2402,8 +2447,15 @@ class SWATokenToKVPoolHost:
                 io_backend,
             )
 
+    @nvtx_annotated_method("backup_from_device_all_layer")
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+        swa_host_indices,
+        swa_device_indices,
     ):
         assert io_backend == "kernel", "Only kernel IO backend is supported."
         # Backup full-attention KV cache.
@@ -2421,8 +2473,6 @@ class SWATokenToKVPoolHost:
             num_layers=self.device_pool.full_layer_nums,
         )
         # Backup SWA KV cache.
-        swa_host_indices = self.full_to_swa_index_mapping[host_indices]
-        swa_device_indices = device_pool.full_to_swa_index_mapping[device_indices]
         transfer_kv_all_layer_fuse_lf_pf(
             src_k_layers=device_pool.swa_kv_pool.k_data_ptrs,
             dst_k=self.swa_pool_host.k_buffer,

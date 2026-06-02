@@ -603,6 +603,7 @@ class RadixCache(BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
+            self._on_tree_value_removed(x)
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
             self._delete_leaf(x)
@@ -616,6 +617,33 @@ class RadixCache(BasePrefixCache):
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
+    def _on_node_becomes_protected(self, node: TreeNode) -> None:
+        """Hook fired when ``node`` transitions from evictable to protected
+        (lock_ref 0 -> 1) during inc_lock_ref. Subclasses can override to
+        maintain auxiliary per-bucket counters.
+        """
+
+    def _on_node_becomes_evictable(self, node: TreeNode) -> None:
+        """Hook fired when ``node`` transitions from protected to evictable
+        (lock_ref 1 -> 0) during dec_lock_ref.
+        """
+
+    def _on_tree_value_added(self, node: TreeNode) -> None:
+        """Hook fired after ``node.value`` enters the tree's evictable bucket,
+        i.e. whenever ``self.evictable_size_`` is increased for this node.
+        Triggers: inserting a new leaf, repopulating an evicted node, or
+        HiCache load-back. Subclasses maintain auxiliary bucket counters here.
+        """
+
+    def _on_tree_value_removed(self, node: TreeNode) -> None:
+        """Hook fired before ``node.value`` leaves the tree's evictable bucket,
+        i.e. before the allocator.free() call that releases the slots. Must
+        be called while ``node.value`` still references live (non-freed) KV
+        slots so subclasses can inspect any per-slot state (e.g. SWA mapping)
+        before it is cleared by free().
+        Triggers: tree leaf eviction, host-to-device eviction in HiCache.
+        """
+
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult(delta=0)
@@ -626,6 +654,7 @@ class RadixCache(BasePrefixCache):
                 self.evictable_size_ -= len(node.key)
                 self.protected_size_ += len(node.key)
                 delta -= len(node.key)
+                self._on_node_becomes_protected(node)
             node.lock_ref += 1
             self._update_leaf_status(node)
             node = node.parent
@@ -643,6 +672,7 @@ class RadixCache(BasePrefixCache):
                 self.evictable_size_ += len(node.key)
                 self.protected_size_ -= len(node.key)
                 delta += len(node.key)
+                self._on_node_becomes_evictable(node)
             node.lock_ref -= 1
             self._update_leaf_status(node)
             if node.parent is None:
@@ -778,6 +808,7 @@ class RadixCache(BasePrefixCache):
             self.evictable_size_ += len(key)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
+            self._on_tree_value_added(new_node)
             # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
         return total_prefix_length

@@ -1,3 +1,4 @@
+import os
 import unittest
 
 import torch
@@ -20,7 +21,14 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=20, suite="stage-b-test-1-gpu-small")
 
 
-class TestSimpleSWARadixCache(CustomTestCase):
+class _SWACacheTestBase:
+    """Shared setUp / tearDown / helpers for SWA cache tests.
+
+    Not a TestCase subclass on purpose: subclassing CustomTestCase here would
+    cause every test method in TestSimpleSWARadixCache to run again under
+    every other subclass that inherits from it.
+    """
+
     device: str = "cuda"
     req_size: int = 0
     max_context_len: int = 0
@@ -40,6 +48,12 @@ class TestSimpleSWARadixCache(CustomTestCase):
     def setUp(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for SWA cache tests")
+
+        # Use empty reserved points so arbitrary sliding_window_size values
+        # in individual tests don't violate the "must be multiples of
+        # sliding_window_size" constraint.
+        self._prev_reserved_points = os.environ.get("SGLANG_SIMPLE_SWA_RESERVED_POINTS")
+        os.environ["SGLANG_SIMPLE_SWA_RESERVED_POINTS"] = ""
 
         self.device = "cuda"
         self.req_size = 4
@@ -97,6 +111,12 @@ class TestSimpleSWARadixCache(CustomTestCase):
                 sliding_window_size=self.sliding_window_size,
             ),
         )
+
+    def tearDown(self):
+        if self._prev_reserved_points is None:
+            os.environ.pop("SGLANG_SIMPLE_SWA_RESERVED_POINTS", None)
+        else:
+            os.environ["SGLANG_SIMPLE_SWA_RESERVED_POINTS"] = self._prev_reserved_points
 
     def _require_pool(self) -> ReqToTokenPool:
         if self.req_to_token_pool is None:
@@ -208,6 +228,8 @@ class TestSimpleSWARadixCache(CustomTestCase):
         )
         return cache, req_to_token_pool, allocator
 
+
+class TestSimpleSWARadixCache(_SWACacheTestBase, CustomTestCase):
     # ===== A. evict_swa boundary cases =====
 
     def test_evict_swa_boundary_cases(self):
@@ -719,6 +741,150 @@ class TestSimpleSWARadixCache(CustomTestCase):
 
         self.assertGreater(matched_len, 0)
         self.assertLess(matched_len, kv_len)
+
+
+class TestSimpleSWARadixCacheIncrementalCounters(_SWACacheTestBase, CustomTestCase):
+    """Verify that _swa_evictable_size / _swa_protected_size stay in sync with
+    a full-tree recount after every state-changing operation.
+    """
+
+    def _assert_counters_match_recount(self):
+        cache = self._require_cache()
+        recomputed = cache._collect_swa_sizes_recomputed()
+        self.assertEqual(
+            (cache._swa_evictable_size, cache._swa_protected_size),
+            recomputed,
+            f"Incremental counters drifted: got "
+            f"({cache._swa_evictable_size}, {cache._swa_protected_size}) "
+            f"but recount gives {recomputed}",
+        )
+
+    def test_counters_consistent_after_insert(self):
+        cache = self._require_cache()
+        token_ids = list(range(8))
+        kv_indices = self._alloc_kv_indices(len(token_ids))
+        cache.insert(InsertParams(key=RadixKey(token_ids), value=kv_indices))
+        self._assert_counters_match_recount()
+
+    def test_counters_consistent_after_multiple_inserts(self):
+        cache = self._require_cache()
+        for prefix in range(3):
+            token_ids = [prefix * 100 + i for i in range(6)]
+            kv_indices = self._alloc_kv_indices(len(token_ids))
+            cache.insert(InsertParams(key=RadixKey(token_ids), value=kv_indices))
+        self._assert_counters_match_recount()
+
+    def test_evict_swa_keeps_counters_unchanged(self):
+        # evict_swa only frees request-private SWA slots; tree-owned slots
+        # (protected by tree_prefix_len) are untouched, so the incremental
+        # counters must stay exactly the same.
+        cache, pool, allocator = self._build_cache(self.sliding_window_size)
+        seq_len = 10
+        req_pool_idx = pool.alloc(
+            [
+                Req(
+                    rid="placeholder",
+                    origin_input_text="",
+                    origin_input_ids=[],
+                    sampling_params=SamplingParams(
+                        max_new_tokens=1, temperature=0.0
+                    ),
+                )
+            ]
+        )[0]
+        token_ids = list(range(seq_len))
+        kv_indices = allocator.alloc(seq_len)
+        pool.write((req_pool_idx, slice(0, seq_len)), kv_indices)
+        cache.insert(InsertParams(key=RadixKey(token_ids), value=kv_indices))
+
+        ev_before = cache._swa_evictable_size
+        pr_before = cache._swa_protected_size
+
+        req = self._make_req(token_ids, req_pool_idx)
+        cache.evict_swa(req, prelen=seq_len, attention_chunk_size=0)
+
+        self.assertEqual(cache._swa_evictable_size, ev_before)
+        self.assertEqual(cache._swa_protected_size, pr_before)
+        self._assert_counters_match_recount()
+
+    def test_evict_decrements_evictable(self):
+        cache = self._require_cache()
+        token_ids = list(range(8))
+        kv_indices = self._alloc_kv_indices(len(token_ids))
+        cache.insert(InsertParams(key=RadixKey(token_ids), value=kv_indices))
+        ev_before = cache._swa_evictable_size
+        self.assertGreater(ev_before, 0)
+
+        cache.evict(EvictParams(num_tokens=len(token_ids)))
+
+        self.assertLessEqual(cache._swa_evictable_size, ev_before)
+        self._assert_counters_match_recount()
+
+    def test_lock_ref_moves_between_buckets(self):
+        # Invariant: inc_lock_ref moves SWA from evictable -> protected,
+        # dec_lock_ref reverses it. Total live SWA stays constant.
+        cache = self._require_cache()
+        token_ids = list(range(8))
+        kv_indices = self._alloc_kv_indices(len(token_ids))
+        cache.insert(InsertParams(key=RadixKey(token_ids), value=kv_indices))
+
+        ev_before = cache._swa_evictable_size
+        pr_before = cache._swa_protected_size
+        total_before = ev_before + pr_before
+
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
+        cache.inc_lock_ref(result.last_device_node)
+
+        self.assertEqual(
+            cache._swa_evictable_size + cache._swa_protected_size, total_before
+        )
+        self.assertLess(cache._swa_evictable_size, ev_before)
+        self.assertGreater(cache._swa_protected_size, pr_before)
+        self._assert_counters_match_recount()
+
+        cache.dec_lock_ref(result.last_device_node)
+
+        self.assertEqual(cache._swa_evictable_size, ev_before)
+        self.assertEqual(cache._swa_protected_size, pr_before)
+        self._assert_counters_match_recount()
+
+    def test_reset_zeros_counters(self):
+        cache = self._require_cache()
+        token_ids = list(range(8))
+        kv_indices = self._alloc_kv_indices(len(token_ids))
+        cache.insert(InsertParams(key=RadixKey(token_ids), value=kv_indices))
+        self.assertGreater(cache._swa_evictable_size, 0)
+
+        cache.reset()
+
+        self.assertEqual(cache._swa_evictable_size, 0)
+        self.assertEqual(cache._swa_protected_size, 0)
+        self._assert_counters_match_recount()
+
+    def test_counters_consistent_after_complex_sequence(self):
+        # Stress: a mixed sequence of inserts / evictions / lock manipulations.
+        # At each step the incremental counters must equal the full recount.
+        cache = self._require_cache()
+
+        token_ids_a = list(range(8))
+        kv_a = self._alloc_kv_indices(len(token_ids_a))
+        cache.insert(InsertParams(key=RadixKey(token_ids_a), value=kv_a))
+        self._assert_counters_match_recount()
+
+        token_ids_b = list(range(4)) + [100, 101, 102, 103]
+        kv_b = self._alloc_kv_indices(len(token_ids_b))
+        cache.insert(InsertParams(key=RadixKey(token_ids_b), value=kv_b))
+        self._assert_counters_match_recount()
+
+        result_a = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids_a)))
+        cache.inc_lock_ref(result_a.last_device_node)
+        self._assert_counters_match_recount()
+
+        cache.evict(EvictParams(num_tokens=4))
+        self._assert_counters_match_recount()
+
+        cache.dec_lock_ref(result_a.last_device_node)
+        self._assert_counters_match_recount()
 
 
 if __name__ == "__main__":

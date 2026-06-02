@@ -77,6 +77,12 @@ _NVTX_COLOR_MAP = {
     "multi_layer_eagle_draft_worker._draft_extend_for_prefill": "yellow",
     "multi_layer_eagle_draft_worker._draft_extend_for_decode": "yellow",
     "multi_layer_eagle_worker_v2.verify": "gray",
+
+    # Forward gap
+    "scheduler.process_batch_result_disagg_prefill": "yellow",
+    "scheduler.disagg_prefill.process_inflight_queue": "blue",
+    "swa_radix.cache_unfinished_req": "blue",
+    "swa_radix.cache_finished_req": "purple",
 }
 
 

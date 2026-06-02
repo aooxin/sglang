@@ -298,6 +298,9 @@ class Envs:
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
+    SGLANG_HICACHE_KEY_REFRESH_INTERVAL = EnvFloat(300.0)
+    SGLANG_HICACHE_KEY_REFRESH_LRU_MAXSIZE = EnvInt(131072)
+
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)

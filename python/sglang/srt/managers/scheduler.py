@@ -182,6 +182,7 @@ from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.hiradix_cache import BaseHiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.mem_cache.simple_swa_radix_cache import SimpleSWARadixCache
@@ -2311,6 +2312,15 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
+    def _get_tree_cache_info(self):
+        if isinstance(self.tree_cache, BaseHiRadixCache):
+            try:
+                return self.tree_cache.collect_tree_info()
+            except NotImplementedError:
+                return None
+        else:
+            return {}
+
     @nvtx_annotated_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._abort_on_waiting_timeout()
@@ -2384,6 +2394,17 @@ class Scheduler(
             new_batch = self.get_new_batch_dllm()
         else:
             new_batch = self.get_new_batch_prefill()
+
+        if new_batch is None and len(self.waiting_queue) > 0:
+            # Debug: if can not make new batch, output pool info
+            # TODO(yingchun): 开销略大，需控制频率
+            tree_info = self._get_tree_cache_info()
+            token_info = (
+                self._get_swa_token_info() if self.is_hybrid_swa else self._get_token_info()
+            )
+            logging.warning(
+                f"get_new_batch_prefill return None, {tree_info=} {token_info=}"
+            )
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():

@@ -302,10 +302,10 @@ class HiCacheStorage(ABC):
         Check full-attention and SWA key existence separately.
 
         Returns:
-            (full_prefix_pages, swa_valid_per_page):
+            (full_prefix_pages, swa_valid_pages):
                 full_prefix_pages: number of consecutive pages whose full-attention
                     keys (full_k + full_v) all exist from the start.
-                swa_valid_per_page: per-page boolean list (length == full_prefix_pages)
+                swa_valid_pages: per-page boolean list (length == full_prefix_pages)
                     indicating whether the SWA keys (swa_k + swa_v) exist for
                     each page within the full prefix.
 

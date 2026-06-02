@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 import warnings
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -81,6 +81,16 @@ class SchedulerRuntimeCheckerMixin:
             mamba_evictable_size,
         )
 
+    class _SWATokenInfo(NamedTuple):
+        full_num_used: int
+        swa_num_used: int
+        full_token_usage: int
+        swa_token_usage: int
+        full_available_size: int
+        full_evictable_size: int
+        swa_available_size: int
+        swa_evictable_size: int
+
     def _get_swa_token_info(self: Scheduler):
         full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         full_evictable_size = self.tree_cache.full_evictable_size()
@@ -99,7 +109,7 @@ class SchedulerRuntimeCheckerMixin:
         )
         full_token_usage = full_num_used / self.full_tokens_per_layer
         swa_token_usage = swa_num_used / self.swa_tokens_per_layer
-        return (
+        return __class__._SWATokenInfo(
             full_num_used,
             swa_num_used,
             full_token_usage,

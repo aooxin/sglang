@@ -8,6 +8,7 @@ import logging
 import os
 import threading
 import time
+from dataclasses import dataclass
 from queue import Empty
 from typing import TYPE_CHECKING, Dict, List, Optional
 
@@ -57,6 +58,34 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BasicTreeInfo:
+    tokens: int = 0
+    tokens_locked: int = 0
+    nodes: int = 0
+    leaves: int = 0
+    leaves_locked: int = 0
+
+
+@dataclass
+class SWATreeInfo:
+    full_tokens: int = 0
+    full_tokens_locked: int = 0
+    swa_tokens: int = 0
+    swa_tokens_locked: int = 0
+    nodes: int = 0
+    leaves: int = 0
+    leaves_locked: int = 0
+
+
+@dataclass
+class HiTreeInfo:
+    dev: BasicTreeInfo | SWATreeInfo
+    host: BasicTreeInfo | SWATreeInfo
+    all_nodes: int = 0
+
 
 """
 从根到叶，状态严格按照 backuped → device_only → evicted 的顺序排列，每段都可以为空，但不会交替出现。
@@ -238,6 +267,7 @@ class BaseHiRadixCache(abc.ABC):
         )
         self.load_back_threshold = 10
         self.sliding_window_size = params.sliding_window_size
+        self.is_hybrid_swa = self.sliding_window_size is not None and self.sliding_window_size > 0
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -804,9 +834,126 @@ class BaseHiRadixCache(abc.ABC):
             # no need to lock nodes if write back
             self.inc_lock_ref(node)
 
+        # 理论上这里应该是返回能释放多少device上的东西，只不多正好这里host和device刚好精确一致
         return len(full_host_indices), self.cache_controller.get_valid_swa_host_len(
             full_host_indices
         )
+
+    def rewrite_swa_backup(
+        self, node: TreeNode, new_swa_mask: torch.Tensor, write_back=False
+    ):
+        """
+        补齐 node 在 host 上缺失的 SWA backup。
+
+        背景：在 HiSimpleSWARadixCache 中，device 侧和 host 侧各自维护一套
+        `full_to_swa_index_mapping`。它们可能在两个常见路径上变得不一致：
+          1) prefetch 从 storage 回来时只 cover 了前 `reserve_swa_size` 个 token
+             的 SWA，剩下的 token host 侧 mapping 為 0；但 device 侧 prefill 时
+             为它们全部分配了 SWA。
+          2) insert() 中 `splice_swa_mapping` 把新 device page 的 SWA 转移給了
+             tree node，device 端突然多了 SWA，但 host 端没跟上。
+        无论哪种路径，结果都是 "device 有 SWA / host 缺 SWA"（swa_device_only）。
+        这会让后续 match_prefix 的 swa_hit_len 短于 full_hit_len（出现 gap）。
+
+        本方法的职责：为 `new_swa_mask` 标记的位置在 host 上补分配 SWA slot，
+        并把 device 上的 SWA KV 异步写回 host，恢复 full ↔ SWA 一致性。
+
+        调用方必须先算好 mask（device_swa != 0 && host_swa == 0），
+        详见 evict() 和 insert() 里的 swa_device_only_mask 逻辑。
+        """
+        assert self.is_hybrid_swa
+        assert len(node.value) == len(node.host_value) == len(new_swa_mask)
+        # 前置条件：被 mask 选中的位置，host 侧 mapping 必须全为 0。
+        # 否则后续赋值会覆盖掉既有的 SWA slot 指针，导致原 SWA slot
+        # 彻底泄露（无人 free）
+        assert not bool(
+            torch.any(
+                self.token_to_kv_pool_host.full_to_swa_index_mapping[
+                    node.host_value[new_swa_mask]
+                ]
+            )
+        )
+
+        if node.id in self.ongoing_write_through:
+            # TODO: how to rewrite with ongoing_write_through?
+            return 0, 0
+
+        full_host_indices = node.host_value
+
+        # allocate and amp new_swa_host_indices
+        num_new_swa = int(new_swa_mask.count_nonzero())
+        assert num_new_swa % self.page_size == 0
+
+        # 只申请 SWA host slot
+        _, new_swa_host_indices, _, lack_swa_size = (
+            self.token_to_kv_pool_host.alloc_unmapped_host_by_len(0, num_new_swa)
+        )
+        if new_swa_host_indices is None:
+            assert lack_swa_size > 0
+            self.evict_host(0, lack_swa_size)
+            _, new_swa_host_indices, _, _ = (
+                self.token_to_kv_pool_host.alloc_unmapped_host_by_len(0, num_new_swa)
+            )
+        if new_swa_host_indices is None:
+            return 0, 0
+
+        # 建立 host 上 full 和 swa 的映射关系
+        self.token_to_kv_pool_host.full_to_swa_index_mapping[
+            full_host_indices[new_swa_mask]
+        ] = new_swa_host_indices
+
+        # write to host
+        # TODO: optimize to avoid rewrite full attn
+        self.cache_controller.write(
+            device_indices=node.value[new_swa_mask],
+            host_indices=full_host_indices[new_swa_mask],
+            node_id=node.id,
+        )
+        self.ongoing_write_through[node.id] = {
+            "node": node,
+            "key": RadixKey(token_ids=node.key.token_ids),
+            "hash_value": list(node.hash_value) if node.hash_value else None,
+            "host_value": full_host_indices,
+        }
+        if not write_back:
+            # no need to lock nodes if write back
+            self.inc_lock_ref(node)
+
+        # return how many tokens can be free with this node
+        return len(node.value), int(
+            self.token_to_kv_pool_allocator.full_to_swa_index_mapping[
+                node.value
+            ].count_nonzero()
+        )
+
+    def _compute_swa_mismatch_masks(
+        self,
+        device_indices: torch.Tensor,
+        host_indices: torch.Tensor,
+        need_host_only: bool = False,
+        need_device_only: bool = False,
+    ):
+        """Compute SWA mismatch masks between device and host pools.
+
+        Gathers both pools' SWA index mapping once (shared work), then builds
+        only the masks requested by the caller. Returns a tuple where each
+        slot is either the mask tensor or None if not requested:
+          (swa_host_only_mask | None, swa_device_only_mask | None)
+
+        - swa_host_only:   host has SWA but device does not (unlikely)
+        - swa_device_only: device has SWA but host does not (may trigger
+                           rewrite_swa_backup)
+        """
+        assert need_host_only or need_device_only, "at least one mask must be requested"
+        device_swa = self.token_to_kv_pool_allocator.full_to_swa_index_mapping[
+            device_indices
+        ]
+        host_swa = self.token_to_kv_pool_host.full_to_swa_index_mapping[host_indices]
+        swa_host_only = (device_swa == 0) & (host_swa != 0) if need_host_only else None
+        swa_device_only = (
+            (device_swa != 0) & (host_swa == 0) if need_device_only else None
+        )
+        return swa_host_only, swa_device_only
 
     def write_backup_storage(self, node: TreeNode):
         prefix_keys = (
@@ -1015,7 +1162,29 @@ class BaseHiRadixCache(abc.ABC):
             if x.lock_ref > 0:
                 continue
 
-            if not x.backuped:
+            if (
+                x.backuped
+                and not x.evicted
+                and self.cache_controller.write_policy == "write_back"
+            ):
+                # check whether device-swa are missing from host-swa under write_back mode
+                _, swa_device_only_mask = self._compute_swa_mismatch_masks(
+                    x.value, x.host_value, need_device_only=True
+                )
+                # if any missing, rewrite swa under write_back mode
+                swa_device_only_count = int(swa_device_only_mask.count_nonzero())
+                if swa_device_only_count > 0:
+                    if self.enable_storage_metrics:
+                        self.storage_metrics_collector.log_rewrite_swa_backup(swa_device_only_count,
+                        reason="evict_write_back",)
+                    # rewrite swa backup
+                    freed_full, freed_swa = self.rewrite_swa_backup(
+                        x, swa_device_only_mask, write_back=True
+                    )
+                    full_evicted += freed_full
+                    swa_evicted += freed_swa
+                    write_back_nodes.append(x)
+            elif not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
                     # write to host if the node is not backuped
                     freed_full, freed_swa = self.write_backup(x, write_back=True)
@@ -1060,10 +1229,10 @@ class BaseHiRadixCache(abc.ABC):
 
     def _evict_backuped(self, node: TreeNode):
         # GPU -> CPU demotion: no BlockRemoved since block is still reachable via load_back
+        self._on_tree_value_removed(node)
         full_evicted, swa_evicted = self.cache_controller.evict_device(node.value)
         assert full_evicted > 0
         self.evictable_size_ -= full_evicted
-        # TODO(yingchun): swa_evictable_size 是在 SimpleSWARadixCache 的 _collect_swa_sizes() 中动态计算的，那里的实时计算会更费一些。这里可以优化？
         node.value = None
         self._update_leaf_status(node)
         self._update_host_leaf_status(node)
@@ -1080,6 +1249,7 @@ class BaseHiRadixCache(abc.ABC):
         )
         full_evicted = len(node.value)
         swa_evicted = torch.count_nonzero(swa_device_indices).item()
+        self._on_tree_value_removed(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         self._delete_leaf(node)
         return full_evicted, swa_evicted
@@ -1123,6 +1293,26 @@ class BaseHiRadixCache(abc.ABC):
             if len(x.parent.children) == 0 and x.parent.evicted:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
+
+    def estimate_load_back(self, node: TreeNode, host_hit_length: int):
+        if host_hit_length <= 0 or not node.evicted:
+            return 0, 0
+
+        nodes_to_load = []
+        while node.evicted:
+            assert (
+                node.backuped
+            ), "No backup available on evicted nodes, should not happen"
+            # TODO(yingchun): 改为 append + reverse()
+            nodes_to_load.insert(0, node)
+            node = node.parent
+
+        # TODO(yingchun): torch.cat + count_nonzero().item() 开销大，可在 node 上维护 SWA 数量
+        host_indices = torch.cat([n.host_value for n in nodes_to_load])
+        swa_host_indices = self.token_to_kv_pool_host.full_to_swa_index_mapping[
+            host_indices
+        ]
+        return len(host_indices), int(swa_host_indices.count_nonzero())
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
@@ -1214,9 +1404,10 @@ class BaseHiRadixCache(abc.ABC):
             ].clone()
             offset += len(node.host_value)
             assert len(node.value) == len(node.host_value)
+            self._on_tree_value_added(node)
         assert offset == len(full_device_indices)
         self.evictable_size_ += len(full_device_indices)
-        # TODO(yingchun): swa_evictable_size 同上
+
         self.inc_lock_ref(last_hit_node)
 
         if self.metrics_collector is not None:
@@ -1356,6 +1547,10 @@ class BaseHiRadixCache(abc.ABC):
             completed = (
                 operation.completed_tokens == len(operation.hash_value) * self.page_size
             )
+        if completed:
+            self.cache_controller.assert_host_indices(
+                operation.host_indices, self.sliding_window_size
+            )
 
         if self.prefetch_stop_policy == "wait_complete":
             can_terminate = completed
@@ -1464,7 +1659,7 @@ class BaseHiRadixCache(abc.ABC):
 
         fetched_token_ids = token_ids[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
-        matched_length = self._insert_helper_host(
+        matched_length, matched_tree_host_indices = self._insert_helper_host(
             last_host_node,
             RadixKey(
                 token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
@@ -1472,6 +1667,31 @@ class BaseHiRadixCache(abc.ABC):
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
         )
+
+        # Before freeing the overlapping prefetch indices, transfer any SWA
+        # slots that the prefetch brought back but the existing tree nodes lack.
+        # This closes the SWA gap that would otherwise persist across sessions.
+        #
+        # TODO(yingchun): only the host-side SWA gap is closed here.
+        #  Tree nodes whose device value exists but has no SWA mapping
+        #  (full-only device) are still unfixed — match_prefix will still
+        #  trim at the device-swa boundary until those nodes are evicted and
+        #  reloaded (load-back rebuilds device SWA from host). Consider also
+        #  doing a device-side splice (or forced H2D SWA copy) so prefetched
+        #  SWA benefits the first request hitting this prefix.
+        if (
+            self.is_hybrid_swa
+            and matched_length > 0
+            and matched_tree_host_indices is not None
+        ):
+            prefetch_host_indices = host_indices[:matched_length]
+            assert len(matched_tree_host_indices) == len(prefetch_host_indices)
+            num_spliced = self.cache_controller.mem_pool_host.splice_swa_mapping(
+                matched_tree_host_indices, prefetch_host_indices
+            )
+            if num_spliced > 0 and self.enable_storage_metrics:
+                self.storage_metrics_collector.log_rewrite_swa_backup(num_spliced,
+                reason="prefetch_splice_to_tree",)
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
         self.cache_controller.append_full_and_swa_mem_release_separately(
@@ -1639,18 +1859,42 @@ class BaseHiRadixCache(abc.ABC):
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
-    ):
+    ) -> tuple[int, Optional[torch.Tensor]]:
+        """
+        Insert prefetched host data into the radix tree.
+
+        Walks the tree following *key*. For the prefix that already exists
+        (matched portion), existing nodes are kept unchanged and their
+        host_value slices are collected.  The remaining suffix (if any) is
+        inserted as a new host-only node (``value=None``).
+
+        Returns:
+            matched_length: number of tokens already present in the tree.
+            matched_tree_host_indices: 1-D tensor of host full-pool indices
+                from matched backuped tree nodes (root-to-leaf). Positions
+                corresponding to non-backuped nodes are filled with -1.
+                None if matched_length == 0.
+        """
         node.last_access_time = time.monotonic()
         if len(key) == 0:
-            return 0
+            return 0, None
 
         child_key = self.get_child_key_fn(key)
 
+        max_len = len(host_value)
+        # TODO(yingchun): matched_buf 可 lazy 分配
+        matched_buf = torch.full((max_len,), -1, dtype=torch.int64, device=self.device)
         matched_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(node.key, key)
+
+            if node.backuped:
+                matched_buf[matched_length : matched_length + prefix_len] = (
+                    node.host_value[:prefix_len]
+                )
+
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
@@ -1675,7 +1919,9 @@ class BaseHiRadixCache(abc.ABC):
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
 
-        return matched_length
+        if matched_length == 0:
+            return 0, None
+        return matched_length, matched_buf[:matched_length]
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
@@ -1709,9 +1955,23 @@ class BaseHiRadixCache(abc.ABC):
         new_node = TreeNode(priority=child.priority)
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
+        # `lock_ref` is path-cumulative: inc_lock_ref/dec_lock_ref walk from the
+        # target node up to the root, incrementing/decrementing every ancestor.
+        # When we split `child` into `new_node -> child`, the outstanding dec
+        # path from `child` will naturally pass through `new_node`, so copying
+        # child.lock_ref is correct - it's consumed by the same release.
         new_node.lock_ref = child.lock_ref
-        # FIXME(yingchun): 不能赋值！
-        new_node.host_ref_counter = child.host_ref_counter
+        # `host_ref_counter` is single-point: protect_host/release_host only
+        # touch the node they are called on, and do NOT walk up the tree. An
+        # outside holder (e.g. ongoing_backup / ongoing_prefetch) keeps a Python
+        # reference to the original `child` object and will call release_host
+        # on exactly that object. If we copied child.host_ref_counter here, the
+        # ref assigned to `new_node` would have no owner and never be released
+        # -> `new_node.host_value` would be pinned forever (leak). So leave
+        # `new_node.host_ref_counter = 0` and let the outside holder's release
+        # on `child` correctly zero out the only outstanding ref.
+        # (Same rationale as mamba_lock_ref in mamba_radix_cache._split_node.)
+        new_node.host_ref_counter = 0
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
 
@@ -1761,35 +2021,86 @@ class BaseHiRadixCache(abc.ABC):
             node.priority = max(node.priority, priority)
             prefix_len = self.key_match_fn(node.key, key)
 
-            if prefix_len == len(node.key):
-                if node.evicted:
-                    # change the reference if the node is evicted
-                    # this often happens in the case of KV cache recomputation
-                    node.value = value[:prefix_len].clone()
-                    self.evictable_size_ += len(node.value)
-                    self._update_leaf_status(node)
-                    self._update_host_leaf_status(node)
-                    # update parent status as a new leaf is added into device
-                    self._update_leaf_status(node.parent)
-                else:
-                    self._inc_hit_count(node, chunked)
-                    total_prefix_length += prefix_len
-            else:
+            if prefix_len < len(node.key):
                 # partial match, split the node
                 new_node = self._split_node(node.key, node, prefix_len)
                 # shared-prefix node should also reflect max priority
                 new_node.priority = max(new_node.priority, priority)
-                if new_node.evicted:
-                    new_node.value = value[:prefix_len].clone()
-                    self.evictable_size_ += len(new_node.value)
-                    self._update_leaf_status(new_node)
-                    self._update_host_leaf_status(new_node)
-                    # update parent status as a new leaf is added into device
-                    self._update_leaf_status(new_node.parent)
-                else:
-                    self._inc_hit_count(new_node, chunked)
-                    total_prefix_length += prefix_len
                 node = new_node
+
+            if node.evicted:
+                # change the reference if the node is evicted
+                # this often happens in the case of KV cache recomputation
+                node.value = value[:prefix_len].clone()
+                self._update_leaf_status(node)
+                self._update_host_leaf_status(node)
+                # update parent status as a new leaf is added into device
+                self._update_leaf_status(node.parent)
+                # 这些 slot 已被 tree 接管，调用方不要再使用
+                value[:prefix_len] = 0
+                if self.is_hybrid_swa:
+                    swa_host_only_mask, swa_device_only_mask = (
+                        self._compute_swa_mismatch_masks(
+                            node.value,
+                            node.host_value,
+                            need_host_only=True,
+                            need_device_only=True,
+                        )
+                    )
+                    # if new device page DO NOT have swa and the host page own it?
+                    #  It seems a little unlikely.
+                    # TODO: deal with it
+                    swa_host_only_count = int(swa_host_only_mask.count_nonzero())
+                    if swa_host_only_count > 0:
+                        if self.enable_storage_metrics:
+                            self.storage_metrics_collector.log_rewrite_swa_backup(swa_host_only_count,
+                            reason="insert_swa_host_only",)
+
+                    # if new device page have swa but the host page DO NOT.
+                    # It seems quite possible
+                    swa_device_only_count = int(swa_device_only_mask.count_nonzero())
+                    if swa_device_only_count > 0:
+                        if self.cache_controller.write_policy == "write_back":
+                            # DONE: deal it in evict()
+                            # TODO(yingchun): 提前跳过避免无用计算
+                            pass
+                        else:
+                            if self.enable_storage_metrics:
+                                self.storage_metrics_collector.log_rewrite_swa_backup(swa_device_only_count,
+                                reason="insert_evicted_node",)
+                            self.rewrite_swa_backup(node, swa_device_only_mask)
+                self.evictable_size_ += len(node.value)
+                self._on_tree_value_added(node)
+            else:
+                if self.is_hybrid_swa:
+                    # deal with if new device page have swa and the old device page DO NOT
+                    num_transferred = (
+                        self.token_to_kv_pool_allocator.splice_swa_mapping(
+                            node.value, value[:prefix_len]
+                        )
+                    )
+                    # if new device page have swa but the host page DO NOT
+                    # It seems quite possible
+                    if num_transferred > 0 and node.backuped:
+                        if self.cache_controller.write_policy == "write_back":
+                            # DONE: deal it in evict()
+                            pass
+                        else:
+                            _, swa_device_only_mask = self._compute_swa_mismatch_masks(
+                                node.value,
+                                node.host_value,
+                                need_device_only=True,
+                            )
+                            swa_device_only_count = int(
+                                swa_device_only_mask.count_nonzero()
+                            )
+                            if swa_device_only_count > 0:
+                                if self.enable_storage_metrics:
+                                    self.storage_metrics_collector.log_rewrite_swa_backup(swa_device_only_count,
+                                    reason="insert_splice_swa",)
+                                self.rewrite_swa_backup(node, swa_device_only_mask)
+                self._inc_hit_count(node, chunked)
+                total_prefix_length += prefix_len
 
             key = key[prefix_len:]
             value = value[prefix_len:]
@@ -1806,6 +2117,7 @@ class BaseHiRadixCache(abc.ABC):
             self.evictable_size_ += len(value)
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
+            self._on_tree_value_added(new_node)
 
             # Compute hash_value if storage or kv events are enabled
             if self.enable_storage or self.enable_kv_cache_events:
@@ -1817,6 +2129,77 @@ class BaseHiRadixCache(abc.ABC):
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
         return InsertResult(prefix_len=total_prefix_length)
+
+    def collect_tree_info(self) -> HiTreeInfo:
+        if not self.is_hybrid_swa:
+            raise NotImplementedError
+
+        dev_values = []
+        dev_values_locked = []
+        host_values = []
+        host_values_locked = []
+
+        ret = HiTreeInfo(SWATreeInfo(), SWATreeInfo())
+        stack = [self.root_node]
+        while stack:
+            cur_node: TreeNode = stack.pop()
+            ret.all_nodes += 1
+
+            is_evicted = cur_node.evicted
+            is_backuped = cur_node.backuped
+            value = cur_node.value
+            host_value = cur_node.host_value
+
+            if not is_evicted:
+                ret.dev.nodes += 1
+                if isinstance(value, torch.Tensor):
+                    dev_values.append(value)
+                    if cur_node.lock_ref > 0:
+                        dev_values_locked.append(value)
+
+                children = cur_node.children
+                if cur_node is not self.root_node:
+                    if not children or all(c.evicted for c in children.values()):
+                        ret.dev.leaves += 1
+                        if cur_node.lock_ref > 0:
+                            ret.dev.leaves_locked += 1
+
+            if is_backuped:
+                ret.host.nodes += 1
+                if isinstance(host_value, torch.Tensor):
+                    host_values.append(host_value)
+                    if cur_node.host_ref_counter > 0:
+                        host_values_locked.append(host_value)
+
+                if not cur_node.children:
+                    ret.host.leaves += 1
+                    if cur_node.host_ref_counter > 0:
+                        ret.host.leaves_locked += 1
+
+            stack.extend(cur_node.children.values())
+
+        dev_mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+        host_mapping = self.token_to_kv_pool_host.full_to_swa_index_mapping
+
+        if dev_values:
+            cat_dev = torch.cat(dev_values)
+            ret.dev.full_tokens = len(cat_dev)
+            ret.dev.swa_tokens = int(dev_mapping[cat_dev].count_nonzero())
+        if dev_values_locked:
+            cat_dev_locked = torch.cat(dev_values_locked)
+            ret.dev.full_tokens_locked = len(cat_dev_locked)
+            ret.dev.swa_tokens_locked = int(dev_mapping[cat_dev_locked].count_nonzero())
+        if host_values:
+            cat_host = torch.cat(host_values)
+            ret.host.full_tokens = len(cat_host)
+            ret.host.swa_tokens = int(host_mapping[cat_host].count_nonzero())
+        if host_values_locked:
+            cat_host_locked = torch.cat(host_values_locked)
+            ret.host.full_tokens_locked = len(cat_host_locked)
+            ret.host.swa_tokens_locked = int(
+                host_mapping[cat_host_locked].count_nonzero()
+            )
+        return ret
 
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request

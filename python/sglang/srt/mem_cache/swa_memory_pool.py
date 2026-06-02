@@ -583,6 +583,27 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[free_index] = 0
         return swa_freed
 
+    def splice_swa_mapping(
+        self, tgt_full_indices: torch.Tensor, src_full_indices: torch.Tensor
+    ) -> int:
+        """
+        transfer swa kvcache from src_full_indices[i] to tgt_full_indices[i] if tgt_full_indices[i]
+        do not have its own swa page.
+        return the num of tokens transferred.
+        """
+        assert len(tgt_full_indices) == len(src_full_indices)
+        tgt_swa = self.full_to_swa_index_mapping[tgt_full_indices]
+        src_swa = self.full_to_swa_index_mapping[src_full_indices]
+        transfer_mask: torch.Tensor = (tgt_swa == 0) & (src_swa != 0)
+        num_transferred = int(transfer_mask.count_nonzero())
+        if num_transferred > 0:
+            assert num_transferred % self.page_size == 0
+            self.full_to_swa_index_mapping[tgt_full_indices[transfer_mask]] = src_swa[
+                transfer_mask
+            ]
+            self.full_to_swa_index_mapping[src_full_indices[transfer_mask]] = 0
+        return num_transferred
+
     def backup_state(self):
         return [
             self.full_attn_allocator.backup_state(),

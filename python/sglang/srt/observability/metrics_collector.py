@@ -1709,6 +1709,24 @@ class StorageMetricsCollector:
             multiprocess_mode="mostrecent",
         )
 
+        self.key_refresh_keys_total = Counter(
+            name="sglang:key_refresh_keys_total",
+            documentation="Total number of keys sent to batch_exists in key refresh.",
+            labelnames=labels.keys(),
+        )
+
+        self.rewrite_swa_backup_calls_total = Counter(
+            name="sglang:rewrite_swa_backup_calls_total",
+            documentation="Number of rewrite_swa_backup invocations, labeled by reason.",
+            labelnames=[*labels.keys(), "reason"],
+        )
+
+        self.rewrite_swa_backup_tokens_total = Counter(
+            name="sglang:rewrite_swa_backup_tokens_total",
+            documentation="Number of SWA tokens rewritten to host, labeled by reason.",
+            labelnames=[*labels.keys(), "reason"],
+        )
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
@@ -1724,6 +1742,17 @@ class StorageMetricsCollector:
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+
+    def log_key_refresh_keys(self, num_keys: int):
+        if num_keys > 0:
+            self.key_refresh_keys_total.labels(**self.labels).inc(num_keys)
+
+    def log_rewrite_swa_backup(self, num_tokens: int, reason: str):
+        self.rewrite_swa_backup_calls_total.labels(**self.labels, reason=reason).inc(1)
+        if num_tokens > 0:
+            self.rewrite_swa_backup_tokens_total.labels(
+                **self.labels, reason=reason
+            ).inc(num_tokens)
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)

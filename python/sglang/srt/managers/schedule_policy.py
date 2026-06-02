@@ -889,13 +889,18 @@ class PrefillAdder:
             CLIP_MAX_NEW_TOKENS,
         )
 
+        swa_total_tokens = 0
         if self.is_hybrid_swa:
-            # SWA needs: cache + real_extend
-            swa_cache_tokens = min(
-                len(req.prefix_indices) + req.host_hit_length,
-                self.sliding_window_size,
+            # SWA needs: swa_load_back_tokens + real_extend
+            swa_load_back_tokens = 0
+            estimate_load_back = getattr(
+                self.tree_cache, "estimate_load_back", None
             )
-            swa_total_tokens = swa_cache_tokens + (
+            if estimate_load_back is not None:
+                _, swa_load_back_tokens = estimate_load_back(
+                    req.last_host_node, req.host_hit_length
+                )
+            swa_total_tokens = swa_load_back_tokens + (
                 req.extend_input_len - req.host_hit_length
             )
             if (
@@ -903,8 +908,6 @@ class PrefillAdder:
                 and swa_total_tokens > self.rem_chunk_tokens
             ):
                 swa_total_tokens = self.rem_chunk_tokens
-        else:
-            swa_total_tokens = 0
 
         real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)

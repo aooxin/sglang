@@ -43,8 +43,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -207,6 +208,13 @@ class SimpleSWARadixCache(RadixCache):
         # safety trim) used by callers for diagnostics. Updated in match_prefix().
         self._last_raw_match_len: int = 0
 
+        # Incrementally-maintained live SWA token counts, partitioned by
+        # ownership. Updated on insert / evict / lock_ref changes; evict_swa
+        # is a no-op here because it only frees request-private SWA slots
+        # (tree-owned slots are protected by the tree_prefix_len lower bound).
+        self._swa_evictable_size: int = 0
+        self._swa_protected_size: int = 0
+
     ##### Public API #####
 
     def supports_swa(self) -> bool:
@@ -349,10 +357,11 @@ class SimpleSWARadixCache(RadixCache):
             req.swa_evicted_seqlen = swa_free_end
         return freed_swa_size
 
-    def _count_live_swa_tokens(self, value: torch.Tensor | None) -> int:
-        if value is None or value.numel() == 0:
-            return 0
-
+    # TODO(yingchun): 在节点上缓存 SWA 数量（注意在 splice/free 时更新），避免频繁的 GPU sync
+    def _count_live_swa_tokens(self, value: torch.Tensor) -> int:
+        assert (
+            value is not None and value.numel() > 0
+        ), "value must be a non-empty tensor"
         mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
         return int(torch.count_nonzero(mapping[value]).item())
 
@@ -366,15 +375,11 @@ class SimpleSWARadixCache(RadixCache):
         mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
         return int(torch.count_nonzero(mapping[all_indices]).item())
 
-    # TODO(yingchun): _collect_swa_sizes is expensive, reduce call times in hot path
-    def _collect_swa_sizes(self) -> tuple[int, int]:
-        """Return live SWA sizes split by evictable/protected ownership.
-
-        Batches GPU operations to minimize CPU-GPU sync points.
-        Instead of N per-node .item() calls (each forcing a GPU sync),
-        we collect all value tensors first, then do at most 2 batched
-        GPU operations.
-        """
+    def _collect_swa_sizes_recomputed(self) -> tuple[int, int]:
+        """Full tree traversal to recompute live SWA sizes. Used only as a
+        reference by tests / debug assertions; production queries use the
+        incrementally-maintained counters."""
+        assert envs.SGLANG_IS_IN_CI.get() is True
         evictable_values: list[torch.Tensor] = []
         protected_values: list[torch.Tensor] = []
         stack = [self.root_node]
@@ -389,23 +394,52 @@ class SimpleSWARadixCache(RadixCache):
                         evictable_values.append(child.value)
                 stack.append(child)
 
-        swa_evictable = self._batch_count_live_swa(evictable_values)
-        swa_protected = self._batch_count_live_swa(protected_values)
-        return swa_evictable, swa_protected
+        return (
+            self._batch_count_live_swa(evictable_values),
+            self._batch_count_live_swa(protected_values),
+        )
 
     def full_evictable_size(self) -> int:
         return self.evictable_size()
 
     def swa_evictable_size(self) -> int:
-        swa_evictable, _ = self._collect_swa_sizes()
-        return swa_evictable
+        return self._swa_evictable_size
 
     def full_protected_size(self) -> int:
         return self.protected_size()
 
     def swa_protected_size(self) -> int:
-        _, swa_protected = self._collect_swa_sizes()
-        return swa_protected
+        return self._swa_protected_size
+
+    def _on_node_becomes_protected(self, node: TreeNode) -> None:
+        swa_live = self._count_live_swa_tokens(node.value)
+        self._swa_evictable_size -= swa_live
+        self._swa_protected_size += swa_live
+
+    def _on_node_becomes_evictable(self, node: TreeNode) -> None:
+        swa_live = self._count_live_swa_tokens(node.value)
+        self._swa_evictable_size += swa_live
+        self._swa_protected_size -= swa_live
+
+    def _on_tree_value_added(self, node: TreeNode) -> None:
+        self._swa_evictable_size += self._count_live_swa_tokens(node.value)
+
+    def _on_tree_value_removed(self, node: TreeNode) -> None:
+        # Called before node.value is released; if the node is protected
+        # (lock_ref > 0) the SWA tokens were in _swa_protected_size, otherwise
+        # in _swa_evictable_size. Deduct from the right bucket.
+        swa_live = self._count_live_swa_tokens(node.value)
+        if swa_live == 0:
+            return
+        if node.lock_ref > 0:
+            self._swa_protected_size -= swa_live
+        else:
+            self._swa_evictable_size -= swa_live
+
+    def reset(self):
+        super().reset()
+        self._swa_evictable_size = 0
+        self._swa_protected_size = 0
 
     def evict(self, params: EvictParams) -> EvictResult:
         """Evict cache entries to satisfy both full and SWA shortages.
@@ -444,6 +478,7 @@ class SimpleSWARadixCache(RadixCache):
             value = x.value
             reclaimed_swa = self._count_live_swa_tokens(value)
 
+            self._on_tree_value_removed(x)
             self.token_to_kv_pool_allocator.free(value)
             full_num_evicted += len(value)
             swa_num_evicted += reclaimed_swa
@@ -528,6 +563,7 @@ class SimpleSWARadixCache(RadixCache):
         )
         return super().match_prefix(safe_params)
 
+    @nvtx_annotated_method("swa_radix.cache_unfinished_req")
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished, freeing out-of-window SWA KV.
 
@@ -596,6 +632,7 @@ class SimpleSWARadixCache(RadixCache):
         )
         req.prefix_indices = kv_indices
 
+    @nvtx_annotated_method("swa_radix.cache_finished_req")
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes, keeping only swa_size SWA KV.
 

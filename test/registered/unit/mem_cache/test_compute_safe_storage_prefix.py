@@ -69,6 +69,12 @@ class TestComputeSafeStoragePrefix(unittest.TestCase):
         mask = [True, True, False, True]
         self.assertEqual(_f(mask, 3), 2)
 
+    def test_int_tensor_input(self):
+        mask_int = torch.tensor([1, 1, 0, 1], dtype=torch.int)
+        self.assertEqual(HiCacheController._compute_safe_storage_prefix(mask_int, 3), 2)
+        mask_int = torch.tensor([0, 1, 1, 1], dtype=torch.int)
+        self.assertEqual(HiCacheController._compute_safe_storage_prefix(mask_int, 3), 4)
+
 
 if __name__ == "__main__":
     unittest.main()

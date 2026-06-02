@@ -1737,7 +1737,7 @@ class HiCacheController:
                     self.append_host_mem_release(operation.host_indices)
                     self.append_swa_only_host_mem_release(operation.swa_host_indices)
                     if self.metrics_collector is not None:
-                        self.metrics_collector.log_revoke_tokens(revoke_tokens)
+                        self.metrics_collector.log_revoke_tokens(revoke_tokens, reason="insufficient_l3_hits")
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
@@ -1765,7 +1765,7 @@ class HiCacheController:
                             operation.swa_host_indices
                         )
                         if self.metrics_collector is not None:
-                            self.metrics_collector.log_revoke_tokens(revoke_tokens)
+                            self.metrics_collector.log_revoke_tokens(revoke_tokens, reason="insufficient_swa_hits")
                         logger.debug(
                             f"Revoking prefetch for request {operation.request_id} due to insufficient SWA hits ({swa_valid_len})."
                         )

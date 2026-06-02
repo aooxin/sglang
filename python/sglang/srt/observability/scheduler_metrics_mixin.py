@@ -508,6 +508,12 @@ class SchedulerMetricsMixin:
                         self.stats.host_swa_tokens = tree_info.host.swa_tokens
                         self.stats.host_full_tokens_locked = tree_info.host.full_tokens_locked
                         self.stats.host_swa_tokens_locked = tree_info.host.swa_tokens_locked
+                        self.stats.dev_nodes = tree_info.dev.nodes
+                        self.stats.dev_leaves = tree_info.dev.leaves
+                        self.stats.dev_leaves_locked = tree_info.dev.leaves_locked
+                        self.stats.host_nodes = tree_info.host.nodes
+                        self.stats.host_leaves = tree_info.host.leaves
+                        self.stats.host_leaves_locked = tree_info.host.leaves_locked
                     self.last_tree_cache_info_time = now
                 # TODO(yingchun): 使用接口，避免直接访问 self.tree_cache
                 cur_swa_freed = self.tree_cache.swa_active_freed_tokens

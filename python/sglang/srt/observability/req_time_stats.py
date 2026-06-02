@@ -105,6 +105,13 @@ class RequestStage:
         level=2,
     )
 
+    # Pre-processing (HTTP arrival → Req creation in scheduler)
+    PRE_PROCESS = RequestStageConfig(
+        "pre_process",
+        level=1,
+        metrics_is_observed=True,
+    )
+
     # common/non-disaggregation
     REQUEST_PROCESS = RequestStageConfig(
         "request_process",

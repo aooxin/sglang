@@ -156,6 +156,13 @@ class SchedulerStats:
     host_swa_tokens: int = 0
     host_full_tokens_locked: int = 0
     host_swa_tokens_locked: int = 0
+    # Gauge: tree node/leaf breakdown (device/host)
+    dev_nodes: int = 0
+    dev_leaves: int = 0
+    dev_leaves_locked: int = 0
+    host_nodes: int = 0
+    host_leaves: int = 0
+    host_leaves_locked: int = 0
     # Gauge: host memory release queue lengths
     host_mem_release_queue_size: int = 0
     swa_only_host_mem_release_queue_size: int = 0
@@ -962,6 +969,42 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.dev_nodes = Gauge(
+            name="sglang:dev_nodes",
+            documentation="Number of nodes on device (L1) in the radix tree.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.dev_leaves = Gauge(
+            name="sglang:dev_leaves",
+            documentation="Number of leaves on device (L1) in the radix tree.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.dev_leaves_locked = Gauge(
+            name="sglang:dev_leaves_locked",
+            documentation="Number of locked leaves on device (L1) in the radix tree.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.host_nodes = Gauge(
+            name="sglang:host_nodes",
+            documentation="Number of nodes on host (L2) in the radix tree.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.host_leaves = Gauge(
+            name="sglang:host_leaves",
+            documentation="Number of leaves on host (L2) in the radix tree.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.host_leaves_locked = Gauge(
+            name="sglang:host_leaves_locked",
+            documentation="Number of locked leaves on host (L2) in the radix tree.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.host_mem_release_queue_size = Gauge(
             name="sglang:host_mem_release_queue_size",
             documentation="Number of pending items in the host memory release queue.",
@@ -1278,6 +1321,12 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.host_swa_tokens, stats.host_swa_tokens)
         self._log_gauge(self.host_full_tokens_locked, stats.host_full_tokens_locked)
         self._log_gauge(self.host_swa_tokens_locked, stats.host_swa_tokens_locked)
+        self._log_gauge(self.dev_nodes, stats.dev_nodes)
+        self._log_gauge(self.dev_leaves, stats.dev_leaves)
+        self._log_gauge(self.dev_leaves_locked, stats.dev_leaves_locked)
+        self._log_gauge(self.host_nodes, stats.host_nodes)
+        self._log_gauge(self.host_leaves, stats.host_leaves)
+        self._log_gauge(self.host_leaves_locked, stats.host_leaves_locked)
         self._log_gauge(
             self.host_mem_release_queue_size, stats.host_mem_release_queue_size
         )
@@ -1744,8 +1793,8 @@ class StorageMetricsCollector:
 
         self.revoke_tokens_total = Counter(
             name="sglang:revoke_tokens_total",
-            documentation="Number of pre-allocated host tokens revoked due to insufficient L3 hits.",
-            labelnames=labels.keys(),
+            documentation="Number of pre-allocated host tokens revoked due to insufficient hits.",
+            labelnames=[*labels.keys(), "reason"],
         )
 
         self.backuped_tokens_total = Counter(
@@ -1855,9 +1904,11 @@ class StorageMetricsCollector:
         if dropped_tokens > 0:
             self.prefetch_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
 
-    def log_revoke_tokens(self, revoke_tokens: int):
+    def log_revoke_tokens(self, revoke_tokens: int, reason: str = "unknown"):
         if revoke_tokens > 0:
-            self.revoke_tokens_total.labels(**self.labels).inc(revoke_tokens)
+            self.revoke_tokens_total.labels(**self.labels, reason=reason).inc(
+                revoke_tokens
+            )
 
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:

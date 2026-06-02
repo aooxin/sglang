@@ -239,6 +239,9 @@ class GenerateReqInput(BaseReq):
     need_wait_for_mm_inputs: Optional[bool] = None
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
 
+    # Wall-clock arrival time at HTTP layer (time.time())
+    http_arrival_time: Optional[float] = None
+
     # Multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
@@ -747,6 +750,9 @@ class TokenizedGenerateReqInput(BaseReq):
 
     need_wait_for_mm_inputs: bool = False
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
+
+    # Wall-clock arrival time at HTTP layer (time.time())
+    http_arrival_time: Optional[float] = None
 
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None

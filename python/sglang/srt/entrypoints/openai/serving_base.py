@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -77,6 +78,7 @@ class OpenAIServingBase(ABC):
         If you want to override this method, you should be careful to record the validation time.
         """
         received_time = monotonic_time()
+        http_arrival_time = time.time()
 
         try:
             # Validate request
@@ -97,6 +99,7 @@ class OpenAIServingBase(ABC):
             if isinstance(adapted_request, (GenerateReqInput, EmbeddingReqInput)):
                 # Only set timing fields if adapted_request supports them
                 adapted_request.received_time = received_time
+                adapted_request.http_arrival_time = http_arrival_time
 
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:

@@ -1913,6 +1913,12 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            if self.enable_metrics and getattr(recv_req, "http_arrival_time", None):
+                req.time_stats.observe_per_stage_req_latency(
+                    RequestStage.PRE_PROCESS,
+                    time.time() - recv_req.http_arrival_time,
+                )
+
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if (

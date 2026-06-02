@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -44,6 +45,9 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
+TREE_CACHE_INFO_INTERVAL = float(
+    os.environ.get("SGLANG_TREE_CACHE_INFO_INTERVAL", "10")
+)
 
 
 @dataclasses.dataclass
@@ -118,6 +122,7 @@ class SchedulerMetricsMixin:
         self.last_swa_active_freed_tokens: int = 0
         self.last_swa_evicted_from_tree: int = 0
         self.last_full_evicted_from_tree: int = 0
+        self.last_tree_cache_info_time: float = 0.0
 
         self.stats = SchedulerStats()
 
@@ -353,7 +358,7 @@ class SchedulerMetricsMixin:
         num_used = token_usage = full_token_usage = None
 
         if self.is_hybrid_swa:
-            full_num_used, swa_num_used, full_tok, swa_token_usage, _, full_evictable_size, _, swa_evictable_size = (
+            full_num_used, swa_num_used, full_tok, swa_token_usage, full_available_size, full_evictable_size, swa_available_size, swa_evictable_size = (
                 self._get_swa_token_info()
             )
             num_used = max(full_num_used, swa_num_used)
@@ -471,8 +476,39 @@ class SchedulerMetricsMixin:
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
                 # SWA radix cache metrics
+                self.stats.full_available_size = full_available_size
+                self.stats.swa_available_size = swa_available_size
                 self.stats.swa_tree_evictable_tokens = swa_evictable_size
                 self.stats.full_tree_evictable_tokens = full_evictable_size
+                # L2 host pool available size
+                host_pool = self.tree_cache.cache_controller.mem_pool_host
+                if hasattr(host_pool, "swa_available_size"):
+                    host_full_avail, host_swa_avail = host_pool.swa_available_size()
+                    self.stats.host_full_available_size = host_full_avail
+                    self.stats.host_swa_available_size = host_swa_avail
+                # Host memory release queue lengths
+                cc = self.tree_cache.cache_controller
+                if hasattr(cc, "host_mem_release_queue"):
+                    self.stats.host_mem_release_queue_size = (
+                        cc.host_mem_release_queue.qsize()
+                    )
+                    self.stats.swa_only_host_mem_release_queue_size = (
+                        cc.swa_only_host_mem_release_queue.qsize()
+                    )
+                # Tree token breakdown (device/host × full/swa), rate-limited
+                now = time.perf_counter()
+                if now - self.last_tree_cache_info_time >= TREE_CACHE_INFO_INTERVAL:
+                    tree_info = self._get_tree_cache_info()
+                    if tree_info is not None:
+                        self.stats.dev_full_tokens = tree_info.dev.full_tokens
+                        self.stats.dev_swa_tokens = tree_info.dev.swa_tokens
+                        self.stats.dev_full_tokens_locked = tree_info.dev.full_tokens_locked
+                        self.stats.dev_swa_tokens_locked = tree_info.dev.swa_tokens_locked
+                        self.stats.host_full_tokens = tree_info.host.full_tokens
+                        self.stats.host_swa_tokens = tree_info.host.swa_tokens
+                        self.stats.host_full_tokens_locked = tree_info.host.full_tokens_locked
+                        self.stats.host_swa_tokens_locked = tree_info.host.swa_tokens_locked
+                    self.last_tree_cache_info_time = now
                 # TODO(yingchun): 使用接口，避免直接访问 self.tree_cache
                 cur_swa_freed = self.tree_cache.swa_active_freed_tokens
                 cur_swa_evicted = self.tree_cache.swa_evicted_from_tree

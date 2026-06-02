@@ -2257,6 +2257,9 @@ class SWATokenToKVPoolHost:
     def available_size(self) -> int:
         return self.full_pool_host.available_size()
 
+    def swa_available_size(self) -> tuple[int, int]:
+        return self.full_pool_host.available_size(), self.swa_pool_host.available_size()
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         # Legacy alloc API is no longer valid for SWA host pool: full and SWA
         # sub-pools are now coupled through full_to_swa_index_mapping and must

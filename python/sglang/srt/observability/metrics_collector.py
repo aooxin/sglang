@@ -139,9 +139,26 @@ class SchedulerStats:
     routing_key_all_req_counts: List[int] = field(default_factory=list)
 
     # SWA radix cache metrics (SimpleSWARadixCache / HiSimpleSWARadixCache only)
-    # Gauge: current evictable token counts in the radix tree
+    # Gauge: current available/evictable token counts
+    full_available_size: int = 0
+    swa_available_size: int = 0
     swa_tree_evictable_tokens: int = 0
     full_tree_evictable_tokens: int = 0
+    # Gauge: L2 host pool available size
+    host_full_available_size: int = 0
+    host_swa_available_size: int = 0
+    # Gauge: tree token breakdown (device/host × full/swa)
+    dev_full_tokens: int = 0
+    dev_swa_tokens: int = 0
+    dev_full_tokens_locked: int = 0
+    dev_swa_tokens_locked: int = 0
+    host_full_tokens: int = 0
+    host_swa_tokens: int = 0
+    host_full_tokens_locked: int = 0
+    host_swa_tokens_locked: int = 0
+    # Gauge: host memory release queue lengths
+    host_mem_release_queue_size: int = 0
+    swa_only_host_mem_release_queue_size: int = 0
     # Counter deltas: tokens freed/evicted since the last log interval
     swa_active_freed_tokens_delta: int = 0
     swa_evicted_from_tree_delta: int = 0
@@ -873,6 +890,90 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.full_available_size = Gauge(
+            name="sglang:full_available_size",
+            documentation="Number of available full-attention KV token slots in the pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.swa_available_size = Gauge(
+            name="sglang:swa_available_size",
+            documentation="Number of available SWA KV token slots in the pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.host_full_available_size = Gauge(
+            name="sglang:host_full_available_size",
+            documentation="Number of available full-attention KV token slots in the host (L2) pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.host_swa_available_size = Gauge(
+            name="sglang:host_swa_available_size",
+            documentation="Number of available SWA KV token slots in the host (L2) pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.dev_full_tokens = Gauge(
+            name="sglang:dev_full_tokens",
+            documentation="Number of full-attention KV tokens on device (L1) in the radix tree.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.dev_swa_tokens = Gauge(
+            name="sglang:dev_swa_tokens",
+            documentation="Number of SWA KV tokens on device (L1) in the radix tree.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.dev_full_tokens_locked = Gauge(
+            name="sglang:dev_full_tokens_locked",
+            documentation="Number of locked full-attention KV tokens on device (L1).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.dev_swa_tokens_locked = Gauge(
+            name="sglang:dev_swa_tokens_locked",
+            documentation="Number of locked SWA KV tokens on device (L1).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.host_full_tokens = Gauge(
+            name="sglang:host_full_tokens",
+            documentation="Number of full-attention KV tokens on host (L2) in the radix tree.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.host_swa_tokens = Gauge(
+            name="sglang:host_swa_tokens",
+            documentation="Number of SWA KV tokens on host (L2) in the radix tree.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.host_full_tokens_locked = Gauge(
+            name="sglang:host_full_tokens_locked",
+            documentation="Number of locked full-attention KV tokens on host (L2).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.host_swa_tokens_locked = Gauge(
+            name="sglang:host_swa_tokens_locked",
+            documentation="Number of locked SWA KV tokens on host (L2).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.host_mem_release_queue_size = Gauge(
+            name="sglang:host_mem_release_queue_size",
+            documentation="Number of pending items in the host memory release queue.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.swa_only_host_mem_release_queue_size = Gauge(
+            name="sglang:swa_only_host_mem_release_queue_size",
+            documentation="Number of pending items in the SWA-only host memory release queue.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.swa_active_freed_tokens_total = Counter(
             name="sglang:swa_active_freed_tokens_total",
             documentation="Cumulative SWA KV tokens proactively freed outside the sliding window.",
@@ -1161,9 +1262,28 @@ class SchedulerMetricsCollector:
         )
 
         # SWA radix cache metrics
+        self._log_gauge(self.full_available_size, stats.full_available_size)
+        self._log_gauge(self.swa_available_size, stats.swa_available_size)
         self._log_gauge(self.swa_tree_evictable_tokens, stats.swa_tree_evictable_tokens)
         self._log_gauge(
             self.full_tree_evictable_tokens, stats.full_tree_evictable_tokens
+        )
+        self._log_gauge(self.host_full_available_size, stats.host_full_available_size)
+        self._log_gauge(self.host_swa_available_size, stats.host_swa_available_size)
+        self._log_gauge(self.dev_full_tokens, stats.dev_full_tokens)
+        self._log_gauge(self.dev_swa_tokens, stats.dev_swa_tokens)
+        self._log_gauge(self.dev_full_tokens_locked, stats.dev_full_tokens_locked)
+        self._log_gauge(self.dev_swa_tokens_locked, stats.dev_swa_tokens_locked)
+        self._log_gauge(self.host_full_tokens, stats.host_full_tokens)
+        self._log_gauge(self.host_swa_tokens, stats.host_swa_tokens)
+        self._log_gauge(self.host_full_tokens_locked, stats.host_full_tokens_locked)
+        self._log_gauge(self.host_swa_tokens_locked, stats.host_swa_tokens_locked)
+        self._log_gauge(
+            self.host_mem_release_queue_size, stats.host_mem_release_queue_size
+        )
+        self._log_gauge(
+            self.swa_only_host_mem_release_queue_size,
+            stats.swa_only_host_mem_release_queue_size,
         )
         if stats.swa_active_freed_tokens_delta > 0:
             self.swa_active_freed_tokens_total.labels(**self.labels).inc(

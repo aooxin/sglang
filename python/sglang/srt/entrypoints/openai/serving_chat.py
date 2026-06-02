@@ -639,6 +639,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # Parsers for tool calls and reasoning
         parser_dict = {}
         reasoning_parser_dict = {}
+        reasoning_tool_parser_dict = {}
 
         # State tracking for streaming
         is_firsts = {}
@@ -660,6 +661,16 @@ class OpenAIServingChat(OpenAIServingBase):
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
                 self.tokenizer_manager.server_args.stream_response_default_include_usage,
+            )
+            should_parse_tool_calls = bool(
+                request.tool_choice != "none"
+                and request.tools
+                and self.tool_call_parser
+            )
+            history_tool_calls_cnt = (
+                self._get_history_tool_calls_cnt(request)
+                if should_parse_tool_calls
+                else 0
             )
 
             async for content in self.tokenizer_manager.generate_request(
@@ -740,54 +751,70 @@ class OpenAIServingChat(OpenAIServingBase):
                         index, delta, reasoning_parser_dict, content, request
                     )
                     if reasoning_text:
-                        choice_data = ChatCompletionResponseStreamChoice(
-                            index=index,
-                            delta=DeltaMessage(reasoning_content=reasoning_text),
-                            finish_reason=None,
-                        )
-                        chunk = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
-                            created=int(time.time()),
-                            choices=[choice_data],
-                            model=request.model,
-                        )
-
-                        # Add usage stats if continuous_usage_stats is enabled
-                        if continuous_usage_stats:
-                            chunk.usage = UsageProcessor.calculate_token_usage(
-                                prompt_tokens=prompt_tokens.get(index, 0),
-                                reasoning_tokens=reasoning_tokens.get(index, 0),
-                                completion_tokens=completion_tokens.get(index, 0),
+                        if should_parse_tool_calls:
+                            async for chunk in self._process_tool_call_stream(
+                                index,
+                                reasoning_text,
+                                reasoning_tool_parser_dict,
+                                content,
+                                request,
+                                has_tool_calls,
+                                continuous_usage_stats,
+                                emit_text_as_reasoning=True,
+                                history_tool_calls_cnt=history_tool_calls_cnt,
+                            ):
+                                if chunk:
+                                    yield chunk
+                        else:
+                            choice_data = ChatCompletionResponseStreamChoice(
+                                index=index,
+                                delta=DeltaMessage(reasoning_content=reasoning_text),
+                                finish_reason=None,
+                            )
+                            chunk = ChatCompletionStreamResponse(
+                                id=content["meta_info"]["id"],
+                                created=int(time.time()),
+                                choices=[choice_data],
+                                model=request.model,
                             )
 
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+                            # Add usage stats if continuous_usage_stats is enabled
+                            if continuous_usage_stats:
+                                chunk.usage = UsageProcessor.calculate_token_usage(
+                                    prompt_tokens=prompt_tokens.get(index, 0),
+                                    reasoning_tokens=reasoning_tokens.get(index, 0),
+                                    completion_tokens=completion_tokens.get(index, 0),
+                                )
+
+                            yield f"data: {chunk.model_dump_json()}\n\n"
 
                 # Handle tool calls
-                if (
-                    request.tool_choice != "none"
-                    and request.tools
-                    and self.tool_call_parser
-                ):
-                    async for chunk in self._process_tool_call_stream(
-                        index,
-                        delta,
-                        parser_dict,
-                        content,
-                        request,
-                        has_tool_calls,
-                        continuous_usage_stats,
-                    ):
-                        if chunk:
-                            yield chunk
+                if should_parse_tool_calls:
+                    if delta:
+                        async for chunk in self._process_tool_call_stream(
+                            index,
+                            delta,
+                            parser_dict,
+                            content,
+                            request,
+                            has_tool_calls,
+                            continuous_usage_stats,
+                            history_tool_calls_cnt=history_tool_calls_cnt,
+                        ):
+                            if chunk:
+                                yield chunk
 
                     # Send any remaining tool call arguments when generation finishes
-                    if finish_reason_type is not None and index in parser_dict:
-                        parser = parser_dict[index]
-                        remaining_chunk = self._check_for_unstreamed_tool_args(
-                            parser, content, request, index
-                        )
-                        if remaining_chunk:
-                            yield remaining_chunk
+                    if finish_reason_type is not None:
+                        for parser_pool in (parser_dict, reasoning_tool_parser_dict):
+                            if index not in parser_pool:
+                                continue
+                            parser = parser_pool[index]
+                            remaining_chunk = self._check_for_unstreamed_tool_args(
+                                parser, content, request, index
+                            )
+                            if remaining_chunk:
+                                yield remaining_chunk
 
                 else:
                     # Regular content
@@ -1005,8 +1032,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 and self.tool_call_parser
             ):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
-                tool_calls, text, finish_reason = self._process_tool_calls(
+                (
+                    tool_calls,
                     text,
+                    reasoning_text,
+                    finish_reason,
+                ) = self._process_tool_calls_with_reasoning_fallback(
+                    text,
+                    reasoning_text,
                     request.tools,
                     finish_reason,
                     request.tool_choice,
@@ -1200,6 +1233,38 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return ToolCallProcessingResult(None, text, finish_reason)
 
+    def _process_tool_calls_with_reasoning_fallback(
+        self,
+        text: str,
+        reasoning_text: Optional[str],
+        tools: List[Any],
+        finish_reason: Dict[str, Any],
+        tool_choice: Optional[Union[str, ToolChoice]] = None,
+        history_tool_calls_cnt: int = 0,
+    ) -> tuple[Optional[List[ToolCall]], str, Optional[str], Dict[str, Any]]:
+        tool_calls, text, finish_reason = self._process_tool_calls(
+            text,
+            tools,
+            finish_reason,
+            tool_choice,
+            history_tool_calls_cnt,
+        )
+        if not tool_calls and reasoning_text:
+            reasoning_tool_calls, cleaned_reasoning, finish_reason = (
+                self._process_tool_calls(
+                    reasoning_text,
+                    tools,
+                    finish_reason,
+                    tool_choice,
+                    history_tool_calls_cnt,
+                )
+            )
+            if reasoning_tool_calls:
+                tool_calls = reasoning_tool_calls
+                reasoning_text = cleaned_reasoning
+
+        return tool_calls, text, reasoning_text, finish_reason
+
     def _process_streaming_logprobs(
         self,
         content: Dict[str, Any],
@@ -1322,6 +1387,8 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         has_tool_calls: Dict[int, bool],
         continuous_usage_stats: bool = False,
+        emit_text_as_reasoning: bool = False,
+        history_tool_calls_cnt: Optional[int] = None,
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
@@ -1347,9 +1414,14 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Yield normal text
         if normal_text:
+            delta_message = (
+                DeltaMessage(reasoning_content=normal_text)
+                if emit_text_as_reasoning
+                else DeltaMessage(content=normal_text)
+            )
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
-                delta=DeltaMessage(content=normal_text),
+                delta=delta_message,
                 finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
@@ -1373,7 +1445,8 @@ class OpenAIServingChat(OpenAIServingBase):
             yield f"data: {chunk.model_dump_json()}\n\n"
 
         # Yield tool calls
-        history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
+        if history_tool_calls_cnt is None:
+            history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
         for call_item in calls:
             # Mark that this choice has tool calls
             has_tool_calls[index] = True

@@ -13,7 +13,6 @@
 # ==============================================================================
 
 import ast
-import html
 import json
 import logging
 import re
@@ -44,7 +43,8 @@ def _convert_param_value(
     Convert parameter value based on its type in the schema.
     Adapted from vllm-project/vllm (vllm/entrypoints/openai/tool_parsers/qwen3coder_tool_parser.py)
     """
-    param_value = html.unescape(param_value)
+    # MiMo emits raw parameter text. Do not call html.unescape() here: it can
+    # corrupt values such as "&current" into a currency-sign escape.
 
     # Handle null value for any type
     if param_value.lower() == "null":

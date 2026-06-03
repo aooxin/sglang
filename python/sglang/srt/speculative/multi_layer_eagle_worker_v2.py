@@ -646,6 +646,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 if self.draft_worker.chain_mtp_hidden_states
                 else CaptureHiddenMode.LAST
             )
+            model_worker_batch.return_hidden_states_before_norm = True
             batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
                 model_worker_batch,
                 batch_output.logits_output.hidden_states,
@@ -695,6 +696,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     self.target_worker,
                 )
             )
+        verify_forward_batch.return_hidden_states_before_norm = True
 
         # Correct some buffers due to the overlap plan
         if self.plan_stream:

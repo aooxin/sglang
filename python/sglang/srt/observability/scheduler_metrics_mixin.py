@@ -480,21 +480,23 @@ class SchedulerMetricsMixin:
                 self.stats.swa_available_size = swa_available_size
                 self.stats.swa_tree_evictable_tokens = swa_evictable_size
                 self.stats.full_tree_evictable_tokens = full_evictable_size
-                # L2 host pool available size
-                host_pool = self.tree_cache.cache_controller.mem_pool_host
-                if hasattr(host_pool, "swa_available_size"):
-                    host_full_avail, host_swa_avail = host_pool.swa_available_size()
-                    self.stats.host_full_available_size = host_full_avail
-                    self.stats.host_swa_available_size = host_swa_avail
-                # Host memory release queue lengths
-                cc = self.tree_cache.cache_controller
-                if hasattr(cc, "host_mem_release_queue"):
-                    self.stats.host_mem_release_queue_size = (
-                        cc.host_mem_release_queue.qsize()
-                    )
-                    self.stats.swa_only_host_mem_release_queue_size = (
-                        cc.swa_only_host_mem_release_queue.qsize()
-                    )
+                # L2 host pool and release queues are only present with HiCache
+                cc = getattr(self.tree_cache, "cache_controller", None)
+                if cc is not None:
+                    # L2 host pool available size
+                    host_pool = cc.mem_pool_host
+                    if hasattr(host_pool, "swa_available_size"):
+                        host_full_avail, host_swa_avail = host_pool.swa_available_size()
+                        self.stats.host_full_available_size = host_full_avail
+                        self.stats.host_swa_available_size = host_swa_avail
+                    # Host memory release queue lengths
+                    if hasattr(cc, "host_mem_release_queue"):
+                        self.stats.host_mem_release_queue_size = (
+                            cc.host_mem_release_queue.qsize()
+                        )
+                        self.stats.swa_only_host_mem_release_queue_size = (
+                            cc.swa_only_host_mem_release_queue.qsize()
+                        )
                 # Tree token breakdown (device/host × full/swa), rate-limited
                 now = time.perf_counter()
                 if now - self.last_tree_cache_info_time >= TREE_CACHE_INFO_INTERVAL:

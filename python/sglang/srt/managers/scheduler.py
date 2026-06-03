@@ -2324,8 +2324,7 @@ class Scheduler(
                 return self.tree_cache.collect_tree_info()
             except NotImplementedError:
                 return None
-        else:
-            return {}
+        return None
 
     @nvtx_annotated_method("scheduler.get_next_batch_to_run")
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:

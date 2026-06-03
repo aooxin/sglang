@@ -2200,6 +2200,7 @@ class SWATokenToKVPoolHost:
         self.layer_num = self.device_pool.layer_num
         self.reserve_swa_size = envs.SGLANG_RESERVE_SWA_SIZE_BEFORE_PREFETCHING.get()
         assert self.reserve_swa_size % self.page_size == 0
+        self._token_stride_sizes, self._page_element_sizes = self._compute_page_meta()
 
     def _validate_host_pool_sizes(
         self,
@@ -2567,7 +2568,33 @@ class SWATokenToKVPoolHost:
             + self.swa_pool_host.get_ksize_per_token()
         )
 
-    # TODO(yingchun): 考虑复用 get_page_buffer_meta 中的方法
+    def _compute_page_meta(self):
+        itemsize = self.dtype.itemsize
+        # TODO(yingchun): 与已有的 full/swa_pool_host.layout_dim/v_layout_dim 完全相同
+        stride_sizes = (
+            self.device_pool.full_layer_nums
+            * self.full_pool_host.head_num
+            * self.full_pool_host.head_dim
+            * itemsize,
+            self.device_pool.full_layer_nums
+            * self.full_pool_host.head_num
+            * self.full_pool_host.v_head_dim
+            * itemsize,
+            self.device_pool.swa_layer_nums
+            * self.swa_pool_host.head_num
+            * self.swa_pool_host.head_dim
+            * itemsize,
+            self.device_pool.swa_layer_nums
+            * self.swa_pool_host.head_num
+            * self.swa_pool_host.v_head_dim
+            * itemsize,
+        )
+        element_sizes = tuple(s * self.page_size for s in stride_sizes)
+        return stride_sizes, element_sizes
+
+    def get_page_element_sizes(self):
+        return self._page_element_sizes
+
     def get_page_buffer_meta(self, full_host_indices, swa_needed_per_page=None):
         """
         meta data for zero copy
@@ -2581,60 +2608,15 @@ class SWATokenToKVPoolHost:
         full_host_indices = full_host_indices.tolist()
         swa_host_indices = self.full_to_swa_index_mapping[full_host_indices]
 
-        itemsize = self.dtype.itemsize
-        full_k_element_size = (
-            self.device_pool.full_layer_nums
-            * itemsize
-            * self.page_size
-            * self.full_pool_host.head_num
-            * self.full_pool_host.head_dim
+        full_k_stride, full_v_stride, swa_k_stride, swa_v_stride = (
+            self._token_stride_sizes
         )
-        full_v_element_size = (
-            self.device_pool.full_layer_nums
-            * itemsize
-            * self.page_size
-            * self.full_pool_host.head_num
-            * self.full_pool_host.v_head_dim
-        )
-        swa_k_element_size = (
-            self.device_pool.swa_layer_nums
-            * itemsize
-            * self.page_size
-            * self.swa_pool_host.head_num
-            * self.swa_pool_host.head_dim
-        )
-        swa_v_element_size = (
-            self.device_pool.swa_layer_nums
-            * itemsize
-            * self.page_size
-            * self.swa_pool_host.head_num
-            * self.swa_pool_host.v_head_dim
-        )
-
-        full_k_stride = (
-            self.device_pool.full_layer_nums
-            * self.full_pool_host.head_num
-            * self.full_pool_host.head_dim
-            * itemsize
-        )
-        full_v_stride = (
-            self.device_pool.full_layer_nums
-            * self.full_pool_host.head_num
-            * self.full_pool_host.v_head_dim
-            * itemsize
-        )
-        swa_k_stride = (
-            self.device_pool.swa_layer_nums
-            * self.swa_pool_host.head_num
-            * self.swa_pool_host.head_dim
-            * itemsize
-        )
-        swa_v_stride = (
-            self.device_pool.swa_layer_nums
-            * self.swa_pool_host.head_num
-            * self.swa_pool_host.v_head_dim
-            * itemsize
-        )
+        (
+            full_k_element_size,
+            full_v_element_size,
+            swa_k_element_size,
+            swa_v_element_size,
+        ) = self._page_element_sizes
 
         ptr_list = []
         element_size_list = []

@@ -33,9 +33,21 @@ class GcacheStorage(HiCacheStorage):
         # TODO(yingchun): move to python/sglang/srt/environ.py
         master_addr = os.environ.get("GCACHE_MASTER_ADDR")
         cache_group = os.environ.get("GCACHE_CACHE_GROUP")
-        client_ifname = os.environ.get("GCACHE_CLIENT_IFNAME")
-        if not master_addr or not cache_group or not client_ifname:
-            raise RuntimeError("Gcache need ENV variables, please check GCACHE_MASTER_ADDR, GCACHE_CACHE_GROUP or GCACHE_CLIENT_IFNAME")
+        if not master_addr or not cache_group:
+            raise RuntimeError(
+                "Gcache need env GCACHE_MASTER_ADDR and GCACHE_CACHE_GROUP"
+            )
+
+        hpn_ifname = os.environ.get("HPN_IB_IFNAME")
+        obsolete_ifname = os.environ.get("GCACHE_CLIENT_IFNAME")
+        if hpn_ifname:
+            client_ifname = hpn_ifname
+        elif obsolete_ifname:
+            client_ifname = obsolete_ifname
+        else:
+            raise RuntimeError(
+                "Gcache need env HPN_IB_IFNAME or GCACHE_CLIENT_IFNAME"
+            )
 
         # One client only uses one NIC
         # nic_names = client_ifname.split(",")
@@ -58,6 +70,7 @@ class GcacheStorage(HiCacheStorage):
         self.backup_pgs: list = []
         self.prefetch_bandwidth: list = []
         self.backup_bandwidth: list = []
+        self.mem_pool_host = mem_pool_host
 
         self.warmup()
 
@@ -101,6 +114,7 @@ class GcacheStorage(HiCacheStorage):
             )
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache) -> None:
+        assert self.mem_pool_host == mem_pool_host
         super().register_mem_pool_host(mem_pool_host)
         assert isinstance(self.mem_pool_host, SWATokenToKVPoolHost)
         assert self.mem_pool_host.layout in [
@@ -124,12 +138,13 @@ class GcacheStorage(HiCacheStorage):
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
-        query_keys = self._convert_hybrid_keys(keys)
-        # TODO(yingchun): reduce cost in f-string debug logs
+        query_keys, size_list = self._convert_hybrid_keys(keys, with_size=True)
         logger.debug(f"gcache: begin check {len(query_keys)} keys")
         key_multiplier = 4
         assert len(query_keys) == len(keys) * key_multiplier
-        exist_mask = self.gcache_client.batch_exists(query_keys)
+        exist_mask = self.gcache_client.batch_exists(
+            query_keys, for_read=True, size_list=size_list
+        )
         assert len(exist_mask) == len(query_keys)
 
         prefix_success = 0
@@ -148,11 +163,13 @@ class GcacheStorage(HiCacheStorage):
     def batch_exists_hybrid(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> tuple[int, list[bool]]:
-        query_keys = self._convert_hybrid_keys(keys)
+        query_keys, size_list = self._convert_hybrid_keys(keys, with_size=True)
         logger.debug(f"gcache: begin hybrid check {len(query_keys)} keys")
         key_multiplier = 4
         assert len(query_keys) == len(keys) * key_multiplier
-        exist_mask: List[bool] = self.gcache_client.batch_exists(query_keys)
+        exist_mask: List[bool] = self.gcache_client.batch_exists(
+            query_keys, for_read=True, size_list=size_list
+        )
         assert len(exist_mask) == len(query_keys)
 
         full_prefix_success = len(keys)
@@ -188,7 +205,9 @@ class GcacheStorage(HiCacheStorage):
         )
         logger.debug(f"gcache: begin set {len(gcache_keys)} keys")
 
-        exist_result = self.gcache_client.batch_exists(gcache_keys, False)
+        exist_result = self.gcache_client.batch_exists(
+            gcache_keys, for_read=False, size_list=value_size_list
+        )
         assert len(exist_result) == len(gcache_keys)
 
         set_keys = []
@@ -335,8 +354,11 @@ class GcacheStorage(HiCacheStorage):
         )
 
     def _convert_hybrid_keys(
-        self, keys: List[str], swa_valid_list: Optional[List[bool]] = None
-    ) -> List[str]:
+        self,
+        keys: List[str],
+        swa_valid_list: Optional[List[bool]] = None,
+        with_size: bool = False,
+    ):
         if swa_valid_list is not None:
             assert len(keys) == len(swa_valid_list)
         ret = []
@@ -347,7 +369,17 @@ class GcacheStorage(HiCacheStorage):
             if swa_valid_list is None or swa_valid_list[i]:
                 ret.append(f"{self.model_name}_{key_}_{self.tp_rank}_swa_k")
                 ret.append(f"{self.model_name}_{key_}_{self.tp_rank}_swa_v")
-        return ret
+
+        size_list = []
+        if with_size:
+            full_and_swa = self.mem_pool_host.get_page_element_sizes()
+            full_only = full_and_swa[:2]
+            if swa_valid_list is None:
+                size_list = list(full_and_swa) * len(keys)
+            else:
+                for valid in swa_valid_list:
+                    size_list.extend(full_and_swa if valid else full_only)
+        return ret, size_list
 
     def _batch_preprocess(
         self,
@@ -362,10 +394,9 @@ class GcacheStorage(HiCacheStorage):
         ptr_list, element_size_list, swa_valid_list = (
             self.mem_pool_host.get_page_buffer_meta(host_indices, swa_needed_per_page)
         )
-        assert len(ptr_list) == len(element_size_list)
         assert len(swa_valid_list) == len(keys)
 
-        key_list = self._convert_hybrid_keys(keys, swa_valid_list)
+        key_list, _ = self._convert_hybrid_keys(keys, swa_valid_list)
 
         assert len(key_list) == len(ptr_list) == len(element_size_list)
         return key_list, ptr_list, element_size_list, swa_valid_list

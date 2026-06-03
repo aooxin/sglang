@@ -489,14 +489,6 @@ class SchedulerMetricsMixin:
                         host_full_avail, host_swa_avail = host_pool.swa_available_size()
                         self.stats.host_full_available_size = host_full_avail
                         self.stats.host_swa_available_size = host_swa_avail
-                    # Host memory release queue lengths
-                    if hasattr(cc, "host_mem_release_queue"):
-                        self.stats.host_mem_release_queue_size = (
-                            cc.host_mem_release_queue.qsize()
-                        )
-                        self.stats.swa_only_host_mem_release_queue_size = (
-                            cc.swa_only_host_mem_release_queue.qsize()
-                        )
                 # Tree token breakdown (device/host × full/swa), rate-limited
                 now = time.perf_counter()
                 if now - self.last_tree_cache_info_time >= TREE_CACHE_INFO_INTERVAL:

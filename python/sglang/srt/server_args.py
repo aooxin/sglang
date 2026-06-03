@@ -421,6 +421,7 @@ class ServerArgs:
     bucket_prefill_bootstrap_time: Optional[List[float]] = None
     bucket_decode_bootstrap_time: Optional[List[float]] = None
     bucket_decode_alloc_wait_time: Optional[List[float]] = None
+    bucket_per_stage_req_latency: Optional[List[float]] = None
     bucket_io: Optional[List[float]] = None
     bucket_bandwidth: Optional[List[float]] = None
     collect_tokens_histogram: bool = False
@@ -4422,6 +4423,14 @@ class ServerArgs:
             nargs="+",
             default=ServerArgs.bucket_decode_alloc_wait_time,
             help="The buckets (in seconds) for the decode alloc wait time histogram.",
+        )
+        parser.add_argument(
+            "--bucket-per-stage-req-latency",
+            type=float,
+            nargs="+",
+            default=ServerArgs.bucket_per_stage_req_latency,
+            help="The buckets (in seconds) for the per-stage request latency histogram "
+            "(per_stage_req_latency_seconds), shared across all stages.",
         )
         parser.add_argument(
             "--bucket-io",

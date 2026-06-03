@@ -163,9 +163,6 @@ class SchedulerStats:
     host_nodes: int = 0
     host_leaves: int = 0
     host_leaves_locked: int = 0
-    # Gauge: host memory release queue lengths
-    host_mem_release_queue_size: int = 0
-    swa_only_host_mem_release_queue_size: int = 0
     # Counter deltas: tokens freed/evicted since the last log interval
     swa_active_freed_tokens_delta: int = 0
     swa_evicted_from_tree_delta: int = 0
@@ -524,6 +521,11 @@ class SchedulerMetricsCollector:
             if server_args
             else None
         )
+        bucket_per_stage_req_latency = (
+            getattr(server_args, "bucket_per_stage_req_latency", None)
+            if server_args
+            else None
+        )
 
         self.histogram_prefill_bootstrap_time = Histogram(
             name="sglang:prefill_bootstrap_time_seconds",
@@ -675,8 +677,9 @@ class SchedulerMetricsCollector:
         self.per_stage_req_latency_seconds = Histogram(
             name="sglang:per_stage_req_latency_seconds",
             documentation="The latency of each stage of requests.",
-            # captures latency in range [1ms - ~1191s]
-            buckets=exponential_buckets(start=0.001, width=1.62, length=30),
+            # Default captures latency in range [1ms - ~1191s].
+            buckets=bucket_per_stage_req_latency
+            or exponential_buckets(start=0.001, width=1.62, length=30),
             labelnames=list(labels.keys()) + ["stage"],
         )
 
@@ -1005,18 +1008,6 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-        self.host_mem_release_queue_size = Gauge(
-            name="sglang:host_mem_release_queue_size",
-            documentation="Number of pending items in the host memory release queue.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        self.swa_only_host_mem_release_queue_size = Gauge(
-            name="sglang:swa_only_host_mem_release_queue_size",
-            documentation="Number of pending items in the SWA-only host memory release queue.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
         self.swa_active_freed_tokens_total = Counter(
             name="sglang:swa_active_freed_tokens_total",
             documentation="Cumulative SWA KV tokens proactively freed outside the sliding window.",
@@ -1327,13 +1318,6 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.host_nodes, stats.host_nodes)
         self._log_gauge(self.host_leaves, stats.host_leaves)
         self._log_gauge(self.host_leaves_locked, stats.host_leaves_locked)
-        self._log_gauge(
-            self.host_mem_release_queue_size, stats.host_mem_release_queue_size
-        )
-        self._log_gauge(
-            self.swa_only_host_mem_release_queue_size,
-            stats.swa_only_host_mem_release_queue_size,
-        )
         if stats.swa_active_freed_tokens_delta > 0:
             self.swa_active_freed_tokens_total.labels(**self.labels).inc(
                 stats.swa_active_freed_tokens_delta

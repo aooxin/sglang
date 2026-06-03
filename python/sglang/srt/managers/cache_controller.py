@@ -565,6 +565,21 @@ class HiCacheController:
             self.tp_size = get_tensor_model_parallel_world_size()
             self.dp_rank = 0
 
+        self._hicache_queue_gauge = None
+        if self.enable_storage_metrics:
+            from prometheus_client import Gauge
+
+            self._hicache_queue_gauge = Gauge(
+                name="sglang:hicache_queue_length",
+                documentation="Queue length inside HiCacheController.",
+                labelnames=["tp_rank", "dp_rank", "queue"],
+                multiprocess_mode="mostrecent",
+            )
+            self._hicache_queue_labels = {
+                "tp_rank": str(self.tp_rank),
+                "dp_rank": str(self.dp_rank),
+            }
+
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
@@ -1359,6 +1374,7 @@ class HiCacheController:
                     keys.extend(self.key_refresh_queue.get_nowait())
                 except Exception:
                     break
+            self._log_queue_length("key_refresh_queue", self.key_refresh_queue.qsize())
             if keys:
                 if self.metrics_collector is not None:
                     self.metrics_collector.log_key_refresh_keys(len(keys))
@@ -1374,12 +1390,31 @@ class HiCacheController:
         operation.mark_terminate()
         return operation.completed_tokens, operation.hash_value
 
+    def _log_queue_length(self, queue_name: str, size: int):
+        if self._hicache_queue_gauge is not None:
+            self._hicache_queue_gauge.labels(
+                **self._hicache_queue_labels, queue=queue_name
+            ).set(size)
+
+    def _put_prefetch_revoke(self, request_id: str):
+        self.prefetch_revoke_queue.put(request_id)
+        self._log_queue_length(
+            "prefetch_revoke_queue", self.prefetch_revoke_queue.qsize()
+        )
+
+    def _put_ack_backup(self, operation):
+        self.ack_backup_queue.put(operation)
+        self._log_queue_length("ack_backup_queue", self.ack_backup_queue.qsize())
+
     def append_host_mem_release(self, host_indices: torch.Tensor):
         if host_indices.numel() == 0:
             return
         pages = host_indices.split(self.mem_pool_host.page_size)
         for page in pages:
             self.host_mem_release_queue.put(page)
+        self._log_queue_length(
+            "host_mem_release_queue", self.host_mem_release_queue.qsize()
+        )
 
     def append_swa_only_host_mem_release(
         self, swa_only_to_release: Optional[torch.Tensor]
@@ -1404,6 +1439,10 @@ class HiCacheController:
             # TODO(yingchun): 单独 put 入队，lock 获取频繁。可考虑批量入队。
             for page in paged[valid_page_mask]:
                 self.swa_only_host_mem_release_queue.put(page)
+            self._log_queue_length(
+                "swa_only_host_mem_release_queue",
+                self.swa_only_host_mem_release_queue.qsize(),
+            )
 
     def append_full_and_swa_mem_release_separately(
         self, full_host_indices_to_release: torch.Tensor
@@ -1506,6 +1545,7 @@ class HiCacheController:
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
+                self._log_queue_length("prefetch_buffer", self.prefetch_buffer.qsize())
                 if operation is None:
                     continue
                 self._page_transfer(operation)
@@ -1686,6 +1726,7 @@ class HiCacheController:
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
+                self._log_queue_length("prefetch_queue", self.prefetch_queue.qsize())
                 if operation is None:
                     continue
 
@@ -1732,7 +1773,7 @@ class HiCacheController:
                 #  可以把阈值设置成 0
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
-                    self.prefetch_revoke_queue.put(operation.request_id)
+                    self._put_prefetch_revoke(operation.request_id)
                     revoke_tokens = len(operation.host_indices)
                     self.append_host_mem_release(operation.host_indices)
                     self.append_swa_only_host_mem_release(operation.swa_host_indices)
@@ -1758,7 +1799,7 @@ class HiCacheController:
                             self.sliding_window_pages,
                         )
                     if swa_valid_len < self.sliding_window_pages:
-                        self.prefetch_revoke_queue.put(operation.request_id)
+                        self._put_prefetch_revoke(operation.request_id)
                         revoke_tokens = len(operation.host_indices)
                         self.append_host_mem_release(operation.host_indices)
                         self.append_swa_only_host_mem_release(
@@ -1874,12 +1915,13 @@ class HiCacheController:
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
+                self._log_queue_length("backup_queue", self.backup_queue.qsize())
                 if operation is None:
                     continue
 
                 if not self.backup_skip:
                     self._page_backup(operation)
-                self.ack_backup_queue.put(operation)
+                self._put_ack_backup(operation)
 
             except Empty:
                 continue

@@ -39,8 +39,7 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages --no-build-iso
 RUN rm -fr /sgl-workspace/sglang
 
 RUN python3 -m pip install https://cnbj1-fds.api.xiaomi.net/aie-shared-objects/20260514/transfer_kernel-0.4.1-cp310-abi3-linux_x86_64.whl \
-    --no-cache-dir --no-dependencies --force-reinstall
-
+    --no-cache-dir --no-deps --force-reinstall
 # gcache
 COPY docker/gcache.flags /sgl-workspace/
 RUN mkdir -p /home/work/gcache && \
@@ -52,6 +51,10 @@ RUN mkdir -p /home/work/gcache && \
     pip install http://cnbj1-fds.api.xiaomi.net/juicefs/gcache/release/tmp-build/20260415-aa25c909/gcache_sdk-0.1.0-py3-none-any.whl
 COPY docker/start-gcache-server.sh /home/work/gcache/
 COPY docker/wait-gcache-server.sh /home/work/gcache/
+
+# pos_enc_kernel: standalone fp32 rotary embedding kernel
+RUN python3 -m pip install https://cnbj1-fds.api.xiaomi.net/aie-shared-objects/20260603/pos_enc_kernel-0.4.1-cp310-abi3-linux_x86_64.whl \
+    --no-cache-dir --no-deps --force-reinstall
 
 COPY . .
 

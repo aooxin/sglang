@@ -104,10 +104,6 @@ if(CCACHE_FOUND AND ENABLE_CCACHE AND DEFINED ENV{CCACHE_DIR})
     set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "ccache")
 endif()
 
-# TODO(yingchun): 与 BUILD_TRANSFER_ONLY 重构复用
-# Option to build only pos_enc kernel as standalone package
-option(BUILD_POS_ENC_ONLY "Build only pos_enc kernel" OFF)
-
 # Configure gencode below SM90
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
     set(DEFAULT_ENABLE_BELOW_SM90 OFF)
@@ -272,32 +268,6 @@ if (BUILD_TRANSFER_ONLY)
     )
 
     install(TARGETS transfer_ops LIBRARY DESTINATION transfer_kernel)
-
-    # Skip the rest of the file
-    return()
-endif()
-
-# =========================== BUILD_POS_ENC_ONLY Mode ============================= #
-if (BUILD_POS_ENC_ONLY)
-    message(STATUS "Building pos_enc kernel only")
-
-    set(POS_ENC_SOURCES
-        "csrc/elementwise/pos_enc.cu"
-        "csrc/pos_enc_extension.cc"
-    )
-
-    Python_add_library(pos_enc_ops MODULE WITH_SOABI ${POS_ENC_SOURCES})
-
-    target_compile_options(pos_enc_ops PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
-    )
-
-    target_link_libraries(pos_enc_ops PRIVATE
-        ${TORCH_LIBRARIES}
-        CUDA::cudart
-    )
-
-    install(TARGETS pos_enc_ops LIBRARY DESTINATION pos_enc_kernel)
 
     # Skip the rest of the file
     return()

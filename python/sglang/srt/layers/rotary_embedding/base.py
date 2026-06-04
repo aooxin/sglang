@@ -88,7 +88,7 @@ class RotaryEmbedding(MultiPlatformOp):
             # rotary_embedding from sglang.jit_kernel.rope and vllm._custom_ops has the same implementation.
             # TODO: Test on different devices and remove this conditional.
             if _is_cuda:
-                from pos_enc_kernel import rotary_embedding
+                from sglang.jit_kernel.rope import rotary_embedding
             elif _is_hip:
                 from sgl_kernel import rotary_embedding
             else:
@@ -390,8 +390,9 @@ class RotaryEmbedding(MultiPlatformOp):
                 assert (
                     fused_set_kv_buffer_arg is None
                 ), "save kv cache is not supported for fallback_rotary_embedding."
-                # Mixed precision is supported: cos_sin_cache can be float32 while query/key are bf16/fp16.
-                self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+                self.cos_sin_cache = self.cos_sin_cache.to(
+                    query.device, dtype=query.dtype
+                )
                 self.fallback_rotary_embedding(
                     positions,
                     query,

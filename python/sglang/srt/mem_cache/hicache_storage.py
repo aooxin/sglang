@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import struct
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -14,20 +15,35 @@ from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 logger = logging.getLogger(__name__)
 
 
-def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
+def get_hash_str(
+    token_ids: torch.Tensor | List[int], prior_hash: Optional[str] = None
+) -> str:
     hasher = hashlib.sha256()
 
     if prior_hash:
         hasher.update(bytes.fromhex(prior_hash))
 
-    for t in token_ids:
-        if isinstance(t, tuple):
-            # EAGLE bigram mode: hash both elements to uniquely identify the bigram
-            for elem in t:
-                hasher.update(elem.to_bytes(4, byteorder="little", signed=False))
+    if isinstance(token_ids, torch.Tensor):
+        # Flatten to 1D and encode each element as 4-byte little-endian unsigned,
+        # consistent with the non-tensor path.
+        hasher.update(token_ids.flatten().to(torch.int32).numpy().tobytes())
+    elif len(token_ids) == 0:
+        pass  # Empty list, no need to update hasher
+    else:
+        first = next(iter(token_ids))
+        is_tuple_mode = isinstance(first, tuple)
+
+        if is_tuple_mode:
+            # EAGLE bigram mode: each element is a (int, int,...) sample tuple
+            # Flatten all tuples and batch-pack: [t0[0], t0[1], t1[0], t1[1], ...]
+            flattened = []
+            for t in token_ids:
+                flattened.extend(t)
+            buf = struct.pack(f"<{len(flattened)}I", *flattened)
+            hasher.update(buf)
         else:
-            # Regular mode: single integer token
-            hasher.update(t.to_bytes(4, byteorder="little", signed=False))
+            buf = struct.pack(f"<{len(token_ids)}I", *token_ids)
+            hasher.update(buf)
 
     return hasher.hexdigest()
 

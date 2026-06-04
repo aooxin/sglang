@@ -718,6 +718,11 @@ class ChatCompletionRequest(BaseModel):
         if not response_format:
             return values
 
+        if not isinstance(response_format, dict):
+            raise ValueError(
+                'response_format must be a JSON object, e.g. {"type": "json_object"}'
+            )
+
         if response_format.get("type") != "json_schema":
             return values
 

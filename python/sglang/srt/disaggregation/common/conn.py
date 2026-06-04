@@ -176,6 +176,10 @@ class CommonKVManager(BaseKVManager):
             )
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
+        if bootstrap_room not in self.request_status:
+            logger.warning(f"Request with {bootstrap_room=} not found")
+            return KVPoll.Failed
+
         return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):

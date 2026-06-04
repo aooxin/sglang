@@ -399,6 +399,11 @@ class SchedulerMetricsCollector:
             documentation="Total number of prefill retries.",
             labelnames=labels.keys(),
         )
+        self.disagg_prefill_run_batch_busy_seconds = Counter(
+            name="sglang:disagg_prefill_run_batch_busy_seconds_total",
+            documentation="Cumulative seconds spent in run_batch in the disagg prefill overlap event loop.",
+            labelnames=labels.keys(),
+        )
         self.kv_transfer_speed_gb_s = Histogram(
             name="sglang:kv_transfer_speed_gb_s",
             documentation="Histogram of KV cache transfer speed in GB/s.",
@@ -1054,6 +1059,9 @@ class SchedulerMetricsCollector:
     def increment_prefill_retries(self, count: int) -> None:
         if count > 0:
             self.num_prefill_retries_total.labels(**self.labels).inc(count)
+
+    def observe_disagg_prefill_run_batch_busy(self, seconds: float) -> None:
+        self.disagg_prefill_run_batch_busy_seconds.labels(**self.labels).inc(seconds)
 
     def observe_kv_transfer_metrics(
         self,

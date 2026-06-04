@@ -20,6 +20,7 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List, Optional
@@ -465,7 +466,12 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
+                run_batch_start_time = time.perf_counter()
                 batch_result = self.run_batch(batch)
+                if self.current_scheduler_metrics_enabled:
+                    self.metrics_collector.observe_disagg_prefill_run_batch_busy(
+                        time.perf_counter() - run_batch_start_time
+                    )
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None

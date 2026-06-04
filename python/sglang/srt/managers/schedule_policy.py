@@ -891,7 +891,16 @@ class PrefillAdder:
 
         swa_total_tokens = 0
         if self.is_hybrid_swa:
-            # SWA needs: swa_load_back_tokens + real_extend
+            # Chunk limit should only constrain the extend portion (which can be
+            # chunked), not the load_back portion (which must be loaded in full).
+            swa_extend_tokens = req.extend_input_len - req.host_hit_length
+            if (
+                self.rem_chunk_tokens is not None
+                and swa_extend_tokens > self.rem_chunk_tokens
+            ):
+                swa_extend_tokens = self.rem_chunk_tokens
+
+            # SWA needs: swa_load_back_tokens + swa_extend_tokens
             swa_load_back_tokens = 0
             estimate_load_back = getattr(
                 self.tree_cache, "estimate_load_back", None
@@ -900,14 +909,8 @@ class PrefillAdder:
                 _, swa_load_back_tokens = estimate_load_back(
                     req.last_host_node, req.host_hit_length
                 )
-            swa_total_tokens = swa_load_back_tokens + (
-                req.extend_input_len - req.host_hit_length
-            )
-            if (
-                self.rem_chunk_tokens is not None
-                and swa_total_tokens > self.rem_chunk_tokens
-            ):
-                swa_total_tokens = self.rem_chunk_tokens
+
+            swa_total_tokens = swa_load_back_tokens + swa_extend_tokens
 
         real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)

@@ -922,7 +922,19 @@ class PrefillAdder:
         )
         if total_tokens >= self.rem_total_tokens or swa_over_budget:
             if swa_over_budget:
-                logger.warning("swa mem not enough,try to increase swa!!!")
+                swa_available = (
+                    self.token_to_kv_pool_allocator.swa_available_size()
+                )
+                swa_evictable = self.tree_cache.swa_evictable_size()
+                logger.warning(
+                    "swa mem not enough, try to increase swa!!! "
+                    f"swa_total_tokens_needed={swa_total_tokens} "
+                    f"(load_back={swa_load_back_tokens}, extend={swa_extend_tokens}), "
+                    f"rem_swa_total_tokens={self.rem_swa_total_tokens}, "
+                    f"swa_available_size={swa_available}, "
+                    f"swa_evictable_size={swa_evictable}, "
+                    f"swa_rem_total_token_offset={self.swa_rem_total_token_offset}"
+                )
             return AddReqResult.NO_TOKEN
 
         # This request's input tokens exceed the remaining input budget, but the
@@ -939,8 +951,23 @@ class PrefillAdder:
             )
             if total_tokens >= self.rem_total_tokens or swa_over_budget:
                 if swa_over_budget:
+                    swa_available = (
+                        self.token_to_kv_pool_allocator.swa_available_size()
+                    )
+                    swa_evictable = self.tree_cache.swa_evictable_size()
                     logger.warning(
-                        "[lock_node] swa mem not enough,try to increase swa!!!"
+                        "[lock_node] swa mem not enough, try to increase swa!!! "
+                        f"swa_total_tokens_needed={swa_total_tokens} "
+                        f"(load_back={swa_load_back_tokens}, extend={swa_extend_tokens}), "
+                        f"rem_swa_total_tokens={self.rem_swa_total_tokens}, "
+                        f"swa_available_size={swa_available}, "
+                        f"swa_evictable_size={swa_evictable}, "
+                        f"swa_rem_total_token_offset={self.swa_rem_total_token_offset}, "
+                        f"req.rid={req.rid}, "
+                        f"req.extend_input_len={req.extend_input_len}, "
+                        f"req.host_hit_length={req.host_hit_length}, "
+                        f"req.prefix_indices_len={len(req.prefix_indices)}, "
+                        f"req.fill_ids_len={len(req.fill_ids)}"
                     )
                 return AddReqResult.NO_TOKEN
 

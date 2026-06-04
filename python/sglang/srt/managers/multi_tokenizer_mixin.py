@@ -332,6 +332,7 @@ class MultiTokenizerRouter:
         port_args: PortArgs,
     ):
         self.server_args = server_args
+        self.model_config = server_args.get_model_config()
         context = zmq.asyncio.Context(3)
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
@@ -492,9 +493,12 @@ def write_data_for_multi_tokenizer(
     return args_shm
 
 
-def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
-    """Monkey patch uvicorn multiprocessing is_alive timeout"""
-    # from default 5s -> 10s
+def monkey_patch_uvicorn_multiprocessing(timeout: float = 10, use_fork: bool = True):
+    """Monkey patch uvicorn multiprocessing.
+
+    1. is_alive timeout: from default 5s -> 10s.
+    2. Optionally switch uvicorn worker processes from spawn to fork.
+    """
     try:
         from uvicorn.supervisors.multiprocess import Process
 
@@ -503,6 +507,42 @@ def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
     except ImportError:
         logger.warning(
             "uvicorn.supervisors.multiprocess not found, skipping monkey patch"
+        )
+
+    if not use_fork:
+        logger.info(
+            "Skipping uvicorn fork patch (use_fork=False); workers will use spawn"
+        )
+        return
+
+    try:
+        import uvicorn._subprocess as _uv_sub
+        import uvicorn.supervisors.multiprocess as _uv_mp
+
+        fork_ctx = multiprocessing.get_context("fork")
+
+        def _fork_get_subprocess(config, target, sockets):
+            try:
+                stdin_fileno = sys.stdin.fileno()
+            except (AttributeError, OSError):
+                stdin_fileno = None
+
+            kwargs = {
+                "config": config,
+                "target": target,
+                "sockets": sockets,
+                "stdin_fileno": stdin_fileno,
+            }
+            return fork_ctx.Process(target=_uv_sub.subprocess_started, kwargs=kwargs)
+
+        _uv_sub.get_subprocess = _fork_get_subprocess
+        _uv_mp.get_subprocess = _fork_get_subprocess
+        logger.info(
+            "Monkey-patched uvicorn to use fork instead of spawn for worker processes"
+        )
+    except Exception as e:
+        logger.warning(
+            f"Failed to patch uvicorn to use fork: {e}; workers will use spawn"
         )
 
 

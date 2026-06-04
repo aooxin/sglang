@@ -304,6 +304,7 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     tokenizer_worker_num: int = 1
+    enable_fork_tokenizer_workers: bool = False
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -3714,6 +3715,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tokenizer_worker_num,
             help="The worker num of the tokenizer manager.",
+        )
+        parser.add_argument(
+            "--enable-fork-tokenizer-workers",
+            action="store_true",
+            help="Whether to enable forked tokenizer workers.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",

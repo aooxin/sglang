@@ -2102,7 +2102,12 @@ def _setup_and_run_http_server(
                 "level": "INFO",
                 "propagate": False,
             }
-            monkey_patch_uvicorn_multiprocessing()
+            # Multimodal models may hang when uvicorn workers are forked, so only
+            # enable the fork optimization for text-only models.
+            monkey_patch_uvicorn_multiprocessing(
+                use_fork=server_args.enable_fork_tokenizer_workers
+                and not tokenizer_manager.model_config.is_multimodal
+            )
 
             if server_args.enable_ssl_refresh:
                 logger.warning(

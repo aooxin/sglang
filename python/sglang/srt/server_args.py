@@ -667,6 +667,7 @@ class ServerArgs:
     enable_draft_weights_cpu_backup: bool = False
     allow_auto_truncate: bool = False
     enable_custom_logit_processor: bool = False
+    default_custom_logit_processor: Optional[str] = None
     flashinfer_mla_disable_ragged: bool = False
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
@@ -3658,6 +3659,25 @@ class ServerArgs:
                     self.preferred_sampling_params
                 )
 
+        if (
+            self.default_custom_logit_processor is not None
+            and not self.enable_custom_logit_processor
+        ):
+            raise ValueError(
+                "Should not set --default-custom-logit-processor when "
+                "--enable-custom-logit-processor is not enabled"
+            )
+
+        if (
+            self.default_custom_logit_processor
+            == "MiMoV2FlashNoRepeatNGramLogitProcessor"
+            and envs.SGLANG_MIMO_NGRAM_NO_REPEAT_PROCESSOR_DEBUG_SKIP_TRUNCATION.get()
+            is True
+        ):
+            logger.warning(
+                "SGLANG_MIMO_NGRAM_NO_REPEAT_PROCESSOR_DEBUG_SKIP_TRUNCATION is enabled, it is only encouraged for debugging purposes."
+            )
+
     def _handle_debug_utils(self):
         if is_in_ci() and self.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")
@@ -5681,6 +5701,14 @@ class ServerArgs:
             "--enable-custom-logit-processor",
             action="store_true",
             help="Enable users to pass custom logit processors to the server (disabled by default for security)",
+        )
+        parser.add_argument(
+            "--default-custom-logit-processor",
+            choices=[
+                "DeepseekOCRNoRepeatNGramLogitProcessor",
+                "MiMoV2FlashNoRepeatNGramLogitProcessor",
+            ],
+            help="The default custom logit processor to apply when --enable-custom-logit-processor is true but the user does not specify one.",
         )
         parser.add_argument(
             "--flashinfer-mla-disable-ragged",

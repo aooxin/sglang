@@ -31,32 +31,29 @@ _NVTX_COLOR_MAP = {
     "scheduler.run_batch": "red",
     "scheduler.launch_batch_sample_if_needed": "magenta",
     "scheduler.process_batch_result": "cyan",
-
     # === Disagg decode loop (mirrors main-loop colors) ===
     "scheduler.disagg_decode.event_loop_normal": "blue",
     "scheduler.disagg_decode.event_loop_overlap": "blue",
     "scheduler.disagg_decode.process_decode_queue": "purple",
     "scheduler.disagg_decode.get_next_batch": "green",
     "scheduler.disagg_decode.get_new_prebuilt_batch": "green",
-
     # === Disagg prefill ===
     "scheduler.process_batch_result_disagg_prefill": "cyan",
     "scheduler.process_disagg_prefill_inflight_queue": "cyan",
-
     # === ScheduleBatch helpers (state mutations) ===
     "scheduler.schedule_batch.prepare_for_decode": "pink",
     "scheduler.schedule_batch.maybe_wait_verify_done": "pink",
     "scheduler.schedule_batch.filter_batch": "pink",
     "schedulebatch.prepare_for_prebuilt": "pink",
     "decode_schedule_batch.process_prebuilt": "pink",
-
     # === GPU forward path ===
     "target_worker.forward_batch_generation": "brown",
     "tp_worker.batch_init_new": "pink",
     "model_runner.forward_decode": "red",
     "cuda_graph_runner.replay_prepare": "green",
     "cuda_graph_runner.replay": "red",
-
+    # === Sampler ===
+    "sampler.apply_custom_logit_processor": "purple",
     # === EAGLE V2 - draft (yellow) ===
     "eagle_worker_v2.forward_batch_generation": "brown",
     "eagle_draft_worker.draft": "yellow",
@@ -65,12 +62,10 @@ _NVTX_COLOR_MAP = {
     "eagle_draft_input_v2_mixin.prepare_for_decode": "pink",
     "eagle_draft_input_v2_mixin.prepare_for_v2_draft": "pink",
     "eagle_draft_input_v2_mixin.prepare_for_extend_to_fill_draft_kvcache": "pink",
-
     # === EAGLE V2 - verify (gray) ===
     "eagle_verify_input_v2_mixin.prepare_for_v2_verify": "pink",
     "eagle_verify_input_v2_mixin.sample": "magenta",
     "eagle_worker_v2.verify": "gray",
-
     # === Multi-layer EAGLE V2 (same color scheme) ===
     "multi_layer_eagle_draft_worker.draft": "yellow",
     "multi_layer_eagle_draft_worker.draft_forward": "yellow",

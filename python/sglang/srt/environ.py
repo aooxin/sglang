@@ -487,6 +487,16 @@ class Envs:
     SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK = EnvBool(False)
     SGLANG_LOGITS_PROCESSER_CHUNK_SIZE = EnvInt(2048)
 
+    # Custom logits processor
+    # MiMoV2Flash custom logits processor
+    SGLANG_MIMO_NGRAM_NO_REPEAT_PROCESSOR_MIN_CONTENT_LENGTH = EnvInt(0)
+    SGLANG_MIMO_NGRAM_NO_REPEAT_PROCESSOR_NGRAM_SIZE = EnvInt(30)
+    SGLANG_MIMO_NGRAM_NO_REPEAT_PROCESSOR_WINDOW_SIZE = EnvInt(90)
+    SGLANG_MIMO_NGRAM_NO_REPEAT_PROCESSOR_MIN_REPEAT = EnvInt(2)
+    # For debugging purpose, the finish reason will be 'repetition_truncation' but the
+    # output will not be truncated even found repetition in output.
+    SGLANG_MIMO_NGRAM_NO_REPEAT_PROCESSOR_DEBUG_SKIP_TRUNCATION = EnvBool(False)
+
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
 

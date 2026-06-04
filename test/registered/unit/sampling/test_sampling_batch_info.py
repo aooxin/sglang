@@ -302,6 +302,14 @@ class TestFilterBatch(CustomTestCase):
         self.assertEqual(info.custom_params, [{"a": 1}, {"c": 3}])
         mask = info.custom_logit_processor[42][1]
         self.assertEqual(mask.shape[0], 2)
+        self.assertEqual(info.custom_logit_processor_params[42], [{"a": 1}, {"c": 3}])
+        self.assertEqual(info.custom_logit_processor_indices[42], [0, 1])
+        self.assertTrue(
+            torch.equal(
+                info.custom_logit_processor_indices_device[42],
+                torch.tensor([0, 1], dtype=torch.long),
+            )
+        )
 
     def test_filter_removes_all_custom_processors(self):
         """Test cleanup when filter removes all requests using a processor."""
@@ -315,6 +323,9 @@ class TestFilterBatch(CustomTestCase):
         info.filter_batch([0, 2], keep)
         self.assertFalse(info.has_custom_logit_processor)
         self.assertIsNone(info.custom_logit_processor)
+        self.assertIsNone(info.custom_logit_processor_params)
+        self.assertIsNone(info.custom_logit_processor_indices)
+        self.assertIsNone(info.custom_logit_processor_indices_device)
 
     def test_filter_with_none_sampling_seed(self):
         """Test that filter preserves None sampling_seed without error."""
@@ -381,6 +392,14 @@ class TestMergeBatch(CustomTestCase):
         info1.merge_batch(info2)
         self.assertTrue(info1.has_custom_logit_processor)
         self.assertEqual(len(info1.custom_params), 2)
+        self.assertEqual(info1.custom_logit_processor_params[1], [{"a": 1}])
+        self.assertEqual(info1.custom_logit_processor_indices[1], [0])
+        self.assertTrue(
+            torch.equal(
+                info1.custom_logit_processor_indices_device[1],
+                torch.tensor([0], dtype=torch.long),
+            )
+        )
 
     def test_merge_with_none_sampling_seed(self):
         """Test that merge preserves None when both sampling_seeds are None."""
@@ -575,6 +594,14 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertFalse(mask[1].item())
         # custom_params should be collected for all reqs
         self.assertEqual(len(info.custom_params), 2)
+        self.assertEqual(info.custom_logit_processor_params[key], [{"token_ids": [1]}])
+        self.assertEqual(info.custom_logit_processor_indices[key], [0])
+        self.assertTrue(
+            torch.equal(
+                info.custom_logit_processor_indices_device[key],
+                torch.tensor([0], dtype=torch.long),
+            )
+        )
 
 
 if __name__ == "__main__":

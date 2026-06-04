@@ -38,6 +38,12 @@ import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
 
+from sglang.srt.configs.deepseek_ocr import (
+    DEFAULT_CUSTOM_LOGIT_PROCESSOR as DEFAULT_DEEPSEEK_CUSTOM_LOGIT_PROCESSOR,
+)
+from sglang.srt.configs.mimov2flash import (
+    DEFAULT_CUSTOM_LOGIT_PROCESSOR as DEFAULT_MIMOV2FLASH_CUSTOM_LOGIT_PROCESSOR,
+)
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -448,6 +454,26 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_TOKENIZER.get(),
         )
+
+        self.default_custom_logit_processor = None
+        if (
+            self.server_args.enable_custom_logit_processor
+            and self.server_args.default_custom_logit_processor is not None
+        ):
+            if (
+                self.server_args.default_custom_logit_processor
+                == "DeepseekOCRNoRepeatNGramLogitProcessor"
+            ):
+                self.default_custom_logit_processor = (
+                    DEFAULT_DEEPSEEK_CUSTOM_LOGIT_PROCESSOR
+                )
+            elif (
+                self.server_args.default_custom_logit_processor
+                == "MiMoV2FlashNoRepeatNGramLogitProcessor"
+            ):
+                self.default_custom_logit_processor = (
+                    DEFAULT_MIMOV2FLASH_CUSTOM_LOGIT_PROCESSOR
+                )
 
     def init_request_dispatcher(self):
         self._result_dispatcher = TypeBasedDispatcher(
@@ -977,7 +1003,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 lora_id=obj.lora_id,
                 input_embeds=input_embeds,
                 session_params=session_params,
-                custom_logit_processor=obj.custom_logit_processor,
+                custom_logit_processor=(
+                    obj.custom_logit_processor
+                    if obj.custom_logit_processor is not None
+                    else self.default_custom_logit_processor
+                ),
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,

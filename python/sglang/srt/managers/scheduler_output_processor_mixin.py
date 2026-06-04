@@ -15,6 +15,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
 )
 from sglang.srt.managers.schedule_batch import (
+    FINISH_REPEAT_TRUNCATION,
     BaseFinishReason,
     Req,
     ScheduleBatch,
@@ -1028,9 +1029,17 @@ class SchedulerOutputProcessorMixin:
                 )
                 rids.append(req.rid)
                 http_worker_ipcs.append(req.http_worker_ipc)
-                finished_reasons.append(
+                finish_reason_data = (
                     req.finished_reason.to_json() if req.finished_reason else None
                 )
+                # If 'repetition_truncation' was detected, override finish reason if necessary
+                if finish_reason_data and req.repetition_detected:
+                    if finish_reason_data.get("type") not in (
+                        "abort",
+                        "repetition_truncation",
+                    ):
+                        finish_reason_data = FINISH_REPEAT_TRUNCATION().to_json()
+                finished_reasons.append(finish_reason_data)
                 decoded_texts.append(req.decoded_text)
                 decode_ids, read_offset = req.init_incremental_detokenize()
 

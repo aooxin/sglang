@@ -1,11 +1,17 @@
 import json
+import logging
 from abc import ABC, abstractmethod
+from collections import deque
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 import dill
 import orjson
 import torch
+
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -18,6 +24,40 @@ def _cache_from_str(json_str: str):
     """
     data = orjson.loads(json_str)
     return dill.loads(bytes.fromhex(data["callable"]))
+
+
+@lru_cache(maxsize=1)
+def _get_logit_processor_collector_impl():
+    from sglang.srt.observability.metrics_collector import LogitProcessorCollector
+
+    return LogitProcessorCollector()
+
+
+def _is_logit_processor_metrics_rank() -> bool:
+    try:
+        from sglang.srt.layers.dp_attention import get_attention_tp_rank
+
+        return get_attention_tp_rank() == 0
+    except (AssertionError, ValueError):
+        try:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            return get_tensor_model_parallel_rank() == 0
+        except (AssertionError, ValueError):
+            return True
+
+
+def _get_logit_processor_collector():
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        if not get_global_server_args().enable_metrics:
+            return None
+    except ValueError:
+        return None
+    if not _is_logit_processor_metrics_rank():
+        return None
+    return _get_logit_processor_collector_impl()
 
 
 class CustomLogitProcessor(ABC):
@@ -198,5 +238,197 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
 
             indices = list(banned_tokens)
             logits[batch_idx, indices] = -float("inf")
+
+        return logits
+
+
+class MiMoV2FlashNoRepeatNGramLogitProcessor(CustomLogitProcessor):
+    """Block n-gram repetitions within a sliding window for MiMoV2Flash outputs."""
+
+    EOS_TOKEN_ID: int = 151645
+    NGRAM_SIZE: int = envs.SGLANG_MIMO_NGRAM_NO_REPEAT_PROCESSOR_NGRAM_SIZE.get()
+    WINDOW_SIZE: int = envs.SGLANG_MIMO_NGRAM_NO_REPEAT_PROCESSOR_WINDOW_SIZE.get()
+    MIN_CONTENT_LENGTH: int = (
+        envs.SGLANG_MIMO_NGRAM_NO_REPEAT_PROCESSOR_MIN_CONTENT_LENGTH.get()
+    )
+    MIN_REPEAT: int = max(
+        2, envs.SGLANG_MIMO_NGRAM_NO_REPEAT_PROCESSOR_MIN_REPEAT.get()
+    )
+    DEBUG_SKIP_TRUNCATION: bool = (
+        envs.SGLANG_MIMO_NGRAM_NO_REPEAT_PROCESSOR_DEBUG_SKIP_TRUNCATION.get()
+    )
+    CACHE_ATTR: str = "_mimov2flash_ngram_no_repeat_cache"
+    DETECT_FLAG_ATTR: str = "_mimov2flash_no_repeat_detected"
+    REQ_PARAM_KEY: str = "__req__"
+    ACTION_SKIP: str = "skip"
+    ACTION_FORCE_STOP: str = "force_stop"
+
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        custom_param_list: Optional[List[Dict[str, Any]]] = None,
+    ) -> torch.Tensor:
+        if not custom_param_list:
+            return logits
+
+        if (
+            self.NGRAM_SIZE <= 1
+            or self.WINDOW_SIZE <= 0
+            or self.WINDOW_SIZE < self.NGRAM_SIZE
+        ):
+            logger.warning(
+                f"MiMoV2Flash no-repeat processor disabled due to invalid config: window_size={self.WINDOW_SIZE}, ngram_size={self.NGRAM_SIZE}"
+            )
+            return logits
+
+        collector = _get_logit_processor_collector()
+        # Per-request decision cache for this batch (spec decoding can repeat requests).
+        per_req_action = {}
+
+        for batch_idx, params in enumerate(custom_param_list):
+            if not params:
+                continue
+
+            req = params.get(self.REQ_PARAM_KEY)
+            if req is None:
+                continue
+
+            if req.repetition_detected and not self.DEBUG_SKIP_TRUNCATION:
+                assert req.to_finish is not None
+                logits[batch_idx, :] = -float("inf")
+                logits[batch_idx, self.EOS_TOKEN_ID] = 0.0
+                continue
+
+            action = per_req_action.get(req)
+            if action is not None:
+                # Same request appears again: reuse the decision but apply it to this row.
+                logger.debug(
+                    "MiMoV2Flash no-repeat reuse cached action: rid=%s action=%s output_ids_len=%s output_ids=%s",
+                    getattr(req, "rid", None),
+                    action,
+                    len(req.output_ids),
+                    req.output_ids,
+                )
+                if action == self.ACTION_SKIP:
+                    continue
+
+                assert action == self.ACTION_FORCE_STOP
+                assert req.to_finish is not None
+                logits[batch_idx, :] = -float("inf")
+                logits[batch_idx, self.EOS_TOKEN_ID] = 0.0
+                continue
+
+            sequence: List[int] = req.output_ids
+            seq_len = len(sequence)
+            if seq_len < self.MIN_CONTENT_LENGTH:
+                per_req_action[req] = self.ACTION_SKIP
+                continue
+
+            if seq_len < self.NGRAM_SIZE:
+                per_req_action[req] = self.ACTION_SKIP
+                continue
+
+            if collector is not None and not getattr(req, self.DETECT_FLAG_ATTR, False):
+                collector.no_repeat_processor_detected_count.inc()
+                setattr(req, self.DETECT_FLAG_ATTR, True)
+
+            # Cache tracks a sliding window of n-gram occurrences for this request.
+            # It lets us update counts incrementally instead of rescanning the entire
+            # sequence on every step.
+            #
+            # Diagram (NGRAM_SIZE=3):
+            #   sequence: [t0, t1, t2, t3, t4, t5]
+            #   n-grams :  (t0,t1,t2), (t1,t2,t3), (t2,t3,t4), (t3,t4,t5)
+            #   queue   :  [(t0,t1,t2), (t1,t2,t3), (t2,t3,t4), (t3,t4,t5)]
+            #   ngram_counts: {(t0,t1,t2):1, (t1,t2,t3):1, ...}
+            cache = getattr(req, self.CACHE_ATTR, None)
+            if cache is None:
+                # Sliding window cache of n-gram occurrences for this request.
+                cache = {
+                    "last_len": 0,
+                    "queue_start": 0,
+                    "queue": deque(),
+                    "ngram_counts": {},
+                }
+                setattr(req, self.CACHE_ATTR, cache)
+
+            # last_len tracks the output length processed into the cache so far.
+            # It helps us append only newly formed n-grams when the sequence grows.
+            last_len = cache["last_len"]
+            if seq_len < last_len:
+                # Sequence can shrink on speculative decoding retraction; reset cache.
+                cache["queue"].clear()
+                cache["ngram_counts"].clear()
+                cache["queue_start"] = 0
+                last_len = 0
+
+            if seq_len != last_len:
+                start_i = last_len - self.NGRAM_SIZE + 1
+                if start_i < 0:
+                    start_i = 0
+                end_i = seq_len - self.NGRAM_SIZE
+                if end_i >= start_i:
+                    queue = cache["queue"]
+                    ngram_counts = cache["ngram_counts"]
+                    if not queue:
+                        cache["queue_start"] = start_i
+                    for i in range(start_i, end_i + 1):
+                        ngram = tuple(sequence[i : i + self.NGRAM_SIZE])
+                        queue.append(ngram)
+                        ngram_counts[ngram] = ngram_counts.get(ngram, 0) + 1
+                cache["last_len"] = seq_len
+
+                # Trim the queue to keep only the last WINDOW_SIZE tokens worth of
+                # n-grams. This maintains a moving window over the output sequence.
+                #
+                # Diagram (WINDOW_SIZE=5, NGRAM_SIZE=3):
+                #   keep n-grams starting at indices [seq_len-5, ..., seq_len-3]
+                #   drop older entries from queue and ngram_counts.
+                min_start = seq_len - self.WINDOW_SIZE
+                if min_start < 0:
+                    min_start = 0
+                queue = cache["queue"]
+                ngram_counts = cache["ngram_counts"]
+                # queue_start is the absolute start index (in sequence) for the
+                # first element stored in the queue; it advances as we pop items.
+                queue_start = cache["queue_start"]
+                while queue and queue_start < min_start:
+                    ngram = queue.popleft()
+                    count = ngram_counts[ngram] - 1
+                    if count:
+                        ngram_counts[ngram] = count
+                    else:
+                        del ngram_counts[ngram]
+                    queue_start += 1
+                cache["queue_start"] = queue_start
+
+            if not cache["ngram_counts"]:
+                per_req_action[req] = self.ACTION_SKIP
+                continue
+
+            if not any(
+                count >= self.MIN_REPEAT for count in cache["ngram_counts"].values()
+            ):
+                per_req_action[req] = self.ACTION_SKIP
+                continue
+
+            # Found repetition in the request's output ids.
+            if collector is not None and req.repetition_detected is False:
+                collector.no_repeat_processor_truncated_count.inc()
+
+            req.repetition_detected = True
+            if self.DEBUG_SKIP_TRUNCATION:
+                per_req_action[req] = self.ACTION_SKIP
+                continue
+
+            if req.to_finish is None:
+                from sglang.srt.managers.schedule_batch import FINISH_REPEAT_TRUNCATION
+
+                req.to_finish = FINISH_REPEAT_TRUNCATION()
+
+            # Assign the highest probability to the EOS token
+            logits[batch_idx, :] = -float("inf")
+            logits[batch_idx, self.EOS_TOKEN_ID] = 0.0
+            per_req_action[req] = self.ACTION_FORCE_STOP
 
         return logits

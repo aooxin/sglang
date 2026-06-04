@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
@@ -181,7 +182,9 @@ class EagleDraftInputV2Mixin:
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         return forward_batch, can_cuda_graph
 
-    @nvtx_annotated_method("eagle_draft_input_v2_mixin.prepare_for_extend_to_fill_draft_kvcache")
+    @nvtx_annotated_method(
+        "eagle_draft_input_v2_mixin.prepare_for_extend_to_fill_draft_kvcache"
+    )
     def prepare_for_extend_to_fill_draft_kvcache(
         self,
         batch: ModelWorkerBatch,
@@ -305,6 +308,14 @@ class EagleVerifyInputV2Mixin:
             assert self.grammar is not None
             self.grammar.apply_vocab_mask(
                 logits=next_token_logits, vocab_mask=vocab_mask
+            )
+
+        # Apply custom logit processor if registered
+        if sampling_info.has_custom_logit_processor:
+            apply_custom_logit_processor(
+                next_token_logits,
+                sampling_info,
+                num_tokens_in_batch=self.draft_token_num,
             )
 
         candidates = self.draft_token.reshape(bs, self.draft_token_num)

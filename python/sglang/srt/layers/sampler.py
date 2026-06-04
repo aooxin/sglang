@@ -13,6 +13,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.hash import murmur_hash32
 from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.nvtx_utils import nvtx_range
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
@@ -709,6 +710,29 @@ def get_token_ids_logprobs_batch_optimized(
     return output_token_ids_logprobs_val, output_token_ids_logprobs_idx
 
 
+def _expand_custom_logit_processor_indices(
+    batch_indices: torch.Tensor,
+    num_tokens_in_batch: int,
+) -> torch.Tensor:
+    if num_tokens_in_batch == 1:
+        return batch_indices
+
+    token_offsets = torch.arange(
+        num_tokens_in_batch, dtype=batch_indices.dtype, device=batch_indices.device
+    )
+    return (batch_indices[:, None] * num_tokens_in_batch + token_offsets).reshape(-1)
+
+
+def _custom_logit_processor_covers_full_batch(
+    batch_indices: Optional[List[int]], batch_size: int
+) -> bool:
+    return (
+        batch_indices is not None
+        and len(batch_indices) == batch_size
+        and all(idx == expected for expected, idx in enumerate(batch_indices))
+    )
+
+
 def apply_custom_logit_processor(
     logits: torch.Tensor,
     sampling_batch_info: SamplingBatchInfo,
@@ -726,25 +750,87 @@ def apply_custom_logit_processor(
         f"({num_tokens_in_batch})"
     )
 
-    for _, (
-        processor,
-        batch_mask,
-    ) in sampling_batch_info.custom_logit_processor.items():
-        # Get the batch indices that need to be processed
-        batch_indices = batch_mask.nonzero(as_tuple=True)[0]
+    with nvtx_range("sampler.apply_custom_logit_processor"):
+        for processor_key, (
+            processor,
+            batch_mask,
+        ) in sampling_batch_info.custom_logit_processor.items():
+            assert batch_mask.shape[0] == len(sampling_batch_info), (
+                f"The number of batch mask ({batch_mask.shape[0]}) does not match the number of "
+                f"sampling_batch_info ({len(sampling_batch_info)})"
+            )
 
-        assert batch_mask.shape[0] == len(sampling_batch_info), (
-            f"The number of batch mask ({batch_mask.shape[0]}) does not match the number of "
-            f"sampling_batch_info ({len(sampling_batch_info)})"
-        )
-        batch_mask = torch.repeat_interleave(batch_mask, num_tokens_in_batch)
+            processor_params = None
+            processor_param_map = getattr(
+                sampling_batch_info, "custom_logit_processor_params", None
+            )
+            if processor_param_map is not None:
+                processor_params = processor_param_map.get(processor_key)
 
-        # Apply the processor to the logits
-        logits[batch_mask] = processor(
-            logits[batch_mask],
-            [sampling_batch_info.custom_params[i] for i in batch_indices],
-        )
+            processor_indices = None
+            processor_indices_map = getattr(
+                sampling_batch_info, "custom_logit_processor_indices_device", None
+            )
+            if processor_indices_map is not None:
+                processor_indices = processor_indices_map.get(processor_key)
 
-        logger.debug(
-            f"Custom logit processor {processor.__class__.__name__} is applied."
-        )
+            processor_batch_indices = None
+            processor_batch_indices_map = getattr(
+                sampling_batch_info, "custom_logit_processor_indices", None
+            )
+            if processor_batch_indices_map is not None:
+                processor_batch_indices = processor_batch_indices_map.get(
+                    processor_key
+                )
+
+            if processor_params is None or processor_indices is None:
+                # Fallback for manually constructed SamplingBatchInfo objects.
+                # nonzero()/tolist() here can trigger an implicit GPU-to-CPU sync.
+                batch_indices = batch_mask.nonzero(as_tuple=True)[0]
+                batch_indices_list = batch_indices.tolist()
+                processor_indices = torch.tensor(
+                    batch_indices_list, dtype=torch.long, device=logits.device
+                )
+                processor_batch_indices = batch_indices_list
+                processor_params = [
+                    sampling_batch_info.custom_params[i] for i in batch_indices_list
+                ]
+
+            if not processor_params:
+                continue
+
+            expanded_params = [
+                param
+                for param in processor_params
+                for _ in range(num_tokens_in_batch)
+            ]
+
+            covers_full_batch = _custom_logit_processor_covers_full_batch(
+                processor_batch_indices, len(sampling_batch_info)
+            )
+            if covers_full_batch:
+                expanded_indices = None
+            else:
+                expanded_indices = _expand_custom_logit_processor_indices(
+                    processor_indices, num_tokens_in_batch
+                )
+
+            if expanded_indices is not None and expanded_indices.numel() == 0:
+                continue
+
+            if covers_full_batch:
+                processor_logits = logits
+            else:
+                processor_logits = logits.index_select(0, expanded_indices)
+
+            processed_logits = processor(processor_logits, expanded_params)
+
+            if covers_full_batch:
+                if processed_logits is not logits:
+                    logits.copy_(processed_logits)
+            else:
+                logits.index_copy_(0, expanded_indices, processed_logits)
+
+            logger.debug(
+                f"Custom logit processor {processor.__class__.__name__} is applied."
+            )

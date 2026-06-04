@@ -2052,3 +2052,18 @@ class RadixCacheMetricsCollector:
 
     def observe_load_back_duration(self, duration_seconds: float) -> None:
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+
+class LogitProcessorCollector:
+    def __init__(self) -> None:
+        from prometheus_client import Counter
+
+        self.no_repeat_processor_detected_count = Counter(
+            name="sglang:no_repeat_processor_detected_count",
+            documentation="The request count of no-repeat n-gram processor detected.",
+        )
+
+        self.no_repeat_processor_truncated_count = Counter(
+            name="sglang:no_repeat_processor_truncated_count",
+            documentation="The request count of no-repeat n-gram processor found repetition.",
+        )

@@ -198,6 +198,16 @@ class FINISH_ABORT(BaseFinishReason):
         }
 
 
+class FINISH_REPEAT_TRUNCATION(BaseFinishReason):
+    def __init__(self):
+        super().__init__()
+
+    def to_json(self):
+        return {
+            "type": "repetition_truncation",
+        }
+
+
 class Modality(Enum):
     IMAGE = auto()
     VIDEO = auto()
@@ -649,6 +659,9 @@ class Req(ReqDllmMixin):
             sampling_params.custom_params = sampling_params.custom_params | {
                 "__req__": self
             }
+        elif custom_logit_processor is not None:
+            sampling_params = copy.copy(sampling_params)
+            sampling_params.custom_params = {"__req__": self}
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
@@ -686,6 +699,8 @@ class Req(ReqDllmMixin):
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_finish: Optional[BaseFinishReason] = None
+        # Whether repetition detected in its output.
+        self.repetition_detected = False
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size

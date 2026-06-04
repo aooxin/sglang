@@ -26,6 +26,7 @@ class RandomDataset(BaseDataset):
     dataset_path: str
     return_text: bool
     random_sample: bool
+    avoid_cache_hit: bool
 
     @classmethod
     def from_args(cls, args: Namespace) -> "RandomDataset":
@@ -37,6 +38,7 @@ class RandomDataset(BaseDataset):
             dataset_path=args.dataset_path,
             return_text=not getattr(args, "tokenize_prompt", False),
             random_sample=(args.dataset_name == "random"),
+            avoid_cache_hit=getattr(args, "avoid_cache_hit", False),
         )
 
     def load(
@@ -51,6 +53,7 @@ class RandomDataset(BaseDataset):
             dataset_path=self.dataset_path,
             random_sample=self.random_sample,
             return_text=self.return_text,
+            avoid_cache_hit=self.avoid_cache_hit,
         )
 
 
@@ -63,6 +66,7 @@ def sample_random_requests(
     dataset_path: str,
     random_sample: bool = True,
     return_text: bool = True,
+    avoid_cache_hit: bool = False,
 ) -> List[DatasetRow]:
     input_lens = compute_random_lens(
         full_len=input_len,
@@ -152,6 +156,13 @@ def sample_random_requests(
                 int((offsets[i] + i + j) % tokenizer.vocab_size)
                 for j in range(input_lens[i])
             ]
+            if avoid_cache_hit:
+                if len(input_content) >= 1:
+                    input_content[0] = random.randint(0, tokenizer.vocab_size - 1)
+                if len(input_content) >= 2:
+                    input_content[1] = random.randint(0, tokenizer.vocab_size - 1)
+                if len(input_content) >= 3:
+                    input_content[2] = (i % (tokenizer.vocab_size - 1)) + 1
             if return_text:
                 input_content = tokenizer.decode(input_content)
             input_requests.append(

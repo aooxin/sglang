@@ -2033,6 +2033,15 @@ if __name__ == "__main__":
         help="Range of sampled ratio of input/output length, "
         "used only for random and image dataset.",
     )
+    parser.add_argument(
+        "--avoid-cache-hit",
+        action="store_true",
+        help=(
+            "For random-ids: randomize the first two prompt tokens per request; "
+            "if the prompt has at least three tokens, set the third to a per-request "
+            "sequential value to reduce KV cache reuse."
+        ),
+    )
     # image dataset args
     parser.add_argument(
         "--image-count",

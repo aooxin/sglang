@@ -207,45 +207,25 @@ class BaseHiRadixCache(abc.ABC):
             }
             self._hicache_labels = hicache_labels
 
-            self._write_backup_host_full_alloc_retry_total = Counter(
-                name="sglang:write_backup_host_full_alloc_retry_total",
-                documentation="Number of write_backup retries triggered by insufficient full-attention host memory.",
-                labelnames=hicache_labels.keys(),
+            self._alloc_retry_total = Counter(
+                name="sglang:hicache_alloc_retry_total",
+                documentation=(
+                    "Number of allocation retries triggered by insufficient "
+                    "host/device memory. Labeled by scenario (write_backup, "
+                    "load_back, rewrite_swa_backup, prefetch) and "
+                    "attention_type (full, swa)."
+                ),
+                labelnames=[*hicache_labels.keys(), "scenario", "attention_type"],
             )
-            self._write_backup_host_swa_alloc_retry_total = Counter(
-                name="sglang:write_backup_host_swa_alloc_retry_total",
-                documentation="Number of write_backup retries triggered by insufficient SWA host memory.",
-                labelnames=hicache_labels.keys(),
-            )
-            self._load_back_device_full_alloc_retry_total = Counter(
-                name="sglang:load_back_device_full_alloc_retry_total",
-                documentation="Number of load_back retries triggered by insufficient full-attention device memory.",
-                labelnames=hicache_labels.keys(),
-            )
-            self._load_back_device_swa_alloc_retry_total = Counter(
-                name="sglang:load_back_device_swa_alloc_retry_total",
-                documentation="Number of load_back retries triggered by insufficient SWA device memory.",
-                labelnames=hicache_labels.keys(),
-            )
-            self._write_backup_host_full_alloc_failure_total = Counter(
-                name="sglang:write_backup_host_full_alloc_failure_total",
-                documentation="Number of write_backup failures due to insufficient full-attention host memory.",
-                labelnames=hicache_labels.keys(),
-            )
-            self._write_backup_host_swa_alloc_failure_total = Counter(
-                name="sglang:write_backup_host_swa_alloc_failure_total",
-                documentation="Number of write_backup failures due to insufficient SWA host memory.",
-                labelnames=hicache_labels.keys(),
-            )
-            self._load_back_device_full_alloc_failure_total = Counter(
-                name="sglang:load_back_device_full_alloc_failure_total",
-                documentation="Number of load_back failures due to insufficient full-attention device memory.",
-                labelnames=hicache_labels.keys(),
-            )
-            self._load_back_device_swa_alloc_failure_total = Counter(
-                name="sglang:load_back_device_swa_alloc_failure_total",
-                documentation="Number of load_back failures due to insufficient SWA device memory.",
-                labelnames=hicache_labels.keys(),
+            self._alloc_failure_total = Counter(
+                name="sglang:hicache_alloc_failure_total",
+                documentation=(
+                    "Number of allocation failures due to insufficient "
+                    "host/device memory. Labeled by scenario (write_backup, "
+                    "load_back, rewrite_swa_backup, prefetch) and "
+                    "attention_type (full, swa)."
+                ),
+                labelnames=[*hicache_labels.keys(), "scenario", "attention_type"],
             )
 
         # record the nodes with ongoing write through
@@ -742,52 +722,26 @@ class BaseHiRadixCache(abc.ABC):
             logger.warning("Hierarchical cache storage backend is not enabled.")
             return False
 
-    def _log_write_backup_host_alloc_retry(
-        self, lack_full: bool, lack_swa: bool
-    ) -> None:
+    def _log_alloc_retry(self, scenario: str, lack_full: bool, lack_swa: bool) -> None:
         if lack_full:
-            self._write_backup_host_full_alloc_retry_total.labels(
-                **self._hicache_labels
+            self._alloc_retry_total.labels(
+                **self._hicache_labels, scenario=scenario, attention_type="full"
             ).inc(1)
         if lack_swa:
-            self._write_backup_host_swa_alloc_retry_total.labels(
-                **self._hicache_labels
+            self._alloc_retry_total.labels(
+                **self._hicache_labels, scenario=scenario, attention_type="swa"
             ).inc(1)
 
-    def _log_write_backup_host_alloc_failure(
-        self, lack_full: bool, lack_swa: bool
+    def _log_alloc_failure(
+        self, scenario: str, lack_full: bool, lack_swa: bool
     ) -> None:
         if lack_full:
-            self._write_backup_host_full_alloc_failure_total.labels(
-                **self._hicache_labels
+            self._alloc_failure_total.labels(
+                **self._hicache_labels, scenario=scenario, attention_type="full"
             ).inc(1)
         if lack_swa:
-            self._write_backup_host_swa_alloc_failure_total.labels(
-                **self._hicache_labels
-            ).inc(1)
-
-    def _log_load_back_device_alloc_retry(
-        self, lack_full: bool, lack_swa: bool
-    ) -> None:
-        if lack_full:
-            self._load_back_device_full_alloc_retry_total.labels(
-                **self._hicache_labels
-            ).inc(1)
-        if lack_swa:
-            self._load_back_device_swa_alloc_retry_total.labels(
-                **self._hicache_labels
-            ).inc(1)
-
-    def _log_load_back_device_alloc_failure(
-        self, lack_full: bool, lack_swa: bool
-    ) -> None:
-        if lack_full:
-            self._load_back_device_full_alloc_failure_total.labels(
-                **self._hicache_labels
-            ).inc(1)
-        if lack_swa:
-            self._load_back_device_swa_alloc_failure_total.labels(
-                **self._hicache_labels
+            self._alloc_failure_total.labels(
+                **self._hicache_labels, scenario=scenario, attention_type="swa"
             ).inc(1)
 
     def write_backup(self, node: TreeNode, write_back=False):
@@ -799,7 +753,8 @@ class BaseHiRadixCache(abc.ABC):
         if full_host_indices is None:
             assert lack_full_size > 0 or lack_swa_size > 0
             if self.enable_hicache_metrics:
-                self._log_write_backup_host_alloc_retry(
+                self._log_alloc_retry(
+                    scenario="write_backup",
                     lack_full=lack_full_size > 0,
                     lack_swa=lack_swa_size > 0,
                 )
@@ -811,7 +766,8 @@ class BaseHiRadixCache(abc.ABC):
             )
         if full_host_indices is None:
             if self.enable_hicache_metrics:
-                self._log_write_backup_host_alloc_failure(
+                self._log_alloc_failure(
+                    scenario="write_backup",
                     lack_full=lack_full_size > 0,
                     lack_swa=lack_swa_size > 0,
                 )
@@ -890,11 +846,23 @@ class BaseHiRadixCache(abc.ABC):
         )
         if new_swa_host_indices is None:
             assert lack_swa_size > 0
+            if self.enable_hicache_metrics:
+                self._log_alloc_retry(
+                    scenario="rewrite_swa_backup",
+                    lack_full=False,
+                    lack_swa=True,
+                )
             self.evict_host(0, lack_swa_size)
-            _, new_swa_host_indices, _, _ = (
+            _, new_swa_host_indices, _, lack_swa_size = (
                 self.token_to_kv_pool_host.alloc_unmapped_host_by_len(0, num_new_swa)
             )
         if new_swa_host_indices is None:
+            if self.enable_hicache_metrics:
+                self._log_alloc_failure(
+                    scenario="rewrite_swa_backup",
+                    lack_full=False,
+                    lack_swa=True,
+                )
             return 0, 0
 
         # 建立 host 上 full 和 swa 的映射关系
@@ -1351,7 +1319,8 @@ class BaseHiRadixCache(abc.ABC):
         if full_device_indices is None:
             assert lack_full_size > 0 or lack_swa_size > 0
             if self.enable_hicache_metrics:
-                self._log_load_back_device_alloc_retry(
+                self._log_alloc_retry(
+                    scenario="load_back",
                     lack_full=lack_full_size > 0,
                     lack_swa=lack_swa_size > 0,
                 )
@@ -1375,7 +1344,8 @@ class BaseHiRadixCache(abc.ABC):
         # no sufficient GPU memory to load back KV caches
         if full_device_indices is None:
             if self.enable_hicache_metrics:
-                self._log_load_back_device_alloc_failure(
+                self._log_alloc_failure(
+                    scenario="load_back",
                     lack_full=lack_full_size > 0,
                     lack_swa=lack_swa_size > 0,
                 )
@@ -1611,11 +1581,7 @@ class BaseHiRadixCache(abc.ABC):
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
             req_id
         ]
-
-        if operation.host_indices is None:
-            assert operation.swa_host_indices is None
-            # prefetch has not been issued due to insufficient host memory
-            return True
+        assert operation.host_indices is not None
 
         if not self.can_terminate_prefetch(operation):
             return False
@@ -1719,9 +1685,7 @@ class BaseHiRadixCache(abc.ABC):
             return
 
         _, _, _, operation = self.ongoing_prefetch[req_id]
-        if operation.host_indices is None:
-            assert operation.swa_host_indices is None
-            return
+        assert operation.host_indices is not None
         operation.mark_terminate()
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
@@ -1831,12 +1795,24 @@ class BaseHiRadixCache(abc.ABC):
         )
         if full_host_indices is None:
             assert lack_full_size > 0 or lack_swa_size > 0
+            if self.enable_hicache_metrics:
+                self._log_alloc_retry(
+                    scenario="prefetch",
+                    lack_full=lack_full_size > 0,
+                    lack_swa=lack_swa_size > 0,
+                )
             self.evict_host(lack_full_size, lack_swa_size)
-            full_host_indices, swa_host_indices, _, _ = (
+            full_host_indices, swa_host_indices, lack_full_size, lack_swa_size = (
                 self._alloc_prefetch_host_indices(prefetch_length)
             )
         if full_host_indices is None:
             assert swa_host_indices is None
+            if self.enable_hicache_metrics:
+                self._log_alloc_failure(
+                    scenario="prefetch",
+                    lack_full=lack_full_size > 0,
+                    lack_swa=lack_swa_size > 0,
+                )
             last_host_node.release_host()
             # no sufficient host memory for prefetch
             return False
@@ -2212,9 +2188,7 @@ class BaseHiRadixCache(abc.ABC):
             return
 
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[rid]
-        if operation.host_indices is None:
-            assert operation.swa_host_indices is None
-            return
+        assert operation.host_indices is not None
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
         if self.tp_world_size > 1:
@@ -2410,6 +2384,8 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
         """
         assert self.load_back_threshold == 0
 
+        # BaseHiRadixCache matches the longest prefix on the tree regardless of SWA safety, returning
+        # the full matched length on device and host.
         full_matched_result = BaseHiRadixCache.match_prefix(self, params)
         full_matched_device_len = len(full_matched_result.device_indices)
         full_matched_host_len = full_matched_result.host_hit_length
@@ -2421,6 +2397,11 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
             ), f"{full_matched_device_len=}, {full_matched_host_len=}"
             return full_matched_result
 
+        # Apply SWA safety checks and trim the matched prefix if needed, before re-matching to get the
+        # final safe match result.
+        # TODO(yingchun): after _compute_safe_prefix_len, swa_matched_device_len may far from _last_raw_match_len, it
+        #  cause redundant prefetching full portion KV cache from storage in following steps. Consider just prefetch
+        #  necessary full KV cache.
         swa_matched_device_len, swa_matched_host_len = self._compute_safe_prefix_len(
             full_matched_result
         )
@@ -2451,6 +2432,9 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
                 0 <= swa_matched_host_len <= full_matched_host_len
             ), f"{swa_matched_host_len=} must be in [0, {full_matched_host_len=}]"
 
+        # TODO(yingchun): Rematch the radix tree with the SWA-trimmed key to get the final matched nodes and indices,
+        #  this is aimed to deal with the last matched node to be split. It ca be optimized to split the node manually
+        #  to avoid matching the whole key again.
         swa_matched_total_len = swa_matched_device_len + swa_matched_host_len
         if self.is_eagle:
             swa_matched_total_len = (

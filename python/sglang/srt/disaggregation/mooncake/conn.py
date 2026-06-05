@@ -1320,6 +1320,10 @@ class MooncakeKVManager(CommonKVManager):
                                         status,
                                         prefill_unique_rank,
                                     )
+                                if not all(polls):
+                                    logger.warning(
+                                        f"[PD-Trace] transfer_worker: room={kv_chunk.room} all_ranks_done but FAILED, polls={polls}"
+                                    )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
@@ -1600,11 +1604,16 @@ class MooncakeKVManager(CommonKVManager):
         return self.engine.get_session_id()
 
     def _handle_node_failure(self, failed_bootstrap_addr):
+        dead_endpoints = []
         with self.connection_lock:
             keys_to_remove = [
                 k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
             ]
             for k in keys_to_remove:
+                for info in self.connection_pool[k]:
+                    dead_endpoints.append(
+                        NetworkAddress(info["rank_ip"], info["rank_port"]).to_tcp()
+                    )
                 del self.connection_pool[k]
 
             possible_affected_rooms = self.addr_to_rooms_tracker.get(
@@ -1612,6 +1621,8 @@ class MooncakeKVManager(CommonKVManager):
             )
             self.prefill_info_table.pop(failed_bootstrap_addr, None)
             self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
+
+        num_closed = MooncakeKVReceiver._disconnect(dead_endpoints)
 
         # Report the requests associated with the failed bootstrap addr and mark their status as KVPoll.Failed
         affected_rooms = []
@@ -1627,7 +1638,8 @@ class MooncakeKVManager(CommonKVManager):
                 self.update_status(room, KVPoll.Failed)
                 affected_rooms.append(room)
         logger.error(
-            f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), {len(affected_rooms)} requests affected"
+            f"Losing connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), "
+            f"{len(affected_rooms)} requests affected, {num_closed} zombie sockets closed"
         )
 
 

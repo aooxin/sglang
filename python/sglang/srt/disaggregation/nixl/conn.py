@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
@@ -255,11 +256,16 @@ class NixlKVManager(CommonKVManager):
 
     def _handle_node_failure(self, failed_bootstrap_addr):
         """Handle failure of a prefill node."""
+        dead_endpoints = []
         with self.connection_lock:
             keys_to_remove = [
                 k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
             ]
             for k in keys_to_remove:
+                for info in self.connection_pool[k]:
+                    dead_endpoints.append(
+                        NetworkAddress(info["rank_ip"], info["rank_port"]).to_tcp()
+                    )
                 del self.connection_pool[k]
             self.prefill_info_table.pop(failed_bootstrap_addr, None)
 
@@ -267,6 +273,8 @@ class NixlKVManager(CommonKVManager):
                 failed_bootstrap_addr, []
             )
             self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
+
+        num_closed = CommonKVReceiver._disconnect(dead_endpoints)
 
         # Mark all pending transfers associated with the failed node as failed
         affected_rooms = []
@@ -281,7 +289,7 @@ class NixlKVManager(CommonKVManager):
 
         logger.error(
             f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), "
-            f"{len(affected_rooms)} transfers affected"
+            f"{len(affected_rooms)} transfers affected, {num_closed} zombie sockets closed"
         )
         for room in possible_affected_rooms:
             logger.error(f"Let room {room} be failed due to prefill down")

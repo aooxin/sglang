@@ -663,6 +663,20 @@ class CommonKVReceiver(BaseKVReceiver):
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
     @classmethod
+    def _disconnect(cls, endpoints: list) -> int:
+        stale = []
+        with cls._global_lock:
+            for ep in endpoints:
+                sock = cls._socket_cache.pop(ep, None)
+                lock = cls._socket_locks.pop(ep, None)
+                if sock is not None and lock is not None:
+                    stale.append((sock, lock))
+        for sock, lock in stale:
+            with lock:
+                sock.close(linger=0)
+        return len(stale)
+
+    @classmethod
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):
         ip_address = bootstrap_info["rank_ip"]
         port = bootstrap_info["rank_port"]

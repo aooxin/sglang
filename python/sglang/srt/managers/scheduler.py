@@ -2076,6 +2076,17 @@ class Scheduler(
                 )
                 if prefetch_started:
                     req.time_stats.set_hicache_prefetch_wait_start_time()
+                    req.time_stats.trace_ctx.trace_slice_add_attr(
+                        {
+                            "hicache_prefetch_started.prefetch_tokens": len(
+                                new_input_tokens
+                            ),
+                            "hicache_prefetch_started.gpu_cached_tokens": len(
+                                req.prefix_indices
+                            ),
+                            "hicache_prefetch_started.host_cached_tokens": req.host_hit_length,
+                        },
+                    )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
@@ -2632,8 +2643,33 @@ class Scheduler(
                 req.storage_swa_hit_tokens = self.tree_cache.pop_storage_swa_hit(
                     req.rid
                 )
+                prefetch_trace_attrs = self.tree_cache.pop_prefetch_trace_attrs(
+                    req.rid
+                )
+                if prefetch_trace_attrs:
+                    req.time_stats.trace_ctx.trace_slice_add_attr(prefetch_trace_attrs)
+                if hicache_prefetch_wait_duration is not None:
+                    req.time_stats.trace_ctx.trace_slice_add_attr(
+                        {
+                            "hicache_prefetch_wait_done.total_ms": round(
+                                hicache_prefetch_wait_duration * 1000, 2
+                            ),
+                            "hicache_prefetch_wait_done.io_ms": round(
+                                (hicache_prefetch_io_duration or 0) * 1000, 2
+                            ),
+                        },
+                    )
 
             req.init_next_round_input(self.tree_cache)
+            req.time_stats.trace_ctx.trace_slice_add_attr(
+                {
+                    "prefill_match_result.prefix_cached_tokens": len(
+                        req.prefix_indices
+                    ),
+                    "prefill_match_result.host_hit_tokens": req.host_hit_length,
+                    "prefill_match_result.extend_input_len": req.extend_input_len,
+                },
+            )
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -2965,6 +3001,17 @@ class Scheduler(
         # Capture prefill end time for EXTEND mode
         if batch.forward_mode == ForwardMode.EXTEND:
             set_time_batch(batch.reqs, "set_prefill_run_batch_end_time")
+            for req in batch.reqs:
+                prefill_duration = req.time_stats.get_prefill_launch_latency()
+                if prefill_duration is not None:
+                    req.time_stats.trace_ctx.trace_slice_add_attr(
+                        {
+                            "prefill_forward_done.prefill_latency_ms": round(
+                                prefill_duration * 1000, 2
+                            ),
+                            "prefill_forward_done.batch_size": len(batch.reqs),
+                        }
+                    )
 
         if (
             self.server_args.enable_dp_attention

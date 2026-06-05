@@ -631,6 +631,19 @@ class TraceReqContext:
         if self.thread_context.thread_span:
             self.thread_context.thread_span.set_attributes(attrs)
 
+    def trace_slice_add_attr(self, attrs: Dict[str, Any]):
+        if self.__check_fast_return():
+            return
+
+        if self.thread_context.cur_slice_stack:
+            span = self.thread_context.cur_slice_stack[-1].span
+            if span:
+                span.set_attributes(attrs)
+                return
+
+        if self.thread_context.thread_span:
+            self.thread_context.thread_span.set_attributes(attrs)
+
     def abort(self, ts=None, abort_info: Optional[Dict] = None):
         if self.__check_fast_return():
             return

@@ -241,6 +241,7 @@ class BaseHiRadixCache(abc.ABC):
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.prefetch_trace_attrs_by_reqid: dict[str, dict[str, float | int]] = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -560,6 +561,8 @@ class BaseHiRadixCache(abc.ABC):
                 self.prefetch_io_duration_by_reqid.pop(req_id, None)
                 self.storage_full_hit_by_reqid.pop(req_id, None)
                 self.storage_swa_hit_by_reqid.pop(req_id, None)
+                self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+                self.prefetch_trace_attrs_by_reqid.pop(req_id, None)
                 info = self.ongoing_prefetch.pop(req_id, None)
                 if info is not None:
                     last_host_node, token_ids, _, _ = info
@@ -690,6 +693,7 @@ class BaseHiRadixCache(abc.ABC):
         self.storage_swa_hit_by_reqid.clear()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
+        self.prefetch_trace_attrs_by_reqid.clear()
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -1664,11 +1668,20 @@ class BaseHiRadixCache(abc.ABC):
             host_indices[min_completed_tokens:completed_tokens]
         )
         last_host_node.release_host()
-        self.prefetch_io_duration_by_reqid[req_id] = operation.get_io_duration()
+        io_duration = operation.get_io_duration()
+        self.prefetch_io_duration_by_reqid[req_id] = io_duration
         self.storage_full_hit_by_reqid[req_id] = operation.full_hit_count
         self.storage_swa_hit_by_reqid[req_id] = operation.swa_hit_count
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+        self.prefetch_trace_attrs_by_reqid[req_id] = {
+            "hicache_prefetch_done.tp_completed_tokens": completed_tokens,
+            "hicache_prefetch_done.min_completed_tokens": min_completed_tokens,
+            "hicache_prefetch_done.requested_tokens": len(token_ids),
+            "hicache_prefetch_done.io_duration_ms": round(
+                (io_duration or 0) * 1000, 2
+            ),
+        }
 
         # Track tokens actually loaded from storage for this request (L3 hits)
         loaded_from_storage = min_completed_tokens - matched_length
@@ -1698,6 +1711,9 @@ class BaseHiRadixCache(abc.ABC):
 
     def pop_prefetch_io_duration(self, req_id: str) -> Optional[float]:
         return self.prefetch_io_duration_by_reqid.pop(req_id, None)
+
+    def pop_prefetch_trace_attrs(self, req_id: str) -> dict[str, float | int]:
+        return self.prefetch_trace_attrs_by_reqid.pop(req_id, {})
 
     def pop_storage_full_hit(self, req_id: str) -> int:
         return self.storage_full_hit_by_reqid.pop(req_id, 0)
@@ -2183,6 +2199,7 @@ class BaseHiRadixCache(abc.ABC):
         self.storage_full_hit_by_reqid.pop(rid, None)
         self.storage_swa_hit_by_reqid.pop(rid, None)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self.prefetch_trace_attrs_by_reqid.pop(rid, None)
 
         if rid not in self.ongoing_prefetch:
             return

@@ -972,7 +972,6 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
-                # len(req.prefix_indices)=102336, host_hit_len=53504, req.extend_input_len=57630
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         last_host_node=req.last_host_node,
@@ -980,6 +979,14 @@ class PrefillAdder:
                         req=req,
                     )
                 )
+                if len(new_indices) > 0:
+                    req.time_stats.trace_ctx.trace_slice_add_attr(
+                        {"hicache_load_back_start.load_tokens": len(new_indices)},
+                    )
+                else:
+                    req.time_stats.trace_ctx.trace_slice_add_attr(
+                        {"hicache_load_back_skip.host_hit_tokens": req.host_hit_length},
+                    )
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 # len(req.prefix_indices)=155840, host_hit_len=53504, req.extend_input_len=4126

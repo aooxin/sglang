@@ -215,6 +215,11 @@ class SimpleSWARadixCache(RadixCache):
         self._swa_evictable_size: int = 0
         self._swa_protected_size: int = 0
 
+        # Invariant check sampling counter. Triggered every
+        # SGLANG_DEBUG_SWA_INVARIANT_INTERVAL queries when
+        # SGLANG_DEBUG_SWA_INVARIANT is enabled. Logs (does NOT raise) on drift.
+        self._swa_invariant_query_counter: int = 0
+
     ##### Public API #####
 
     def supports_swa(self) -> bool:
@@ -376,10 +381,9 @@ class SimpleSWARadixCache(RadixCache):
         return int(torch.count_nonzero(mapping[all_indices]).item())
 
     def _collect_swa_sizes_recomputed(self) -> tuple[int, int]:
-        """Full tree traversal to recompute live SWA sizes. Used only as a
-        reference by tests / debug assertions; production queries use the
-        incrementally-maintained counters."""
-        assert envs.SGLANG_IS_IN_CI.get() is True
+        """Full tree traversal to recompute live SWA sizes. Used as a
+        reference by tests / debug invariant checks; production queries use
+        the incrementally-maintained counters."""
         evictable_values: list[torch.Tensor] = []
         protected_values: list[torch.Tensor] = []
         stack = [self.root_node]
@@ -399,10 +403,33 @@ class SimpleSWARadixCache(RadixCache):
             self._batch_count_live_swa(protected_values),
         )
 
+    def _check_swa_invariant_if_due(self) -> None:
+        if not envs.SGLANG_DEBUG_SWA_INVARIANT.get():
+            return
+        self._swa_invariant_query_counter += 1
+        interval = envs.SGLANG_DEBUG_SWA_INVARIANT_INTERVAL.get()
+        if interval <= 0 or self._swa_invariant_query_counter % interval != 0:
+            return
+        try:
+            real_evictable, real_protected = self._collect_swa_sizes_recomputed()
+        except Exception as e:
+            logger.warning(f"SWA invariant: tree traversal failed: {e}")
+            return
+        evictable_drift = self._swa_evictable_size - real_evictable
+        protected_drift = self._swa_protected_size - real_protected
+        if evictable_drift != 0 or protected_drift != 0:
+            logger.warning(
+                "SWA counter drift detected: "
+                f"_swa_evictable_size={self._swa_evictable_size} (real={real_evictable}, drift={evictable_drift}); "
+                f"_swa_protected_size={self._swa_protected_size} (real={real_protected}, drift={protected_drift}); "
+                f"sampled_at_query={self._swa_invariant_query_counter}"
+            )
+
     def full_evictable_size(self) -> int:
         return self.evictable_size()
 
     def swa_evictable_size(self) -> int:
+        self._check_swa_invariant_if_due()
         return self._swa_evictable_size
 
     def full_protected_size(self) -> int:
@@ -435,6 +462,16 @@ class SimpleSWARadixCache(RadixCache):
             self._swa_protected_size -= swa_live
         else:
             self._swa_evictable_size -= swa_live
+
+    def _on_node_swa_mapping_increased(
+        self, node: TreeNode, num_transferred: int
+    ) -> None:
+        if num_transferred <= 0:
+            return
+        if node.lock_ref > 0:
+            self._swa_protected_size += num_transferred
+        else:
+            self._swa_evictable_size += num_transferred
 
     def reset(self):
         super().reset()

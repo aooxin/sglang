@@ -2071,6 +2071,7 @@ class BaseHiRadixCache(abc.ABC):
                             node.value, value[:prefix_len]
                         )
                     )
+                    self._on_node_swa_mapping_increased(node, num_transferred)
                     # if new device page have swa but the host page DO NOT
                     # It seems quite possible
                     if num_transferred > 0 and node.backuped:

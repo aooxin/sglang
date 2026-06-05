@@ -644,6 +644,22 @@ class RadixCache(BasePrefixCache):
         Triggers: tree leaf eviction, host-to-device eviction in HiCache.
         """
 
+    def _on_node_swa_mapping_increased(
+        self, node: TreeNode, num_transferred: int
+    ) -> None:
+        """Hook fired AFTER an external mutation increased ``node.value``'s
+        live SWA-mapping count by ``num_transferred`` (e.g. via
+        ``splice_swa_mapping`` transferring SWA slots from a request-side
+        source into a tree-resident target).
+
+        Subclasses that maintain per-slot SWA bucket counters (e.g.
+        ``_swa_evictable_size`` / ``_swa_protected_size``) MUST add
+        ``num_transferred`` to the appropriate bucket based on the node's
+        current ``lock_ref`` state. Without this synchronization the bucket
+        counter will drift on every subsequent ``_on_tree_value_removed``
+        call, which queries the (now-changed) mapping at evict time.
+        """
+
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult(delta=0)

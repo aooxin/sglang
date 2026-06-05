@@ -572,6 +572,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     hicache_prefetch_count: int = 0
 
     # other
+    transfer_elapsed_s: float = 0.0
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
     # Number of prefill retries for this request
@@ -835,7 +836,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             transfer_latency_s = (
                 self.completion_time - self.prefill_transfer_queue_entry_time
             )
-            latency_ms = transfer_latency_s * 1000
 
             num_pages = kv_to_page_num(num_tokens, page_size)
             total_bytes = bytes_per_page_all_layers * num_pages
@@ -847,13 +847,17 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 speed_gb_s = (total_mb / 1024) / transfer_latency_s
                 self.transfer_speed_gb_s = speed_gb_s
 
-            result["latency_ms"] = latency_ms
+            result["latency_ms"] = transfer_latency_s * 1000
             result["total_mb"] = total_mb
             result["speed_gb_s"] = speed_gb_s
 
+            if self.transfer_elapsed_s > 0:
+                result["rdma_latency_ms"] = self.transfer_elapsed_s * 1000
+                result["rdma_speed_gb_s"] = (total_mb / 1024) / self.transfer_elapsed_s
+
             if self.enable_metrics:
                 self.metrics_collector.observe_kv_transfer_metrics(
-                    latency_ms=latency_ms,
+                    latency_ms=result["latency_ms"],
                     total_mb=total_mb,
                     speed_gb_s=speed_gb_s,
                 )

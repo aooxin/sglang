@@ -663,6 +663,10 @@ class SchedulerDisaggregationPrefillMixin:
             elif poll == KVPoll.Success:  # transfer done
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
+                if hasattr(req.disagg_kv_sender, "transfer_elapsed_s"):
+                    req.time_stats.transfer_elapsed_s = (
+                        req.disagg_kv_sender.transfer_elapsed_s
+                    )
                 # FIXME: clean up req's data in transfer engine
                 if hasattr(req.disagg_kv_sender, "clear"):
                     req.disagg_kv_sender.clear()
@@ -707,12 +711,16 @@ class SchedulerDisaggregationPrefillMixin:
                 page_size=page_size,
                 bytes_per_page_all_layers=bytes_per_page_all_layers,
             )
-            if metrics:
-                # Update last-value for REST API
-                if "latency_ms" in metrics:
-                    self.kv_transfer_latency_ms = metrics["latency_ms"]
-                if "speed_gb_s" in metrics:
-                    self.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
+            if metrics is None:
+                continue
+            if "latency_ms" in metrics:
+                self.kv_transfer_latency_ms = metrics["latency_ms"]
+            if "speed_gb_s" in metrics:
+                self.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
+            if "rdma_latency_ms" in metrics:
+                self.kv_transfer_rdma_latency_ms = metrics["rdma_latency_ms"]
+            if "rdma_speed_gb_s" in metrics:
+                self.kv_transfer_rdma_speed_gb_s = metrics["rdma_speed_gb_s"]
 
         # Stream requests which have finished transfer
         self.stream_output(

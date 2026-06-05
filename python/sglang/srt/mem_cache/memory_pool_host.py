@@ -214,6 +214,8 @@ class HostKVCache(abc.ABC):
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
+        self.h2d_block_quota = envs.SGLANG_HICACHE_H2D_BLOCK_QUOTA.get()
+        self.d2h_block_quota = envs.SGLANG_HICACHE_D2H_BLOCK_QUOTA.get()
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
@@ -543,6 +545,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.element_dim,
+                        block_quota=self.h2d_block_quota,
                     )
                 else:
                     transfer_kv_per_layer(
@@ -553,6 +556,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         item_size=self.token_stride_size,
+                        block_quota=self.h2d_block_quota,
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
@@ -567,6 +571,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.element_dim,
+                        block_quota=self.h2d_block_quota,
                     )
                 else:
                     transfer_kv_per_layer_pf_lf(
@@ -579,6 +584,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         layer_id=layer_id,
                         item_size=self.token_stride_size,
                         src_layout_dim=self.layout_dim,
+                        block_quota=self.h2d_block_quota,
                     )
             elif self.layout == "page_head":
                 transfer_kv_per_layer_ph_lf(
@@ -593,6 +599,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     src_layout_dim=self.layout_dim,
                     page_size=self.page_size,
                     head_num=self.head_num,
+                    block_quota=self.h2d_block_quota,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -657,6 +664,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         kv_cache_dst_stride_bytes=self.token_stride_size,
                         kv_cache_src_stride_bytes=self.token_stride_size,
                         element_size=self.element_dim * self.dtype.itemsize,
+                        block_quota=self.d2h_block_quota,
                     )
                 else:
                     transfer_kv_all_layer(
@@ -668,6 +676,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         dst_indices=host_indices,
                         item_size=self.token_stride_size,
                         num_layers=self.layer_num,
+                        block_quota=self.d2h_block_quota,
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
@@ -683,6 +692,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         kv_cache_src_stride_bytes=self.token_stride_size,
                         kv_cache_dst_stride_bytes=self.layout_dim,
                         element_size=self.element_dim * self.dtype.itemsize,
+                        block_quota=self.d2h_block_quota,
                     )
                 else:
                     transfer_kv_all_layer_lf_pf(
@@ -695,6 +705,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         item_size=self.token_stride_size,
                         dst_layout_dim=self.layout_dim,
                         num_layers=self.layer_num,
+                        block_quota=self.d2h_block_quota,
                     )
             elif self.layout == "page_head":
                 transfer_kv_all_layer_lf_ph(
@@ -709,6 +720,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     num_layers=self.layer_num,
                     page_size=self.page_size,
                     head_num=self.head_num,
+                    block_quota=self.d2h_block_quota,
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -1111,6 +1123,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.kv_cache_dim,
+                        block_quota=self.h2d_block_quota,
                     )
                 else:
                     transfer_kv_per_layer_mla(
@@ -1119,6 +1132,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         item_size=self.token_stride_size,
+                        block_quota=self.h2d_block_quota,
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
@@ -1128,6 +1142,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.kv_cache_dim,
+                        block_quota=self.h2d_block_quota,
                     )
                 else:
                     transfer_kv_per_layer_mla_pf_lf(
@@ -1138,6 +1153,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                         layer_id=layer_id,
                         item_size=self.token_stride_size,
                         src_layout_dim=self.layout_dim,
+                        block_quota=self.h2d_block_quota,
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -1196,6 +1212,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                         cache_dst_stride_bytes=self.token_stride_size,
                         cache_src_stride_bytes=self.token_stride_size,
                         element_size=self.kv_cache_dim * self.dtype.itemsize,
+                        block_quota=self.d2h_block_quota,
                     )
                 else:
                     transfer_kv_all_layer_mla(
@@ -1205,6 +1222,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                         dst_indices=host_indices,
                         item_size=self.token_stride_size,
                         num_layers=self.layer_num,
+                        block_quota=self.d2h_block_quota,
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
@@ -1216,6 +1234,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                         cache_src_stride_bytes=self.token_stride_size,
                         cache_dst_stride_bytes=self.layout_dim,
                         element_size=self.kv_cache_dim * self.dtype.itemsize,
+                        block_quota=self.d2h_block_quota,
                     )
                 else:
                     transfer_kv_all_layer_mla_lf_pf(
@@ -1226,6 +1245,7 @@ class MLATokenToKVPoolHost(HostKVCache):
                         item_size=self.token_stride_size,
                         dst_layout_dim=self.layout_dim,
                         num_layers=self.layer_num,
+                        block_quota=self.d2h_block_quota,
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -2169,6 +2189,9 @@ class SWATokenToKVPoolHost:
             device=self.device,
             allocator_type=allocator_type,
         )
+        self.h2d_block_quota = self.full_pool_host.h2d_block_quota
+        self.d2h_block_quota = self.full_pool_host.d2h_block_quota
+
         # Validate host pool capacities: in disaggregated prefill mode the
         # host pools buffer KV data evicted from the device before transfer to
         # the decode node.  If the host pool is smaller than 1.5x the device
@@ -2525,6 +2548,7 @@ class SWATokenToKVPoolHost:
             v_item_size=self.full_pool_host.v_token_stride_size,
             v_dst_layout_dim=self.full_pool_host.v_layout_dim,
             num_layers=self.device_pool.full_layer_nums,
+            block_quota=self.d2h_block_quota,
         )
         # Backup SWA KV cache.
         transfer_kv_all_layer_fuse_lf_pf(
@@ -2539,6 +2563,7 @@ class SWATokenToKVPoolHost:
             v_item_size=self.swa_pool_host.v_token_stride_size,
             v_dst_layout_dim=self.swa_pool_host.v_layout_dim,
             num_layers=self.device_pool.swa_layer_nums,
+            block_quota=self.d2h_block_quota,
         )
 
     def get_data_page(self, index, flat: bool = True):

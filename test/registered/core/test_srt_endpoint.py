@@ -313,60 +313,66 @@ class TestSRTEndpoint(CustomTestCase):
         self.assertTrue(all(x is not None for x in logprobs))
 
     def run_custom_logit_processor(self, target_token_id: Optional[int] = None):
-        """Test custom logit processor with custom params.
+        """Verify client-supplied ``custom_logit_processor`` is rejected (CVE-2026-7304).
 
-        If target_token_id is None, the custom logit processor won't be passed in.
+        Historically this test ran a deterministic processor end-to-end. The CVE
+        fix unconditionally rejects any client-supplied ``custom_logit_processor``
+        (the field carries a dill-serialized payload that the scheduler would
+        otherwise feed to ``dill.loads()``, i.e. arbitrary code execution).
+
+        - When ``target_token_id`` is ``None``, no processor is sent: the request
+          must succeed normally.
+        - Otherwise we expect the server to respond with HTTP 400 and a message
+          that mentions the CVE / security rationale.
         """
 
-        custom_params = {"token_id": target_token_id}
-
         class DeterministicLogitProcessor(CustomLogitProcessor):
-            """A dummy logit processor that changes the logits to always
-            sample the given token id.
-            """
-
             def __call__(self, logits, custom_param_list):
                 assert logits.shape[0] == len(custom_param_list)
-                key = "token_id"
-
                 for i, param_dict in enumerate(custom_param_list):
-                    # Mask all other tokens
                     logits[i, :] = -float("inf")
-                    # Assign highest probability to the specified token
-                    logits[i, param_dict[key]] = 0.0
+                    logits[i, param_dict["token_id"]] = 0.0
                 return logits
 
         prompts = "Question: Is Paris the Capital of France? Answer:"
 
-        # Base case json data to be posted to the server.
         base_json = {
             "text": prompts,
             "sampling_params": {"temperature": 0.0},
             "return_logprob": True,
         }
 
-        # Custom json data with custom logit processor and params.
-        custom_json = base_json.copy()
-        # Only set the custom logit processor if target_token_id is not None.
-        if target_token_id is not None:
-            custom_json["custom_logit_processor"] = DeterministicLogitProcessor.to_str()
-            custom_json["sampling_params"]["custom_params"] = custom_params
-
-        custom_response = requests.post(
-            self.base_url + "/generate",
-            json=custom_json,
-        ).json()
-
-        output_token_logprobs = custom_response["meta_info"]["output_token_logprobs"]
-        sampled_tokens = [x[1] for x in output_token_logprobs]
-
-        # The logit processor should always sample the given token as the logits is deterministic.
-        if target_token_id is not None:
-            self.assertTrue(
-                all(x == custom_params["token_id"] for x in sampled_tokens),
-                # Print the detailed test case info if the test fails.
-                f"{target_token_id=}\n{sampled_tokens=}\n{custom_response=}",
+        if target_token_id is None:
+            # Sanity path: a request without a custom processor still works.
+            response = requests.post(self.base_url + "/generate", json=base_json)
+            self.assertEqual(
+                response.status_code,
+                200,
+                f"Baseline request without custom_logit_processor failed: {response.text}",
             )
+            return
+
+        # Attack-surface path: server MUST reject the payload.
+        custom_json = base_json.copy()
+        custom_json["custom_logit_processor"] = DeterministicLogitProcessor.to_str()
+        custom_json["sampling_params"] = {
+            **base_json["sampling_params"],
+            "custom_params": {"token_id": target_token_id},
+        }
+
+        response = requests.post(self.base_url + "/generate", json=custom_json)
+        self.assertEqual(
+            response.status_code,
+            400,
+            f"Expected HTTP 400 for client-supplied custom_logit_processor, "
+            f"got {response.status_code}: {response.text}",
+        )
+        message = response.json().get("error", {}).get("message", "")
+        self.assertIn(
+            "CVE-2026-7304",
+            message,
+            f"Error message should reference CVE-2026-7304, got: {message!r}",
+        )
 
     def run_stateful_custom_logit_processor(
         self, first_token_id: int | None, delay: int = 2

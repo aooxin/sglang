@@ -888,13 +888,17 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     "The server is not configured to return the hidden states. "
                     "Please set `--enable-return-hidden-states` to enable this feature."
                 )
-            if (
-                obj.custom_logit_processor
-                and not self.server_args.enable_custom_logit_processor
-            ):
+            if obj.custom_logit_processor:
+                # SECURITY (CVE-2026-7304): The `custom_logit_processor` field carries a
+                # dill-serialized payload that is later passed to `dill.loads()` in the
+                # scheduler process, which is equivalent to arbitrary code execution.
+                # Client-supplied payloads are unconditionally rejected. To use a custom
+                # logit processor, configure it on the server via
+                # `--default-custom-logit-processor` at startup instead.
                 raise ValueError(
-                    "The server is not configured to enable custom logit processor. "
-                    "Please set `--enable-custom-logit-processor` to enable this feature."
+                    "Client-supplied `custom_logit_processor` is not allowed for "
+                    "security reasons (CVE-2026-7304). Configure the processor on the "
+                    "server via `--default-custom-logit-processor` at startup instead."
                 )
 
     def _validate_mm_limits(

@@ -881,60 +881,63 @@ class TestOpenAIServerCustomLogitProcessor(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def run_custom_logit_processor(self, target_token_id: Optional[int] = None) -> None:
-        """
-        Test custom logit processor with custom params.
+        """Verify client-supplied ``custom_logit_processor`` is rejected (CVE-2026-7304).
 
-        If target_token_id is None, the custom logit processor won't be passed in.
+        The CVE fix unconditionally rejects client payloads because the field
+        carries a dill-serialized object that the scheduler would otherwise feed
+        to ``dill.loads()`` (arbitrary code execution).
+
+        - When ``target_token_id`` is ``None``: a baseline chat completion
+          without the field must succeed.
+        - Otherwise: the OpenAI client must receive ``BadRequestError`` with
+          a CVE-2026-7304 reference in the error message.
         """
 
         class DeterministicLogitProcessor(CustomLogitProcessor):
-            """A dummy logit processor that changes the logits to always sample the given token id."""
-
             CUSTOM_PARAM_KEY = "token_id"
 
             def __call__(self, logits, custom_param_list):
                 assert logits.shape[0] == len(custom_param_list)
-
                 for i, param_dict in enumerate(custom_param_list):
-                    # Mask all other tokens
                     logits[i, :] = -float("inf")
-                    # Assign highest probability to the specified token
                     logits[i, param_dict[self.CUSTOM_PARAM_KEY]] = 0.0
-
                 return logits
 
-        extra_body = {}
-
-        if target_token_id is not None:
-            extra_body["custom_logit_processor"] = (
-                DeterministicLogitProcessor().to_str()
-            )
-            extra_body["custom_params"] = {
-                "token_id": target_token_id,
-            }
-
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
-        max_tokens = 200
+        messages = [
+            {"role": "user", "content": "Question: Is Paris the Capital of France?"}
+        ]
 
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": "Question: Is Paris the Capital of France?",
-                },
-            ],
-            temperature=0.0,
-            max_tokens=max_tokens,
-            extra_body=extra_body,
-        )
-
-        if target_token_id is not None:
-            target_text = self.tokenizer.decode([target_token_id] * max_tokens)
-            self.assertTrue(
-                target_text == response.choices[0].message.content,
-                f"{target_token_id=}\n{target_text=}\n{response.model_dump(mode='json')}",
+        if target_token_id is None:
+            # Sanity path: request without the field must still succeed.
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.0,
+                max_tokens=8,
             )
+            self.assertTrue(response.choices[0].message.content)
+            return
+
+        # Attack-surface path: server MUST reject the payload.
+        extra_body = {
+            "custom_logit_processor": DeterministicLogitProcessor().to_str(),
+            "custom_params": {"token_id": target_token_id},
+        }
+        with self.assertRaises(openai.BadRequestError) as ctx:
+            client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.0,
+                max_tokens=8,
+                extra_body=extra_body,
+            )
+        message = str(ctx.exception)
+        self.assertIn(
+            "CVE-2026-7304",
+            message,
+            f"Error message should reference CVE-2026-7304, got: {message!r}",
+        )
 
     def test_custom_logit_processor(self) -> None:
         """Test custom logit processor with a single request."""

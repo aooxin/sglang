@@ -510,21 +510,22 @@ class SchedulerMetricsMixin:
                         self.stats.host_leaves_locked = tree_info.host.leaves_locked
                     self.last_tree_cache_info_time = now
                 # TODO(yingchun): 使用接口，避免直接访问 self.tree_cache
-                cur_swa_freed = self.tree_cache.swa_active_freed_tokens
-                cur_swa_evicted = self.tree_cache.swa_evicted_from_tree
-                cur_full_evicted = self.tree_cache.full_evicted_from_tree
-                self.stats.swa_active_freed_tokens_delta = (
+                if hasattr(self.tree_cache, "swa_active_freed_tokens"):
+                    cur_swa_freed = self.tree_cache.swa_active_freed_tokens
+                    cur_swa_evicted = self.tree_cache.swa_evicted_from_tree
+                    cur_full_evicted = self.tree_cache.full_evicted_from_tree
+                    self.stats.swa_active_freed_tokens_delta = (
                         cur_swa_freed - self.last_swa_active_freed_tokens
-                )
-                self.stats.swa_evicted_from_tree_delta = (
+                    )
+                    self.stats.swa_evicted_from_tree_delta = (
                         cur_swa_evicted - self.last_swa_evicted_from_tree
-                )
-                self.stats.full_evicted_from_tree_delta = (
+                    )
+                    self.stats.full_evicted_from_tree_delta = (
                         cur_full_evicted - self.last_full_evicted_from_tree
-                )
-                self.last_swa_active_freed_tokens = cur_swa_freed
-                self.last_swa_evicted_from_tree = cur_swa_evicted
-                self.last_full_evicted_from_tree = cur_full_evicted
+                    )
+                    self.last_swa_active_freed_tokens = cur_swa_freed
+                    self.last_swa_evicted_from_tree = cur_swa_evicted
+                    self.last_full_evicted_from_tree = cur_full_evicted
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
 

@@ -478,14 +478,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             rids=[req.rid for req in batch.reqs],
-            # TODO(yingchun): duplicate to ret.out_cache_loc_swa = ... below
-            out_cache_loc_swa = (
-                model_runner.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    batch.out_cache_loc
-                )
-                if model_runner.is_hybrid_swa
-                else None
-            ),
+            out_cache_loc_swa=None,
         )
         device = model_runner.device
 

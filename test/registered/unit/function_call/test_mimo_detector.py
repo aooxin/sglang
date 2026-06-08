@@ -235,7 +235,7 @@ line 3</parameter>
         self.assertEqual(tool_calls[0]["name"], "get_current_weather")
         self.assertEqual(json.loads(tool_calls[0]["parameters"])["city"], "Dallas")
 
-    def test_streaming_incomplete_tool_call_buffers_until_complete(self):
+    def test_streaming_incomplete_tool_call_streams_completed_parts(self):
         chunks = [
             "<tool_call>",
             "\n<function=get_current_weather>",
@@ -246,17 +246,20 @@ line 3</parameter>
         normal_text, tool_calls = self._collect_streaming_result(chunks)
 
         self.assertEqual(normal_text, "")
-        self.assertEqual(tool_calls, {})
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_current_weather")
+        self.assertEqual(tool_calls[0]["parameters"], '{"city": "Dallas", "state": ')
 
         result = self.detector.parse_streaming_increment(
             "TX</parameter>\n</function>\n</tool_call>", self.tools
         )
 
         self.assertEqual(result.normal_text, "")
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "get_current_weather")
+        for call in result.calls:
+            if call.parameters:
+                tool_calls[call.tool_index]["parameters"] += call.parameters
         self.assertEqual(
-            json.loads(result.calls[0].parameters),
+            json.loads(tool_calls[0]["parameters"]),
             {"city": "Dallas", "state": "TX"},
         )
 

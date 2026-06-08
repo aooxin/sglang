@@ -13,6 +13,7 @@ from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
+from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
@@ -2545,6 +2546,177 @@ class TestGlm47MoeDetector(unittest.TestCase):
             tools_with_array,
         )
         check_single_todos(result, expected_output)
+
+
+class TestMiMoDetectorStreaming(unittest.TestCase):
+    """Tests for per-token SAX-based streaming in MiMoDetector."""
+
+    def setUp(self):
+        self.write_tool = Tool(
+            type="function",
+            function=Function(
+                name="write",
+                description="Write a file",
+                parameters={
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["path", "content"],
+                },
+            ),
+        )
+        self.calc_tool = Tool(
+            type="function",
+            function=Function(
+                name="calc",
+                description="Calculate",
+                parameters={
+                    "properties": {
+                        "shape": {"type": "string"},
+                        "dims": {"type": "object"},
+                        "precision": {"type": "integer"},
+                    }
+                },
+            ),
+        )
+        self.bash_tool = Tool(
+            type="function",
+            function=Function(
+                name="bash",
+                description="Run command",
+                parameters={
+                    "properties": {
+                        "command": {"type": "string"},
+                    }
+                },
+            ),
+        )
+
+    def _collect_streaming(self, chunks, tools):
+        detector = MiMoDetector()
+        text = ""
+        tool_calls = {}
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, tools)
+            text += result.normal_text
+            for call in result.calls:
+                idx = call.tool_index
+                if idx is not None:
+                    if idx not in tool_calls:
+                        tool_calls[idx] = {"name": "", "params": "", "chunk_count": 0}
+                    if call.name:
+                        tool_calls[idx]["name"] = call.name
+                    if call.parameters:
+                        tool_calls[idx]["params"] += call.parameters
+                        tool_calls[idx]["chunk_count"] += 1
+        return text, tool_calls
+
+    def test_streaming_per_token_string(self):
+        """String parameters should produce multiple incremental ToolCallItem chunks."""
+        chunks = [
+            "<tool_call>",
+            "\n<function=write>",
+            "\n<parameter=path>/tmp/test.html</parameter>",
+            "\n<parameter=content>",
+            "<div>",
+            "Hello",
+            " World",
+            "</div>",
+            "</parameter>",
+            "\n</function>",
+            "\n</tool_call>",
+        ]
+        _, tool_calls = self._collect_streaming(chunks, [self.write_tool])
+        self.assertEqual(len(tool_calls), 1)
+        tc = tool_calls[0]
+        self.assertEqual(tc["name"], "write")
+        params = json.loads(tc["params"])
+        self.assertEqual(params["path"], "/tmp/test.html")
+        self.assertEqual(params["content"], "<div>Hello World</div>")
+        # Per-token streaming should produce MORE chunks than the old
+        # buffered approach (which would produce exactly 1)
+        self.assertGreater(tc["chunk_count"], 3)
+
+    def test_streaming_deferred_complex_type(self):
+        """Object-type parameters should be buffered and emitted at once."""
+        chunks = [
+            "<tool_call>\n<function=calc>\n<parameter=shape>rect</parameter>",
+            '\n<parameter=dims>{"w": 10, "h": 20}</parameter>',
+            "\n<parameter=precision>2</parameter>",
+            "\n</function>\n</tool_call>",
+        ]
+        _, tool_calls = self._collect_streaming(chunks, [self.calc_tool])
+        self.assertEqual(len(tool_calls), 1)
+        params = json.loads(tool_calls[0]["params"])
+        self.assertEqual(params["shape"], "rect")
+        self.assertEqual(params["dims"], {"w": 10, "h": 20})
+        self.assertEqual(params["precision"], 2)
+
+    def test_streaming_html_with_angle_brackets(self):
+        """HTML content with <, > should not break the XML parser."""
+        html = '<!DOCTYPE html><html><body><div class="x">Test &amp; Go</div></body></html>'
+        chunks = [
+            "<tool_call>\n<function=write>\n",
+            "<parameter=path>/tmp/t.html</parameter>\n",
+            "<parameter=content>",
+        ]
+        for i in range(0, len(html), 10):
+            chunks.append(html[i : i + 10])
+        chunks.append("</parameter>\n</function>\n</tool_call>")
+        _, tool_calls = self._collect_streaming(chunks, [self.write_tool])
+        params = json.loads(tool_calls[0]["params"])
+        self.assertEqual(params["path"], "/tmp/t.html")
+        self.assertEqual(params["content"], html)
+
+    def test_streaming_multi_tool_call(self):
+        """Two consecutive tool calls should have correct tool_index."""
+        chunks = [
+            "Let me run then write.",
+            "<tool_call>\n<function=bash>",
+            "\n<parameter=command>ls</parameter>",
+            "\n</function>\n</tool_call>",
+            "\n<tool_call>\n<function=write>",
+            "\n<parameter=path>/tmp/f.txt</parameter>",
+            "\n<parameter=content>hi</parameter>",
+            "\n</function>\n</tool_call>",
+        ]
+        text, tool_calls = self._collect_streaming(
+            chunks, [self.bash_tool, self.write_tool]
+        )
+        self.assertIn("Let me run then write.", text)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "bash")
+        self.assertEqual(tool_calls[1]["name"], "write")
+        p0 = json.loads(tool_calls[0]["params"])
+        self.assertEqual(p0["command"], "ls")
+        p1 = json.loads(tool_calls[1]["params"])
+        self.assertEqual(p1["path"], "/tmp/f.txt")
+        self.assertEqual(p1["content"], "hi")
+
+    def test_streaming_entity_not_unescaped(self):
+        """&copy; and &amp; should be preserved as-is (no html.unescape)."""
+        chunks = [
+            "<tool_call>\n<function=write>",
+            "\n<parameter=path>/tmp/e.html</parameter>",
+            "\n<parameter=content>&copy; 2026 &amp; more</parameter>",
+            "\n</function>\n</tool_call>",
+        ]
+        _, tool_calls = self._collect_streaming(chunks, [self.write_tool])
+        params = json.loads(tool_calls[0]["params"])
+        self.assertEqual(params["content"], "&copy; 2026 &amp; more")
+
+    def test_streaming_empty_parameters(self):
+        """Tool call with no parameters should produce {}."""
+        chunks = [
+            "<tool_call>\n<function=bash>",
+            "\n</function>\n</tool_call>",
+        ]
+        _, tool_calls = self._collect_streaming(chunks, [self.bash_tool])
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "bash")
+        params = json.loads(tool_calls[0]["params"])
+        self.assertEqual(params, {})
 
 
 class TestJsonArrayParser(unittest.TestCase):

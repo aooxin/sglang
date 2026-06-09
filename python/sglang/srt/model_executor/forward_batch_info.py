@@ -519,6 +519,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 global_num_tokens_for_logprob, dtype=torch.int64
             ).to(device, non_blocking=True)
 
+        # Precompute SWA cache location once for all SWA layers. This must happen
+        # before the idle early return because speculative draft-extend CUDA graph
+        # replay still expects an empty tensor instead of None for idle batches.
+        if model_runner.is_hybrid_swa and ret.out_cache_loc is not None:
+            ret.out_cache_loc_swa = (
+                model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    ret.out_cache_loc
+                )
+            )
+
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
             return ret
@@ -580,13 +590,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             else:
                 ret._compute_mrope_positions(model_runner, batch)
 
-        # Precompute SWA cache location once for all SWA layers
-        if model_runner.is_hybrid_swa and ret.out_cache_loc is not None:
-            ret.out_cache_loc_swa = (
-                model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                    ret.out_cache_loc
-                )
-            )
 
         # Init lora information
         if model_runner.server_args.enable_lora:

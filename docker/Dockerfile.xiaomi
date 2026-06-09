@@ -1,7 +1,7 @@
 ARG BASE_IMAGE_VERSION=v0.5.10
 FROM micr.cloud.mioffice.cn/llm-infra/sglang:${BASE_IMAGE_VERSION}
 
-ARG UBUNTU_MIRROR=http://mirrors.aliyun.com
+ARG UBUNTU_MIRROR=https://pkgs.d.xiaomi.net/artifactory/deb-remote/ubuntu/
 ARG PIP_DEFAULT_INDEX=https://pkgs.d.xiaomi.net/artifactory/api/pypi/pypi-virtual/simple
 ARG BUILD_MAX_JOBS=128
 ARG DEBIAN_FRONTEND=noninteractive

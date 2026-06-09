@@ -9,8 +9,10 @@ __pycache__/
 # Distribution / packaging
 .Python
 **/build/
+sgl-kernel/build_*/
 **/develop-eggs/
 **/dist/
+sgl-kernel/dist_*/
 **/downloads/
 **/eggs/
 .eggs/

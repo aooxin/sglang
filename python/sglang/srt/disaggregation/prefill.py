@@ -856,7 +856,8 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
             elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
                 # SWA hybrid model: send last window KV indices
-                seq_len = len(req.fill_ids)
+                # match decode & main-KV token range so the state-index count agrees on both sides
+                seq_len = min(len(req.fill_ids), len(req.origin_input_ids))
                 window_size = self.sliding_window_size
                 window_start = max(0, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
@@ -876,12 +877,26 @@ class SchedulerDisaggregationPrefillMixin:
             elif isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(), NSATokenToKVPool
             ):
-                seq_len = len(req.fill_ids)
+                # match decode & main-KV token range so the state-index count agrees on both sides
+                seq_len = min(len(req.fill_ids), len(req.origin_input_ids))
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
                 state_indices = kv_indices_full.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
+
+            # diag: correlate by room with conn.py's state-index mismatch warning
+            if state_indices is not None and len(req.fill_ids) != len(
+                req.origin_input_ids
+            ):
+                logger.warning(
+                    f"[PD-Trace] SWA/NSA state-index diag room={req.bootstrap_room} "
+                    f"rid={req.rid} fill_ids={len(req.fill_ids)} "
+                    f"origin={len(req.origin_input_ids)} "
+                    f"cached_tokens={getattr(req, 'cached_tokens', '?')} "
+                    f"prefix_len={len(getattr(req, 'prefix_indices', []))} "
+                    f"state_pages={len(state_indices)}"
+                )
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if len(page_indices) == 0:

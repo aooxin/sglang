@@ -668,6 +668,8 @@ class MooncakeKVManager(CommonKVManager):
         ) -> List[Tuple[int, int, int]]:
             transfer_blocks = []
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+                if len(prefill_index) == 0 or len(decode_index) == 0:
+                    continue
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
@@ -1036,6 +1038,16 @@ class MooncakeKVManager(CommonKVManager):
             # Reuse _send_kvcache_generic interface to send extra pool data
             prefill_state_indices = np.array(prefill_state_indices, dtype=np.int32)
             dst_state_indices = np.array(req.dst_state_indices, dtype=np.int32)
+            # unequal lengths make group_concurrent_contiguous emit an empty group -> IndexError; trim to common length
+            if len(prefill_state_indices) != len(dst_state_indices):
+                logger.warning(
+                    f"State index length mismatch for room={req.room}: "
+                    f"prefill={len(prefill_state_indices)} dst={len(dst_state_indices)}, "
+                    f"trimming to min"
+                )
+                n = min(len(prefill_state_indices), len(dst_state_indices))
+                prefill_state_indices = prefill_state_indices[:n]
+                dst_state_indices = dst_state_indices[:n]
             return self._send_kvcache_generic(
                 mooncake_session_id=req.mooncake_session_id,
                 src_data_ptrs=self.kv_args.state_data_ptrs,
@@ -1176,6 +1188,7 @@ class MooncakeKVManager(CommonKVManager):
         staging_strategy = None
 
         while True:
+            kv_chunk = None
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 t_chunk_start = time.monotonic()
@@ -1445,10 +1458,32 @@ class MooncakeKVManager(CommonKVManager):
                         self.transfer_infos.pop(kv_chunk.room)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                raise RuntimeError(
-                    f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
+                # fail only this request; never kill the worker (a dead worker stalls all transfers -> 300s timeouts)
+                failed_room = getattr(kv_chunk, "room", None)
+                logger.error(
+                    f"transfer_worker error (room={failed_room}, "
+                    f"bootstrap_port={self.bootstrap_port}): {e}",
+                    exc_info=True,
                 )
+                if failed_room is not None and failed_room in self.request_status:
+                    self.record_failure(failed_room, f"transfer_worker exception: {e}")
+                    self.update_status(failed_room, KVPoll.Failed)
+                    # notify decode so it fails fast instead of waiting its own timeout
+                    local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
+                    for info in list(self.transfer_infos.get(failed_room, {}).values()):
+                        if info.is_dummy:
+                            continue
+                        try:
+                            self.sync_status_to_decode_endpoint(
+                                info.endpoint,
+                                info.dst_port,
+                                failed_room,
+                                KVPoll.Failed,
+                                local_rank,
+                            )
+                        except Exception:
+                            pass
+                continue
 
     def start_prefill_thread(self):
         def bootstrap_thread():

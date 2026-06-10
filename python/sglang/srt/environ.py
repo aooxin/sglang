@@ -312,6 +312,11 @@ class Envs:
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
 
+    # Mooncake KV Transfer: PD-Trace per-chunk/per-request info logging switch.
+    # Disabled by default to avoid flooding prefill node logs; slow-path
+    # warning/error diagnostics are always emitted regardless of this flag.
+    SGLANG_PD_TRACE = EnvBool(False)
+
     # Mooncake KV Transfer: PD-Trace slow-path diagnostics thresholds (seconds)
     SGLANG_DIAG_SLOW_SEND_KVCACHE_S = EnvFloat(5.0)
     SGLANG_DIAG_SLOW_SEND_AUX_S = EnvFloat(2.0)

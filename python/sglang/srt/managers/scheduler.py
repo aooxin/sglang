@@ -1219,6 +1219,7 @@ class Scheduler(
             )
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
+            self._pd_trace = envs.SGLANG_PD_TRACE.get()
 
         # Init mm receiver for EPD disaggregation mode
         if (

@@ -543,11 +543,12 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 self.disagg_prefill_inflight_queue.append(req)
-                logger.info(
-                    f"[PD-Trace] rid={req.rid} room={req.bootstrap_room} entered inflight_queue, "
-                    f"origin_len={len(req.origin_input_ids)}, fill_ids_len={len(req.fill_ids)}, "
-                    f"is_chunked={req.is_chunked}, return_logprob={req.return_logprob}"
-                )
+                if self._pd_trace:
+                    logger.info(
+                        f"[PD-Trace] rid={req.rid} room={req.bootstrap_room} entered inflight_queue, "
+                        f"origin_len={len(req.origin_input_ids)}, fill_ids_len={len(req.fill_ids)}, "
+                        f"is_chunked={req.is_chunked}, return_logprob={req.return_logprob}"
+                    )
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
                     req.output_topk_index = batch.spec_info.topk_index[i]
@@ -889,7 +890,7 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
         req.disagg_kv_sender.send(page_indices, state_indices)
-        if last_chunk:
+        if last_chunk and self._pd_trace:
             _sender = req.disagg_kv_sender
             logger.info(
                 f"[PD-Trace] rid={req.rid} room={req.bootstrap_room} send_kv_chunk(last_chunk=True) done, "

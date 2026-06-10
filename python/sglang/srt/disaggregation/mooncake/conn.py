@@ -1908,25 +1908,40 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 staging_total_size_str = b""
 
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-            with lock:
-                sock.send_multipart(
-                    [
-                        "None".encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
-                        packed_kv_data_ptrs,
-                        packed_aux_data_ptrs,
-                        packed_state_data_ptrs,
-                        dst_tp_rank,
-                        dst_attn_tp_size,
-                        dst_kv_item_len,
-                        packed_state_item_lens,
-                        packed_state_dim_per_tensor,
-                        enable_hisparse,
-                        packed_staging_base_ptr,
-                        staging_total_size_str,
-                    ]
+
+            ip_address = bootstrap_info["rank_ip"]
+            port = bootstrap_info["rank_port"]
+            endpoint = NetworkAddress(ip_address, port).to_tcp()
+
+            count = self._send_with_failure_tracking(
+                sock,
+                lock,
+                endpoint,
+                [
+                    "None".encode("ascii"),
+                    self.kv_mgr.local_ip.encode("ascii"),
+                    str(self.kv_mgr.rank_port).encode("ascii"),
+                    self.session_id.encode("ascii"),
+                    packed_kv_data_ptrs,
+                    packed_aux_data_ptrs,
+                    packed_state_data_ptrs,
+                    dst_tp_rank,
+                    dst_attn_tp_size,
+                    dst_kv_item_len,
+                    packed_state_item_lens,
+                    packed_state_dim_per_tensor,
+                    enable_hisparse,
+                    packed_staging_base_ptr,
+                    staging_total_size_str,
+                ],
+            )
+            if count is not None:
+                logger.error(
+                    f"_register_kv_args send timed out to {endpoint} "
+                    f"(failure_count={count}); prefill rank likely unreachable"
+                )
+                raise RuntimeError(
+                    f"Failed to register KV args to bootstrap endpoint {endpoint}"
                 )
 
     def init(
@@ -1962,26 +1977,43 @@ class MooncakeKVReceiver(CommonKVReceiver):
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
             is_dummy = bootstrap_info["is_dummy"]
 
-            with lock:
-                sock.send_multipart(
-                    [
-                        str(self.bootstrap_room).encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
-                        kv_indices.tobytes() if not is_dummy else b"",
-                        str(aux_index).encode("ascii") if not is_dummy else b"",
-                        (
-                            np.array(
-                                state_indices,
-                                dtype=np.int32,
-                            ).tobytes()
-                            if not is_dummy and state_indices is not None
-                            else b""
-                        ),
-                        str(self.required_dst_info_num).encode("ascii"),
-                    ]
+            ip_address = bootstrap_info["rank_ip"]
+            port = bootstrap_info["rank_port"]
+            endpoint = NetworkAddress(ip_address, port).to_tcp()
+
+            count = self._send_with_failure_tracking(
+                sock,
+                lock,
+                endpoint,
+                [
+                    str(self.bootstrap_room).encode("ascii"),
+                    self.kv_mgr.local_ip.encode("ascii"),
+                    str(self.kv_mgr.rank_port).encode("ascii"),
+                    self.session_id.encode("ascii"),
+                    kv_indices.tobytes() if not is_dummy else b"",
+                    str(aux_index).encode("ascii") if not is_dummy else b"",
+                    (
+                        np.array(
+                            state_indices,
+                            dtype=np.int32,
+                        ).tobytes()
+                        if not is_dummy and state_indices is not None
+                        else b""
+                    ),
+                    str(self.required_dst_info_num).encode("ascii"),
+                ],
+            )
+            if count is not None:
+                logger.warning(
+                    f"Bootstrap PUSH send timed out to {endpoint} "
+                    f"(failure_count={count}, room={self.bootstrap_room})"
                 )
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    f"Bootstrap send timed out to {endpoint}",
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:

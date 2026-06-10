@@ -99,6 +99,9 @@ class CommonKVManager(BaseKVManager):
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
+        self.bootstrap_send_max_failures = (
+            server_args.disaggregation_bootstrap_send_max_failures
+        )
         self.dist_init_addr = server_args.dist_init_addr
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
@@ -545,6 +548,7 @@ class CommonKVReceiver(BaseKVReceiver):
     _socket_cache = {}
     _socket_locks = {}
     _global_lock = threading.Lock()
+    _endpoint_failures: dict[str, int] = {}
 
     def __init__(
         self,
@@ -697,6 +701,11 @@ class CommonKVReceiver(BaseKVReceiver):
         with cls._global_lock:
             if endpoint not in cls._socket_cache:
                 sock = cls._ctx.socket(zmq.PUSH)
+                sock.setsockopt(
+                    zmq.SNDTIMEO,
+                    envs.SGLANG_DISAGGREGATION_BOOTSTRAP_SEND_TIMEOUT_MS.get(),
+                )
+                sock.setsockopt(zmq.LINGER, 0)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
                 sock.connect(endpoint)
@@ -713,10 +722,46 @@ class CommonKVReceiver(BaseKVReceiver):
                 lock = cls._socket_locks.pop(ep, None)
                 if sock is not None and lock is not None:
                     stale.append((sock, lock))
+                cls._endpoint_failures.pop(ep, None)
         for sock, lock in stale:
             with lock:
                 sock.close(linger=0)
         return len(stale)
+
+    @classmethod
+    def _bump_endpoint_failure(cls, endpoint: str) -> int:
+        with cls._global_lock:
+            new_count = cls._endpoint_failures.get(endpoint, 0) + 1
+            cls._endpoint_failures[endpoint] = new_count
+            return new_count
+
+    @classmethod
+    def _reset_endpoint_failure(cls, endpoint: str):
+        if endpoint not in cls._endpoint_failures:
+            return
+        with cls._global_lock:
+            cls._endpoint_failures.pop(endpoint, None)
+
+    def _send_with_failure_tracking(
+        self, sock, lock, endpoint: str, parts: list
+    ) -> Optional[int]:
+        """Send a multipart message with bootstrap endpoint failure tracking.
+
+        On success, resets the endpoint failure counter and returns None.
+        On send timeout (zmq.error.Again), bumps the failure counter, evicts the
+        cached socket once the configured threshold is reached, and returns the
+        current failure count so the caller can decide how to react.
+        """
+        try:
+            with lock:
+                sock.send_multipart(parts)
+            type(self)._reset_endpoint_failure(endpoint)
+            return None
+        except zmq.error.Again:
+            count = type(self)._bump_endpoint_failure(endpoint)
+            if count >= self.kv_mgr.bootstrap_send_max_failures:
+                type(self)._disconnect([endpoint])
+            return count
 
     @classmethod
     def _connect_to_bootstrap_server(cls, bootstrap_info: dict):

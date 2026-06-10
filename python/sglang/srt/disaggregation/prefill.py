@@ -543,6 +543,11 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 self.disagg_prefill_inflight_queue.append(req)
+                logger.info(
+                    f"[PD-Trace] rid={req.rid} room={req.bootstrap_room} entered inflight_queue, "
+                    f"origin_len={len(req.origin_input_ids)}, fill_ids_len={len(req.fill_ids)}, "
+                    f"is_chunked={req.is_chunked}, return_logprob={req.return_logprob}"
+                )
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
                     req.output_topk_index = batch.spec_info.topk_index[i]
@@ -659,6 +664,26 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
+                _inflight_age = time.perf_counter() - getattr(
+                    req.time_stats,
+                    "prefill_transfer_queue_entry_time",
+                    time.perf_counter(),
+                )
+                if _inflight_age > envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get():
+                    _sender = req.disagg_kv_sender
+                    if _sender.conclude_state is None:
+                        _sender.kv_mgr.record_failure(
+                            req.bootstrap_room,
+                            f"KV transfer timed out after {_inflight_age:.1f}s in inflight_queue",
+                        )
+                        _sender.conclude_state = KVPoll.Failed
+                        logger.error(
+                            f"[PD-Trace] rid={req.rid} room={req.bootstrap_room} "
+                            f"timed out in inflight_queue after {_inflight_age:.1f}s, poll={poll}, "
+                            f"has_sent={getattr(_sender, 'has_sent', '?')}, "
+                            f"curr_idx={getattr(_sender, 'curr_idx', '?')}/{getattr(_sender, 'num_kv_indices', '?')}, "
+                            f"aborting request"
+                        )
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
@@ -864,3 +889,13 @@ class SchedulerDisaggregationPrefillMixin:
             )
             return
         req.disagg_kv_sender.send(page_indices, state_indices)
+        if last_chunk:
+            _sender = req.disagg_kv_sender
+            logger.info(
+                f"[PD-Trace] rid={req.rid} room={req.bootstrap_room} send_kv_chunk(last_chunk=True) done, "
+                f"has_sent={getattr(_sender, 'has_sent', '?')}, "
+                f"curr_idx={getattr(_sender, 'curr_idx', '?')}/{getattr(_sender, 'num_kv_indices', '?')}, "
+                f"page_indices_len={len(page_indices)}, "
+                f"fill_ids_len={len(req.fill_ids)}, origin_len={len(req.origin_input_ids)}, "
+                f"start_send_idx={start_idx}, end_idx={end_idx}"
+            )

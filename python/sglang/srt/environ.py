@@ -311,6 +311,11 @@ class Envs:
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
 
+    # Mooncake KV Transfer: PD-Trace slow-path diagnostics thresholds (seconds)
+    SGLANG_DIAG_SLOW_SEND_KVCACHE_S = EnvFloat(5.0)
+    SGLANG_DIAG_SLOW_SEND_AUX_S = EnvFloat(2.0)
+    SGLANG_DIAG_SLOW_QUEUE_WAIT_S = EnvFloat(10.0)
+
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)

@@ -59,6 +59,8 @@ class TransferKVChunk:
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List[int]]
+    enqueue_ts: float = 0.0
+    shard_idx: int = -1
 
 
 from sglang.srt.disaggregation.common.staging_handler import (
@@ -248,6 +250,9 @@ class MooncakeKVManager(CommonKVManager):
                 ).start()
             self.room_transfer_elapsed: dict[int, float] = {}
             self.room_transfer_elapsed_lock = threading.Lock()
+            self._diag_slow_send_kvcache_s = envs.SGLANG_DIAG_SLOW_SEND_KVCACHE_S.get()
+            self._diag_slow_send_aux_s = envs.SGLANG_DIAG_SLOW_SEND_AUX_S.get()
+            self._diag_slow_queue_wait_s = envs.SGLANG_DIAG_SLOW_QUEUE_WAIT_S.get()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
@@ -1172,6 +1177,32 @@ class MooncakeKVManager(CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                t_chunk_start = time.monotonic()
+                _shard_idx = kv_chunk.shard_idx
+                if (
+                    kv_chunk.enqueue_ts > 0
+                    and (t_chunk_start - kv_chunk.enqueue_ts)
+                    > self._diag_slow_queue_wait_s
+                ):
+                    logger.warning(
+                        f"[PD-Trace] transfer_worker shard={_shard_idx} "
+                        f"room={kv_chunk.room} chunk waited {t_chunk_start - kv_chunk.enqueue_ts:.1f}s "
+                        f"in queue before being picked up (qsize_after_get={len(queue._buf)})"
+                    )
+                logger.info(
+                    f"[PD-Trace] worker pick shard={_shard_idx} "
+                    f"room={kv_chunk.room} chunk_idx={kv_chunk.index_slice} "
+                    f"is_last={kv_chunk.is_last_chunk} "
+                    f"queue_wait={(t_chunk_start - kv_chunk.enqueue_ts):.3f}s "
+                    f"qsize={len(queue._buf)}"
+                )
+                if kv_chunk.room not in self.transfer_infos:
+                    logger.warning(
+                        f"[PD-Trace] transfer_worker shard={_shard_idx} "
+                        f"room={kv_chunk.room} dropped: room not in transfer_infos "
+                        f"(likely cleared by failure path before chunk was processed); "
+                        f"is_last={kv_chunk.is_last_chunk}"
+                    )
                 if (
                     self.enable_staging
                     and staging_strategy is None
@@ -1230,6 +1261,7 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
+                        _t_send_start = time.monotonic()
                         if self.is_mla_backend or (
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
@@ -1293,6 +1325,23 @@ class MooncakeKVManager(CommonKVManager):
                             self._add_room_transfer_elapsed(
                                 kv_chunk.room, time.monotonic() - transfer_start
                             )
+                        _send_elapsed = time.monotonic() - _t_send_start
+                        if kv_chunk.is_last_chunk or ret != 0:
+                            logger.info(
+                                f"[PD-Trace] send_kvcache shard={_shard_idx} "
+                                f"room={kv_chunk.room} session={req.mooncake_session_id} "
+                                f"ret={ret} cost={_send_elapsed:.3f}s "
+                                f"is_last={kv_chunk.is_last_chunk}"
+                            )
+                        if _send_elapsed > self._diag_slow_send_kvcache_s:
+                            logger.warning(
+                                f"[PD-Trace] slow send_kvcache shard={_shard_idx} "
+                                f"room={kv_chunk.room} session={req.mooncake_session_id} "
+                                f"elapsed={_send_elapsed:.1f}s ret={ret} "
+                                f"n_prefill_idx={len(kv_chunk.prefill_kv_indices)} "
+                                f"n_dst_idx={len(chunked_dst_kv_indice)} "
+                                f"is_last={kv_chunk.is_last_chunk}"
+                            )
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
@@ -1328,11 +1377,20 @@ class MooncakeKVManager(CommonKVManager):
                                 )
 
                             # Only the last chunk we need to send the aux data
+                            _t_aux_start = time.monotonic()
                             ret = self.send_aux(
                                 req,
                                 kv_chunk.prefill_aux_index,
                                 target_rank_registration_info.dst_aux_ptrs,
                             )
+                            _aux_elapsed = time.monotonic() - _t_aux_start
+                            if _aux_elapsed > self._diag_slow_send_aux_s:
+                                logger.warning(
+                                    f"[PD-Trace] slow send_aux shard={_shard_idx} "
+                                    f"room={kv_chunk.room} session={req.mooncake_session_id} "
+                                    f"endpoint={req.endpoint}:{req.dst_port} "
+                                    f"elapsed={_aux_elapsed:.1f}s ret={ret}"
+                                )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
@@ -1342,6 +1400,17 @@ class MooncakeKVManager(CommonKVManager):
                             if len(polls) == req.required_dst_info_num:
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
                                 self.update_status(req.room, status)
+                                _total_room_elapsed = self.room_transfer_elapsed.get(
+                                    kv_chunk.room, 0.0
+                                )
+                                _chunk_elapsed = time.monotonic() - t_chunk_start
+                                logger.info(
+                                    f"[PD-Trace] worker done shard={_shard_idx} "
+                                    f"room={kv_chunk.room} status={status} "
+                                    f"last_chunk_cost={_chunk_elapsed:.3f}s "
+                                    f"room_total_cost={_total_room_elapsed:.3f}s "
+                                    f"required_dst={req.required_dst_info_num}"
+                                )
                                 for endpoint, dst_port, room in dst_ranks_infos:
                                     self.sync_status_to_decode_endpoint(
                                         endpoint,
@@ -1618,7 +1687,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
-
+        _enqueue_ts = time.monotonic()
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
                 room=bootstrap_room,
@@ -1627,6 +1696,8 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                enqueue_ts=_enqueue_ts,
+                shard_idx=shard_idx,
             )
         )
 

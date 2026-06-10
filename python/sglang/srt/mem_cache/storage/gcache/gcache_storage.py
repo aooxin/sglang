@@ -49,9 +49,14 @@ class GcacheStorage(HiCacheStorage):
                 "Gcache need env HPN_IB_IFNAME or GCACHE_CLIENT_IFNAME"
             )
 
-        # One client only uses one NIC
+        # In case there is only one NIC
+        if obsolete_ifname and len(obsolete_ifname.split(",")) == 1:
+            client_ifname = obsolete_ifname
+
+        # # Each client uses one NIC
         # nic_names = client_ifname.split(",")
         # nic_index = (self.dp_rank * self.tp_size + self.tp_rank) % len(nic_names)
+        # selected_ifname = nic_names[nic_index]
 
         subprocess_config = GCACHE_CONFIG_FILE + f".dp{self.dp_rank}tp{self.tp_rank}"
         self.generate_config_file(

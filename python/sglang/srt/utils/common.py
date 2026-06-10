@@ -3052,6 +3052,10 @@ def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
+def floor_align(x: int, y: int) -> int:
+    return x // y * y
+
+
 def parse_lscpu_topology():
     try:
         # Get CPU topology: CPU,Core,Socket,Node

@@ -15,7 +15,7 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.common import get_num_new_pages
+from sglang.srt.utils.common import floor_align, get_num_new_pages
 
 _is_npu = is_npu()
 
@@ -419,8 +419,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if need_size <= 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
 
-        align_start = max(need_size - chunked_size, 0)
-        align_start = align_start // self.page_size * self.page_size
+        align_start = floor_align(max(need_size - chunked_size, 0), self.page_size)
         swa_need_size = need_size - align_start
         if self.page_size == 1:
             if need_size > self.full_attn_allocator.available_size():

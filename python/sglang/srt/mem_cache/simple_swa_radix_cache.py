@@ -46,7 +46,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.nvtx_utils import nvtx_annotated_method
-from sglang.srt.utils.common import log_info_on_rank0
+from sglang.srt.utils.common import ceil_align, floor_align, log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -317,17 +317,17 @@ class SimpleSWARadixCache(RadixCache):
             "req_to_token row and should only run after a prefill chunk has "
             "completed."
         )
-        swa_free_end = max(0, prelen - self.sliding_window_size)
-        if self.page_size > 1:
-            # Keep SWA eviction page-aligned to avoid freeing a partial page.
-            # PagedTokenToKVPoolAllocator.free() converts token indices to page
-            # indices and frees *entire* pages.  If the free range slices through
-            # the middle of a page, the whole page is returned to the free-list
-            # while tokens on the remaining portion still hold non-zero SWA
-            # mappings.  A later free of those tokens would then trigger a
-            # double-free.  Rounding the end down and the start up guarantees
-            # only fully-covered pages are freed.
-            swa_free_end = (swa_free_end // self.page_size) * self.page_size
+        # Keep SWA eviction page-aligned to avoid freeing a partial page.
+        # PagedTokenToKVPoolAllocator.free() converts token indices to page
+        # indices and frees *entire* pages.  If the free range slices through
+        # the middle of a page, the whole page is returned to the free-list
+        # while tokens on the remaining portion still hold non-zero SWA
+        # mappings.  A later free of those tokens would then trigger a
+        # double-free.  Rounding the end down and the start up guarantees
+        # only fully-covered pages are freed.
+        swa_free_end = floor_align(
+            max(0, prelen - self.sliding_window_size), self.page_size
+        )
         # effective_start 取两者的最大值：
         # 1. req.swa_evicted_seqlen：避免重复 free 同一段请求本地 SWA；
         # 2. tree_prefix_len：保护已经共享给 radix tree 的前缀，不允许请求本地
@@ -336,11 +336,9 @@ class SimpleSWARadixCache(RadixCache):
         # 例子：请求命中了 6 个前缀 token，当前 prelen=12、window=4。
         # 理论上窗口外可回收到位置 8；但前 6 个 token 已是树共享前缀，因此只能
         # 从 max(swa_evicted_seqlen, 6) 开始回收，而不能动 [0, 6)。
-        effective_start = max(req.swa_evicted_seqlen, tree_prefix_len)
-        if self.page_size > 1:
-            effective_start = (
-                (effective_start + self.page_size - 1) // self.page_size
-            ) * self.page_size
+        effective_start = ceil_align(
+            max(req.swa_evicted_seqlen, tree_prefix_len), self.page_size
+        )
         freed_swa_size = 0
         if swa_free_end > effective_start:
             free_slots = self.req_to_token_pool.req_to_token[
@@ -686,10 +684,7 @@ class SimpleSWARadixCache(RadixCache):
             if self.is_eagle
             else all_token_len
         )
-        if self.page_size != 1:
-            page_aligned_len = actual_kv_len // self.page_size * self.page_size
-        else:
-            page_aligned_len = actual_kv_len
+        page_aligned_len = floor_align(actual_kv_len, self.page_size)
 
         tree_prefix_len = req.cache_protected_len
 

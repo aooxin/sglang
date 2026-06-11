@@ -77,6 +77,25 @@ class GcacheStorage(HiCacheStorage):
         self.backup_bandwidth: list = []
         self.mem_pool_host = mem_pool_host
 
+        if self.enable_storage_metrics:
+            from prometheus_client import Counter
+
+            self._metric_labels = {
+                "storage_backend": "gcache",
+                "tp_rank": self.tp_rank,
+                "dp_rank": self.dp_rank,
+            }
+            self._prefetch_bytes_total = Counter(
+                name="sglang:gcache_prefetch_bytes_total",
+                documentation="Cumulative bytes fetched from gcache (per rank).",
+                labelnames=self._metric_labels.keys(),
+            )
+            self._backup_bytes_total = Counter(
+                name="sglang:gcache_backup_bytes_total",
+                documentation="Cumulative bytes written to gcache (per rank).",
+                labelnames=self._metric_labels.keys(),
+            )
+
         self.warmup()
 
     def generate_config_file(
@@ -240,11 +259,13 @@ class GcacheStorage(HiCacheStorage):
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = partial_set_results[i]
 
-            if self.enable_storage_metrics and self.gb_per_page is not None:
+            if self.enable_storage_metrics:
                 self.backup_pgs.append(len(set_keys))
+                total_bytes = sum(set_buffer_sizes)
                 self.backup_bandwidth.append(
-                    len(set_keys) / (t1_set - t0_set) * self.gb_per_page
+                    total_bytes / (t1_set - t0_set) / (1 << 30)
                 )
+                self._backup_bytes_total.labels(**self._metric_labels).inc(total_bytes)
 
         end_time = time.perf_counter()
         execution_time = (end_time - start_time) * 1e6
@@ -293,11 +314,13 @@ class GcacheStorage(HiCacheStorage):
         execution_time = (end_time - start_time) * 1e6
         success_count = sum(1 for each in results if each)
 
-        if self.enable_storage_metrics and self.gb_per_page is not None:
+        if self.enable_storage_metrics:
             self.prefetch_pgs.append(len(keys))
+            total_bytes = sum(value_size_list)
             self.prefetch_bandwidth.append(
-                len(keys) / (end_time - start_time) * self.gb_per_page
+                total_bytes / (end_time - start_time) / (1 << 30)
             )
+            self._prefetch_bytes_total.labels(**self._metric_labels).inc(total_bytes)
 
         logger.debug(
             f"gcache: end get {len(gcache_keys)} keys, success count: {success_count}, "

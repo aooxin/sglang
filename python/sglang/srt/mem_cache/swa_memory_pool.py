@@ -169,8 +169,6 @@ class SWAKVPool(KVCache):
         cache_v: torch.Tensor,
         k_scale: float = 1.0,
         v_scale: float = 1.0,
-        # TODO(yingchun): because self.swa_loc is passed in, so use_mapping maybe useless, can be removed
-        use_mapping: bool = False,
     ):
 
         layer_id = layer.layer_id
@@ -178,9 +176,6 @@ class SWAKVPool(KVCache):
         if is_swa_layer:
             if self.swa_loc is not None:
                 loc = self.swa_loc
-            else:
-                if use_mapping and self.full_to_swa_index_mapping is not None:
-                    loc = self.translate_loc_from_full_to_swa(loc)
 
             self.swa_kv_pool.set_kv_buffer(
                 None,

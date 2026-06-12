@@ -17,7 +17,6 @@ import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
 
 if TYPE_CHECKING:
@@ -270,17 +269,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return not self.is_chunk_cache()
 
     def available_and_evictable_str(self) -> str:
-        if not isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
-            available_size = self.token_to_kv_pool_allocator.available_size()
-            evictable_size = self.evictable_size()
-            return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
-        else:
-            # TODO(yingchun): should move to SimpleSWARadixCache
-            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-            full_evictable_size = self.evictable_size()
-            swa_evictable_size = self.evictable_size()
-            return (
-                f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
-                f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
-            )
+        available_size = self.token_to_kv_pool_allocator.available_size()
+        evictable_size = self.evictable_size()
+        return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"

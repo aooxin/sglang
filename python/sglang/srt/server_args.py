@@ -3167,6 +3167,27 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+        # Defensive check for multi-layer EAGLE with CUDA graph:
+        # The non-CUDA-graph fallback path is not fully implemented and may have
+        # correctness issues. We must ensure that cuda_graph_max_bs covers all
+        # possible batch sizes (i.e., cuda_graph_max_bs >= max_running_requests // dp_size).
+        if (
+            self.enable_multi_layer_eagle
+            and not self.disable_cuda_graph
+            and self.max_running_requests is not None
+        ):
+            required_bs = self.max_running_requests // self.dp_size
+            if self.cuda_graph_max_bs < required_bs:
+                logger.warning(
+                    f"Multi-layer EAGLE requires cuda_graph_max_bs >= "
+                    f"max_running_requests // dp_size ({self.max_running_requests} // "
+                    f"{self.dp_size} = {required_bs}), but got cuda_graph_max_bs="
+                    f"{self.cuda_graph_max_bs}. Adjusting cuda_graph_max_bs to "
+                    f"{required_bs} to avoid correctness issues."
+                )
+                self.cuda_graph_max_bs = required_bs
+                self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes()
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"

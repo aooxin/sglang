@@ -2508,6 +2508,8 @@ class SWATokenToKVPoolHost:
         if is_swa:
             assert swa_host_indices is not None
             assert swa_device_indices is not None
+            if swa_host_indices.numel() == 0:
+                return
             self.swa_pool_host.load_to_device_per_layer(
                 self.device_pool.swa_kv_pool,
                 swa_host_indices,
@@ -2551,6 +2553,8 @@ class SWATokenToKVPoolHost:
             block_quota=self.d2h_block_quota,
         )
         # Backup SWA KV cache.
+        if swa_host_indices.numel() == 0:
+            return
         transfer_kv_all_layer_fuse_lf_pf(
             src_k_layers=device_pool.swa_kv_pool.k_data_ptrs,
             dst_k=self.swa_pool_host.k_buffer,

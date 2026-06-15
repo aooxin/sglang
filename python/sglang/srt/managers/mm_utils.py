@@ -595,12 +595,16 @@ def _get_chunked_prefill_embedding(
     extend_length: List[int],
     items_offset_list: List[List[Tuple[int, int]]],
     input_ids: torch.Tensor,
-) -> tuple[torch.Tensor | None, torch.Tensor]:
+) -> tuple[torch.Tensor | None, torch.Tensor, bool]:
     """
     Chunked prefill embedding: encode per-request items and extract the chunk.
     Items are already split per-image at processor stage.
+
+    Returns (embedding, input_ids, evs_modified) where evs_modified is True
+    when EVS has redistributed placeholders (invalidating original offsets).
     """
     embedding_list = []
+    evs_modified = False
     device = input_ids.device
     # FIXME(Xinyuan): temporary workaround for eagle3
     max_iterations = min(len(items_size) - 1, len(prefix_length))
@@ -636,6 +640,7 @@ def _get_chunked_prefill_embedding(
             if chunk_embedding is not None:
                 embedding_list.append(chunk_embedding)
         else:
+            prev_input_ids = input_ids
             chunk_embedding, input_ids = _get_chunked_embedding_full(
                 data_embedding_func,
                 embedding_items_per_req,
@@ -645,12 +650,14 @@ def _get_chunked_prefill_embedding(
                 input_ids,
                 device,
             )
+            if input_ids is not prev_input_ids:
+                evs_modified = True
             if chunk_embedding is not None:
                 embedding_list.append(chunk_embedding)
 
     if len(embedding_list) == 0:
-        return None, input_ids
-    return torch.concat(embedding_list, dim=0), input_ids
+        return None, input_ids, evs_modified
+    return torch.concat(embedding_list, dim=0), input_ids, evs_modified
 
 
 def _get_multimodal_mask(
@@ -659,13 +666,46 @@ def _get_multimodal_mask(
     return torch.isin(input_ids, placeholder_tensor).unsqueeze(-1)
 
 
+def _overlap_count(start: int, end: int, chunk_start: int, chunk_end: int) -> int:
+    """Inclusive-range overlap length between [start, end] and [chunk_start, chunk_end]."""
+    return max(0, min(end, chunk_end) - max(start, chunk_start) + 1)
+
+
+def _count_mm_tokens_from_offsets(
+    items_size: List[int],
+    prefix_length: List[int],
+    extend_length: List[int],
+    items_offset_list: List[List[Tuple[int, int]]],
+) -> int:
+    """Count expected mm tokens in the current chunk using CPU-side offset info.
+
+    Avoids GPU synchronization by computing the count purely from the offset
+    metadata already on the CPU, instead of calling mask.sum().item().
+    """
+    total = 0
+    max_req = min(len(items_size) - 1, len(prefix_length))
+    for i in range(max_req):
+        if items_size[i] == items_size[i + 1]:
+            continue
+        if i >= len(items_offset_list):
+            continue
+        extend_start = prefix_length[i]
+        extend_seq_len = extend_length[i] if i < len(extend_length) else 0
+        extend_end = extend_start + extend_seq_len - 1
+        for start, end in items_offset_list[i]:
+            total += _overlap_count(start, end, extend_start, extend_end)
+    return total
+
+
 def _adjust_embedding_length(
     embedding: torch.Tensor,
     mask: torch.Tensor,
     logger,
+    num_mm_tokens_in_input_ids: Optional[int] = None,
 ) -> torch.Tensor:
     num_mm_tokens_in_embedding = embedding.shape[0]
-    num_mm_tokens_in_input_ids = mask.sum().item()
+    if num_mm_tokens_in_input_ids is None:
+        num_mm_tokens_in_input_ids = mask.sum().item()
     if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
         logger.warning(
             f"Number of tokens in multimodal embedding does not match those in the input text. "
@@ -724,8 +764,9 @@ def get_embedding_and_mask(
     embedding = _get_precomputed_embedding(
         embedding_items, items_size, prefix_length, extend_length, items_offset_list
     )
+    evs_modified = False
     if embedding is None:
-        embedding, input_ids = _get_chunked_prefill_embedding(
+        embedding, input_ids, evs_modified = _get_chunked_prefill_embedding(
             data_embedding_func,
             embedding_items,
             items_size,
@@ -740,8 +781,22 @@ def get_embedding_and_mask(
     if _is_npu:
         torch.npu.current_stream().synchronize()
     special_multimodal_mask = _get_multimodal_mask(input_ids, placeholder_tensor)
-    # 3. Adjust embedding length if needed
-    embedding = _adjust_embedding_length(embedding, special_multimodal_mask, logger)
+    # 3. Adjust embedding length if needed.
+    # Use CPU offset count to avoid GPU sync, but fall back when EVS has
+    # modified input_ids (making the original offsets stale).
+    num_expected = (
+        None
+        if evs_modified
+        else _count_mm_tokens_from_offsets(
+            items_size, prefix_length, extend_length, items_offset_list
+        )
+    )
+    embedding = _adjust_embedding_length(
+        embedding,
+        special_multimodal_mask,
+        logger,
+        num_mm_tokens_in_input_ids=num_expected,
+    )
     return embedding, special_multimodal_mask, input_ids
 
 
@@ -867,18 +922,18 @@ def embed_mm_inputs(
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
     # 4. scatter embeddings into input embedding
+    # masked_scatter_ avoids the cudaStreamSynchronize that torch.where triggers.
+    def _scatter(dest, mask, src):
+        dest.masked_scatter_(mask.expand_as(dest), src.to(dest.device, dest.dtype))
+
     for i, modality, embedding, mask in zip(
         range(len(embeddings)), modalities, embeddings, masks
     ):
         if embedding is None or mask is None:
             continue
-        # in-place update
-        indices = torch.where(mask.squeeze(dim=-1))[0]
-        input_embeds[indices] = embedding.to(input_embeds.device, input_embeds.dtype)
+        _scatter(input_embeds, mask, embedding)
         if use_deepstack.get(modality, None):
-            input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
-                input_embeds.device, input_embeds.dtype
-            )
+            _scatter(input_deepstack_embeds, mask, deepstack_embeddings[i])
 
     return input_embeds, other_info
 
@@ -1211,7 +1266,9 @@ def tensor_hash(tensor_list) -> int:
 
 def hash_feature(f):
     if isinstance(f, list):
-        if isinstance(f[0], torch.Tensor):
+        if len(f) > 0 and isinstance(f[0], ShmPointerMMData):
+            return tensor_hash([x.tensor for x in f])
+        if len(f) > 0 and isinstance(f[0], torch.Tensor):
             return tensor_hash(f)
         return data_hash(tuple(flatten_nested_list(f)))
     elif isinstance(f, np.ndarray):
@@ -1225,6 +1282,10 @@ def hash_feature(f):
     elif isinstance(f, CudaIpcTensorTransportProxy):
         reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
         return tensor_hash([reconstruct_t])
+    elif isinstance(f, ShmPointerMMData):
+        if f.precomputed_hash is not None:
+            return f.precomputed_hash
+        return tensor_hash([f.tensor])
     return data_hash(f)
 
 
@@ -1529,13 +1590,16 @@ class ShmPointerMMData:
     This acts as a "pointer" to the tensor data across process boundaries.
     """
 
-    def __init__(self, tensor: torch.Tensor):
+    def __init__(
+        self, tensor: torch.Tensor, precomputed_hash: Optional[int] = None
+    ):
         if not tensor.is_cpu:
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
         self.shape = tensor.shape
         self.dtype = tensor.dtype
+        self.precomputed_hash = precomputed_hash
         nbytes = tensor.numel() * tensor.element_size()
         shm = shared_memory.SharedMemory(create=True, size=nbytes)
         try:
@@ -1554,12 +1618,14 @@ class ShmPointerMMData:
             "shm_name": self.shm_name,
             "shape": self.shape,
             "dtype": self.dtype,
+            "precomputed_hash": self.precomputed_hash,
         }
 
     def __setstate__(self, state):
         self.shm_name = state["shm_name"]
         self.shape = state["shape"]
         self.dtype = state["dtype"]
+        self.precomputed_hash = state.get("precomputed_hash")
         self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
         # Zero-copy view into shared memory (no clone, no unlink)
         self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
@@ -1598,10 +1664,15 @@ def _get_is_default_transport():
     return _is_default_tensor_transport
 
 
-def _wrap_tensor_or_list(value):
-    """Wrap a CPU tensor (or list of CPU tensors) in ShmPointerMMData."""
+def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
+    """Wrap a CPU tensor (or list of CPU tensors) in ShmPointerMMData.
+
+    ``precomputed_hash`` is only forwarded for the single-tensor case.
+    For list features the item-level hash covers all elements jointly,
+    so per-element hashes are not applicable.
+    """
     if isinstance(value, torch.Tensor) and value.is_cpu:
-        return ShmPointerMMData(value)
+        return ShmPointerMMData(value, precomputed_hash=precomputed_hash)
     elif isinstance(value, (list, tuple)):
         wrapped = [
             (ShmPointerMMData(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
@@ -1620,14 +1691,17 @@ def wrap_shm_features(obj):
 
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
         for item in obj.mm_inputs.mm_items:
+            item_hash = getattr(item, "hash", None)
             if hasattr(item, "feature") and item.feature is not None:
-                item.feature = _wrap_tensor_or_list(item.feature)
+                item.feature = _wrap_tensor_or_list(
+                    item.feature, precomputed_hash=item_hash
+                )
             if (
                 hasattr(item, "precomputed_embeddings")
                 and item.precomputed_embeddings is not None
             ):
                 item.precomputed_embeddings = _wrap_tensor_or_list(
-                    item.precomputed_embeddings
+                    item.precomputed_embeddings, precomputed_hash=item_hash
                 )
     return obj
 

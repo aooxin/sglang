@@ -198,6 +198,9 @@ def _handle_output_by_index(output, i):
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            image_tokens=_extract_field_by_index(output, "image_tokens", i),
+            audio_tokens=_extract_field_by_index(output, "audio_tokens", i),
+            video_tokens=_extract_field_by_index(output, "video_tokens", i),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
@@ -287,6 +290,9 @@ def _handle_output_by_index(output, i):
             dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            image_tokens=_extract_field_by_index(output, "image_tokens", i),
+            audio_tokens=_extract_field_by_index(output, "audio_tokens", i),
+            video_tokens=_extract_field_by_index(output, "video_tokens", i),
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False

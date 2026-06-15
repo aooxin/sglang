@@ -189,6 +189,17 @@ class MetadataBuffers:
             self.output_hidden_states = torch.zeros(
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
+            # Multimodal token counts (image/audio/video)
+            # Use shape (size, 16) to meet RDMA 64-byte minimum
+            self.mm_image_tokens = torch.zeros(
+                (size, 16), dtype=torch.int32, device=device
+            )
+            self.mm_audio_tokens = torch.zeros(
+                (size, 16), dtype=torch.int32, device=device
+            )
+            self.mm_video_tokens = torch.zeros(
+                (size, 16), dtype=torch.int32, device=device
+            )
             # Request validation: store bootstrap_room to detect metadata corruption
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
@@ -205,6 +216,9 @@ class MetadataBuffers:
             self.output_topk_p.data_ptr(),
             self.output_topk_index.data_ptr(),
             self.output_hidden_states.data_ptr(),
+            self.mm_image_tokens.data_ptr(),
+            self.mm_audio_tokens.data_ptr(),
+            self.mm_video_tokens.data_ptr(),
             self.bootstrap_room.data_ptr(),
         ]
         data_lens = [
@@ -217,6 +231,9 @@ class MetadataBuffers:
             self.output_topk_p.nbytes,
             self.output_topk_index.nbytes,
             self.output_hidden_states.nbytes,
+            self.mm_image_tokens.nbytes,
+            self.mm_audio_tokens.nbytes,
+            self.mm_video_tokens.nbytes,
             self.bootstrap_room.nbytes,
         ]
         item_lens = [
@@ -229,6 +246,9 @@ class MetadataBuffers:
             self.output_topk_p[0].nbytes,
             self.output_topk_index[0].nbytes,
             self.output_hidden_states[0].nbytes,
+            self.mm_image_tokens[0].nbytes,
+            self.mm_audio_tokens[0].nbytes,
+            self.mm_video_tokens[0].nbytes,
             self.bootstrap_room[0].nbytes,
         ]
         return ptrs, data_lens, item_lens
@@ -244,6 +264,9 @@ class MetadataBuffers:
             self.output_topk_p[idx],
             self.output_topk_index[idx],
             self.output_hidden_states[idx],
+            self.mm_image_tokens[idx],
+            self.mm_audio_tokens[idx],
+            self.mm_video_tokens[idx],
             self.bootstrap_room[idx],
         )
 
@@ -294,6 +317,24 @@ class MetadataBuffers:
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
         )
+
+        # Compute and store multimodal token counts
+        image_t, audio_t, video_t = 0, 0, 0
+        if req.multimodal_inputs:
+            for item in req.multimodal_inputs.mm_items:
+                if item.offsets:
+                    num_tokens = sum(
+                        end - start + 1 for start, end in item.offsets
+                    )
+                    if item.is_image():
+                        image_t += num_tokens
+                    elif item.is_audio():
+                        audio_t += num_tokens
+                    elif item.is_video():
+                        video_t += num_tokens
+        self.mm_image_tokens[req.metadata_buffer_index][0] = image_t
+        self.mm_audio_tokens[req.metadata_buffer_index][0] = audio_t
+        self.mm_video_tokens[req.metadata_buffer_index][0] = video_t
 
 
 #########################

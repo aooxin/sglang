@@ -953,6 +953,9 @@ class SchedulerOutputProcessorMixin:
         storage_full_hit_tokens = []
         storage_swa_hit_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
+        image_tokens_list = []
+        audio_tokens_list = []
+        video_tokens_list = []
         spec_verify_ct = []
         spec_accepted_tokens = []
         spec_acceptance_histogram = []
@@ -1067,6 +1070,29 @@ class SchedulerOutputProcessorMixin:
 
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self._get_cached_tokens_details(req))
+
+                # Calculate multi-modal tokens
+                image_t, audio_t, video_t = 0, 0, 0
+                if req.mm_image_tokens or req.mm_audio_tokens or req.mm_video_tokens:
+                    # Use pre-computed values (transferred from prefill in disagg mode)
+                    image_t = req.mm_image_tokens
+                    audio_t = req.mm_audio_tokens
+                    video_t = req.mm_video_tokens
+                elif req.multimodal_inputs:
+                    for item in req.multimodal_inputs.mm_items:
+                        if item.offsets:
+                            num_tokens = sum(
+                                end - start + 1 for start, end in item.offsets
+                            )
+                            if item.is_image():
+                                image_t += num_tokens
+                            elif item.is_audio():
+                                audio_t += num_tokens
+                            elif item.is_video():
+                                video_t += num_tokens
+                image_tokens_list.append(image_t)
+                audio_tokens_list.append(audio_t)
+                video_tokens_list.append(video_t)
 
                 retraction_counts.append(req.retraction_count)
 
@@ -1198,6 +1224,9 @@ class SchedulerOutputProcessorMixin:
                     storage_full_hit_tokens=storage_full_hit_tokens,
                     storage_swa_hit_tokens=storage_swa_hit_tokens,
                     cached_tokens_details=cached_tokens_details,
+                    image_tokens=image_tokens_list,
+                    audio_tokens=audio_tokens_list,
+                    video_tokens=video_tokens_list,
                     input_token_logprobs_val=input_token_logprobs_val,
                     input_token_logprobs_idx=input_token_logprobs_idx,
                     output_token_logprobs_val=output_token_logprobs_val,

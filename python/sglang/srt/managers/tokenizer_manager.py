@@ -1614,11 +1614,18 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
+                image_tokens_list = getattr(recv_obj, "image_tokens", None)
+                audio_tokens_list = getattr(recv_obj, "audio_tokens", None)
+                video_tokens_list = getattr(recv_obj, "video_tokens", None)
+
                 meta_info.update(
                     {
                         "reasoning_tokens": recv_obj.reasoning_tokens[i],
                         "completion_tokens": recv_obj.completion_tokens[i],
                         "cached_tokens": recv_obj.cached_tokens[i],
+                        "image_tokens": image_tokens_list[i] if image_tokens_list else 0,
+                        "audio_tokens": audio_tokens_list[i] if audio_tokens_list else 0,
+                        "video_tokens": video_tokens_list[i] if video_tokens_list else 0,
                     }
                 )
                 # Add detailed cache breakdown if available

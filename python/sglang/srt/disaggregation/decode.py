@@ -1221,6 +1221,9 @@ class DecodeTransferQueue:
             output_topk_p,
             output_topk_index,
             output_hidden_states,
+            mm_image_tokens,
+            mm_audio_tokens,
+            mm_video_tokens,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
 
@@ -1264,6 +1267,9 @@ class DecodeTransferQueue:
         decode_req.req.cached_tokens_device = cached_tokens[1].item()
         decode_req.req.cached_tokens_host = cached_tokens[2].item()
         decode_req.req.cached_tokens_storage = cached_tokens[3].item()
+        decode_req.req.mm_image_tokens = mm_image_tokens[0].item()
+        decode_req.req.mm_audio_tokens = mm_audio_tokens[0].item()
+        decode_req.req.mm_video_tokens = mm_video_tokens[0].item()
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index

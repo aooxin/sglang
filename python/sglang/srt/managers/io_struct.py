@@ -1018,6 +1018,11 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Number of times each request was retracted.
     retraction_counts: List[int]
 
+    # Modality tokens
+    image_tokens: Optional[List[int]] = None
+    audio_tokens: Optional[List[int]] = None
+    video_tokens: Optional[List[int]] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None
 
@@ -1082,6 +1087,11 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # Number of times each request was retracted.
     retraction_counts: List[int]
+
+    # Modality tokens
+    image_tokens: Optional[List[int]] = None
+    audio_tokens: Optional[List[int]] = None
+    video_tokens: Optional[List[int]] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: List[List[int]] = None

@@ -10,6 +10,7 @@ __pycache__/
 .Python
 **/build/
 sgl-kernel/build_*/
+!sgl-kernel/build_transfer.sh
 **/develop-eggs/
 **/dist/
 sgl-kernel/dist_*/

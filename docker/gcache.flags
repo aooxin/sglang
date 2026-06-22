@@ -1,7 +1,7 @@
 --master_addr=value_need_update_in_production
 --cache_group=value_need_update_in_production
 --client_ifname=value_need_update_in_production
---client_threads=8
+--client_threads=value_need_update_in_production
 --rpc_socket_type=rdma
 --use_byterpc=true
 --log_dir=/home/work/log/
@@ -13,4 +13,4 @@
 --force_same_rail_nic=true
 --fixed_numa_node=false
 --byterpc_byte_express_memory_pool_max_regions=50
---traffic_class=-1
+--traffic_class=value_need_update_in_production

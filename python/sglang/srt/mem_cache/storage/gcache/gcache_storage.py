@@ -38,6 +38,14 @@ class GcacheStorage(HiCacheStorage):
                 "Gcache need env GCACHE_MASTER_ADDR and GCACHE_CACHE_GROUP"
             )
 
+        client_threads = os.environ.get("GCACHE_CLIENT_THREADS")
+        if not client_threads:
+            client_threads = "8"
+
+        traffic_class = os.environ.get("GCACHE_TRAFFIC_CLASS")
+        if not traffic_class:
+            traffic_class = "-1"
+
         hpn_ifname = os.environ.get("HPN_IB_IFNAME")
         obsolete_ifname = os.environ.get("GCACHE_CLIENT_IFNAME")
         if hpn_ifname:
@@ -65,6 +73,8 @@ class GcacheStorage(HiCacheStorage):
             master_addr,
             cache_group,
             client_ifname,
+            client_threads,
+            traffic_class,
         )
 
         self.gcache_client = GCacheClient(conf_file=subprocess_config)
@@ -100,16 +110,20 @@ class GcacheStorage(HiCacheStorage):
 
     def generate_config_file(
         self,
-        config_file,
-        subprocess_config_file,
-        master_addr,
-        cache_group,
-        client_ifname,
+        config_file: str,
+        subprocess_config_file: str,
+        master_addr: str,
+        cache_group: str,
+        client_ifname: str,
+        client_threads: str,
+        traffic_class: str,
     ):
         config_map = {
             "master_addr": master_addr,
             "cache_group": cache_group,
             "client_ifname": client_ifname,
+            "client_threads": client_threads,
+            "traffic_class": traffic_class,
         }
         new_lines = []
         with open(config_file, "r", encoding="utf-8") as f:

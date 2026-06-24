@@ -29,6 +29,7 @@ class DatasetRow:
     audio_data: Optional[List[str]] = None
     video_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
+    fake_cache_hit_ratio: Optional[float] = None
     routing_key: Optional[str] = None
     extra_request_body: Optional[Dict[str, Any]] = None  # Per-request API parameters
 

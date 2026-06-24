@@ -603,6 +603,7 @@ class Req(ReqDllmMixin):
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        custom_labels: Optional[Dict[str, str]] = None,
         time_stats: Optional[
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
         ] = None,
@@ -645,6 +646,9 @@ class Req(ReqDllmMixin):
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
+
+        # Custom labels for metrics tags and benchmark-only signals.
+        self.custom_labels = custom_labels
 
         # Require reasoning for the request
         self.require_reasoning = require_reasoning
@@ -832,6 +836,8 @@ class Req(ReqDllmMixin):
         self.storage_full_hit_tokens = 0
         self.storage_swa_hit_tokens = 0
         self.raw_prefix_len = 0
+        # Length of the (real or fake) matched prefix; read by fake-cache-hit path and radix free.
+        self.last_matched_prefix_len = 0
         self.already_computed = 0
 
         # Detailed breakdown of cached tokens by source (for HiCache)
@@ -920,6 +926,11 @@ class Req(ReqDllmMixin):
             return self.output_ids[: self.finished_len]
         return self.output_ids
 
+    @property
+    def fake_cache_hit_ratio(self) -> Optional[float]:
+        ratio = (self.custom_labels or {}).get("fake_cache_hit_ratio")
+        return float(ratio) if ratio is not None else None
+
     def pop_committed_kv_cache(self) -> int:
         """Return the length of committed KV cache and mark them as freed."""
         assert (
@@ -974,6 +985,50 @@ class Req(ReqDllmMixin):
             self.fill_ids = self.origin_input_ids + self.output_ids
 
         input_len = len(self.fill_ids)
+
+        if (
+            self.fake_cache_hit_ratio is not None
+            and len(self.output_ids) == 0
+            and self.last_matched_prefix_len == 0
+            and tree_cache is not None
+        ):
+            ratio = max(0.0, min(1.0, self.fake_cache_hit_ratio))
+            fake_len = min(int(input_len * ratio), input_len - 1)
+            # Page-align: keeps alloc_extend's Part 1 a no-op so it does not
+            # write slots adjacent to the fake prefix and double-free them.
+            allocator = tree_cache.token_to_kv_pool_allocator
+            page_size = allocator.page_size
+            if page_size > 1:
+                fake_len = (fake_len // page_size) * page_size
+            if fake_len > 0:
+                # Broadcast one slot across every fake-prefix position.
+                fake_slot = getattr(tree_cache, "_fake_prefix_slot", None)
+                if fake_slot is None:
+                    slot = allocator.alloc(max(1, page_size))
+                    if slot is not None and len(slot) >= 1:
+                        device = tree_cache.req_to_token_pool.req_to_token.device
+                        fake_slot = slot[:1].to(device=device, dtype=torch.int64)
+                        tree_cache._fake_prefix_slot = fake_slot
+                if fake_slot is not None:
+                    logger.info(
+                        f"[fake-cache-hit] req={self.rid} input_len={input_len} "
+                        f"ratio={ratio:.2f} fake_len={fake_len}"
+                    )
+                    self.prefix_indices = fake_slot.expand(fake_len).clone()
+                    self.last_node = tree_cache.root_node
+                    self.last_host_node = tree_cache.root_node
+                    self.host_hit_length = 0
+                    self.last_matched_prefix_len = fake_len
+                    self.raw_prefix_len = fake_len
+                    # Protect the whole fake prefix from SWA window eviction:
+                    # those positions all alias one broadcast slot with no real
+                    # per-token SWA allocation, so evict_swa() must not free them
+                    # (else swa_attn_allocator over-frees and trips its assert).
+                    self.cache_protected_len = fake_len
+                    # Also sets extend_logprob_start_len so the DP-attention
+                    # MLP-sync assert (num_tokens_for_logprob == batch_size) holds.
+                    self.set_extend_input_len(input_len - fake_len)
+                    return
 
         # Streaming sessions reuse committed KV from the session slot, so
         # custom logprob_start_len is not supported — override to -1.

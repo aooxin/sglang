@@ -475,6 +475,18 @@ class RadixCache(BasePrefixCache):
             is_insert = False
 
         kv_committed_len = req.pop_committed_kv_cache()
+
+        # Fake-cache-hit reqs skip tree insert and do not free the shared fake prefix slot.
+        if req.fake_cache_hit_ratio is not None:
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :kv_committed_len
+            ]
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[req.last_matched_prefix_len :]
+            )
+            self.dec_lock_ref(req.last_node)
+            return
+
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len

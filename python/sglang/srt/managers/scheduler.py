@@ -1912,6 +1912,7 @@ class Scheduler(
                 routing_key=recv_req.routing_key,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
+                custom_labels=recv_req.custom_labels,
                 time_stats=recv_req.time_stats,
             )
             req.tokenizer = self.tokenizer
@@ -2058,6 +2059,8 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
+            if req.fake_cache_hit_ratio is not None:
+                return
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             last_host_node = req.last_host_node
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:

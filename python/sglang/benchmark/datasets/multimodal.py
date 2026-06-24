@@ -90,6 +90,7 @@ def sample_multimodal_requests(
                 data.get("images", []),
                 data.get("audios", []),
                 data.get("videos", []),
+                data.get("fake_cache_hit_ratio"),
             ))
         else:
             # Format: {"question": ..., "image_urls": [...], ...}
@@ -101,6 +102,7 @@ def sample_multimodal_requests(
                 data.get("image_urls", []),
                 data.get("audio_urls", []),
                 data.get("video_urls", []),
+                data.get("fake_cache_hit_ratio"),
             ))
     dataset = parsed
     if random_sample:
@@ -134,6 +136,7 @@ def sample_multimodal_requests(
         image_data_list = list(data[1])
         audio_data_list = list(data[2])
         video_data_list = list(data[3])
+        fake_hit = data[4]
 
         input_requests.append(
             DatasetRow(
@@ -143,5 +146,6 @@ def sample_multimodal_requests(
                 image_data=image_data_list,
                 audio_data=audio_data_list,
                 video_data=video_data_list,
+                fake_cache_hit_ratio=fake_hit,
             ))
     return input_requests

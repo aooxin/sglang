@@ -90,6 +90,7 @@ def sample_sharegpt_requests(
         (
             data.get("conversations", data.get("conversation", []))[0]["value"],
             data.get("conversations", data.get("conversation", []))[1]["value"],
+            data.get("fake_cache_hit_ratio"),
         )
         for data in dataset
     ]
@@ -124,6 +125,7 @@ def sample_sharegpt_requests(
 
         prompt_token_ids = tokenizer.encode(prompt)
         completion = dataset[i][1]
+        fake_hit = dataset[i][2]
         completion_token_ids = tokenizer.encode(completion)
         prompt_len = len(prompt_token_ids)
         output_len = (
@@ -143,6 +145,7 @@ def sample_sharegpt_requests(
                 prompt=prompt,
                 prompt_len=prompt_len,
                 output_len=output_len,
+                fake_cache_hit_ratio=fake_hit,
             )
         )
 

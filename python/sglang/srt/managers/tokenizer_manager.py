@@ -1024,6 +1024,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 http_arrival_time=getattr(obj, "http_arrival_time", None),
+                custom_labels=obj.custom_labels,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -2009,7 +2010,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         custom_labels = getattr(state.obj, "custom_labels", None)
         labels = dict(self.metrics_collector.labels)
         if custom_labels:
-            labels.update(custom_labels)
+            labels.update(
+                {
+                    k: v
+                    for k, v in custom_labels.items()
+                    if k != "fake_cache_hit_ratio"
+                }
+            )
         if self.enable_priority_scheduling:
             priority = getattr(state.obj, "priority", None)
             if priority is not None:

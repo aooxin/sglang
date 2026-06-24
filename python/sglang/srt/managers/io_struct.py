@@ -757,6 +757,9 @@ class TokenizedGenerateReqInput(BaseReq):
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
+    # For custom metric labels (and benchmark fake_cache_hit_ratio signal)
+    custom_labels: Optional[Dict[str, str]] = None
+
 
 @dataclass
 class BatchTokenizedGenerateReqInput(BaseBatchReq):

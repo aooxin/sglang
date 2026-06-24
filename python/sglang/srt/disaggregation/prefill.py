@@ -842,8 +842,13 @@ class SchedulerDisaggregationPrefillMixin:
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
+            # Fake reqs: D side has no matching allocation for SWA/draft/mamba state.
+            is_fake_req = getattr(req, "fake_cache_hit_ratio", None) is not None
+
             # Prepare extra pool indices for hybrid models
-            if isinstance(
+            if is_fake_req:
+                state_indices = None
+            elif isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(), HybridLinearKVPool
             ):
                 # Mamba hybrid model: send single mamba state index

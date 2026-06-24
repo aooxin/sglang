@@ -90,6 +90,7 @@ class RequestFuncInput:
     video_data: Optional[List[str]] = None
     audio_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
+    fake_cache_hit_ratio: Optional[float] = None
     routing_key: Optional[str] = None
 
 
@@ -654,6 +655,11 @@ async def async_request_sglang_generate(
         # Add image data if available (list of image urls/base64)
         if request_func_input.image_data:
             payload["image_data"] = request_func_input.image_data
+
+        if request_func_input.fake_cache_hit_ratio is not None:
+            payload.setdefault("custom_labels", {})["fake_cache_hit_ratio"] = str(
+                request_func_input.fake_cache_hit_ratio
+            )
 
         headers = get_request_headers()
         if request_func_input.routing_key:
@@ -1397,6 +1403,7 @@ async def benchmark(
             audio_data=getattr(request, "audio_data", None),
             extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
+            fake_cache_hit_ratio=getattr(request, "fake_cache_hit_ratio", None),
             routing_key=request.routing_key,
         )
 

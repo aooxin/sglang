@@ -28,7 +28,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReq
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ImageData
+from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.hf_transformers_utils import get_processor
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -1104,14 +1104,23 @@ class MMReceiverBase(ABC):
                 if not isinstance(mm_items, list):
                     mm_items = [mm_items]
                 for mm_item in mm_items:
+                    if isinstance(mm_item, VideoData):
+                        url = mm_item.url
+                        preprocess_kwargs = mm_item.preprocess_kwargs
+                    elif isinstance(mm_item, ImageData):
+                        url = mm_item.url
+                        preprocess_kwargs = None
+                    elif isinstance(mm_item, dict):
+                        url = mm_item.get("url")
+                        preprocess_kwargs = mm_item.get("preprocess_kwargs")
+                    else:
+                        url = mm_item
+                        preprocess_kwargs = None
                     mm_data.append(
                         {
-                            "url": (
-                                mm_item.url
-                                if isinstance(mm_item, ImageData)
-                                else mm_item
-                            ),
+                            "url": url,
                             "modality": modality,
+                            "preprocess_kwargs": preprocess_kwargs,
                         }
                     )
         return mm_data
@@ -1189,6 +1198,15 @@ class MMReceiverHTTP(MMReceiverBase):
                         "encoder_idx": idx,
                         "mm_items": [
                             mm_item.get("url")
+                            for mm_item in mm_data_modality[
+                                cum_num_items : cum_num_items + assigned_num
+                            ]
+                        ],
+                        # Parallel to "mm_items" (same slice/order). Carries
+                        # per-request preprocess_kwargs so the encode node can
+                        # honor video fps/max_frames/pixels. JSON-serializable.
+                        "mm_items_preprocess_kwargs": [
+                            mm_item.get("preprocess_kwargs")
                             for mm_item in mm_data_modality[
                                 cum_num_items : cum_num_items + assigned_num
                             ]

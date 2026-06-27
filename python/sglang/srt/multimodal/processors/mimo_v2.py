@@ -591,7 +591,7 @@ class MiMoProcessor:
         except Exception:
             return False
 
-    def _load_video_for_encoder(self, video_data):
+    def _load_video_for_encoder(self, video_data, preprocess_kwargs=None):
         # Normalise once to bytes-or-path; reused by frame decode, audio
         # detection, and audio preprocessing without re-downloading.
         from sglang.srt.utils.common import VideoData, _normalize_video_input
@@ -612,22 +612,27 @@ class MiMoProcessor:
             video_blob, device="cpu",
             num_decode_threads=self.video_decode_num_threads,
         )
+        # Merge per-request preprocess_kwargs over the processor defaults so EPD
+        # honors request-level fps/max_frames just like the single-machine path.
+        ele = {
+            **self.default_video_processor_kwargs,
+            **(preprocess_kwargs or {}),
+        }
         try:
-            video_tuple = _decode_frames_and_timestamps(
-                vdw, self.default_video_processor_kwargs
-            )
+            video_tuple = _decode_frames_and_timestamps(vdw, ele)
         finally:
             if hasattr(vdw, "close"):
                 vdw.close()
         return video_blob, video_tuple
 
-    def preprocess_for_encoder(self, mm_data, modality):
+    def preprocess_for_encoder(self, mm_data, modality, preprocess_kwargs_list=None):
         # EPD encoder-side features. video_audio_* fields appear when any
         # video has audio; the D side uses them to rebuild input_ids.
         from sglang.srt.managers.schedule_batch import Modality
 
         if not isinstance(mm_data, (list, tuple)):
             mm_data = [mm_data]
+        preprocess_kwargs_list = preprocess_kwargs_list or []
 
         if modality == Modality.IMAGE:
             factor = self.patch_size * self.merge_size
@@ -652,10 +657,20 @@ class MiMoProcessor:
             audio_features, audio_feature_lens = [], []
             seg_lens_flat, seg_starts_flat, per_video_num_units = [], [], []
 
-            for video_data in mm_data:
-                video_blob, video_tuple = self._load_video_for_encoder(video_data)
+            for i, video_data in enumerate(mm_data):
+                pk = (
+                    preprocess_kwargs_list[i]
+                    if i < len(preprocess_kwargs_list)
+                    else None
+                ) or {}
+                video_blob, video_tuple = self._load_video_for_encoder(video_data, pk)
+                video_input_overrides = {
+                    k: pk[k]
+                    for k in self.default_video_processor_kwargs
+                    if pk.get(k) is not None
+                }
                 patches, grid, aligned_ts, video_meta = self.process_video(
-                    VideoInput(video=video_tuple)
+                    VideoInput(video=video_tuple, **video_input_overrides)
                 )
                 all_patches.append(patches)
                 all_grids.append(grid)

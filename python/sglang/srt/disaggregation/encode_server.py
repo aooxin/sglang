@@ -755,9 +755,12 @@ class MMEncoder:
         num_parts: int,
         part_idx: int,
         hashes: Optional[List[str]] = None,
+        mm_items_preprocess_kwargs=None,
     ) -> torch.Tensor:
         # mm_inputs: dict
-        mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
+        mm_inputs, get_feature_fn = await self._process_mm_items(
+            mm_items, modality, mm_items_preprocess_kwargs
+        )
         grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
         mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
         num_items = len(grid_thw)
@@ -955,7 +958,9 @@ class MMEncoder:
         ]
         return timestamps
 
-    async def _process_mm_items(self, mm_items, modality):
+    async def _process_mm_items(
+        self, mm_items, modality, mm_items_preprocess_kwargs=None
+    ):
         model_preprocessor = getattr(self.model, "preprocess_mm_for_encoder", None)
 
         if modality == Modality.IMAGE:
@@ -964,7 +969,7 @@ class MMEncoder:
             )
         elif modality == Modality.VIDEO:
             processor_input = await self._process_video_items(
-                mm_items, model_preprocessor
+                mm_items, model_preprocessor, mm_items_preprocess_kwargs
             )
         elif modality == Modality.AUDIO:
             processor_input = await self._process_audio_items(
@@ -986,9 +991,16 @@ class MMEncoder:
         image_config = self.vision_config.get("image", {})
         return self.image_processor(images=images, **image_config)
 
-    async def _process_video_items(self, mm_items, model_preprocessor):
+    async def _process_video_items(
+        self, mm_items, model_preprocessor, mm_items_preprocess_kwargs=None
+    ):
         if model_preprocessor:
-            return model_preprocessor(mm_items, Modality.VIDEO, self.vision_config)
+            return model_preprocessor(
+                mm_items,
+                Modality.VIDEO,
+                self.vision_config,
+                mm_items_preprocess_kwargs,
+            )
         if not self.video_processor:
             raise ValueError("No video processor available")
 
@@ -1068,9 +1080,13 @@ class MMEncoder:
         processor_input["audio_feature_lens"] = output_lengths
         return processor_input
 
-    async def _encode(self, mm_items, modality: Modality) -> torch.Tensor:
+    async def _encode(
+        self, mm_items, modality: Modality, mm_items_preprocess_kwargs=None
+    ) -> torch.Tensor:
         try:
-            mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
+            mm_inputs, get_feature_fn = await self._process_mm_items(
+                mm_items, modality, mm_items_preprocess_kwargs
+            )
         except NotImplementedError as e:
             raise InternalError(f"Not implemented error: {str(e)}")
         except Exception as e:
@@ -1222,9 +1238,19 @@ class MMEncoder:
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
 
-    async def encode(self, mm_items, modality: Modality, req_id, num_parts, part_idx):
+    async def encode(
+        self,
+        mm_items,
+        modality: Modality,
+        req_id,
+        num_parts,
+        part_idx,
+        mm_items_preprocess_kwargs=None,
+    ):
         try:
-            grid_dim, mm_embedding, aux_data = await self._encode(mm_items, modality)
+            grid_dim, mm_embedding, aux_data = await self._encode(
+                mm_items, modality, mm_items_preprocess_kwargs
+            )
 
             if self.rank == 0:
                 mm_data = EmbeddingData(
@@ -1264,6 +1290,7 @@ class MMEncoder:
 
     async def encode_request(self, req: dict, modality: Modality):
         """Single-request encode dispatcher: picks cache vs no-cache path."""
+        mm_items_preprocess_kwargs = req.get("mm_items_preprocess_kwargs")
         if self.mm_global_cache is not None:
             return await self.encode_with_global_cache(
                 mm_items=req["mm_items"],
@@ -1272,6 +1299,7 @@ class MMEncoder:
                 num_parts=req["num_parts"],
                 part_idx=req["part_idx"],
                 hashes=req.get("hashes"),
+                mm_items_preprocess_kwargs=mm_items_preprocess_kwargs,
             )
         return await self.encode(
             mm_items=req["mm_items"],
@@ -1279,6 +1307,7 @@ class MMEncoder:
             req_id=req["req_id"],
             num_parts=req["num_parts"],
             part_idx=req["part_idx"],
+            mm_items_preprocess_kwargs=mm_items_preprocess_kwargs,
         )
 
     async def batch_encode(

@@ -6,6 +6,7 @@ from sglang.srt.parser.jinja_template_utils import (
     detect_jinja_template_content_format,
     process_content_for_template_format,
 )
+from sglang.srt.utils import VideoData
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -323,11 +324,12 @@ class TestTemplateContentFormatDetection(CustomTestCase):
             msg_dict, "openai", image_data, video_data, audio_data, modalities
         )
         self.assertEqual(len(video_data), 1)
-        self.assertEqual(video_data[0], "http://example.com/v.mp4")
+        self.assertIsInstance(video_data[0], VideoData)
+        self.assertEqual(video_data[0].url, "http://example.com/v.mp4")
         self.assertEqual(result["content"][1], {"type": "video"})
 
     def test_process_content_video_with_max_dynamic_patch(self):
-        """Test video_url with max_dynamic_patch stores structured dict."""
+        """Test video_url with max_dynamic_patch stores it on VideoData."""
         msg_dict = {
             "role": "user",
             "content": [
@@ -348,8 +350,8 @@ class TestTemplateContentFormatDetection(CustomTestCase):
             msg_dict, "openai", image_data, video_data, audio_data, modalities
         )
         self.assertEqual(len(video_data), 1)
-        self.assertIsInstance(video_data[0], dict)
-        self.assertEqual(video_data[0]["max_dynamic_patch"], 4)
+        self.assertIsInstance(video_data[0], VideoData)
+        self.assertEqual(video_data[0].max_dynamic_patch, 4)
 
     def test_process_content_v32_encoding(self):
         """Test v32 encoding mode flattens text and ignores structured content parts."""

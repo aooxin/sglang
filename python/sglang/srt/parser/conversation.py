@@ -411,12 +411,7 @@ class Conversation:
 
     def append_video(self, video: str, preprocess_kwargs: Optional[Dict] = None):
         """Append a new video."""
-        if preprocess_kwargs:
-            self.video_data.append(
-                VideoData(video, preprocess_kwargs=preprocess_kwargs)
-            )
-        else:
-            self.video_data.append(video)
+        self.video_data.append(VideoData(video, preprocess_kwargs=preprocess_kwargs))
 
     def append_audio(self, audio: str):
         """Append a new audio."""
@@ -666,7 +661,10 @@ def generate_chat_conv(
                         )
                     elif content.type == "video_url":
                         real_content += video_token
-                        conv.append_video(content.video_url.url)
+                        conv.append_video(
+                            content.video_url.url,
+                            preprocess_kwargs=content.preprocess_kwargs,
+                        )
                     elif content.type == "audio_url":
                         real_content += audio_token
                         conv.append_audio(content.audio_url.url)

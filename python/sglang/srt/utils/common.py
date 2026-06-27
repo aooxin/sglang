@@ -786,6 +786,7 @@ class ImageData:
 class VideoData:
     url: str
     preprocess_kwargs: Optional[Dict] = None
+    max_dynamic_patch: Optional[int] = None
 
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")

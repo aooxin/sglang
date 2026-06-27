@@ -29,6 +29,7 @@ from sglang.srt.parser.conversation import (
     get_model_type,
     register_conv_template,
 )
+from sglang.srt.utils import VideoData
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -694,7 +695,8 @@ class TestConversationMethods(CustomTestCase):
         conv.video_data = []
         conv.append_video("http://example.com/vid.mp4")
         self.assertEqual(len(conv.video_data), 1)
-        self.assertEqual(conv.video_data[0], "http://example.com/vid.mp4")
+        self.assertIsInstance(conv.video_data[0], VideoData)
+        self.assertEqual(conv.video_data[0].url, "http://example.com/vid.mp4")
 
     def test_append_audio(self):
         """Test appending audio data to conversation."""
@@ -1128,7 +1130,8 @@ class TestGenerateChatConv(CustomTestCase):
         )
         conv = generate_chat_conv(request, "chatml")
         self.assertEqual(len(conv.video_data), 1)
-        self.assertEqual(conv.video_data[0], "http://example.com/vid.mp4")
+        self.assertIsInstance(conv.video_data[0], VideoData)
+        self.assertEqual(conv.video_data[0].url, "http://example.com/vid.mp4")
 
     def test_user_message_with_audio(self):
         """Test user message with audio content part."""

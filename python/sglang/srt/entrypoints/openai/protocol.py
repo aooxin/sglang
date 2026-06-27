@@ -463,6 +463,7 @@ class ChatCompletionMessageContentImagePart(BaseModel):
 class ChatCompletionMessageContentVideoPart(BaseModel):
     type: Literal["video_url"]
     video_url: ChatCompletionMessageContentVideoURL
+    preprocess_kwargs: Optional[Dict] = None
 
 
 class ChatCompletionMessageContentAudioPart(BaseModel):

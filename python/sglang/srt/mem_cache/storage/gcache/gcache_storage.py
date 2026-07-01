@@ -30,6 +30,15 @@ class GcacheStorage(HiCacheStorage):
         self.model_name: str = hicache_config.model_name
         assert self.model_name, "Empty model name"
 
+        # Cache the constant key prefix/suffixes so the per-page hot loop only
+        # concatenates the variable middle part instead of formatting a full
+        # f-string for every key.
+        self._key_prefix = f"{self.model_name}_"
+        self._key_suffix_full_k = f"_{self.tp_rank}_full_k"
+        self._key_suffix_full_v = f"_{self.tp_rank}_full_v"
+        self._key_suffix_swa_k = f"_{self.tp_rank}_swa_k"
+        self._key_suffix_swa_v = f"_{self.tp_rank}_swa_v"
+
         # TODO(yingchun): move to python/sglang/srt/environ.py
         master_addr = os.environ.get("GCACHE_MASTER_ADDR")
         cache_group = os.environ.get("GCACHE_CACHE_GROUP")
@@ -403,14 +412,19 @@ class GcacheStorage(HiCacheStorage):
     ):
         if swa_valid_list is not None:
             assert len(keys) == len(swa_valid_list)
+        prefix = self._key_prefix
+        suffix_full_k = self._key_suffix_full_k
+        suffix_full_v = self._key_suffix_full_v
+        suffix_swa_k = self._key_suffix_swa_k
+        suffix_swa_v = self._key_suffix_swa_v
         ret = []
         for i in range(len(keys)):
-            key_ = keys[i]
-            ret.append(f"{self.model_name}_{key_}_{self.tp_rank}_full_k")
-            ret.append(f"{self.model_name}_{key_}_{self.tp_rank}_full_v")
+            mid = prefix + keys[i]
+            ret.append(mid + suffix_full_k)
+            ret.append(mid + suffix_full_v)
             if swa_valid_list is None or swa_valid_list[i]:
-                ret.append(f"{self.model_name}_{key_}_{self.tp_rank}_swa_k")
-                ret.append(f"{self.model_name}_{key_}_{self.tp_rank}_swa_v")
+                ret.append(mid + suffix_swa_k)
+                ret.append(mid + suffix_swa_v)
 
         size_list = []
         if with_size:

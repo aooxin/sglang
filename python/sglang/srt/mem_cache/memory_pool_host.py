@@ -2633,9 +2633,6 @@ class SWATokenToKVPoolHost:
         full_v_base_ptr = self.full_pool_host.v_buffer.data_ptr()
         swa_k_base_ptr = self.swa_pool_host.k_buffer.data_ptr()
         swa_v_base_ptr = self.swa_pool_host.v_buffer.data_ptr()
-        # TODO(yingchun): 改为 full_host_indices[::self.page_size].tolist() 可减少 (page_size-1)/page_size 的对象分配
-        full_host_indices = full_host_indices.tolist()
-        swa_host_indices = self.full_to_swa_index_mapping[full_host_indices]
 
         full_k_stride, full_v_stride, swa_k_stride, swa_v_stride = (
             self._token_stride_sizes
@@ -2647,24 +2644,36 @@ class SWATokenToKVPoolHost:
             swa_v_element_size,
         ) = self._page_element_sizes
 
+        # Vectorized: take the first token index of every page in one shot.
+        page_full_idx = full_host_indices[:: self.page_size]
+        page_swa_idx = self.full_to_swa_index_mapping[page_full_idx]
+
+        # Vectorized per-page pointer computation (one tensor op instead of a
+        # Python scalar loop over pages).
+        full_k_ptrs = (full_k_base_ptr + page_full_idx * full_k_stride).tolist()
+        full_v_ptrs = (full_v_base_ptr + page_full_idx * full_v_stride).tolist()
+        swa_k_ptrs = (swa_k_base_ptr + page_swa_idx * swa_k_stride).tolist()
+        swa_v_ptrs = (swa_v_base_ptr + page_swa_idx * swa_v_stride).tolist()
+
+        swa_needed_mask = page_swa_idx != 0
+        if swa_needed_per_page is not None:
+            swa_needed_mask &= torch.as_tensor(
+                swa_needed_per_page, dtype=torch.bool, device=swa_needed_mask.device
+            )
+        swa_valid_list = swa_needed_mask.tolist()
+
         ptr_list = []
         element_size_list = []
-        swa_valid_list = []
-        page_idx = 0
-        for index in range(0, len(full_host_indices), self.page_size):
-            full_idx = full_host_indices[index]
-            full_k_ptr = full_k_base_ptr + full_idx * full_k_stride
-            full_v_ptr = full_v_base_ptr + full_idx * full_v_stride
-
-            # TODO(yingchun): 可以像 full_host_indices 一样先转为 list，避免 PyTorch dispatch 开销
-            swa_needed = swa_host_indices[index] != 0 and (
-                swa_needed_per_page is None or swa_needed_per_page[page_idx]
-            )
+        for page_idx, swa_needed in enumerate(swa_valid_list):
             if swa_needed:
-                swa_idx = swa_host_indices[index]
-                swa_k_ptr = swa_k_base_ptr + swa_idx * swa_k_stride
-                swa_v_ptr = swa_v_base_ptr + swa_idx * swa_v_stride
-                ptr_list.extend([full_k_ptr, full_v_ptr, swa_k_ptr, swa_v_ptr])
+                ptr_list.extend(
+                    [
+                        full_k_ptrs[page_idx],
+                        full_v_ptrs[page_idx],
+                        swa_k_ptrs[page_idx],
+                        swa_v_ptrs[page_idx],
+                    ]
+                )
                 element_size_list.extend(
                     [
                         full_k_element_size,
@@ -2673,15 +2682,12 @@ class SWATokenToKVPoolHost:
                         swa_v_element_size,
                     ]
                 )
-                swa_valid_list.append(True)
             else:
-                ptr_list.extend([full_k_ptr, full_v_ptr])
+                ptr_list.extend([full_k_ptrs[page_idx], full_v_ptrs[page_idx]])
                 element_size_list.extend(
                     [
                         full_k_element_size,
                         full_v_element_size,
                     ]
                 )
-                swa_valid_list.append(False)
-            page_idx += 1
         return ptr_list, element_size_list, swa_valid_list

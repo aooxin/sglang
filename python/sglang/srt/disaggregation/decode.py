@@ -304,13 +304,6 @@ class DecodePreallocQueue:
             self.transfer_queue._init_staging_handler(self.kv_manager)
         self._init_hybrid_extra_tokens()
 
-        if self.scheduler.tp_worker.is_hybrid_swa:
-            # FIXME: current SWA allocation allocate full kv cache size in prefill
-            self.max_total_num_tokens = min(
-                self.max_total_num_tokens,
-                self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
-            )
-
     def _init_hybrid_extra_tokens(self):
         self.evict_len_per_step = None
         self.swa_extra_need_tokens = 0

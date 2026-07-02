@@ -78,7 +78,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fused_moe_gate = get_bool_env_var("SGLANG_USE_FUSED_MOE_GATE")
 
 if _is_cuda:
-    from moe_cuda import moe_fused_gate
+    if _use_fused_moe_gate:
+        from moe_cuda import moe_fused_gate
+        from moe_fused_gate_pro import mimo_pro_moe_fused_gate
 
     try:
         from flashinfer.fused_moe import fused_topk_deepseek as _fused_topk_deepseek
@@ -782,6 +784,8 @@ def biased_grouped_topk_gpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ):
 
     num_tokens = gating_output.shape[0]
@@ -812,7 +816,6 @@ def biased_grouped_topk_gpu(
         topk_ids = torch.empty(
             (num_tokens, topk), dtype=torch.int32, device=gating_output.device
         )
-
         # flashinfer always applies the scaling_factor internally
         scaling_factor = 1.0
         if routed_scaling_factor is not None and apply_routed_scaling_factor_on_output:
@@ -832,16 +835,9 @@ def biased_grouped_topk_gpu(
         )
 
         return topk_weights, topk_ids
-
-    elif (
-        _is_cuda
-        and ((
-                _use_fused_moe_gate
-                and experts_per_group <= 32) or (num_experts == 256
-                and num_expert_group == 1
-            ))
-        and is_power_of_two(num_experts)
-    ):
+    elif (_is_cuda and ((_use_fused_moe_gate and experts_per_group <= 32) or
+                        (num_experts == 256 and num_expert_group == 1))
+          and is_power_of_two(num_experts)):
         topk_weights, topk_ids = moe_fused_gate(
             gating_output.to(dtype=torch.float32),
             correction_bias,
@@ -854,7 +850,20 @@ def biased_grouped_topk_gpu(
         )
 
         return topk_weights, topk_ids
-
+    elif _is_cuda and ((experts_per_group <= 32
+                        and is_power_of_two(correction_bias.shape[0])) or
+                       (_use_fused_moe_gate and
+                        (num_experts == 256 or num_experts == 384)
+                        and num_expert_group == 1)):
+        return mimo_pro_moe_fused_gate(
+            gating_output.to(dtype=torch.float32),
+            correction_bias,
+            topk=topk,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=
+            apply_routed_scaling_factor_on_output,
+        )
     elif _use_aiter:
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         token = gating_output.shape[0]

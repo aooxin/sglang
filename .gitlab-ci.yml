@@ -248,6 +248,7 @@ stage-b-test-1-gpu-small:
     - pip install "setuptools==70.0.0"
     - pip install "peft==0.18.1"  # peft 0.19+ requires torchao>=0.16 which conflicts with torch 2.9.x bundled torchao 0.9
     - pip install https://cnbj1-fds.api.xiaomi.net/git-assert/moe_fused_gate-1.0.0-cp312-cp312-linux_x86_64.whl  --force-reinstall
+    - pip install https://git-assert.cnbj1.mi-fds.com/git-assert/pro/mimo_pro_moe_fused_gate-1.0.0-cp312-cp312-linux_x86_64.whl --no-cache-dir --no-dependencies --force-reinstall
     - git clone https://github.com/merrymercy/human-eval.git /tmp/human-eval
         && cd /tmp/human-eval && pip install -e . --no-build-isolation && cd -
     - cd test/
@@ -273,6 +274,7 @@ stage-b-test-1-gpu-large:
     - pip install "setuptools==70.0.0"
     - pip install "peft==0.18.1"  # peft 0.19+ requires torchao>=0.16 which conflicts with torch 2.9.x bundled torchao 0.9
     - pip install https://cnbj1-fds.api.xiaomi.net/git-assert/moe_fused_gate-1.0.0-cp312-cp312-linux_x86_64.whl  --force-reinstall
+    - pip install https://git-assert.cnbj1.mi-fds.com/git-assert/pro/mimo_pro_moe_fused_gate-1.0.0-cp312-cp312-linux_x86_64.whl --no-cache-dir --no-dependencies --force-reinstall
     - git clone https://github.com/merrymercy/human-eval.git /tmp/human-eval
         && cd /tmp/human-eval && pip install -e . --no-build-isolation && cd -
     - cd test/

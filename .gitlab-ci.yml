@@ -190,7 +190,7 @@ stage-a-test-1-gpu-small:
   image: micr.cloud.mioffice.cn/llm-infra/sglang-ci:latest
   interruptible: true
   variables:
-    SGLANG_CUDA_COREDUMP: "1"
+    SGLANG_CUDA_COREDUMP: "0"
     SGLANG_JIT_DEEPGEMM_FAST_WARMUP: "true"
     SGLANG_CUDA_COREDUMP_DIR: "/tmp/sglang_cuda_coredumps"
   before_script:

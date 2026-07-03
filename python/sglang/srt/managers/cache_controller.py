@@ -1562,8 +1562,16 @@ class HiCacheController:
         """
         Rate limit the prefetching operations to avoid overwhelming the storage backend.
         """
+        # report prefetch capacity usage ratio for real-time monitoring
+        if self.metrics_collector is not None:
+            self.metrics_collector.log_prefetch_capacity_usage(
+                self.prefetch_tokens_occupied, self.prefetch_capacity_limit
+            )
+
         # cancel prefetch if too much memory is occupied
         if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
+            if self.metrics_collector is not None:
+                self.metrics_collector.log_prefetch_rate_limited()
             return True
         # todo: more sophisticated rate limiting based on storage backend performance
         return False

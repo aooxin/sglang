@@ -1475,6 +1475,18 @@ class TokenizerMetricsCollector:
             labelnames=list(labels.keys()) + ["cache_source"],
         )
 
+        self.prompt_tokens_excluding_abort_total = Counter(
+            name="sglang:prompt_tokens_excluding_abort_total",
+            documentation="Number of prefill tokens processed, excluding aborted requests.",
+            labelnames=labels.keys(),
+        )
+
+        self.cached_tokens_excluding_abort_total = Counter(
+            name="sglang:cached_tokens_excluding_abort_total",
+            documentation="Number of cached prompt tokens, excluding aborted requests.",
+            labelnames=labels.keys(),
+        )
+
         self.raw_cached_tokens_total = Counter(
             name="sglang:raw_cached_tokens_total",
             documentation="Cumulative raw (pre-SWA-trim) prefix cache hit tokens scheduled for prefill.",
@@ -1655,8 +1667,11 @@ class TokenizerMetricsCollector:
         has_grammar: bool,
         retraction_count: int,
         cached_tokens_details: Optional[Dict[str, Any]] = None,
+        is_abort: bool = False,
     ):
         self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
+        if not is_abort:
+            self.prompt_tokens_excluding_abort_total.labels(**labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**labels).inc(generation_tokens)
 
         # Report cached tokens with detailed source breakdown
@@ -1684,6 +1699,10 @@ class TokenizerMetricsCollector:
                 labels_total = {**labels, "cache_source": "total"}
                 self.cached_tokens_total.labels(**labels_total).inc(cached_tokens)
 
+            if not is_abort:
+                self.cached_tokens_excluding_abort_total.labels(**labels).inc(
+                    cached_tokens
+                )
         if raw_cached_tokens > 0:
             self.raw_cached_tokens_total.labels(**labels).inc(raw_cached_tokens)
         if storage_full_hit_tokens > 0:
@@ -1908,6 +1927,19 @@ class StorageMetricsCollector:
             labelnames=[*labels.keys(), "reason"],
         )
 
+        self.prefetch_rate_limited_total = Counter(
+            name="sglang:prefetch_rate_limited_total",
+            documentation="Number of times prefetch was cancelled due to rate limiting.",
+            labelnames=labels.keys(),
+        )
+
+        self.prefetch_capacity_usage_ratio = Gauge(
+            name="sglang:prefetch_capacity_usage_ratio",
+            documentation="Ratio of prefetch tokens occupied to capacity limit (0.0 ~ 1.0+).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
             self.prefetched_tokens_total.labels(**self.labels).inc(prefetched_tokens)
@@ -1936,6 +1968,14 @@ class StorageMetricsCollector:
             self.rewrite_swa_backup_tokens_total.labels(
                 **self.labels, reason=reason
             ).inc(num_tokens)
+
+    def log_prefetch_rate_limited(self):
+        self.prefetch_rate_limited_total.labels(**self.labels).inc()
+
+    def log_prefetch_capacity_usage(self, tokens_occupied: int, capacity_limit: int):
+        self.prefetch_capacity_usage_ratio.labels(**self.labels).set(
+            tokens_occupied / capacity_limit if capacity_limit > 0 else 0.0
+        )
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)

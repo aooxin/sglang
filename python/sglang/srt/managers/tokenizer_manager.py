@@ -2086,6 +2086,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 and i < len(recv_obj.storage_swa_hit_tokens)
                 else 0
             )
+            # Determine if this request was aborted
+            finished_reason = recv_obj.finished_reasons[i]
+            is_abort = (
+                isinstance(finished_reason, dict)
+                and finished_reason.get("type") == "abort"
+            )
+
             self.metrics_collector.observe_one_finished_request(
                 labels,
                 recv_obj.prompt_tokens[i],
@@ -2098,6 +2105,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 self._request_has_grammar(state.obj),
                 retraction_count,
                 cached_tokens_details,
+                is_abort=is_abort,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):

@@ -1443,6 +1443,11 @@ class BaseHiRadixCache(abc.ABC):
                     self.ongoing_prefetch
                 )
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+            # update prefetch capacity usage ratio periodically
+            cc = self.cache_controller
+            self.storage_metrics_collector.log_prefetch_capacity_usage(
+                cc.prefetch_tokens_occupied, cc.prefetch_capacity_limit
+            )
 
     def drain_storage_control_queues(self):
         """

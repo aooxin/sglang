@@ -47,7 +47,7 @@ RUN mkdir -p /home/work/gcache && \
     cd /home/work/gcache && \
     mkdir -p /home/work/log && \
     ln -s /home/work/log log && \
-    python3 -m pip install --no-cache-dir http://cnbj1-fds.api.xiaomi.net/juicefs/gcache/release/2.1/20260527-15c01187/gcache_sdk-0.1.0-py3-none-any.whl
+    python3 -m pip install --no-cache-dir http://cnbj1-fds.api.xiaomi.net/juicefs/gcache/release/2.1/20260701-76cbc3c2/gcache_sdk-2.1.0+g76cbc3c2.release.2.1-py3-none-any.whl
 COPY docker/wait-gcache-server.sh /home/work/gcache/
 RUN python3 -m pip install https://git-assert.cnbj1.mi-fds.com/git-assert/mimo/moe_fused_gate-1.0.0-cp312-cp312-linux_x86_64.whl \
     --no-cache-dir --no-dependencies --force-reinstall

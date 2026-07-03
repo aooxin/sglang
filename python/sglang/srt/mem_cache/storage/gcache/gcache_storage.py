@@ -95,9 +95,10 @@ class GcacheStorage(HiCacheStorage):
         self.prefetch_bandwidth: list = []
         self.backup_bandwidth: list = []
         self.mem_pool_host = mem_pool_host
+        self._last_batch_get_end_ts: float | None = None
 
         if self.enable_storage_metrics:
-            from prometheus_client import Counter
+            from prometheus_client import Counter, Histogram
 
             self._metric_labels = {
                 "storage_backend": "gcache",
@@ -113,6 +114,94 @@ class GcacheStorage(HiCacheStorage):
                 name="sglang:gcache_backup_bytes_total",
                 documentation="Cumulative bytes written to gcache (per rank).",
                 labelnames=self._metric_labels.keys(),
+            )
+            # Fine-grained timing of batch_get_v1 to locate bandwidth bottleneck.
+            _seg_buckets = [
+                0.00005,
+                0.0001,
+                0.0002,
+                0.0005,
+                0.001,
+                0.002,
+                0.005,
+                0.01,
+                0.02,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1.0,
+            ]
+            self._prefetch_preprocess_seconds = Histogram(
+                name="sglang:gcache_prefetch_preprocess_seconds",
+                documentation="Time spent in _batch_preprocess (tolist, ptr/key build).",
+                labelnames=self._metric_labels.keys(),
+                buckets=_seg_buckets,
+            )
+            self._prefetch_rdma_seconds = Histogram(
+                name="sglang:gcache_prefetch_rdma_seconds",
+                documentation="Time spent inside gcache_client.batch_get (pure RDMA + server).",
+                labelnames=self._metric_labels.keys(),
+                buckets=_seg_buckets,
+            )
+            self._prefetch_postprocess_seconds = Histogram(
+                name="sglang:gcache_prefetch_postprocess_seconds",
+                documentation="Time spent in _batch_postprocess.",
+                labelnames=self._metric_labels.keys(),
+                buckets=_seg_buckets,
+            )
+            _bw_buckets = [
+                0.5,
+                1,
+                2,
+                5,
+                10,
+                15,
+                20,
+                25,
+                30,
+                40,
+                50,
+                75,
+                100,
+                150,
+                200,
+            ]
+            self._prefetch_rdma_bandwidth = Histogram(
+                name="sglang:gcache_prefetch_rdma_bandwidth",
+                documentation="RDMA-only bandwidth in GiB/s (bytes / batch_get duration).",
+                labelnames=self._metric_labels.keys(),
+                buckets=_bw_buckets,
+            )
+            _keys_buckets = [1, 4, 8, 16, 32, 64, 96, 128, 192, 256, 512, 1024]
+            self._prefetch_batch_keys = Histogram(
+                name="sglang:gcache_prefetch_batch_keys",
+                documentation="Number of pages (keys) per batch_get_v1 call.",
+                labelnames=self._metric_labels.keys(),
+                buckets=_keys_buckets,
+            )
+            _idle_buckets = [
+                0.00005,
+                0.0001,
+                0.0005,
+                0.001,
+                0.005,
+                0.01,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1.0,
+                2.0,
+                5.0,
+                10.0,
+                30.0,
+            ]
+            self._prefetch_idle_seconds = Histogram(
+                name="sglang:gcache_prefetch_idle_seconds",
+                documentation="Wall-clock gap between consecutive batch_get_v1 calls (NIC idle time).",
+                labelnames=self._metric_labels.keys(),
+                buckets=_idle_buckets,
             )
 
         self.warmup()
@@ -321,36 +410,52 @@ class GcacheStorage(HiCacheStorage):
             extra_info.swa_needed_per_page if extra_info is not None else None
         )
 
-        start_time = time.perf_counter()
+        t0 = time.perf_counter()
         gcache_keys, value_ptr_list, value_size_list, swa_valid_list = (
             self._batch_preprocess(keys, host_indices, swa_needed_per_page)
         )
         assert len(gcache_keys) == len(value_ptr_list) == len(value_size_list)
         logger.debug(f"gcache: begin get {len(gcache_keys)} keys")
 
+        t1 = time.perf_counter()
         results = self.gcache_client.batch_get(
             gcache_keys, value_ptr_list, value_size_list
         )
+        t2 = time.perf_counter()
         assert len(results) == len(gcache_keys)
-
-        end_time = time.perf_counter()
-        execution_time = (end_time - start_time) * 1e6
         success_count = sum(1 for each in results if each)
+
+        ret = self._batch_postprocess(results, swa_valid_list)
+        t3 = time.perf_counter()
+        execution_time = (t3 - t0) * 1e6
 
         if self.enable_storage_metrics:
             self.prefetch_pgs.append(len(keys))
             total_bytes = sum(value_size_list)
-            self.prefetch_bandwidth.append(
-                total_bytes / (end_time - start_time) / (1 << 30)
-            )
-            self._prefetch_bytes_total.labels(**self._metric_labels).inc(total_bytes)
+            self.prefetch_bandwidth.append(total_bytes / (t3 - t0) / (1 << 30))
+            labels = self._metric_labels
+            self._prefetch_bytes_total.labels(**labels).inc(total_bytes)
+            self._prefetch_preprocess_seconds.labels(**labels).observe(t1 - t0)
+            self._prefetch_rdma_seconds.labels(**labels).observe(t2 - t1)
+            self._prefetch_postprocess_seconds.labels(**labels).observe(t3 - t2)
+            rdma_dt = t2 - t1
+            if rdma_dt > 0:
+                self._prefetch_rdma_bandwidth.labels(**labels).observe(
+                    total_bytes / rdma_dt / (1 << 30)
+                )
+            self._prefetch_batch_keys.labels(**labels).observe(len(keys))
+            if self._last_batch_get_end_ts is not None:
+                idle = t0 - self._last_batch_get_end_ts
+                if idle >= 0:
+                    self._prefetch_idle_seconds.labels(**labels).observe(idle)
+            self._last_batch_get_end_ts = t3
 
         logger.debug(
             f"gcache: end get {len(gcache_keys)} keys, success count: {success_count}, "
             f"cost time: {execution_time:.2f} us"
         )
 
-        return self._batch_postprocess(results, swa_valid_list)
+        return ret
 
     ####################################################################################################################
 

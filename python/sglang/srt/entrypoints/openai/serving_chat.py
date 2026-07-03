@@ -744,6 +744,21 @@ class OpenAIServingChat(OpenAIServingBase):
                         choices=[choice_data],
                         model=request.model,
                     )
+
+                    if continuous_usage_stats:
+                        cached_details = (
+                            UsageProcessor._details_if_cached(
+                                cached_tokens.get(index, 0)
+                            )
+                            if self.tokenizer_manager.server_args.enable_cache_report
+                            else None
+                        )
+                        chunk.usage = UsageProcessor.calculate_token_usage(
+                            prompt_tokens=prompt_tokens.get(index, 0),
+                            completion_tokens=0,
+                            cached_tokens=cached_details,
+                        )
+
                     yield f"data: {chunk.model_dump_json()}\n\n"
                     stream_started = True
 

@@ -1070,6 +1070,12 @@ class BaseHiRadixCache(abc.ABC):
                 self.evictable_size_ -= len(node.key)
                 self.protected_size_ += len(node.key)
                 delta -= len(node.key)
+                # Keep SWA evictable/protected buckets in sync with lock_ref
+                # (matches RadixCache.inc_lock_ref; no-op for non-SWA HiCache).
+                # Guard on node.value: evicted ancestors have value=None and
+                # _count_live_swa_tokens asserts a non-empty value.
+                if node.value is not None:
+                    self._on_node_becomes_protected(node)
             node.lock_ref += 1
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
@@ -1088,6 +1094,10 @@ class BaseHiRadixCache(abc.ABC):
                 self.evictable_size_ += len(node.key)
                 self.protected_size_ -= len(node.key)
                 delta += len(node.key)
+                # Symmetric to inc_lock_ref: return live SWA tokens to the
+                # evictable bucket. Same node.value guard for evicted nodes.
+                if node.value is not None:
+                    self._on_node_becomes_evictable(node)
             node.lock_ref -= 1
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)

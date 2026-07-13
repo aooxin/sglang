@@ -14,7 +14,7 @@
 
 import logging
 import time
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -31,6 +31,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import (
@@ -45,6 +46,7 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleDraftExtendCudaGraphRunner,
 )
+from sglang.srt.speculative.multi_layer_eagle_utils import rotate_input_ids_triton
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
@@ -55,9 +57,6 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
 )
 from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda, is_npu
-
-if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_npu = is_npu()
 
@@ -627,6 +626,7 @@ class MultiLayerEagleWorker(TpModelWorker):
         topk_p_list = []
         topk_index_list = []
         for step in range(self.speculative_num_steps):
+            forward_batch.token_to_kv_pool = self.model_runner_list[step].token_to_kv_pool
             logits_output = (
                 self.mtp_model_runner(step).forward(forward_batch).logits_output
             )
@@ -640,12 +640,12 @@ class MultiLayerEagleWorker(TpModelWorker):
             topk_index_list.append(topk_index)
             pt = 0
             if forward_batch.extend_seq_lens is not None:
-                for i, extend_len in enumerate(forward_batch.extend_seq_lens):
-                    input_ids = forward_batch.input_ids[pt : pt + extend_len]
-                    forward_batch.input_ids[pt : pt + extend_len] = torch.cat(
-                        (input_ids[1:], topk_index[i].reshape(1))
-                    )
-                    pt += extend_len
+                rotate_input_ids_triton(
+                    forward_batch.input_ids,
+                    forward_batch.extend_start_loc,
+                    forward_batch.extend_seq_lens,
+                    topk_index,
+                )
 
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info

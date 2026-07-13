@@ -1061,30 +1061,32 @@ class Scheduler(
 
     def _register_draft_kv_pool_for_hicache(self, server_args):
         """Register draft model KV pool with HiCache for EAGLE speculative decoding"""
-        draft_kv_pool, draft_host_kv_pool = None, None
-        draft_kv_pool_list, draft_host_kv_pool_list = [], []
+        draft_kv_pool, draft_host_kv_pool, draft_runner = None, None, None
+        draft_kv_pool_list, draft_host_kv_pool_list, draft_runner_list = [], [], []
 
         if self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:
-                draft_kv_pool_list = [
-                    mtp_runner.token_to_kv_pool
-                    for mtp_runner in self.draft_worker.draft_worker.draft_runner_list
-                ]
-                for mtp_kv_pool in draft_kv_pool_list:
-                    draft_host_kv_pool_list.append(
-                        self._register_host_kv_pool(mtp_kv_pool, server_args)
-                    )
+                draft_runner_list = self.draft_worker.draft_worker.draft_runner_list
             else:
-                draft_kv_pool = (
-                    self.draft_worker.draft_worker.draft_runner.token_to_kv_pool
-                )
-                draft_host_kv_pool = self._register_host_kv_pool(
-                    draft_kv_pool, server_args
-                )
+                draft_runner = self.draft_worker.draft_worker.draft_runner
         else:
-            draft_runner = self.draft_worker.model_runner
+            if self.server_args.enable_multi_layer_eagle:
+                draft_runner_list = self.draft_worker.model_runner_list
+            else:
+                draft_runner = self.draft_worker.model_runner
+        if draft_runner is not None:
             draft_kv_pool = draft_runner.token_to_kv_pool
-            draft_host_kv_pool = self._register_host_kv_pool(draft_kv_pool, server_args)
+            draft_host_kv_pool = self._register_host_kv_pool(
+                draft_kv_pool, server_args
+            )
+        if draft_runner_list:
+            for draft_runner_iter in draft_runner_list:
+                draft_kv_pool_list.append(
+                    draft_runner_iter.token_to_kv_pool
+                )
+                draft_host_kv_pool_list.append(
+                    self._register_host_kv_pool(draft_runner_iter.token_to_kv_pool, server_args)
+                )
 
         self.tree_cache.cache_controller.set_draft_kv_pool(
             draft_kv_pool,
@@ -1104,22 +1106,30 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
-        draft_token_to_kv_pool_list = []
+        draft_token_to_kv_pool_list, draft_runner_list = [], []
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
-        elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
-            if self.server_args.enable_multi_layer_eagle:
-                draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
-                for i in range(len(self.draft_worker.draft_worker.draft_runner_list)):
-                    draft_token_to_kv_pool_list.append(
-                        self.draft_worker.draft_worker.draft_runner_list[
-                            i
-                        ].token_to_kv_pool
-                    )
+        elif self.spec_algorithm.supports_spec_v2():
+            if self.enable_overlap:
+                if self.server_args.enable_multi_layer_eagle:
+                    draft_runner_list = self.draft_worker.draft_worker.draft_runner_list
+                    draft_runner = draft_runner_list[0]
+                else:
+                    draft_runner = self.draft_worker.draft_worker.draft_runner
             else:
-                draft_runner = self.draft_worker.draft_worker.draft_runner
+                if self.server_args.enable_multi_layer_eagle:
+                    draft_runner_list = self.draft_worker.model_runner_list
+                    draft_runner = draft_runner_list[0]
+                else:
+                    draft_runner = self.draft_worker.model_runner
+
             draft_token_to_kv_pool = draft_runner.token_to_kv_pool
             model_config = draft_runner.model_config
+            if draft_runner_list:
+                for draft_runner_iter in draft_runner_list:
+                    draft_token_to_kv_pool_list.append(
+                        draft_runner_iter.token_to_kv_pool
+                    )
         else:
             draft_token_to_kv_pool = self.draft_worker.model_runner.token_to_kv_pool
             model_config = self.draft_worker.model_config

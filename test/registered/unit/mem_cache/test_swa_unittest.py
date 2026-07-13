@@ -478,8 +478,8 @@ class TestSWA(unittest.TestCase):
         )
         self.assertEqual(len(kv_indices), 6)
         self.assertEqual(len(last_node.key), 2)
-        self.assertEqual(last_node.key.token_ids[0], (5, 60))
-        self.assertEqual(last_node.key.token_ids[1], (60, 70))
+        self.assertTrue(last_node.key.is_ngram)
+        self.assertEqual(list(last_node.key), [(5, 60), (60, 70)])
 
     def test_swa_cache_finished_req_eagle_uses_cache_protected_len_and_bigram_key(self):
         tree, allocator, req_to_token_pool = self._build_swa_tree(is_eagle=True)
@@ -507,7 +507,7 @@ class TestSWA(unittest.TestCase):
 
         def wrapped_insert(params):
             captured["prev_prefix_len"] = params.prev_prefix_len
-            captured["is_bigram"] = params.key.is_bigram
+            captured["is_ngram"] = params.key.is_ngram
             captured["key_len"] = len(params.key)
             return original_insert(params)
 
@@ -515,7 +515,7 @@ class TestSWA(unittest.TestCase):
         tree.cache_finished_req(req, is_insert=True)
 
         self.assertEqual(captured["prev_prefix_len"], req.cache_protected_len)
-        self.assertTrue(captured["is_bigram"])
+        self.assertTrue(captured["is_ngram"])
         self.assertEqual(captured["key_len"], len(req.origin_input_ids) - 1)
 
         # Case 2: is_insert=False should free [cache_protected_len:page_aligned_len]

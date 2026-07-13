@@ -141,6 +141,77 @@ class TestRadixKey(unittest.TestCase):
         self.assertIn("...", repr_str)  # Should be truncated
 
 
+class TestRadixKeyNgram(unittest.TestCase):
+    """Test cases for RadixKey ngram (bigram/MTP) mode."""
+
+    def test_maybe_to_ngram_view_bigram(self):
+        """Test O(1) flip to bigram mode (step=1)."""
+        key = RadixKey([1, 2, 3, 4])
+        key.maybe_to_ngram_view(is_eagle=True, step=1)
+        self.assertTrue(key.is_ngram)
+        self.assertEqual(key.step, 1)
+        self.assertEqual(len(key), 3)  # raw 4 - step 1
+
+    def test_maybe_to_ngram_view_mtp(self):
+        """Test O(1) flip to ngram mode (step=3)."""
+        key = RadixKey([1, 2, 3, 4, 5, 6])
+        key.maybe_to_ngram_view(is_eagle=True, step=3)
+        self.assertTrue(key.is_ngram)
+        self.assertEqual(key.step, 3)
+        self.assertEqual(len(key), 3)  # raw 6 - step 3
+
+    def test_iter_bigram(self):
+        """Test iteration yields bigram tuples."""
+        key = RadixKey([10, 20, 30, 40], is_ngram=True, step=1)
+        self.assertEqual(list(key), [(10, 20), (20, 30), (30, 40)])
+
+    def test_iter_mtp(self):
+        """Test iteration yields 4-gram tuples (step=3)."""
+        key = RadixKey([1, 2, 3, 4, 5, 6], is_ngram=True, step=3)
+        self.assertEqual(list(key), [(1, 2, 3, 4), (2, 3, 4, 5), (3, 4, 5, 6)])
+
+    def test_getitem_slice_ngram(self):
+        """Test slicing preserves boundary tokens."""
+        # bigram: raw [10,20,30,40], logical len=3
+        key = RadixKey([10, 20, 30, 40], is_ngram=True, step=1)
+        sliced = key[1:3]
+        # logical [1:3] -> raw [1:3+1] = [20,30,40]
+        self.assertEqual(sliced.token_ids, [20, 30, 40])
+        self.assertTrue(sliced.is_ngram)
+        self.assertEqual(len(sliced), 2)
+        self.assertEqual(list(sliced), [(20, 30), (30, 40)])
+
+    def test_getitem_empty_slice_ngram(self):
+        """Test empty slice in ngram mode."""
+        key = RadixKey([10, 20, 30], is_ngram=True, step=1)
+        sliced = key[1:1]
+        self.assertEqual(sliced.token_ids, [])
+        self.assertEqual(len(sliced), 0)
+
+    def test_raw_page_slice_bigram(self):
+        """Test raw_page_slice returns page_size + step tokens in ngram mode."""
+        key = RadixKey([1, 2, 3, 4, 5, 6], is_ngram=True, step=1)
+        # page at logical index 0, page_size=2 -> raw [0:2+1] = [1,2,3]
+        self.assertEqual(key.raw_page_slice(0, 2), [1, 2, 3])
+        # page at logical index 2, page_size=2 -> raw [2:2+2+1] = [3,4,5]
+        self.assertEqual(key.raw_page_slice(2, 2), [3, 4, 5])
+
+    def test_raw_page_slice_plain(self):
+        """Test raw_page_slice in plain mode returns exactly page_size tokens."""
+        key = RadixKey([1, 2, 3, 4, 5, 6])
+        self.assertEqual(key.raw_page_slice(0, 2), [1, 2])
+        self.assertEqual(key.raw_page_slice(2, 3), [3, 4, 5])
+
+    def test_value_truncation(self):
+        """Test that maybe_to_ngram_view truncates value to logical length."""
+        key = RadixKey([1, 2, 3, 4, 5])
+        value = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int64)
+        key, value = key.maybe_to_ngram_view(is_eagle=True, value=value, step=2)
+        self.assertEqual(len(key), 3)
+        self.assertEqual(len(value), 3)
+        torch.testing.assert_close(value, torch.tensor([10, 20, 30], dtype=torch.int64))
+
+
 class TestTreeNode(unittest.TestCase):
     """Test cases for TreeNode class."""
 
@@ -793,7 +864,7 @@ class TestRadixCacheMTP(unittest.TestCase):
         )
 
         # [1,2,3,4,5,6] with step=3 -> [(1,2,3,4), (2,3,4,5), (3,4,5,6)], len=3
-        # Pass raw token_ids, let cache internally convert via maybe_bigram_convert
+        # Pass raw token_ids, let cache internally flip via maybe_to_ngram_view.
         key = RadixKey([1, 2, 3, 4, 5, 6])
         value = torch.tensor([10, 20, 30, 40, 50, 60], dtype=torch.int64)
 

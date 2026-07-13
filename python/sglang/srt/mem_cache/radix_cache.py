@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.utils import convert_to_steps_key
 
 """
 Copyright 2023-2024 SGLang Team
@@ -69,54 +68,84 @@ if TYPE_CHECKING:
 
 
 class RadixKey:
+    """
+    is_ngram=True: token_ids holds raw tokens; logical length = len(token_ids) - step.
+    Iterating yields tuples of size (step+1). Slicing preserves boundary tokens.
+    """
+
+    __slots__ = ("token_ids", "extra_key", "is_ngram", "step")
+
     def __init__(
         self,
         token_ids: List[int],
         extra_key: Optional[str] = None,
-        is_bigram: bool = False,
+        is_ngram: bool = False,
+        step: int = 1,
     ):
-        # token ids sequence
         self.token_ids = token_ids
-        # extra key (e.g. lora_id, cache_salt)
         self.extra_key = extra_key
-        # is bigram key
-        self.is_bigram = is_bigram
+        self.is_ngram = is_ngram
+        self.step = step
 
     def __len__(self) -> int:
+        if self.is_ngram:
+            n = len(self.token_ids)
+            return max(0, n - self.step)
         return len(self.token_ids)
 
-    def __iter__(self) -> Iterator[int]:
-        return iter(self.token_ids)
+    def __iter__(self) -> Iterator:
+        if self.is_ngram:
+            t = self.token_ids
+            s = self.step
+            for i in range(len(t) - s):
+                yield tuple(t[i : i + s + 1])
+        else:
+            yield from self.token_ids
 
     def __getitem__(self, idx: Union[int, slice]) -> "RadixKey":
-        if isinstance(idx, slice):
-            return RadixKey(self.token_ids[idx], self.extra_key)
-        return RadixKey([self.token_ids[idx]], self.extra_key)
+        if isinstance(idx, int):
+            if idx < 0:
+                idx += len(self)
+            if idx < 0 or idx >= len(self):
+                raise IndexError(f"RadixKey index out of range: {idx}")
+            idx = slice(idx, idx + 1)
+        start, stop, step_val = idx.indices(len(self))
+        if step_val != 1:
+            raise ValueError("RadixKey slice step must be 1")
+
+        if self.is_ngram:
+            raw = self.token_ids[start : stop + self.step] if stop > start else []
+            return RadixKey(raw, self.extra_key, is_ngram=True, step=self.step)
+        return RadixKey(self.token_ids[start:stop], self.extra_key)
 
     def __repr__(self) -> str:
         preview = self.token_ids[:10]
-        return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''})"
+        return (
+            f"RadixKey(extra_key={self.extra_key!r}, "
+            f"token_ids={preview}{'...' if len(self.token_ids) > 10 else ''}, "
+            f"is_ngram={self.is_ngram}, step={self.step})"
+        )
 
+    def maybe_to_ngram_view(
+        self, is_eagle: bool, value: Optional[torch.Tensor] = None, step: int = 1
+    ) -> Tuple["RadixKey", Optional[torch.Tensor]]:
+        """O(1) flip to ngram mode. Truncates value to logical length."""
+        if is_eagle and not self.is_ngram:
+            self.is_ngram = True
+            self.step = step
+            if value is not None:
+                value = value[: len(self)]
+        return self, value
 
-def maybe_bigram_convert(
-    is_eagle: bool,
-    key: RadixKey,
-    value: Optional[torch.Tensor] = None,
-    speculative_num_steps: int = 1,
-) -> Tuple[RadixKey, Optional[torch.Tensor]]:
-    if is_eagle and not key.is_bigram:
-        key.token_ids = convert_to_steps_key(key.token_ids, speculative_num_steps)
-        key.is_bigram = True
-        if value is not None:
-            value = value[: len(key)]
-    return key, value
-
-
-def page_align_keys(key: list, page_size) -> list:
-    if page_size == 1:
-        return key
-    page_aligned_len = len(key) // page_size * page_size
-    return key[:page_aligned_len]
+    def raw_page_slice(self, start: int, page_size: int) -> List[int]:
+        """Return raw tokens covering one logical page, suitable for hashing.
+        ngram mode: page_size + step raw tokens.
+        plain mode: page_size raw tokens.
+        Caller is responsible for ensuring start + page_size <= len(self).
+        """
+        if self.is_ngram:
+            return self.token_ids[start : start + page_size + self.step]
+        return self.token_ids[start : start + page_size]
 
 
 class TreeNode:
@@ -196,27 +225,44 @@ def _key_match_page_size1(key0: RadixKey, key1: RadixKey):
         if k0 != k1:
             break
         i += 1
+    if key0.is_ngram:
+        return max(0, i - key0.step)
     return i
 
 
 def _key_match_paged(key0: RadixKey, key1: RadixKey, page_size: int):
     _check_extra_key(key0, key1)
-    min_len = min(len(key0), len(key1))
+    if key0.is_ngram:
+        # Walk raw tokens one by one, convert to ngram count, round to page boundary.
+        i = 0
+        for a, b in zip(key0.token_ids, key1.token_ids):
+            if a != b:
+                break
+            i += 1
+        ngram_matched = max(0, i - key0.step)
+        ngram_matched = min(ngram_matched, len(key0), len(key1))
+        return (ngram_matched // page_size) * page_size
 
+    min_len = min(len(key0), len(key1))
     i = 0
     while i < min_len:
         if key0.token_ids[i : i + page_size] != key1.token_ids[i : i + page_size]:
             break
         i += page_size
-
     return i
 
 
 def get_child_key(key: RadixKey, page_size: int = 1):
-    if page_size == 1:
-        plain_key = key.token_ids[0]
+    if key.is_ngram:
+        if page_size == 1:
+            plain_key = tuple(key.token_ids[: key.step + 1])
+        else:
+            plain_key = tuple(key.token_ids[: page_size + key.step])
     else:
-        plain_key = tuple(key.token_ids[:page_size])
+        if page_size == 1:
+            plain_key = key.token_ids[0]
+        else:
+            plain_key = tuple(key.token_ids[:page_size])
     if key.extra_key is None:
         return plain_key
     else:
@@ -244,12 +290,16 @@ def compute_node_hash_values(node: "TreeNode", page_size: int) -> List[str]:
 
     # Iterate through node's pages
     for start in range(0, len(node.key), page_size):
-        page_tokens = node.key.token_ids[start : start + page_size]
+        page_tokens = node.key.raw_page_slice(start, page_size)
         if not page_tokens:
             continue
 
         # Use SHA256-based chaining via get_hash_str
-        hash_val = get_hash_str(page_tokens, prior_hash=parent_hash)
+        hash_val = get_hash_str(
+            page_tokens,
+            prior_hash=parent_hash,
+            step=node.key.step if node.key.is_ngram else 0,
+        )
         hash_values.append(hash_val)
         parent_hash = hash_val
 
@@ -374,11 +424,6 @@ class RadixCache(BasePrefixCache):
         self.evictable_leaves.clear()
         self._record_all_cleared_event()
 
-    def maybe_bigram_convert(
-        self, key: RadixKey, value: Optional[torch.Tensor] = None
-    ) -> Tuple[RadixKey, Optional[torch.Tensor]]:
-        return maybe_bigram_convert(self.is_eagle, key, value, self.speculative_num_steps)
-
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
 
@@ -417,7 +462,7 @@ class RadixCache(BasePrefixCache):
                 subsequent match efficiency and does not duplicate data.
         """
         key = params.key
-        key, _ = self.maybe_bigram_convert(key)
+        key.maybe_to_ngram_view(self.is_eagle, step=self.speculative_num_steps)
 
         def empty_match_result():
             return MatchResult(
@@ -463,7 +508,9 @@ class RadixCache(BasePrefixCache):
         if value is None:
             value = torch.tensor(key.token_ids, dtype=torch.int64)
 
-        key, value = self.maybe_bigram_convert(key, value)
+        key, value = key.maybe_to_ngram_view(
+            self.is_eagle, value, step=self.speculative_num_steps
+        )
 
         prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
         return InsertResult(prefix_len=prefix_len)
@@ -499,17 +546,23 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # Maybe convert to tuple keys for EAGLE/MTP
-        keys = convert_to_steps_key(token_ids, self.speculative_num_steps) if self.is_eagle else token_ids
-        keys = page_align_keys(keys, self.page_size)
-        values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
-        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+        key = RadixKey(token_ids, req.extra_key)
+        key.maybe_to_ngram_view(self.is_eagle, step=self.speculative_num_steps)
+        logical_len = len(key)
+        page_aligned_len = (
+            logical_len // self.page_size * self.page_size
+            if self.page_size != 1
+            else logical_len
+        )
+        values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
             result = self.insert(
-                InsertParams(key=radix_key, value=values, priority=priority)
+                InsertParams(
+                    key=key[:page_aligned_len], value=values, priority=priority
+                )
             )
             new_prefix_len = result.prefix_len
             # Free the duplicates that were already in the tree
@@ -518,11 +571,11 @@ class RadixCache(BasePrefixCache):
             )
         else:
             self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : len(keys)]
+                kv_indices[req.cache_protected_len : page_aligned_len]
             )
 
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[len(keys) :])
+        self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
@@ -537,16 +590,21 @@ class RadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # Maybe convert to tuple keys for EAGLE/MTP
-        keys = convert_to_steps_key(token_ids, self.speculative_num_steps) if self.is_eagle else token_ids
-        keys = page_align_keys(keys, self.page_size)
-        values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
-        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+        key = RadixKey(token_ids, req.extra_key)
+        key.maybe_to_ngram_view(self.is_eagle, step=self.speculative_num_steps)
+        logical_len = len(key)
+        page_aligned_len = (
+            logical_len // self.page_size * self.page_size
+            if self.page_size != 1
+            else logical_len
+        )
+        aligned_key = key[:page_aligned_len]
+        values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
         result = self.insert(
             InsertParams(
-                key=radix_key,
+                key=aligned_key,
                 value=values,
                 chunked=chunked,
                 priority=getattr(req, "priority", 0) or 0,
@@ -559,12 +617,14 @@ class RadixCache(BasePrefixCache):
         )
 
         # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        match_result = self.match_prefix(MatchPrefixParams(key=aligned_key))
         new_indices, new_last_node = (
             match_result.device_indices,
             match_result.last_device_node,
         )
-        assert len(new_indices) == len(keys), f"{len(new_indices)=}, {len(keys)=}"
+        assert (
+            len(new_indices) == page_aligned_len
+        ), f"{len(new_indices)=}, {page_aligned_len=}"
 
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),

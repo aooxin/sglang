@@ -50,7 +50,6 @@ from sglang.srt.mem_cache.simple_swa_radix_cache import (
     compute_swa_safe_len,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.utils import convert_to_steps_key
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 
 if TYPE_CHECKING:
@@ -478,7 +477,7 @@ class BaseHiRadixCache(abc.ABC):
         try:
             for req_id, info in list(self.ongoing_prefetch.items()):
                 try:
-                    last_host_node, token_ids, host_indices, _operation = info
+                    last_host_node, key, host_indices, _operation = info
                 except Exception:
                     # Unexpected shape; just drop it.
                     self.ongoing_prefetch.pop(req_id, None)
@@ -500,7 +499,7 @@ class BaseHiRadixCache(abc.ABC):
                     )
 
                 try:
-                    cc.prefetch_tokens_occupied -= len(token_ids)
+                    cc.prefetch_tokens_occupied -= len(key)
                     if cc.prefetch_tokens_occupied < 0:
                         cc.prefetch_tokens_occupied = 0
                 except Exception:
@@ -565,9 +564,9 @@ class BaseHiRadixCache(abc.ABC):
                 self.prefetch_trace_attrs_by_reqid.pop(req_id, None)
                 info = self.ongoing_prefetch.pop(req_id, None)
                 if info is not None:
-                    last_host_node, token_ids, _, _ = info
+                    last_host_node, key, _, _ = info
                     last_host_node.release_host()
-                    cc.prefetch_tokens_occupied -= len(token_ids)
+                    cc.prefetch_tokens_occupied -= len(key)
                     if cc.prefetch_tokens_occupied < 0:
                         cc.prefetch_tokens_occupied = 0
 
@@ -1597,9 +1596,7 @@ class BaseHiRadixCache(abc.ABC):
 
         # todo: more policies for prefetch progress such as timeout
         # the current policy is to prefetch with best effort and terminate when queuing is over
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
-            req_id
-        ]
+        last_host_node, key, host_indices, operation = self.ongoing_prefetch[req_id]
         assert operation.host_indices is not None
 
         if not self.can_terminate_prefetch(operation):
@@ -1642,13 +1639,15 @@ class BaseHiRadixCache(abc.ABC):
                 == cc.mem_pool_host.swa_pool_host.available_size()
             )
 
-        fetched_token_ids = token_ids[:min_completed_tokens]
+        # RadixKey slicing automatically handles raw/logical offset (ngram mode
+        # extends raw tokens by step, plain mode is identity).
+        fetched_key = key[:min_completed_tokens]
+        # Preserve the parent's extra_key on the host-side insertion key.
+        fetched_key.extra_key = last_host_node.key.extra_key
         written_indices = host_indices[:min_completed_tokens]
         matched_length, matched_tree_host_indices = self._insert_helper_host(
             last_host_node,
-            RadixKey(
-                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
-            ),
+            fetched_key,
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
         )
@@ -1688,11 +1687,12 @@ class BaseHiRadixCache(abc.ABC):
         self.storage_full_hit_by_reqid[req_id] = operation.full_hit_count
         self.storage_swa_hit_by_reqid[req_id] = operation.swa_hit_count
         del self.ongoing_prefetch[req_id]
-        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+        # Match the += at prefetch time which used len(aligned_key).
+        self.cache_controller.prefetch_tokens_occupied -= len(key)
         self.prefetch_trace_attrs_by_reqid[req_id] = {
             "hicache_prefetch_done.tp_completed_tokens": completed_tokens,
             "hicache_prefetch_done.min_completed_tokens": min_completed_tokens,
-            "hicache_prefetch_done.requested_tokens": len(token_ids),
+            "hicache_prefetch_done.requested_tokens": len(key),
             "hicache_prefetch_done.io_duration_ms": round(
                 (io_duration or 0) * 1000, 2
             ),
@@ -1739,7 +1739,7 @@ class BaseHiRadixCache(abc.ABC):
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
-        key, _ = self.maybe_bigram_convert(key)
+        key.maybe_to_ngram_view(self.is_eagle, step=self.speculative_num_steps)
         if self.disable or len(key) == 0:
             return MatchResult(
                 device_indices=empty_value,
@@ -1803,16 +1803,14 @@ class BaseHiRadixCache(abc.ABC):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
     ) -> bool:
-        new_input_tokens = (
-            convert_to_steps_key(new_input_tokens, self.speculative_num_steps)
-            if self.is_eagle
-            else new_input_tokens
+        prefetch_key = RadixKey(new_input_tokens)
+        prefetch_key.maybe_to_ngram_view(
+            self.is_eagle, step=self.speculative_num_steps
         )
         # align the number of fetching tokens to the page size
-        prefetch_length = len(new_input_tokens) - (
-            len(new_input_tokens) % self.page_size
-        )
-        new_input_tokens = new_input_tokens[:prefetch_length]
+        prefetch_length = len(prefetch_key) - (len(prefetch_key) % self.page_size)
+        aligned_key = prefetch_key[:prefetch_length]
+
         if (
             not self.enable_storage
             or prefetch_length < self.prefetch_threshold
@@ -1851,17 +1849,17 @@ class BaseHiRadixCache(abc.ABC):
             req_id,
             full_host_indices,
             swa_host_indices,
-            new_input_tokens,
+            aligned_key,
             last_hash,
             prefix_keys,
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
-            new_input_tokens,
+            aligned_key,
             full_host_indices,
             operation,
         )
-        self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
+        self.cache_controller.prefetch_tokens_occupied += len(aligned_key)
         return True
 
     def _insert_helper_host(
@@ -2009,7 +2007,9 @@ class BaseHiRadixCache(abc.ABC):
 
         if priority is None:
             priority = 0
-        key, value = self.maybe_bigram_convert(key, value)
+        key, value = key.maybe_to_ngram_view(
+            self.is_eagle, value, step=self.speculative_num_steps
+        )
 
         if len(key) == 0:
             return InsertResult(prefix_len=0)
@@ -2220,7 +2220,7 @@ class BaseHiRadixCache(abc.ABC):
         if rid not in self.ongoing_prefetch:
             return
 
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[rid]
+        last_host_node, key, host_indices, operation = self.ongoing_prefetch[rid]
         assert operation.host_indices is not None
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
@@ -2231,7 +2231,7 @@ class BaseHiRadixCache(abc.ABC):
         self.cache_controller.append_full_and_swa_mem_release_separately(
             host_indices[:completed_tokens]
         )
-        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+        self.cache_controller.prefetch_tokens_occupied -= len(key)
 
 
 def _collect_evicted_host_indices(

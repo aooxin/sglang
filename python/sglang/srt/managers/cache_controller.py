@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+    from sglang.srt.mem_cache.radix_cache import RadixKey
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -222,12 +223,13 @@ class PrefetchOperation(StorageOperation):
         self,
         request_id: str,
         host_indices: torch.Tensor,
-        token_ids: List[int],
+        key: "RadixKey",
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         swa_host_indices: Optional[torch.Tensor] = None,
     ):
         self.request_id = request_id
+        self.key = key
         self.swa_valid_mask: Optional[torch.Tensor] = None
         self.full_hit_count: int = 0
         self.swa_hit_count: int = 0
@@ -240,7 +242,7 @@ class PrefetchOperation(StorageOperation):
 
         super().__init__(
             host_indices,
-            token_ids,
+            key.token_ids,  # raw tokens, kept for backward compat with StorageOperation
             last_hash,
             prefix_keys=prefix_keys,
             swa_host_indices=swa_host_indices,
@@ -1324,7 +1326,7 @@ class HiCacheController:
         request_id: str,
         full_host_indices: torch.Tensor,
         swa_host_indices: torch.Tensor,
-        new_input_tokens: List[int],
+        key: "RadixKey",
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
     ) -> PrefetchOperation:
@@ -1334,7 +1336,7 @@ class HiCacheController:
         operation = PrefetchOperation(
             request_id,
             full_host_indices,
-            new_input_tokens,
+            key,
             last_hash,
             prefix_keys,
             swa_host_indices=swa_host_indices,
@@ -1634,24 +1636,23 @@ class HiCacheController:
         - non-hybrid: shape [1], carrying only storage_hit_count.
         """
         last_hash = operation.last_hash
-        tokens_to_fetch = operation.token_ids
+        key = operation.key
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
 
         storage_query_count = 0
         hash_values = []
         swa_valid_pages = []
 
-        for start in range(
-            0, len(tokens_to_fetch), self.page_size * self.storage_batch_size
-        ):
-            end = min(
-                start + self.page_size * self.storage_batch_size, len(tokens_to_fetch)
-            )
-            batch_tokens = tokens_to_fetch[start:end]
+        logical_len = len(key)
+
+        for start in range(0, logical_len, self.page_size * self.storage_batch_size):
+            end = min(start + self.page_size * self.storage_batch_size, logical_len)
             batch_hashes = []
-            for i in range(0, len(batch_tokens), self.page_size):
+            for i in range(start, end, self.page_size):
                 last_hash = self.get_hash_str(
-                    batch_tokens[i : i + self.page_size], last_hash
+                    key.raw_page_slice(i, self.page_size),
+                    last_hash,
+                    step = key.step if key.is_ngram else 0,
                 )
                 batch_hashes.append(last_hash)
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
@@ -1690,7 +1691,7 @@ class HiCacheController:
             )
 
         if self.is_hybrid_swa:
-            new_input_pages = len(tokens_to_fetch) // self.page_size
+            new_input_pages = logical_len // self.page_size
             valid_page_count = len(swa_valid_pages)
             assert (
                 valid_page_count <= new_input_pages

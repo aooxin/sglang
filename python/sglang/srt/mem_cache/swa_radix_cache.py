@@ -46,11 +46,8 @@ from sglang.srt.mem_cache.radix_cache import (
     _key_match_page_size1,
     _key_match_paged,
     get_child_key,
-    maybe_bigram_convert,
-    page_align_keys,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.utils import convert_to_bigram_key
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -362,10 +359,8 @@ class SWARadixCache(BasePrefixCache):
             self.key_match_fn = partial(_key_match_paged, page_size=self.page_size)
             self.get_child_key_fn = partial(get_child_key, page_size=self.page_size)
 
-        if self.is_eagle:
-            self.key_convert_fn = convert_to_bigram_key
-        else:
-            self.key_convert_fn = lambda key: key
+        # SWA cache uses bigram keys for EAGLE, matching step=1 in ngram terminology.
+        self.speculative_num_steps = 1
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -432,9 +427,11 @@ class SWARadixCache(BasePrefixCache):
         swa_evicted_seqlen = params.swa_evicted_seqlen
 
         if value is None:
-            value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
+            value = torch.tensor(key.token_ids, dtype=torch.int64)
 
-        key, value = maybe_bigram_convert(self.is_eagle, key, value)
+        key, value = key.maybe_to_ngram_view(
+            self.is_eagle, value, step=self.speculative_num_steps
+        )
 
         prefix_len = self._insert_helper(
             self.root_node, key, value, prev_prefix_len, swa_evicted_seqlen
@@ -456,16 +453,16 @@ class SWARadixCache(BasePrefixCache):
             req.req_pool_idx, :kv_committed_len
         ]
 
-        # Maybe convert to bigram keys for EAGLE
-        keys = self.key_convert_fn(token_ids)
-        keys = page_align_keys(keys, self.page_size)
-        page_aligned_len = len(keys)
-        values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
-        radix_key = RadixKey(
-            keys[:page_aligned_len],
-            req.extra_key,
-            is_bigram=self.is_eagle,
+        key = RadixKey(token_ids, req.extra_key)
+        key.maybe_to_ngram_view(self.is_eagle, step=self.speculative_num_steps)
+        logical_len = len(key)
+        page_aligned_len = (
+            logical_len // self.page_size * self.page_size
+            if self.page_size != 1
+            else logical_len
         )
+        values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
+        aligned_key = key[:page_aligned_len]
         old_prefix_len = req.cache_protected_len
 
         # Radix Cache takes one ref in memory pool
@@ -473,7 +470,7 @@ class SWARadixCache(BasePrefixCache):
         if is_insert:
             self.insert(
                 InsertParams(
-                    key=radix_key,
+                    key=aligned_key,
                     value=values,
                     prev_prefix_len=old_prefix_len,
                     swa_evicted_seqlen=req.swa_evicted_seqlen,
@@ -508,17 +505,23 @@ class SWARadixCache(BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        keys = self.key_convert_fn(token_ids)
-        keys = page_align_keys(keys, self.page_size)
-        values = kv_indices[: len(keys)].to(dtype=torch.int64, copy=True)
-        radix_key = RadixKey(keys, req.extra_key, is_bigram=self.is_eagle)
+        key = RadixKey(token_ids, req.extra_key)
+        key.maybe_to_ngram_view(self.is_eagle, step=self.speculative_num_steps)
+        logical_len = len(key)
+        page_aligned_len = (
+            logical_len // self.page_size * self.page_size
+            if self.page_size != 1
+            else logical_len
+        )
+        aligned_key = key[:page_aligned_len]
+        values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
         old_prefix_len = req.cache_protected_len
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
         result = self.insert(
             InsertParams(
-                key=radix_key,
+                key=aligned_key,
                 value=values,
                 prev_prefix_len=old_prefix_len,
             )
@@ -526,7 +529,7 @@ class SWARadixCache(BasePrefixCache):
         new_prefix_len = result.prefix_len
 
         # The prefix indices could be updated, reuse it
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        match_result = self.match_prefix(MatchPrefixParams(key=aligned_key))
         new_indices, new_last_node = (
             match_result.device_indices,
             match_result.last_device_node,
@@ -846,7 +849,7 @@ class SWARadixCache(BasePrefixCache):
     def _match_pre_processor(self, params: MatchPrefixParams) -> Optional[RadixKey]:
         """Preprocess the key before matching."""
         key = params.key
-        key, _ = maybe_bigram_convert(self.is_eagle, key)
+        key.maybe_to_ngram_view(self.is_eagle, step=self.speculative_num_steps)
 
         if self.disable or len(key) == 0:
             return None

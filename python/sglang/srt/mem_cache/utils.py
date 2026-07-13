@@ -13,7 +13,7 @@
 # ==============================================================================
 """Common utilities."""
 
-from typing import Any, List, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 import triton
@@ -349,23 +349,3 @@ def maybe_init_custom_mem_pool(
         return init_mooncake_custom_mem_pool(device)
     else:
         return False, None, None
-
-
-def convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
-    # EAGLE uses bigram keys in the radix tree since draft sequence is the one-token-shifted version of target
-    # [1, 2, 3, 4] -> [(1,2), (2,3), (3,4)]
-    if len(tokens) and isinstance(tokens[0], tuple):
-        return tokens
-    if len(tokens) < 2:
-        return []
-    return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
-
-
-def convert_to_steps_key(tokens: List[int], step: int) -> List[tuple]:
-    # MTP uses multistep keys in the radix tree since n-th draft model is the n-token-shifted version of target
-    # [1, 2, 3, 4] -> [(1,2,3), (2,3,4)] for step=2
-    if len(tokens) and isinstance(tokens[0], tuple):
-        return tokens
-    if len(tokens) < step + 1:
-        return []
-    return [tuple(tokens[i : i + step + 1]) for i in range(len(tokens) - step)]

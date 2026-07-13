@@ -16,34 +16,27 @@ logger = logging.getLogger(__name__)
 
 
 def get_hash_str(
-    token_ids: torch.Tensor | List[int], prior_hash: Optional[str] = None
+    token_ids: List[int], prior_hash: Optional[str] = None, step: int = 0
 ) -> str:
     hasher = hashlib.sha256()
 
     if prior_hash:
         hasher.update(bytes.fromhex(prior_hash))
 
-    if isinstance(token_ids, torch.Tensor):
-        # Flatten to 1D and encode each element as 4-byte little-endian unsigned,
-        # consistent with the non-tensor path.
-        hasher.update(token_ids.flatten().to(torch.int32).numpy().tobytes())
-    elif len(token_ids) == 0:
+    if len(token_ids) == 0:
         pass  # Empty list, no need to update hasher
+    elif step > 0:
+        n = len(token_ids)
+        gram_len = step + 1
+        num_grams = n - step
+        if num_grams > 0:
+            raw = struct.pack(f"<{n}I", *token_ids)
+            mv = memoryview(raw)
+            for i in range(num_grams):
+                hasher.update(mv[i * 4 : (i + gram_len) * 4])
     else:
-        first = next(iter(token_ids))
-        is_tuple_mode = isinstance(first, tuple)
-
-        if is_tuple_mode:
-            # EAGLE bigram mode: each element is a (int, int,...) sample tuple
-            # Flatten all tuples and batch-pack: [t0[0], t0[1], t1[0], t1[1], ...]
-            flattened = []
-            for t in token_ids:
-                flattened.extend(t)
-            buf = struct.pack(f"<{len(flattened)}I", *flattened)
-            hasher.update(buf)
-        else:
-            buf = struct.pack(f"<{len(token_ids)}I", *token_ids)
-            hasher.update(buf)
+        buf = struct.pack(f"<{len(token_ids)}I", *token_ids)
+        hasher.update(buf)
 
     return hasher.hexdigest()
 

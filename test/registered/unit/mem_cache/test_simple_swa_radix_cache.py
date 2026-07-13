@@ -727,7 +727,7 @@ class TestSimpleSWARadixCache(_SWACacheTestBase, CustomTestCase):
         cache.insert(InsertParams(key=RadixKey(token_ids), value=kv_indices))
 
         # EAGLE mode stores (step+1)-grams in the radix tree, so N tokens map
-        # to N - speculative_num_steps tree slots (see convert_to_steps_key).
+        # to N - speculative_num_steps tree slots (see RadixKey.maybe_to_ngram_view).
         kv_len = len(token_ids) - speculative_num_steps
         result_full = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
         self.assertEqual(len(result_full.device_indices), kv_len)

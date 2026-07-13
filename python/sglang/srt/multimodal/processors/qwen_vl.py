@@ -2,7 +2,7 @@ import math
 import os
 import re
 import time
-from typing import List, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
@@ -158,6 +158,7 @@ async def preprocess_video(
     vr,
     image_factor: int = IMAGE_FACTOR,
     video_config: dict = {},
+    timing: Optional[dict] = None,
 ) -> torch.Tensor:
     # preprocessed video
     is_video_obj = isinstance(vr, VideoDecoderWrapper)
@@ -174,6 +175,9 @@ async def preprocess_video(
     idx = np.unique(idx)
 
     video = vr.get_frames_as_tensor(idx.tolist())
+    decode_end = time.perf_counter()
+    if timing is not None:
+        timing["decode"] = timing.get("decode", 0.0) + (decode_end - entry_time)
 
     video = video.permute(0, 3, 1, 2)  # NHWC -> TCHW
 
@@ -226,6 +230,10 @@ async def preprocess_video(
         "video_backend": "torchvision",
     }
     torchvision_resize_time = time.perf_counter()
+    if timing is not None:
+        timing["preprocess"] = timing.get("preprocess", 0.0) + (
+            torchvision_resize_time - decode_end
+        )
     logger.debug(
         f"[preprocess_video Perf], "
         f"get_batch_time: {(get_batch_time - entry_time) * 1000:.2f} ms, "

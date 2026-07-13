@@ -2135,3 +2135,227 @@ class LogitProcessorCollector:
             name="sglang:no_repeat_processor_truncated_count",
             documentation="The request count of no-repeat n-gram processor found repetition.",
         )
+
+
+class EncoderMetricsCollector:
+    """Metrics collector for encoder instance."""
+
+    def __init__(self, labels: Dict[str, str]) -> None:
+        from prometheus_client import Counter, Gauge, Histogram
+
+        self.labels = labels
+
+        self.cache_evictions_total = Counter(
+            name="sglang:encoder_cache_evictions_total",
+            documentation="Total cache evictions.",
+            labelnames=list(labels.keys()) + ["modality"],
+        )
+        self.cache_size_mb = Gauge(
+            name="sglang:encoder_cache_size_mb",
+            documentation="Current cache size in MB.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.cache_entries = Gauge(
+            name="sglang:encoder_cache_entries",
+            documentation="Current number of cache entries.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.cache_hit_tokens_total = Counter(
+            name="sglang:encoder_cache_hit_tokens_total",
+            documentation="Total tokens served from cache (cache hits).",
+            labelnames=list(labels.keys()) + ["modality"],
+        )
+        self.cache_total_tokens_total = Counter(
+            name="sglang:encoder_cache_total_tokens_total",
+            documentation="Total tokens processed (hit + miss).",
+            labelnames=list(labels.keys()) + ["modality"],
+        )
+        self.cache_hit_files_total = Counter(
+            name="sglang:encoder_cache_hit_files_total",
+            documentation="Total files served from cache.",
+            labelnames=list(labels.keys()) + ["modality"],
+        )
+        self.cache_total_files_total = Counter(
+            name="sglang:encoder_cache_total_files_total",
+            documentation="Total files processed (hit + miss).",
+            labelnames=list(labels.keys()) + ["modality"],
+        )
+
+        # Total encoder requests by modality and status
+        self.requests_total = Counter(
+            name="sglang:encoder_requests_total",
+            documentation="Total encoder requests by modality and status.",
+            labelnames=list(labels.keys()) + ["modality", "status"],
+        )
+
+        # Total requests received per DP rank (incremented at receive time, before processing).
+        # Use rate(sglang:encoder_requests_received_total[1m]) for per-encoder QPS.
+        self.requests_received_total = Counter(
+            name="sglang:encoder_requests_received_total",
+            documentation="Total requests received by encoder (at receive time), per DP rank.",
+            labelnames=list(labels.keys()) + ["dp_rank", "modality"],
+        )
+
+        # Multimodal items per batch histogram
+        self.mm_items_per_batch = Histogram(
+            name="sglang:encoder_mm_items_per_batch",
+            documentation="Histogram of multimodal items processed per encoder batch.",
+            labelnames=list(labels.keys()) + ["modality"],
+            buckets=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64, 128],
+        )
+
+        # Multimodal items per request histogram
+        self.mm_items_per_request = Histogram(
+            name="sglang:encoder_mm_items_per_request",
+            documentation="Histogram of multimodal items per individual encoder request.",
+            labelnames=list(labels.keys()) + ["modality"],
+            buckets=[1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 24, 32, 64],
+        )
+
+        # Per-request end-to-end encoder latency.
+        self.request_e2e_seconds = Histogram(
+            name="sglang:encoder_request_e2e_seconds",
+            documentation="Per-request end-to-end encoder latency. per-request latency as experienced; do not sum across requests.",
+            labelnames=list(labels.keys()) + ["modality"],
+            buckets=[0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30],
+        )
+
+        # --- Latency breakdown histograms ---
+
+        # Queue wait: time spent in scheduler queue before batch processing starts
+        self.queue_wait_seconds = Histogram(
+            name="sglang:encoder_queue_wait_seconds",
+            documentation="Time request spent waiting in scheduler queue.",
+            labelnames=list(labels.keys()) + ["modality"],
+            buckets=[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10],
+        )
+
+        # Download: fetch bytes to local (HTTP GET / base64 decode / file read).
+        self.download_seconds = Histogram(
+            name="sglang:encoder_download_seconds",
+            documentation="Per-request media download latency (fetch bytes). per-request latency as experienced; do not sum across requests.",
+            labelnames=list(labels.keys()) + ["modality"],
+            buckets=[0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30],
+        )
+
+        # Decode: bytes -> raw media (PIL/nvJPEG decode, AudioDecoder, video frame decode).
+        self.decode_seconds = Histogram(
+            name="sglang:encoder_decode_seconds",
+            documentation="Per-request media decode latency (bytes to raw media). per-request latency as experienced; do not sum across requests.",
+            labelnames=list(labels.keys()) + ["modality"],
+            buckets=[0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30],
+        )
+
+        # Preprocess: HF processor only (excludes download/decode).
+        self.preprocess_seconds = Histogram(
+            name="sglang:encoder_preprocess_seconds",
+            documentation="Processor (feature extraction) latency, excluding media download/decode.",
+            labelnames=list(labels.keys()) + ["modality"],
+            buckets=[0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30],
+        )
+
+        #  Model forward: model forward pass latency
+        self.model_forward_seconds = Histogram(
+            name="sglang:encoder_model_forward_seconds",
+            documentation="GPU model forward pass latency.",
+            labelnames=list(labels.keys()) + ["modality"],
+            buckets=[0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5],
+        )
+
+    def _inc_cache_counter(self, counter, modality: str, count: int = 1) -> None:
+        counter.labels(**self.labels, modality=modality).inc(count)
+
+    def inc_cache_evictions(self, modality: str = "image", count: int = 1) -> None:
+        self._inc_cache_counter(self.cache_evictions_total, modality, count)
+
+    def record_cache_tokens(
+        self, hit_tokens: int, total_tokens: int, modality: str = "image"
+    ) -> None:
+        self._inc_cache_counter(self.cache_total_tokens_total, modality, total_tokens)
+        if hit_tokens > 0:
+            self._inc_cache_counter(self.cache_hit_tokens_total, modality, hit_tokens)
+
+    def record_cache_files(
+        self, hit_files: int, total_files: int, modality: str = "image"
+    ) -> None:
+        self._inc_cache_counter(self.cache_total_files_total, modality, total_files)
+        if hit_files > 0:
+            self._inc_cache_counter(self.cache_hit_files_total, modality, hit_files)
+
+    def set_cache_state(self, current_size: int, num_entries: int) -> None:
+        self.cache_size_mb.labels(**self.labels).set(current_size / (1024 * 1024))
+        self.cache_entries.labels(**self.labels).set(num_entries)
+
+    def observe_queue_wait(
+        self, latency_seconds: float, modality: str = "image"
+    ) -> None:
+        """Record time spent waiting in the scheduler queue."""
+        self.queue_wait_seconds.labels(**self.labels, modality=modality).observe(
+            latency_seconds
+        )
+
+    def observe_download(
+        self, latency_seconds: float, modality: str = "image"
+    ) -> None:
+        """Record per-request media download latency."""
+        self.download_seconds.labels(**self.labels, modality=modality).observe(
+            latency_seconds
+        )
+
+    def observe_decode(
+        self, latency_seconds: float, modality: str = "image"
+    ) -> None:
+        """Record per-request media decode latency."""
+        self.decode_seconds.labels(**self.labels, modality=modality).observe(
+            latency_seconds
+        )
+
+    def observe_preprocess(
+        self, latency_seconds: float, modality: str = "image"
+    ) -> None:
+        """Record processor (feature-extraction) latency, excluding download/decode."""
+        self.preprocess_seconds.labels(**self.labels, modality=modality).observe(
+            latency_seconds
+        )
+
+    def observe_model_forward(
+        self, latency_seconds: float, modality: str = "image"
+    ) -> None:
+        """Record model forward pass latency."""
+        self.model_forward_seconds.labels(**self.labels, modality=modality).observe(
+            latency_seconds
+        )
+
+    def observe_mm_items_per_batch(self, count: int, modality: str = "image") -> None:
+        """Record the number of multimodal items processed in a batch."""
+        self.mm_items_per_batch.labels(**self.labels, modality=modality).observe(count)
+
+    def observe_mm_items_per_request(
+        self, count: int, modality: str = "image"
+    ) -> None:
+        """Record the number of multimodal items in a single request."""
+        self.mm_items_per_request.labels(**self.labels, modality=modality).observe(
+            count
+        )
+
+    def inc_requests_total(self, modality: str, status: str) -> None:
+        """Increment encoder request counter. status: 'success' | 'error'."""
+        self.requests_total.labels(
+            **self.labels, modality=modality, status=status
+        ).inc()
+
+    def inc_requests_received(self, dp_rank: int = 0, modality: str = "image") -> None:
+        """Increment the received-requests counter at request-arrival time."""
+        self.requests_received_total.labels(
+            **self.labels, dp_rank=str(dp_rank), modality=modality
+        ).inc()
+
+    def observe_request_e2e(
+        self, latency_seconds: float, modality: str = "image"
+    ) -> None:
+        """Record per-request end-to-end encoder latency in seconds."""
+        self.request_e2e_seconds.labels(
+            **self.labels, modality=modality
+        ).observe(latency_seconds)

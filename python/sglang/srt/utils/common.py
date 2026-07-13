@@ -707,10 +707,15 @@ def get_mm_http_session() -> requests.Session:
 
 
 def load_audio(
-    audio_file: str, sr: Optional[int] = None, mono: bool = True
+    audio_file: str,
+    sr: Optional[int] = None,
+    mono: bool = True,
+    timing: Optional[dict] = None,
 ) -> np.ndarray:
     if sr is None:
         sr = 16000
+
+    _dl_start = time.perf_counter() if timing is not None else None
 
     # Normalize input: resolve URL / base64 / file:// to bytes or path
     if isinstance(audio_file, bytes):
@@ -731,6 +736,12 @@ def load_audio(
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
 
+    if timing is not None:
+        timing["download"] = timing.get("download", 0.0) + (
+            time.perf_counter() - _dl_start
+        )
+        _dec_start = time.perf_counter()
+
     if _BACKEND == "torchcodec":
         from torchcodec.decoders import AudioDecoder
 
@@ -740,6 +751,10 @@ def load_audio(
             num_channels=1 if mono else None,
         )
         samples = decoder.get_all_samples()
+        if timing is not None:
+            timing["decode"] = timing.get("decode", 0.0) + (
+                time.perf_counter() - _dec_start
+            )
         if mono:
             return samples.data.squeeze(0).numpy()
         return samples.data.T.numpy()
@@ -771,6 +786,10 @@ def load_audio(
         else:
             audio = audio_tensor.T.numpy()
 
+    if timing is not None:
+        timing["decode"] = timing.get("decode", 0.0) + (
+            time.perf_counter() - _dec_start
+        )
     return audio
 
 
@@ -810,6 +829,7 @@ def _load_image(
     image_bytes: bytes = b"",
     image_file: str = "",
     gpu_image_decode: bool = True,
+    timing: Optional[dict] = None,
 ) -> Union[torch.Tensor, Image.Image]:
     """
     Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
@@ -817,26 +837,44 @@ def _load_image(
     Keep the fallback path since nvJPEG may fail on some JPEG images that are not strictly compliant with the standard, while PIL is more tolerant.
     """
     if image_file != "":
+        _dl_start = time.perf_counter() if timing is not None else None
         image_bytes = get_image_bytes(image_file)
+        if timing is not None:
+            timing["download"] = timing.get("download", 0.0) + (
+                time.perf_counter() - _dl_start
+            )
+    _dec_start = time.perf_counter() if timing is not None else None
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
             image_tensor = decode_jpeg(encoded_image, device="cuda")
+            if timing is not None:
+                timing["decode"] = timing.get("decode", 0.0) + (
+                    time.perf_counter() - _dec_start
+                )
             return image_tensor
         except Exception as e:
             logger.warning(
                 f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
             )
-    return Image.open(BytesIO(image_bytes))
+    image = Image.open(BytesIO(image_bytes))
+    if timing is not None:
+        timing["decode"] = timing.get("decode", 0.0) + (
+            time.perf_counter() - _dec_start
+        )
+    return image
 
 
 def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
     gpu_image_decode: bool = True,
+    timing: Optional[dict] = None,
 ) -> tuple[Union[torch.Tensor, Image.Image], Optional[tuple[int, int]]]:
     """
     Load image from multiple input formats, including:
     ImageData, PIL Image, bytes, URL, file path, or base64 string.
+
+    timing (dict): receives {"download","decode"} seconds; None = no-op.
     """
     if isinstance(image_file, ImageData):
         image_file = image_file.url
@@ -847,24 +885,35 @@ def load_image(
         image = image_file
         image_size = (image.width, image.height)
     elif isinstance(image_file, bytes):
-        image = _load_image(image_bytes=image_file, gpu_image_decode=gpu_image_decode)
+        image = _load_image(
+            image_bytes=image_file, gpu_image_decode=gpu_image_decode, timing=timing
+        )
     elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+        image = _load_image(
+            image_file=image_file, gpu_image_decode=gpu_image_decode, timing=timing
+        )
     elif isinstance(image_file, str) and image_file.startswith("file://"):
         image = _load_image(
             image_file=unquote(urlparse(image_file).path),
             gpu_image_decode=gpu_image_decode,
+            timing=timing,
         )
     elif isinstance(image_file, str) and image_file.lower().endswith(
         image_extension_names
     ):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+        image = _load_image(
+            image_file=image_file, gpu_image_decode=gpu_image_decode, timing=timing
+        )
     elif isinstance(image_file, str) and image_file.startswith("data:"):
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+        image = _load_image(
+            image_file=image_file, gpu_image_decode=gpu_image_decode, timing=timing
+        )
     elif isinstance(
         image_file, str
     ):  # Other formats, try to decode as base64 by default
-        image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
+        image = _load_image(
+            image_file=image_file, gpu_image_decode=gpu_image_decode, timing=timing
+        )
     else:
         raise ValueError(f"Invalid image: {image_file}")
     return image, image_size
@@ -926,7 +975,11 @@ def _normalize_video_input(
         return None
 
 
-def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
+def load_video(
+    video_file: Union[str, bytes, VideoData],
+    use_gpu: bool = True,
+    timing: Optional[dict] = None,
+):
     if isinstance(video_file, VideoData):
         # preprocess_kwargs is consumed by the multimodal processor, not here.
         video_file = video_file.url
@@ -934,7 +987,13 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
     if isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
         return video_file
 
+    # Only download timed here; decode is lazy (recorded by preprocess_video).
+    _dl_start = time.perf_counter() if timing is not None else None
     source = _normalize_video_input(video_file)
+    if timing is not None:
+        timing["download"] = timing.get("download", 0.0) + (
+            time.perf_counter() - _dl_start
+        )
     if source is None:
         raise ValueError(f"Unsupported video input type: {type(video_file)}")
 

@@ -717,6 +717,11 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                     n_prev_tokens[index] = total_output_logprobs
 
+                # Attach logprobs to the first chunk emitted this step (reasoning,
+                # tool-call, or content) so they aren't dropped when a parser is active
+                # nor duplicated across chunks; flush any leftover at the end.
+                remaining_logprobs = choice_logprobs
+
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
@@ -800,7 +805,9 @@ class OpenAIServingChat(OpenAIServingBase):
                                 index=index,
                                 delta=DeltaMessage(reasoning_content=reasoning_text),
                                 finish_reason=None,
+                                logprobs=remaining_logprobs,
                             )
+                            remaining_logprobs = None
                             chunk = ChatCompletionStreamResponse(
                                 id=content["meta_info"]["id"],
                                 created=int(time.time()),
@@ -854,8 +861,9 @@ class OpenAIServingChat(OpenAIServingBase):
                             delta=DeltaMessage(content=delta),
                             finish_reason=None,
                             matched_stop=None,
-                            logprobs=choice_logprobs,
+                            logprobs=remaining_logprobs,
                         )
+                        remaining_logprobs = None
                         chunk = ChatCompletionStreamResponse(
                             id=content["meta_info"]["id"],
                             created=int(time.time()),
@@ -872,6 +880,36 @@ class OpenAIServingChat(OpenAIServingBase):
                             )
 
                         yield f"data: {chunk.model_dump_json()}\n\n"
+
+                # Flush logprobs still unattached this step — only when a parser is
+                # active, since _process_tool_call_stream may consume the delta and
+                # emit no content chunk. On the plain path an empty-delta step has
+                # no chunk to attach to either way, and a standalone empty-delta
+                # logprobs chunk is not a shape clients expect.
+                if remaining_logprobs is not None and (
+                    self.reasoning_parser or self.tool_call_parser
+                ):
+                    flush_chunk = ChatCompletionStreamResponse(
+                        id=content["meta_info"]["id"],
+                        created=int(time.time()),
+                        choices=[
+                            ChatCompletionResponseStreamChoice(
+                                index=index,
+                                delta=DeltaMessage(),
+                                finish_reason=None,
+                                logprobs=remaining_logprobs,
+                            )
+                        ],
+                        model=request.model,
+                    )
+                    if continuous_usage_stats:
+                        flush_chunk.usage = UsageProcessor.calculate_token_usage(
+                            prompt_tokens=prompt_tokens.get(index, 0),
+                            reasoning_tokens=reasoning_tokens.get(index, 0),
+                            completion_tokens=completion_tokens.get(index, 0),
+                        )
+                    yield f"data: {flush_chunk.model_dump_json()}\n\n"
+                    remaining_logprobs = None
 
             # Send finish_reason chunks for each index that completed
             for idx, finish_reason_data in finish_reasons.items():
@@ -1156,11 +1194,8 @@ class OpenAIServingChat(OpenAIServingBase):
             token_bytes = list(token.encode("utf-8"))
             top_logprobs = []
             if logprobs.top_logprobs:
-                # - Non-streaming (use_token_index=True): uses token_idx for full data
-                # - Streaming (use_token_index=False): uses index 0 for pre-sliced data
-                top_logprobs_idx = token_idx if use_token_index else 0
                 for top_token, top_logprob in logprobs.top_logprobs[
-                    top_logprobs_idx
+                    token_idx
                 ].items():
                     top_token_bytes = list(top_token.encode("utf-8"))
                     top_logprobs.append(

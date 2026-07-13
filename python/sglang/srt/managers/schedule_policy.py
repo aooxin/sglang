@@ -4,7 +4,7 @@ import logging
 
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import floor_align, get_bool_env_var
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
 logger = logging.getLogger(__name__)
@@ -231,6 +231,8 @@ class SchedulePolicy:
                 match_result.last_host_node,
                 match_result.host_hit_length,
             )
+            r.swa_refill_node = match_result.swa_refill_node
+            r.swa_refill_len = match_result.swa_refill_len
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -603,6 +605,17 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    def _estimate_swa_refill_tokens(self, req: Req) -> int:
+        if req.swa_refill_len <= len(req.prefix_indices):
+            return 0
+
+        # SWA refill only needs the sliding-window tail, not the whole full-cache
+        # prefix that becomes usable after refill.
+        tail_start = max(0, req.swa_refill_len - self.sliding_window_size)
+        tail_start = floor_align(tail_start, self.page_size)
+        refill_start = max(len(req.prefix_indices), tail_start)
+        return req.swa_refill_len - refill_start
+
     def budget_state(self):
         if self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0:
             return AddReqResult.NO_TOKEN
@@ -966,7 +979,11 @@ class PrefillAdder:
                     req.last_host_node, req.host_hit_length
                 )
 
-            swa_total_tokens = swa_load_back_tokens + swa_extend_tokens
+            swa_refill_tokens = self._estimate_swa_refill_tokens(req)
+
+            swa_total_tokens = (
+                swa_load_back_tokens + swa_refill_tokens + swa_extend_tokens
+            )
 
         real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
@@ -983,13 +1000,19 @@ class PrefillAdder:
                 )
                 swa_evictable = self.tree_cache.swa_evictable_size()
                 logger.warning(
-                    "swa mem not enough, try to increase swa!!! "
-                    f"swa_total_tokens_needed={swa_total_tokens} "
-                    f"(load_back={swa_load_back_tokens}, extend={swa_extend_tokens}), "
+                    "SWA KV cache budget is insufficient. Increase the SWA KV "
+                    "pool size or reduce SWA memory demand (smaller batch/chunk). "
+                    f"swa_total_tokens_needed={swa_total_tokens} (load_back={swa_load_back_tokens}, refill={swa_refill_tokens}, extend={swa_extend_tokens}), "
                     f"rem_swa_total_tokens={self.rem_swa_total_tokens}, "
                     f"swa_available_size={swa_available}, "
                     f"swa_evictable_size={swa_evictable}, "
-                    f"swa_rem_total_token_offset={self.swa_rem_total_token_offset}"
+                    f"swa_rem_total_token_offset={self.swa_rem_total_token_offset}, "
+                    f"req.rid={req.rid}, "
+                    f"req.extend_input_len={req.extend_input_len}, "
+                    f"req.host_hit_length={req.host_hit_length}, "
+                    f"req.prefix_indices_len={len(req.prefix_indices)}, "
+                    f"req.swa_refill_len={req.swa_refill_len}, "
+                    f"req.fill_ids_len={len(req.fill_ids)}"
                 )
             return AddReqResult.NO_TOKEN
 
@@ -1012,9 +1035,10 @@ class PrefillAdder:
                     )
                     swa_evictable = self.tree_cache.swa_evictable_size()
                     logger.warning(
-                        "[lock_node] swa mem not enough, try to increase swa!!! "
-                        f"swa_total_tokens_needed={swa_total_tokens} "
-                        f"(load_back={swa_load_back_tokens}, extend={swa_extend_tokens}), "
+                        "[lock_node] SWA KV cache budget is insufficient. Increase "
+                        "the SWA KV pool size or reduce SWA memory demand (smaller "
+                        "batch/chunk). "
+                        f"swa_total_tokens_needed={swa_total_tokens} (load_back={swa_load_back_tokens}, refill={swa_refill_tokens}, extend={swa_extend_tokens}), "
                         f"rem_swa_total_tokens={self.rem_swa_total_tokens}, "
                         f"swa_available_size={swa_available}, "
                         f"swa_evictable_size={swa_evictable}, "
@@ -1023,11 +1047,16 @@ class PrefillAdder:
                         f"req.extend_input_len={req.extend_input_len}, "
                         f"req.host_hit_length={req.host_hit_length}, "
                         f"req.prefix_indices_len={len(req.prefix_indices)}, "
+                        f"req.swa_refill_len={req.swa_refill_len}, "
                         f"req.fill_ids_len={len(req.fill_ids)}"
                     )
                 return AddReqResult.NO_TOKEN
 
             if req.host_hit_length > 0:
+                assert req.swa_refill_len == 0, (
+                    "host load-back and device SWA refill are expected to be "
+                    "mutually exclusive"
+                )
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         last_host_node=req.last_host_node,
@@ -1048,6 +1077,24 @@ class PrefillAdder:
                 # len(req.prefix_indices)=155840, host_hit_len=53504, req.extend_input_len=4126
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+
+            if req.swa_refill_len > len(req.prefix_indices):
+                refill_indices = self.tree_cache.init_swa_refill(
+                    req.swa_refill_node,
+                    len(req.prefix_indices),
+                    req.swa_refill_len,
+                )
+                if len(refill_indices) > 0:
+                    req.time_stats.trace_ctx.trace_slice_add_attr(
+                        {"hicache_swa_refill_start.refill_tokens": len(refill_indices)},
+                    )
+                    req.prefix_indices = torch.cat([req.prefix_indices, refill_indices])
+                    req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+                    req.host_hit_length = 0
+                    req.last_matched_prefix_len = len(req.prefix_indices)
+                    req.last_node = req.swa_refill_node
+                req.swa_refill_node = None
+                req.swa_refill_len = 0
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
             if self.dllm_config is not None:

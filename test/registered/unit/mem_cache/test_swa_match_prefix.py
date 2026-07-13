@@ -27,16 +27,20 @@ Coverage targets:
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.hiradix_cache import HiSimpleSWARadixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 from sglang.srt.mem_cache.simple_swa_radix_cache import SimpleSWARadixCache
@@ -827,6 +831,350 @@ class TestCollectEvictedHostIndices(CustomTestCase):
 
         with self.assertRaises(AssertionError):
             _collect_evicted_host_indices(evicted_no_backup, ancestor)
+
+
+def _make_hicache_swa_cache(
+    host_indices: torch.Tensor,
+    swa_host_indices: torch.Tensor,
+    sliding_window_size: int = 4,
+    page_size: int = 1,
+):
+    cache = HiSimpleSWARadixCache.__new__(HiSimpleSWARadixCache)
+    mapping = torch.zeros(int(host_indices.max().item()) + 1, dtype=torch.int64)
+    mapping[host_indices] = swa_host_indices
+    cache.token_to_kv_pool_host = SimpleNamespace(full_to_swa_index_mapping=mapping)
+    cache.sliding_window_size = sliding_window_size
+    cache.page_size = page_size
+    cache.is_hybrid = True
+    return cache
+
+
+def _make_hicache_evicted_node(parent: TreeNode, host_value: torch.Tensor) -> TreeNode:
+    node = TreeNode()
+    node.parent = parent
+    node.host_value = host_value
+    node.value = None
+    return node
+
+
+class _RecordingDeviceAllocator:
+    def __init__(self):
+        self.calls = []
+
+    def alloc_device(self, host_indices, swa_valid_mask):
+        self.calls.append((host_indices, swa_valid_mask))
+        return torch.arange(len(host_indices), dtype=torch.int64), 0, 0
+
+
+class _RecordingCacheController:
+    def __init__(self):
+        self.alloc_calls = []
+        self.load_calls = []
+
+    def alloc_device(self, host_indices, swa_valid_mask=None):
+        self.alloc_calls.append((host_indices, swa_valid_mask))
+        return torch.arange(len(host_indices), dtype=torch.int64), 0, 0
+
+    def load(self, host_indices, device_indices, priority=None, node_id=-1):
+        self.load_calls.append((host_indices, device_indices, priority, node_id))
+
+    def assert_host_indices(self, host_indices, host_hit_length):
+        pass
+
+
+class _RecordingSwaRefillController:
+    def __init__(self):
+        self.calls = []
+        self.swa_host_indices = None
+
+    def get_swa_host_indices(self, host_indices):
+        if self.swa_host_indices is not None:
+            return self.swa_host_indices[host_indices]
+        return host_indices + 10000
+
+    def refill_device_swa(
+        self, host_indices, device_indices, priority=None, node_id=-1
+    ):
+        self.calls.append((host_indices, device_indices, priority, node_id))
+        return True, len(host_indices), 0
+
+
+def _prepare_hicache_load_back(cache):
+    cache.cache_controller = _RecordingCacheController()
+    cache.load_back_threshold = 0
+    cache.enable_hicache_metrics = False
+    cache.debug_mode = False
+    cache.ongoing_load_back = {}
+    cache.evictable_size_ = 0
+    cache.inc_lock_ref = lambda node: 0
+    cache.dec_lock_ref = lambda node: None
+    cache.evict = lambda lack_full_size, lack_swa_size: None
+    cache._on_tree_value_added = lambda node: None
+    return cache.cache_controller
+
+
+def _make_hicache_load_back_chain(host_indices: torch.Tensor) -> TreeNode:
+    root = TreeNode()
+    root.value = torch.empty(0, dtype=torch.int64)
+    root.host_value = torch.empty(0, dtype=torch.int64)
+    parent = _make_hicache_evicted_node(root, host_indices[: len(host_indices) // 2])
+    return _make_hicache_evicted_node(parent, host_indices[len(host_indices) // 2 :])
+
+
+class TestHiCacheLoadBackSwaMask(unittest.TestCase):
+    def test_load_back_mask_keeps_only_tail_window_swa(self):
+        host_indices = torch.arange(10, 18, dtype=torch.int64)
+        swa_host_indices = torch.tensor([0, 0, 0, 0, 101, 102, 103, 104])
+        cache = _make_hicache_swa_cache(
+            host_indices, swa_host_indices, sliding_window_size=4
+        )
+        controller = _prepare_hicache_load_back(cache)
+        leaf = _make_hicache_load_back_chain(host_indices)
+
+        cache.load_back(leaf)
+
+        _, mask = controller.alloc_calls[0]
+        self.assertEqual(
+            mask.tolist(),
+            [False, False, False, False, True, True, True, True],
+        )
+
+    def test_load_back_mask_uses_full_prefix_when_shorter_than_window(self):
+        host_indices = torch.arange(10, 13, dtype=torch.int64)
+        swa_host_indices = torch.tensor([101, 102, 103])
+        cache = _make_hicache_swa_cache(
+            host_indices, swa_host_indices, sliding_window_size=4
+        )
+        controller = _prepare_hicache_load_back(cache)
+        leaf = _make_hicache_load_back_chain(host_indices)
+
+        cache.load_back(leaf)
+
+        _, mask = controller.alloc_calls[0]
+        self.assertEqual(mask.tolist(), [True, True, True])
+
+    def test_load_back_mask_aligns_tail_start_to_page_boundary(self):
+        host_indices = torch.arange(10, 18, dtype=torch.int64)
+        swa_host_indices = torch.tensor([0, 0, 0, 0, 101, 102, 103, 104])
+        cache = _make_hicache_swa_cache(
+            host_indices, swa_host_indices, sliding_window_size=3, page_size=2
+        )
+        controller = _prepare_hicache_load_back(cache)
+        leaf = _make_hicache_load_back_chain(host_indices)
+
+        cache.load_back(leaf)
+
+        _, mask = controller.alloc_calls[0]
+        self.assertEqual(
+            mask.tolist(),
+            [False, False, False, False, True, True, True, True],
+        )
+
+    def test_load_back_mask_allows_invalid_swa_outside_tail_window(self):
+        host_indices = torch.arange(10, 16, dtype=torch.int64)
+        swa_host_indices = torch.tensor([101, 0, 103, 104, 105, 106])
+        cache = _make_hicache_swa_cache(
+            host_indices, swa_host_indices, sliding_window_size=4
+        )
+        controller = _prepare_hicache_load_back(cache)
+        leaf = _make_hicache_load_back_chain(host_indices)
+
+        cache.load_back(leaf)
+
+        _, mask = controller.alloc_calls[0]
+        self.assertEqual(mask.tolist(), [False, False, True, True, True, True])
+
+    def test_load_back_mask_rejects_invalid_swa_in_tail_window(self):
+        host_indices = torch.arange(10, 16, dtype=torch.int64)
+        swa_host_indices = torch.tensor([101, 102, 103, 0, 105, 106])
+        cache = _make_hicache_swa_cache(
+            host_indices, swa_host_indices, sliding_window_size=4
+        )
+        _prepare_hicache_load_back(cache)
+        leaf = _make_hicache_load_back_chain(host_indices)
+
+        with self.assertRaises(AssertionError):
+            cache.load_back(leaf)
+
+    def test_estimate_load_back_counts_only_tail_window_swa(self):
+        host_indices = torch.arange(10, 18, dtype=torch.int64)
+        swa_host_indices = torch.arange(101, 109, dtype=torch.int64)
+        cache = _make_hicache_swa_cache(
+            host_indices, swa_host_indices, sliding_window_size=4
+        )
+
+        root = TreeNode()
+        root.value = torch.empty(0, dtype=torch.int64)
+        root.host_value = torch.empty(0, dtype=torch.int64)
+        parent = _make_hicache_evicted_node(root, host_indices[:4])
+        leaf = _make_hicache_evicted_node(parent, host_indices[4:])
+
+        full_tokens, swa_tokens = cache.estimate_load_back(
+            leaf, host_hit_length=len(host_indices)
+        )
+
+        self.assertEqual(full_tokens, 8)
+        self.assertEqual(swa_tokens, 4)
+
+    def test_alloc_device_uses_explicit_swa_mask_when_provided(self):
+        host_indices = torch.arange(10, 18, dtype=torch.int64)
+        explicit_mask = torch.tensor(
+            [False, False, False, False, True, True, True, True]
+        )
+        allocator = _RecordingDeviceAllocator()
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mem_pool_device_allocator = allocator
+
+        device_indices, lack_full, lack_swa = controller.alloc_device(
+            host_indices, swa_valid_mask=explicit_mask
+        )
+
+        self.assertEqual(device_indices.tolist(), list(range(8)))
+        self.assertEqual(lack_full, 0)
+        self.assertEqual(lack_swa, 0)
+        called_host_indices, called_mask = allocator.calls[0]
+        self.assertIs(called_host_indices, host_indices)
+        self.assertIs(called_mask, explicit_mask)
+
+    def test_alloc_device_derives_swa_mask_when_not_provided(self):
+        host_indices = torch.arange(10, 14, dtype=torch.int64)
+        allocator = _RecordingDeviceAllocator()
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mem_pool_device_allocator = allocator
+        mapping = torch.zeros(14, dtype=torch.int64)
+        mapping[host_indices] = torch.tensor([0, 201, 0, 203])
+        controller.mem_pool_host = SimpleNamespace(full_to_swa_index_mapping=mapping)
+
+        controller.alloc_device(host_indices)
+
+        called_host_indices, called_mask = allocator.calls[0]
+        self.assertIs(called_host_indices, host_indices)
+        self.assertEqual(called_mask.tolist(), [False, True, False, True])
+
+
+class TestHiCacheDeviceSwaRefill(unittest.TestCase):
+    def _make_refill_cache(self, sliding_window_size: int):
+        cache = HiSimpleSWARadixCache.__new__(HiSimpleSWARadixCache)
+        cache.root_node = TreeNode()
+        cache.device = torch.device("cpu")
+        cache.sliding_window_size = sliding_window_size
+        cache.page_size = 1
+        cache.enable_hicache_metrics = False
+        cache._swa_evictable_size = 0
+        cache._swa_protected_size = 0
+        cache.ongoing_load_back = {}
+        cache.cache_controller = _RecordingSwaRefillController()
+        cache.inc_lock_ref = lambda node: 0
+        return cache
+
+    def test_refill_device_swa_uses_host_tail_for_device_full_hit(self):
+        prefix_len = 512
+        sliding_window_size = 128
+        device_indices = torch.arange(1000, 1000 + prefix_len, dtype=torch.int64)
+        host_indices = torch.arange(2000, 2000 + prefix_len, dtype=torch.int64)
+
+        cache = self._make_refill_cache(sliding_window_size)
+
+        node = TreeNode()
+        node.parent = cache.root_node
+        node.value = device_indices
+        node.host_value = host_indices
+        node.lock_ref = 0
+
+        refill_indices = cache.init_swa_refill(node, prefix_len - 128, prefix_len)
+
+        self.assertEqual(refill_indices.tolist(), device_indices[-128:].tolist())
+        called_host_indices, called_device_indices, _, node_id = (
+            cache.cache_controller.calls[0]
+        )
+        self.assertEqual(called_host_indices.tolist(), host_indices[-128:].tolist())
+        self.assertEqual(called_device_indices.tolist(), device_indices[-128:].tolist())
+        self.assertEqual(node_id, node.id)
+        self.assertEqual(cache._swa_evictable_size, sliding_window_size)
+
+    def test_refill_device_swa_requires_backup_only_for_tail(self):
+        prefix_len = 512
+        sliding_window_size = 128
+        device_indices = torch.arange(1000, 1000 + prefix_len, dtype=torch.int64)
+        host_tail_indices = torch.arange(
+            2000, 2000 + sliding_window_size, dtype=torch.int64
+        )
+
+        cache = self._make_refill_cache(sliding_window_size)
+
+        parent = TreeNode()
+        parent.parent = cache.root_node
+        parent.value = device_indices[:-sliding_window_size]
+        parent.host_value = None
+
+        leaf = TreeNode()
+        leaf.parent = parent
+        leaf.value = device_indices[-sliding_window_size:]
+        leaf.host_value = host_tail_indices
+        leaf.lock_ref = 0
+
+        refill_indices = cache.init_swa_refill(
+            leaf, prefix_len - sliding_window_size, prefix_len
+        )
+
+        self.assertEqual(refill_indices.tolist(), device_indices[-128:].tolist())
+        called_host_indices, called_device_indices, _, node_id = (
+            cache.cache_controller.calls[0]
+        )
+        self.assertEqual(called_host_indices.tolist(), host_tail_indices.tolist())
+        self.assertEqual(called_device_indices.tolist(), device_indices[-128:].tolist())
+        self.assertEqual(node_id, leaf.id)
+
+    def test_refill_device_swa_requires_host_swa_mapping(self):
+        cache = self._make_refill_cache(sliding_window_size=4)
+        cache.cache_controller.swa_host_indices = torch.zeros(20, dtype=torch.int64)
+
+        node = TreeNode()
+        node.parent = cache.root_node
+        node.value = torch.arange(8, dtype=torch.int64)
+        node.host_value = torch.arange(10, 18, dtype=torch.int64)
+
+        refill_indices = cache.init_swa_refill(node, 4, 8)
+
+        self.assertEqual(refill_indices.numel(), 0)
+        self.assertEqual(len(cache.cache_controller.calls), 0)
+
+    def test_refill_device_swa_requires_host_backup(self):
+        cache = self._make_refill_cache(sliding_window_size=4)
+
+        node = TreeNode()
+        node.parent = cache.root_node
+        node.value = torch.arange(8, dtype=torch.int64)
+        node.host_value = None
+
+        refill_indices = cache.init_swa_refill(node, 4, 8)
+
+        self.assertEqual(refill_indices.numel(), 0)
+        self.assertEqual(len(cache.cache_controller.calls), 0)
+
+
+class TestHiCacheSwaRefillBudget(unittest.TestCase):
+    def test_refill_budget_counts_only_sliding_window_tail(self):
+        adder = PrefillAdder.__new__(PrefillAdder)
+        adder.page_size = 1
+        adder.sliding_window_size = 128
+        req = SimpleNamespace(
+            prefix_indices=torch.empty((0,), dtype=torch.int64),
+            swa_refill_len=512,
+        )
+
+        self.assertEqual(adder._estimate_swa_refill_tokens(req), 128)
+
+    def test_refill_budget_counts_only_missing_tail_after_prefix(self):
+        adder = PrefillAdder.__new__(PrefillAdder)
+        adder.page_size = 1
+        adder.sliding_window_size = 128
+        req = SimpleNamespace(
+            prefix_indices=torch.empty((448,), dtype=torch.int64),
+            swa_refill_len=512,
+        )
+
+        self.assertEqual(adder._estimate_swa_refill_tokens(req), 64)
 
 
 if __name__ == "__main__":

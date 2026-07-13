@@ -2518,6 +2518,9 @@ class SWATokenToKVPoolHost:
                 io_backend,
             )
         else:
+            # The full indices may be empty if load SWA only, skip launching kernel in this case.
+            if host_indices.numel() == 0:
+                return
             self.full_pool_host.load_to_device_per_layer(
                 self.device_pool.full_kv_pool,
                 host_indices,

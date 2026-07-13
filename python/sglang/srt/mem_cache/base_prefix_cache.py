@@ -123,6 +123,10 @@ class InitLoadBackParams:
 class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 
+    This object keeps the legacy 4-tuple unpacking behavior. Hybrid-SWA-only
+    refill metadata is exposed as optional attributes so most prefix-cache
+    implementations do not need to care about it.
+
     Attributes:
         device_indices  :   Indices of the KV cache on the device matched by common prefix.
         last_device_node:   The last TreeNode on the device that was matched.
@@ -137,6 +141,8 @@ class MatchResult(NamedTuple):
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
                                 exists a mamba state.
+        swa_refill_node :   Device-resident node whose SWA can be refilled from host.
+        swa_refill_len  :   Target prefix length after SWA refill.
     """
 
     device_indices: torch.Tensor
@@ -145,6 +151,8 @@ class MatchResult(NamedTuple):
     host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
+    swa_refill_node: Any = None
+    swa_refill_len: int = 0
 
 
 class BasePrefixCache(ABC, PrefixCacheTrait):

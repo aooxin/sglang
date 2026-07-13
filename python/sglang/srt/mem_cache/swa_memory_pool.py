@@ -409,6 +409,37 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         return full_device_indices, 0, 0
 
+    def alloc_missing_swa_for_full_indices(
+        self, full_indices: torch.Tensor, swa_host_valid_mask: torch.Tensor
+    ) -> Tuple[Optional[torch.Tensor], int, int]:
+        """Allocate missing SWA slots for already-allocated full KV indices.
+
+        Args:
+            full_indices: Existing full-attention device KV indices.
+            swa_host_valid_mask: Positions whose host SWA KV is valid and can be refilled.
+
+        Returns:
+            A boolean refill mask over ``full_indices``, refill token count, and
+            missing SWA capacity. ``None`` means allocation failed due to
+            insufficient SWA cache space.
+        """
+        assert len(full_indices) == len(swa_host_valid_mask)
+        existing_swa_indices = self.full_to_swa_index_mapping[full_indices]
+        refill_mask = swa_host_valid_mask & (existing_swa_indices == 0)
+        refill_size = int(refill_mask.sum())
+        assert refill_size % self.page_size == 0
+
+        lack_swa_size = refill_size - self.swa_attn_allocator.available_size()
+        if lack_swa_size > 0:
+            return None, 0, lack_swa_size
+        if refill_size == 0:
+            return refill_mask, 0, 0
+
+        swa_indices = self.swa_attn_allocator.alloc(refill_size)
+        assert swa_indices is not None
+        self.full_to_swa_index_mapping[full_indices[refill_mask]] = swa_indices
+        return refill_mask, refill_size, 0
+
     def pre_alloc(self, need_size: int, chunked_size: int):
         # Pre-allocate KV cache for decode requests in PD-disaggregation mode.
         if need_size <= 0:

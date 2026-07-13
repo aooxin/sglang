@@ -742,6 +742,8 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        self.swa_refill_node: Any = None
+        self.swa_refill_len: int = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # The prefix length that is inserted into the tree cache
@@ -1018,6 +1020,8 @@ class Req(ReqDllmMixin):
                     self.last_node = tree_cache.root_node
                     self.last_host_node = tree_cache.root_node
                     self.host_hit_length = 0
+                    self.swa_refill_node = None
+                    self.swa_refill_len = 0
                     self.last_matched_prefix_len = fake_len
                     self.raw_prefix_len = fake_len
                     # Protect the whole fake prefix from SWA window eviction:
@@ -1061,10 +1065,14 @@ class Req(ReqDllmMixin):
             self.cache_protected_len = min(
                 self.cache_protected_len, preserved_prefix_len
             )
+            self.swa_refill_node = None
+            self.swa_refill_len = 0
             self.extend_input_len = input_len - preserved_prefix_len
             return
 
         if tree_cache is None:
+            self.swa_refill_node = None
+            self.swa_refill_len = 0
             self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
             return
 
@@ -1108,6 +1116,8 @@ class Req(ReqDllmMixin):
                     match_result.host_hit_length,
                     match_result.mamba_branching_seqlen,
                 )
+                self.swa_refill_node = match_result.swa_refill_node
+                self.swa_refill_len = match_result.swa_refill_len
                 if match_result.cache_protected_len is not None:
                     self.cache_protected_len = match_result.cache_protected_len
                 else:

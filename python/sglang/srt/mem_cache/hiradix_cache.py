@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.simple_swa_radix_cache import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
+from sglang.srt.utils.common import floor_align
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -225,6 +226,14 @@ class BaseHiRadixCache(abc.ABC):
                     "attention_type (full, swa)."
                 ),
                 labelnames=[*hicache_labels.keys(), "scenario", "attention_type"],
+            )
+            self._swa_refill_tokens_total = Counter(
+                name="sglang:hicache_swa_refill_tokens_total",
+                documentation=(
+                    "Number of SWA KV tokens refilled from host to device when "
+                    "full KV already hits on device."
+                ),
+                labelnames=[*hicache_labels.keys()],
             )
 
         # record the nodes with ongoing write through
@@ -1235,6 +1244,18 @@ class BaseHiRadixCache(abc.ABC):
         self._delete_leaf(node)
         return full_evicted, swa_evicted
 
+    def _get_valid_load_back_swa_tail_start(self, host_indices: torch.Tensor) -> int:
+        tail_start = max(0, len(host_indices) - self.sliding_window_size)
+        tail_start = floor_align(tail_start, self.page_size)
+        tail_swa_host_indices = self.token_to_kv_pool_host.full_to_swa_index_mapping[
+            host_indices[tail_start:]
+        ]
+        assert tail_swa_host_indices.all(), (
+            f"Last {len(host_indices) - tail_start} SWA slots must be valid, "
+            f"got {tail_swa_host_indices.tolist()}"
+        )
+        return tail_start
+
     def evict_host(self, full_num_tokens: int, swa_num_tokens: int = 0):
         leaves = list(self.evictable_host_leaves)
         eviction_heap = [
@@ -1290,10 +1311,11 @@ class BaseHiRadixCache(abc.ABC):
 
         # TODO(yingchun): torch.cat + count_nonzero().item() 开销大，可在 node 上维护 SWA 数量
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
-        swa_host_indices = self.token_to_kv_pool_host.full_to_swa_index_mapping[
-            host_indices
-        ]
-        return len(host_indices), int(swa_host_indices.count_nonzero())
+        if not self.is_hybrid_swa:
+            return len(host_indices), 0
+
+        tail_start = self._get_valid_load_back_swa_tail_start(host_indices)
+        return len(host_indices), len(host_indices) - tail_start
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
@@ -1324,9 +1346,19 @@ class BaseHiRadixCache(abc.ABC):
             self.dec_lock_ref(ancestor_node)
             return None
 
+        alloc_kwargs = {}
+        if self.is_hybrid_swa:
+            swa_valid_mask = torch.zeros(
+                len(host_indices), dtype=torch.bool, device=host_indices.device
+            )
+            tail_start = self._get_valid_load_back_swa_tail_start(host_indices)
+            swa_valid_mask[tail_start:] = True
+            alloc_kwargs["swa_valid_mask"] = swa_valid_mask
+
         full_device_indices, lack_full_size, lack_swa_size = (
             self.cache_controller.alloc_device(
                 host_indices=host_indices,
+                **alloc_kwargs,
             )
         )
         if full_device_indices is None:
@@ -1351,6 +1383,7 @@ class BaseHiRadixCache(abc.ABC):
             full_device_indices, lack_full_size, lack_swa_size = (
                 self.cache_controller.alloc_device(
                     host_indices=host_indices,
+                    **alloc_kwargs,
                 )
             )
 
@@ -1379,6 +1412,7 @@ class BaseHiRadixCache(abc.ABC):
         )
         self.dec_lock_ref(ancestor_node)
 
+        assert last_hit_node.id not in self.ongoing_load_back
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
         offset = 0
         for node in nodes_to_load:
@@ -2407,6 +2441,135 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
         safe_host_len = max(0, safe_total_len - device_len)
         return safe_device_len, safe_host_len
 
+    def _collect_backed_host_tail_indices(
+        self, node: TreeNode, prefix_len: int, host_tail_start: int
+    ) -> Optional[torch.Tensor]:
+        tail_len = prefix_len - host_tail_start
+        if prefix_len <= 0 or tail_len <= 0 or node is self.root_node:
+            return None
+
+        host_tail_parts = []
+        suffix_len = 0
+        cur_node = node
+        while cur_node is not self.root_node and suffix_len < tail_len:
+            node_value = cur_node.value
+            host_value = cur_node.host_value
+            if node_value is None or host_value is None:
+                return None
+
+            # Map this radix node to its [node_start, node_end) span in the matched prefix
+            node_end = prefix_len - suffix_len
+            node_start = max(0, node_end - len(node_value))
+            # Take only the overlap with the SWA tail
+            overlap_start = max(host_tail_start, node_start)
+            overlap_end = min(prefix_len, node_end)
+            if overlap_start < overlap_end:
+                # host_value is node-local, so convert the prefix offset back
+                # to a slice offset inside this node.
+                host_offset = overlap_start - node_start
+                host_tail_parts.append(
+                    host_value[host_offset : host_offset + overlap_end - overlap_start]
+                )
+            suffix_len += node_end - node_start
+            cur_node = cur_node.parent
+
+        if suffix_len < tail_len or len(host_tail_parts) == 0:
+            return None
+
+        host_tail_indices = torch.cat(host_tail_parts[::-1])
+        swa_host_indices = self.cache_controller.get_swa_host_indices(host_tail_indices)
+        if torch.any(swa_host_indices == 0):
+            return None
+        return host_tail_indices
+
+    def _collect_device_prefix_indices(
+        self, node: TreeNode, prefix_len: int
+    ) -> Optional[torch.Tensor]:
+        if prefix_len <= 0 or node is self.root_node or node.evicted:
+            return None
+
+        device_parts = []
+        suffix_len = 0
+        cur_node = node
+        while cur_node is not self.root_node and suffix_len < prefix_len:
+            if cur_node.evicted:
+                return None
+            node_value = cur_node.value
+            assert node_value is not None
+            # Map this radix node to its [node_start, node_end) span in the matched prefix
+            node_end = prefix_len - suffix_len
+            node_start = max(0, node_end - len(node_value))
+            take_len = node_end - node_start
+            device_parts.append(node_value[-take_len:])
+            suffix_len += take_len
+            cur_node = cur_node.parent
+
+        if suffix_len < prefix_len:
+            return None
+        return torch.cat(device_parts[::-1])
+
+    def init_swa_refill(
+        self,
+        node: TreeNode,
+        current_prefix_len: int,
+        target_prefix_len: int,
+    ) -> torch.Tensor:
+        """Restore missing device SWA KV for a full-cache device hit.
+
+        Returns the extra full-cache device indices that become usable after the
+        SWA-only refill is enqueued, or an empty tensor when refill is not needed
+        or cannot be scheduled.
+        """
+        # `current_prefix_len` is the SWA-safe device prefix already returned by
+        # match_prefix(); `target_prefix_len` is the longer full-cache device
+        # match whose SWA slots can be restored from host backup.
+        if target_prefix_len <= current_prefix_len:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        # Refill only the SWA tail needed by sliding-window attention. Align the
+        # start down to page size because HiCache load/write operations are
+        # tracked at page granularity.
+        tail_start = max(0, target_prefix_len - self.sliding_window_size)
+        tail_start = floor_align(tail_start, self.page_size)
+        device_prefix_indices = self._collect_device_prefix_indices(
+            node, target_prefix_len
+        )
+        host_indices = self._collect_backed_host_tail_indices(
+            node, target_prefix_len, tail_start
+        )
+        if device_prefix_indices is None or host_indices is None:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        device_indices = device_prefix_indices[tail_start:target_prefix_len]
+
+        # Allocate missing device SWA slots for existing full-cache device
+        # indices, then enqueue a SWA-only H2D load.
+        ok, refill_size, lack_swa_size = self.cache_controller.refill_device_swa(
+            host_indices=host_indices,
+            device_indices=device_indices,
+            node_id=node.id,
+        )
+        if not ok:
+            if self.enable_hicache_metrics:
+                self._log_alloc_failure(
+                    scenario="refill_device_swa",
+                    lack_full=False,
+                    lack_swa=lack_swa_size > 0,
+                )
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+        if refill_size > 0:
+            if self.enable_hicache_metrics:
+                self._swa_refill_tokens_total.labels(**self._hicache_labels).inc(
+                    refill_size
+                )
+            self._on_node_swa_mapping_increased(node, refill_size)
+            assert node.id not in self.ongoing_load_back
+            self.ongoing_load_back[node.id] = node
+            self.inc_lock_ref(node)
+        # The scheduler appends these full-cache device indices to req.prefix_indices;
+        # the SWA-only load is tracked asynchronously by ongoing_load_back.
+        return device_prefix_indices[current_prefix_len:target_prefix_len]
+
     def match_prefix(self, params):
         """SWA-aware match: trim either device or host portion based on SWA validity.
 
@@ -2432,12 +2595,33 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
 
         # Apply SWA safety checks and trim the matched prefix if needed, before re-matching to get the
         # final safe match result.
-        # TODO(yingchun): after _compute_safe_prefix_len, swa_matched_device_len may far from _last_raw_match_len, it
-        #  cause redundant prefetching full portion KV cache from storage in following steps. Consider just prefetch
-        #  necessary full KV cache.
         swa_matched_device_len, swa_matched_host_len = self._compute_safe_prefix_len(
             full_matched_result
         )
+        swa_refill_node = None
+        swa_refill_len = 0
+        # If full KV is fully on device but SWA KV is missing from the matched
+        # prefix, expose refill metadata through MatchResult. The actual
+        # SWA-only load still happens later in init_swa_refill(), after the
+        # scheduler admits the request and holds the cache lock.
+        if (
+            swa_matched_device_len < full_matched_device_len
+            and full_matched_result.last_host_node
+            is full_matched_result.last_device_node
+        ):
+            tail_start = max(0, full_matched_device_len - self.sliding_window_size)
+            tail_start = floor_align(tail_start, self.page_size)
+            host_tail_indices = self._collect_backed_host_tail_indices(
+                full_matched_result.last_device_node,
+                full_matched_device_len,
+                tail_start,
+            )
+            if host_tail_indices is not None:
+                # Only mark refill when the matched device prefix has host
+                # backup for the SWA tail; earlier tokens are already full-KV
+                # device hits and do not need host SWA for refill.
+                swa_refill_node = full_matched_result.last_device_node
+                swa_refill_len = full_matched_device_len
         logger.debug(
             f"{full_matched_device_len=}, {full_matched_host_len=}, {swa_matched_device_len=}, {swa_matched_host_len=}"
         )
@@ -2448,7 +2632,8 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
                 swa_matched_host_len == 0
             ), f"When device needs trimming, host must be 0: {swa_matched_host_len=}"
             if swa_matched_device_len == 0:
-                # Nothing is SWA-safe — return empty match at root.
+                # Nothing is SWA-safe yet, but keep the refill metadata so the
+                # scheduler can restore SWA KV and extend the device prefix.
                 return MatchResult(
                     device_indices=torch.empty(
                         (0,), dtype=torch.int64, device=self.device
@@ -2456,6 +2641,8 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
                     last_device_node=self.root_node,
                     last_host_node=self.root_node,
                     host_hit_length=0,
+                    swa_refill_node=swa_refill_node,
+                    swa_refill_len=swa_refill_len,
                 )
         else:
             assert (
@@ -2503,4 +2690,14 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
                     swa_rematched_result.host_hit_length,
                 )
 
-        return swa_rematched_result
+        # Preserve the final SWA-safe match result while carrying the optional
+        # refill metadata to schedule_policy; match_prefix itself remains
+        # read-only and does not allocate or enqueue loads.
+        return MatchResult(
+            device_indices=swa_rematched_result.device_indices,
+            last_device_node=swa_rematched_result.last_device_node,
+            last_host_node=swa_rematched_result.last_host_node,
+            host_hit_length=swa_rematched_result.host_hit_length,
+            swa_refill_node=swa_refill_node,
+            swa_refill_len=swa_refill_len,
+        )

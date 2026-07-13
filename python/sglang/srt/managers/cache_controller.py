@@ -111,11 +111,16 @@ class CacheOperation:
         device_indices: torch.Tensor,
         node_id: int,
         priority: Optional[int] = None,
+        swa_only: bool = False,
     ):
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
         self.data = None
+        # TODO(yingchun): 建议 swa_only=False 时用 None 延迟初始化，merge_ops 跳过构造函数的分配。
+        self.swa_only_mask = torch.full(
+            (len(host_indices),), swa_only, dtype=torch.bool, device=host_indices.device
+        )
 
         self.id = CacheOperation.counter
         CacheOperation.counter += 1
@@ -130,12 +135,14 @@ class CacheOperation:
 
         host_indices = torch.cat([op.host_indices for op in ops])
         device_indices = torch.cat([op.device_indices for op in ops])
+        swa_only_mask = torch.cat([op.swa_only_mask for op in ops])
         node_ids = []
         priority = min(op.priority for op in ops)
         for op in ops:
             node_ids.extend(op.node_ids)
         merged_op = CacheOperation(host_indices, device_indices, -1, priority)
         merged_op.node_ids = node_ids
+        merged_op.swa_only_mask = swa_only_mask
         return merged_op
 
     def __lt__(self, other: CacheOperation):
@@ -1037,7 +1044,7 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices = self.move_indices(op)
+        host_indices, device_indices, _ = self.move_indices(op)
         self.write_queue.clear()
 
         # 在 default stream 上预计算 SWA indices（此时 stream 为空）
@@ -1133,6 +1140,7 @@ class HiCacheController:
     def alloc_device(
         self,
         host_indices: torch.Tensor,
+        swa_valid_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], int, int]:
         if not self.is_hybrid_swa:
             need_size = len(host_indices)
@@ -1144,8 +1152,9 @@ class HiCacheController:
                 return None, max(0, lack_full_size), 0
             return device_indices, 0, 0
 
-        swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[host_indices]
-        swa_valid_mask = swa_host_indices.bool()
+        if swa_valid_mask is None:
+            swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[host_indices]
+            swa_valid_mask = swa_host_indices.bool()
         return self.mem_pool_device_allocator.alloc_device(host_indices, swa_valid_mask)
 
     def load(
@@ -1154,35 +1163,82 @@ class HiCacheController:
         device_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
+        swa_only: bool = False,
     ) -> Optional[torch.Tensor]:
         """
         Load KV caches from host memory to device memory.
         """
         assert device_indices is not None
         self.load_queue.append(
-            CacheOperation(host_indices, device_indices, node_id, priority)
+            CacheOperation(host_indices, device_indices, node_id, priority, swa_only)
         )
+
+    def refill_device_swa(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = -1,
+    ) -> tuple[bool, int, int]:
+        """Allocate missing device SWA slots and enqueue a SWA-only H2D load.
+
+        Returns whether refill can proceed, how many tokens need SWA refill, and
+        the missing SWA capacity when allocation fails.
+        """
+        assert self.is_hybrid_swa
+        swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[host_indices]
+        swa_host_valid_mask = swa_host_indices.bool()
+        swa_device_indices = self.mem_pool_device_allocator.full_to_swa_index_mapping[
+            device_indices
+        ]
+        # A missing device SWA slot can only be restored when host SWA exists.
+        if torch.any((swa_device_indices == 0) & (~swa_host_valid_mask)):
+            return False, 0, 0
+        refill_mask, refill_size, lack_swa_size = (
+            self.mem_pool_device_allocator.alloc_missing_swa_for_full_indices(
+                device_indices, swa_host_valid_mask
+            )
+        )
+        if refill_mask is None:
+            return False, 0, lack_swa_size
+
+        if refill_size > 0:
+            self.load(
+                host_indices=host_indices[refill_mask],
+                device_indices=device_indices[refill_mask],
+                priority=priority,
+                node_id=node_id,
+                swa_only=True,
+            )
+        return True, refill_size, 0
 
     def move_indices(self, op: CacheOperation):
         host_indices, device_indices = op.host_indices, op.device_indices
+        swa_only_mask = op.swa_only_mask
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
                 host_indices = host_indices.to(self.device, non_blocking=True)
-            return host_indices, device_indices
+            if not swa_only_mask.is_cuda:
+                swa_only_mask = swa_only_mask.to(self.device, non_blocking=True)
+            return host_indices, device_indices, swa_only_mask
         elif self.io_backend == "direct":
             if self.mem_pool_host.layout == "layer_first":
                 device_indices = device_indices.cpu()
                 host_indices, idx = host_indices.sort()
-                return host_indices, device_indices.index_select(0, idx)
+                return (
+                    host_indices,
+                    device_indices.index_select(0, idx),
+                    swa_only_mask.cpu().index_select(0, idx),
+                )
             elif self.mem_pool_host.layout == "page_first_direct":
-                return host_indices, device_indices.cpu()
+                return host_indices, device_indices.cpu(), swa_only_mask.cpu()
             else:
                 raise ValueError(
                     f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
                 )
         elif self.io_backend == "kernel_ascend":
-            return host_indices, device_indices.cpu()
+            return host_indices, device_indices.cpu(), swa_only_mask.cpu()
         else:
             raise ValueError(f"Unsupported io backend")
 
@@ -1192,7 +1248,7 @@ class HiCacheController:
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices = self.move_indices(op)
+        host_indices, device_indices, swa_only_mask = self.move_indices(op)
         self.load_queue.clear()
 
         # 在 default stream 上预计算 SWA indices
@@ -1226,12 +1282,18 @@ class HiCacheController:
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
-            # 原来 stream 内的 if self.is_hybrid_swa 块已移除，swa_args 在外面算好了
+            # Full layers should skip SWA-only refill entries; SWA layers use
+            # the precomputed swa_host_indices/swa_device_indices in swa_args.
+            # TODO(yingchun): 加 if swa_only_mask.any(): 短路保护，常见场景跳过三次张量运算。
+            full_load_mask = ~swa_only_mask
+            full_host_indices = host_indices[full_load_mask]
+            full_device_indices = device_indices[full_load_mask]
             for i in range(self.layer_num):
+                _, is_swa_layer = self.mem_pool_host.device_pool.layers_mapping[i]
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
-                    host_indices,
-                    device_indices,
+                    host_indices if is_swa_layer else full_host_indices,
+                    device_indices if is_swa_layer else full_device_indices,
                     i,
                     self.io_backend,
                     **swa_args,
@@ -1239,20 +1301,38 @@ class HiCacheController:
                 if self.has_draft_kv_pool_list:
                     for j, draft_host_pool in enumerate(self.mem_pool_host_draft_list):
                         if i < self.mem_pool_host_draft_list[j].layer_num:
+                            _, is_draft_swa_layer = (
+                                draft_host_pool.device_pool.layers_mapping[i]
+                            )
                             draft_host_pool.load_to_device_per_layer(
                                 self.mem_pool_device_draft_list[j],
-                                host_indices,
-                                device_indices,
+                                (
+                                    host_indices
+                                    if is_draft_swa_layer
+                                    else full_host_indices
+                                ),
+                                (
+                                    device_indices
+                                    if is_draft_swa_layer
+                                    else full_device_indices
+                                ),
                                 i,
                                 self.io_backend,
                                 **swa_args,
                             )
                 elif self.has_draft_kv_pool:
                     if i < self.mem_pool_host_draft.layer_num:
+                        _, is_draft_swa_layer = (
+                            self.mem_pool_host_draft.device_pool.layers_mapping[i]
+                        )
                         self.mem_pool_host_draft.load_to_device_per_layer(
                             self.mem_pool_device_draft,
-                            host_indices,
-                            device_indices,
+                            host_indices if is_draft_swa_layer else full_host_indices,
+                            (
+                                device_indices
+                                if is_draft_swa_layer
+                                else full_device_indices
+                            ),
                             i,
                             self.io_backend,
                             **swa_args,
@@ -1265,6 +1345,8 @@ class HiCacheController:
                 host_indices.record_stream(self.load_stream)
             if device_indices.is_cuda:
                 device_indices.record_stream(self.load_stream)
+            if swa_only_mask.is_cuda:
+                swa_only_mask.record_stream(self.load_stream)
             if swa_args:
                 swa_args["swa_host_indices"].record_stream(self.load_stream)
                 swa_args["swa_device_indices"].record_stream(self.load_stream)

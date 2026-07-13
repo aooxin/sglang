@@ -511,6 +511,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # should be treated as client errors (400 BadRequest)
                     raise ValueError(str(template_error)) from template_error
+                except Exception as e:
+                    # Any other failure to apply the chat template is most likely
+                    # caused by an invalid format of the input messages, so treat it
+                    # as a client error (400 BadRequest) rather than a server error.
+                    raise ValueError(
+                        f"Failed to apply chat template to the request: {str(e)}. "
+                        "This is likely due to an invalid format of the input messages. "
+                        "Please check your input."
+                    ) from e
 
             # Append assistant prefix if continue_final_message is enabled
             if assistant_prefix:

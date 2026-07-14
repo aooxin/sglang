@@ -2679,11 +2679,20 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
         ), f"{swa_rematched_result.host_hit_length=} + {len(swa_rematched_result.device_indices)=} != {swa_matched_device_len=} + {swa_matched_host_len=}"
         if self.debug_mode:
             if len(swa_rematched_result.last_host_node.host_value) == 0:
-                assert (
-                    swa_rematched_result.host_hit_length == 0
-                    and swa_rematched_result.last_host_node
-                    is swa_rematched_result.last_device_node
-                ), f"{swa_rematched_result.host_hit_length=}, {swa_rematched_result.last_host_node=}, {swa_rematched_result.last_device_node=}"
+                # An empty host_value only legitimately occurs on root_node
+                # (initialized to []). Walking up via `while not node.backuped`
+                # stops at root when the matched device node is not yet backuped
+                # (write_through backup can fail on host-pool exhaustion, be
+                # pending, or be skipped for chunked reqs). In that case
+                # host_hit_length must be 0 because no evicted host-only tail was
+                # matched, but last_host_node need NOT equal last_device_node -
+                # it may be root or any backuped ancestor. Only host_hit_length>0
+                # requires last_host_node to be the evicted match endpoint.
+                assert swa_rematched_result.host_hit_length == 0, (
+                    f"{swa_rematched_result.host_hit_length=}, "
+                    f"{swa_rematched_result.last_host_node=}, "
+                    f"{swa_rematched_result.last_device_node=}"
+                )
             elif swa_rematched_result.host_hit_length > 0:
                 self.cache_controller.assert_host_indices(
                     swa_rematched_result.last_host_node.host_value,

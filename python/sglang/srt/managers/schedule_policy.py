@@ -1093,6 +1093,12 @@ class PrefillAdder:
                     req.host_hit_length = 0
                     req.last_matched_prefix_len = len(req.prefix_indices)
                     req.last_node = req.swa_refill_node
+                    # refill_indices are sliced from swa_refill_node.value and
+                    # thus owned by the radix tree. Advance cache_protected_len
+                    # so cache_finished_req does not free this tree-owned range
+                    # (which the tree frees again on eviction -> double-free).
+                    # Mirrors the init_load_back branch above.
+                    req.cache_protected_len = len(req.prefix_indices)
                 req.swa_refill_node = None
                 req.swa_refill_len = 0
 

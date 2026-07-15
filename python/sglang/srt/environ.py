@@ -288,6 +288,8 @@ class Envs:
 
     # Tool Calling
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
+    SGLANG_DISCRETIZE_USER_TOOLCALL_TAGS = EnvBool(False)
+    SGLANG_REQUIRE_SPECIAL_TOOLCALL_TOKEN = EnvBool(False)
 
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)

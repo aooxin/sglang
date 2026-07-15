@@ -44,6 +44,7 @@ from sglang.srt.entrypoints.openai.utils import (
     should_include_usage,
     to_openai_style_logprobs,
 )
+from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
@@ -91,6 +92,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
     _default_sampling_params_logged = False
 
+    _TOOLCALL_TAGS = ("<tool_call>", "</tool_call>")
+    # Untrusted-input roles whose <tool_call> tags get discretized: end-user
+    # turns and tool results fed back in can both carry injected tags.
+    _DISCRETIZE_ROLES = ("user", "tool")
+
     def __init__(
         self,
         tokenizer_manager: TokenizerManager,
@@ -122,6 +128,60 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
+
+        # If encode("") returns specials, the discretized-encode site must pass
+        # add_special_tokens=False to avoid a double BOS.
+        try:
+            self._tokenizer_auto_adds_specials = (
+                self.tokenizer_manager.tokenizer is not None
+                and len(self.tokenizer_manager.tokenizer.encode("")) > 0
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to probe tokenizer for auto-added special tokens; "
+                f"assuming it does: {e}"
+            )
+            self._tokenizer_auto_adds_specials = True
+
+        # Precompute the discretized "<" + inner + ">" id list for each fixed tag.
+        self._discretized_tag_ids: Dict[str, List[int]] = {}
+        try:
+            tokenizer = self.tokenizer_manager.tokenizer
+            if tokenizer is not None:
+                open_ids = tokenizer.encode("<", add_special_tokens=False)
+                close_ids = tokenizer.encode(">", add_special_tokens=False)
+                for tag in self._TOOLCALL_TAGS:
+                    inner_ids = tokenizer.encode(tag[1:-1], add_special_tokens=False)
+                    self._discretized_tag_ids[tag] = open_ids + inner_ids + close_ids
+        except Exception as e:
+            logger.warning(
+                f"Failed to precompute discretized tool-call tag ids; "
+                f"will encode them lazily: {e}"
+            )
+            self._discretized_tag_ids = {}
+
+        # Used by the token-level gate; None when unavailable or parser is not mimo.
+        self._toolcall_special_id: Optional[int] = None
+        if self.tool_call_parser == "mimo":
+            try:
+                tokenizer = self.tokenizer_manager.tokenizer
+                if tokenizer is not None:
+                    tid = tokenizer.convert_tokens_to_ids("<tool_call>")
+                    if isinstance(tid, int) and tid >= 0:
+                        self._toolcall_special_id = tid
+            except Exception as e:
+                logger.warning(
+                    f"Failed to resolve the mimo '<tool_call>' special token id; "
+                    f"token-level tool-call gate will be inactive: {e}"
+                )
+                self._toolcall_special_id = None
+
+        self._discretize_user_toolcall_tags = (
+            envs.SGLANG_DISCRETIZE_USER_TOOLCALL_TAGS.get()
+        )
+        self._require_special_toolcall_token = (
+            envs.SGLANG_REQUIRE_SPECIAL_TOOLCALL_TOKEN.get()
+        )
 
     def _handle_last_assistant_message(
         self,
@@ -376,6 +436,129 @@ class OpenAIServingChat(OpenAIServingBase):
         result.tool_call_constraint = tool_call_constraint
         return result
 
+    def _render_prompt_ids(
+        self,
+        messages: List[Dict],
+        tools: Optional[List[Dict]],
+        template_kwargs: Dict,
+    ) -> List[int]:
+        # Non-discretize path keeps the branch's normal single-pass encoding
+        # (apply_chat_template tokenize=True), so default behavior is unchanged.
+        tokenizer = self.tokenizer_manager.tokenizer
+        if not self._discretize_user_toolcall_tags:
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                tools=tools,
+                return_dict=False,
+                **template_kwargs,
+            )
+
+        # The discretize path renders to a string first, then encodes segment by
+        # segment so that <tool_call>/</tool_call> appearing inside USER and TOOL
+        # content are split into ordinary BPE tokens (e.g. '<','tool','_call','>')
+        # instead of the single added-token id, while template structure and tool
+        # definitions keep their normal encoding.
+        rendered = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            tools=tools,
+            **template_kwargs,
+        )
+        return self._encode_with_user_tags_discretized(rendered, messages)
+
+    def _encode_with_user_tags_discretized(
+        self, text: str, messages: List[Dict]
+    ) -> List[int]:
+        tokenizer = self.tokenizer_manager.tokenizer
+        # The rendered string already contains any template-emitted specials
+        # (e.g. BOS as text). Segments are encoded independently and concatenated,
+        # so specials must never be injected per-segment. The single exception is
+        # a tokenizer that does NOT auto-add specials on encode(): to match the
+        # non-discretize path, the leading chunk prepends specials once.
+        lead_add_specials = not self._tokenizer_auto_adds_specials
+
+        spans = self._locate_user_content_spans(text, messages)
+        if not spans:
+            return tokenizer.encode(text, add_special_tokens=lead_add_specials)
+
+        ids: List[int] = []
+        cursor = 0
+        first_chunk = True
+        for start, end in spans:
+            if start > cursor:
+                ids += tokenizer.encode(
+                    text[cursor:start],
+                    add_special_tokens=(lead_add_specials and first_chunk),
+                )
+            ids += self._encode_segment_discretizing_tags(text[start:end])
+            first_chunk = False
+            cursor = end
+        if cursor < len(text):
+            ids += tokenizer.encode(
+                text[cursor:],
+                add_special_tokens=(lead_add_specials and first_chunk),
+            )
+        return ids
+
+    def _locate_user_content_spans(
+        self, text: str, messages: List[Dict]
+    ) -> List[tuple]:
+        # Locate each untrusted-role message's raw content verbatim inside the
+        # rendered prompt. If a content string is not found (e.g. multimodal
+        # content the template rewrote), that message is skipped and encoded
+        # normally.
+        spans = []
+        search_from = 0
+        for msg in messages:
+            if msg.get("role") not in self._DISCRETIZE_ROLES:
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str) or not content:
+                continue
+            idx = text.find(content, search_from)
+            if idx == -1:
+                continue
+            spans.append((idx, idx + len(content)))
+            search_from = idx + len(content)
+        return spans
+
+    def _encode_segment_discretizing_tags(self, seg: str) -> List[int]:
+        tokenizer = self.tokenizer_manager.tokenizer
+        ids: List[int] = []
+        i = 0
+        n = len(seg)
+        while i < n:
+            hit = next((t for t in self._TOOLCALL_TAGS if seg.startswith(t, i)), None)
+            if hit:
+                # Encode "<tool_call>" as "<" + "tool_call" + ">" (and likewise
+                # "</tool_call>" as "<" + "/tool_call" + ">") so the added-token
+                # fast-path is bypassed. decode() reconstructs the identical
+                # string, so the model sees the same text.
+                hit_ids = self._discretized_tag_ids.get(hit)
+                if hit_ids is None:
+                    inner = hit[1:-1]
+                    hit_ids = (
+                        tokenizer.encode("<", add_special_tokens=False)
+                        + tokenizer.encode(inner, add_special_tokens=False)
+                        + tokenizer.encode(">", add_special_tokens=False)
+                    )
+                    self._discretized_tag_ids[hit] = hit_ids
+                ids += hit_ids
+                i += len(hit)
+                continue
+            next_positions = [
+                pos
+                for pos in (seg.find(t, i) for t in self._TOOLCALL_TAGS)
+                if pos != -1
+            ]
+            nxt = min(next_positions) if next_positions else n
+            ids += tokenizer.encode(seg[i:nxt], add_special_tokens=False)
+            i = nxt
+        return ids
+
     def _apply_jinja_template(
         self,
         request: ChatCompletionRequest,
@@ -482,13 +665,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 extra_template_kwargs.update(request.chat_template_kwargs)
 
             try:
-                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                prompt_ids = self._render_prompt_ids(
                     openai_compatible_messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    tools=tools,
-                    return_dict=False,
-                    **extra_template_kwargs,
+                    tools,
+                    extra_template_kwargs,
                 )
             except Exception as e:
                 # If the first attempt fails, try with flat function-only format.
@@ -499,13 +679,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 )
                 try:
-                    prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    prompt_ids = self._render_prompt_ids(
                         openai_compatible_messages,
-                        tokenize=True,
-                        add_generation_prompt=True,
-                        tools=tools,
-                        return_dict=False,
-                        **extra_template_kwargs,
+                        tools,
+                        extra_template_kwargs,
                     )
                 except jinja2.TemplateError as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
@@ -656,6 +833,13 @@ class OpenAIServingChat(OpenAIServingBase):
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
+        seen_special_toolcall = {}
+        toolcall_gate_active = self._toolcall_gate_active()
+        toolcall_special_token_id = self._toolcall_special_id
+        toolcall_incremental_output = (
+            self.tokenizer_manager.server_args.incremental_streaming_output
+        )
+        toolcall_scanned_len = {}
 
         # Usage tracking
         prompt_tokens = {}
@@ -780,6 +964,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 delta = content["text"][len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
 
+                if toolcall_gate_active and not seen_special_toolcall.get(
+                    index, False
+                ):
+                    output_ids = content.get("output_ids") or []
+                    if toolcall_incremental_output:
+                        tail = output_ids
+                    else:
+                        prev = toolcall_scanned_len.get(index, 0)
+                        tail = output_ids[prev:]
+                        toolcall_scanned_len[index] = len(output_ids)
+                    if toolcall_special_token_id in tail:
+                        seen_special_toolcall[index] = True
+
+                # Apply on BOTH the reasoning and main paths so an injected
+                # <tool_call> cannot slip through the reasoning parser.
+                gate_blocked = toolcall_gate_active and not seen_special_toolcall.get(
+                    index, False
+                )
+
                 # Handle reasoning content
                 if self.reasoning_parser and request.separate_reasoning:
                     reasoning_text, delta = self._process_reasoning_stream(
@@ -797,6 +1000,7 @@ class OpenAIServingChat(OpenAIServingBase):
                                 continuous_usage_stats,
                                 emit_text_as_reasoning=True,
                                 history_tool_calls_cnt=history_tool_calls_cnt,
+                                gate_blocked=gate_blocked,
                             ):
                                 if chunk:
                                     yield chunk
@@ -837,6 +1041,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             has_tool_calls,
                             continuous_usage_stats,
                             history_tool_calls_cnt=history_tool_calls_cnt,
+                            gate_blocked=gate_blocked,
                         ):
                             if chunk:
                                 yield chunk
@@ -1110,6 +1315,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.tool_choice != "none"
                 and request.tools
                 and self.tool_call_parser
+                and not self._toolcall_gate_blocks(ret_item.get("output_ids"))
             ):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
                 (
@@ -1245,6 +1451,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 f"Process tool call idx, parser: {self.tool_call_parser}, tool_call_id: {tool_call_id}, history_cnt: {history_tool_calls_cnt}"
             )
             return tool_call_id
+
+    def _toolcall_gate_active(self) -> bool:
+        return (
+            self._require_special_toolcall_token
+            and self._toolcall_special_id is not None
+        )
+
+    def _toolcall_gate_blocks(self, output_ids: Optional[List[int]]) -> bool:
+        # Token-level gate (mimo only): when enabled, a tool_call is honored only
+        # if the output contains the single "<tool_call>" token id. A tool_call
+        # spelled out as discrete tokens (e.g. a repeated/injected string) lacks
+        # that id and is treated as normal text. Global judgement: presence of
+        # the id anywhere means "genuine call present". Fails open (does not
+        # block) when the switch is off, parser is not mimo, ids/id unavailable.
+        if not self._toolcall_gate_active():
+            return False
+        if not output_ids:
+            return False
+        return self._toolcall_special_id not in output_ids
 
     def _process_tool_calls(
         self,
@@ -1481,8 +1706,43 @@ class OpenAIServingChat(OpenAIServingBase):
         continuous_usage_stats: bool = False,
         emit_text_as_reasoning: bool = False,
         history_tool_calls_cnt: Optional[int] = None,
+        gate_blocked: bool = False,
     ):
         """Process tool calls in streaming response"""
+        # Gate blocked (see _toolcall_gate_blocks): emit delta as text, not a call.
+        if gate_blocked:
+            if delta:
+                delta_message = (
+                    DeltaMessage(reasoning_content=delta)
+                    if emit_text_as_reasoning
+                    else DeltaMessage(content=delta)
+                )
+                choice_data = ChatCompletionResponseStreamChoice(
+                    index=index,
+                    delta=delta_message,
+                    finish_reason=None,
+                )
+                chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=int(time.time()),
+                    choices=[choice_data],
+                    model=request.model,
+                )
+
+                # Add usage stats if continuous_usage_stats is enabled
+                if continuous_usage_stats:
+                    prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
+                    completion_tokens = content["meta_info"].get("completion_tokens", 0)
+                    reasoning_tokens = content["meta_info"].get("reasoning_tokens", 0)
+                    chunk.usage = UsageProcessor.calculate_token_usage(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        reasoning_tokens=reasoning_tokens,
+                    )
+
+                yield f"data: {chunk.model_dump_json()}\n\n"
+            return
+
         if index not in parser_dict:
             # Use JSON detector directly for required or named tool choice
             if request.tool_choice == "required" or isinstance(

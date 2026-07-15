@@ -9,6 +9,7 @@ or
 import json
 import unittest
 import uuid
+from contextlib import contextmanager
 from http import HTTPStatus
 from typing import Optional
 from unittest.mock import Mock, patch
@@ -20,6 +21,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     MessageProcessingResult,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -820,6 +822,310 @@ class ServingChatTestCase(unittest.TestCase):
             )
         self.assertEqual(context.exception.status_code, 400)
         self.assertIn("must be an integer", context.exception.detail)
+
+
+class _FakeToolCallTokenizer:
+    """Fake tokenizer modeling the added-token fast-path for <tool_call>.
+
+    Mirrors real behavior needed by the discretization tests:
+    - encode("<tool_call>") -> single added-token id (151657), likewise
+      "</tool_call>" -> 151658 (the fast-path that discretization must bypass)
+    - any other text -> one id per character (deterministic, reversible)
+    - decode reverses both, so round-trips can assert losslessness
+    """
+
+    OPEN = "<tool_call>"
+    CLOSE = "</tool_call>"
+    OPEN_ID = 151657
+    CLOSE_ID = 151658
+    _BASE = 256  # char ids offset so they never collide with the two specials
+    chat_template = None
+
+    def encode(self, text, add_special_tokens=False):
+        ids = []
+        i = 0
+        n = len(text)
+        while i < n:
+            if text.startswith(self.OPEN, i):
+                ids.append(self.OPEN_ID)
+                i += len(self.OPEN)
+            elif text.startswith(self.CLOSE, i):
+                ids.append(self.CLOSE_ID)
+                i += len(self.CLOSE)
+            else:
+                ids.append(self._BASE + ord(text[i]))
+                i += 1
+        return ids
+
+    def decode(self, ids, **kwargs):
+        out = []
+        for tid in ids:
+            if tid == self.OPEN_ID:
+                out.append(self.OPEN)
+            elif tid == self.CLOSE_ID:
+                out.append(self.CLOSE)
+            else:
+                out.append(chr(tid - self._BASE))
+        return "".join(out)
+
+
+class DiscretizeUserToolCallTagsTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tm = _MockTokenizerManager()
+        self.tm.tokenizer = _FakeToolCallTokenizer()
+        self.template_manager = _MockTemplateManager()
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+
+    def _count(self, ids, token_id):
+        return ids.count(token_id)
+
+    def test_segment_discretizes_open_and_close_tags(self):
+        seg = "<tool_call>x</tool_call>"
+        ids = self.chat._encode_segment_discretizing_tags(seg)
+        self.assertNotIn(_FakeToolCallTokenizer.OPEN_ID, ids)
+        self.assertNotIn(_FakeToolCallTokenizer.CLOSE_ID, ids)
+        # lossless: decode reproduces the original segment
+        self.assertEqual(self.tm.tokenizer.decode(ids), seg)
+
+    def test_segment_without_tags_is_unchanged(self):
+        seg = "plain text no tags"
+        ids = self.chat._encode_segment_discretizing_tags(seg)
+        self.assertEqual(ids, self.tm.tokenizer.encode(seg))
+
+    def test_locate_user_spans_only_user_role(self):
+        text = "SYS<tool_call>USERPART tail"
+        messages = [
+            {"role": "system", "content": "ignored"},
+            {"role": "user", "content": "USERPART"},
+        ]
+        spans = self.chat._locate_user_content_spans(text, messages)
+        self.assertEqual(len(spans), 1)
+        start, end = spans[0]
+        self.assertEqual(text[start:end], "USERPART")
+
+    def test_locate_user_spans_missing_content_skipped(self):
+        # content not present verbatim (e.g. multimodal rewrite) -> skipped
+        text = "rendered without the raw user content"
+        messages = [{"role": "user", "content": "NOT_IN_TEXT"}]
+        self.assertEqual(self.chat._locate_user_content_spans(text, messages), [])
+
+    def test_end_to_end_only_user_tag_discretized(self):
+        # Structure carries one <tool_call> (kept as special), user carries one
+        # (must be discretized). Result: exactly one special id remains.
+        text = "STRUCT<tool_call>MID<tool_call>END"
+        messages = [{"role": "user", "content": "<tool_call>"}]
+        # user content "<tool_call>" first appears at index 6 (after STRUCT).
+        ids = self.chat._encode_with_user_tags_discretized(text, messages)
+        # one structural <tool_call> survives, the user one is discretized
+        self.assertEqual(self._count(ids, _FakeToolCallTokenizer.OPEN_ID), 1)
+        # lossless overall
+        self.assertEqual(self.tm.tokenizer.decode(ids), text)
+
+    def test_no_user_message_encodes_whole_string(self):
+        text = "STRUCT<tool_call>END"
+        messages = [{"role": "system", "content": "s"}]
+        ids = self.chat._encode_with_user_tags_discretized(text, messages)
+        # no user span -> whole string encoded normally -> special preserved
+        self.assertEqual(ids, self.tm.tokenizer.encode(text))
+        self.assertEqual(self._count(ids, _FakeToolCallTokenizer.OPEN_ID), 1)
+
+    def test_render_switch_off_uses_apply_chat_template(self):
+        self.tm.tokenizer.apply_chat_template = Mock(return_value=[9, 9, 9])
+        self.chat._discretize_user_toolcall_tags = False
+        out = self.chat._render_prompt_ids(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=None,
+            template_kwargs={},
+        )
+        self.assertEqual(out, [9, 9, 9])
+        _, kwargs = self.tm.tokenizer.apply_chat_template.call_args
+        self.assertTrue(kwargs["tokenize"])
+
+    def test_render_switch_on_renders_then_discretizes(self):
+        self.tm.tokenizer.apply_chat_template = Mock(return_value="AA<tool_call>BB")
+        self.chat._discretize_user_toolcall_tags = True
+        out = self.chat._render_prompt_ids(
+            messages=[{"role": "user", "content": "<tool_call>"}],
+            tools=None,
+            template_kwargs={},
+        )
+        # rendered as string (tokenize=False), then user tag discretized
+        _, kwargs = self.tm.tokenizer.apply_chat_template.call_args
+        self.assertFalse(kwargs["tokenize"])
+        self.assertNotIn(_FakeToolCallTokenizer.OPEN_ID, out)
+        self.assertEqual(self.tm.tokenizer.decode(out), "AA<tool_call>BB")
+
+    def test_locate_user_spans_multi_turn_returns_each_user_in_order(self):
+        text = "sys u1=<tool_call> a1 u2=<tool_call> tail"
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u1=<tool_call>"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2=<tool_call>"},
+        ]
+        spans = self.chat._locate_user_content_spans(text, messages)
+        self.assertEqual(len(spans), 2)
+        self.assertEqual(text[spans[0][0] : spans[0][1]], "u1=<tool_call>")
+        self.assertEqual(text[spans[1][0] : spans[1][1]], "u2=<tool_call>")
+        self.assertLess(spans[0][1], spans[1][0])
+
+    def test_multi_turn_all_user_tags_discretized_assistant_kept(self):
+        # Two user turns each carry <tool_call> (both must be discretized); an
+        # assistant turn in between also carries <tool_call> (must be kept as the
+        # special id, since discretization only targets user content).
+        text = "<tool_call>ASSISTANT<tool_call>"
+        messages = [
+            {"role": "user", "content": "<tool_call>"},
+            {"role": "assistant", "content": "ASSISTANT<tool_call>"},
+        ]
+        ids = self.chat._encode_with_user_tags_discretized(text, messages)
+        # exactly the assistant-turn <tool_call> survives as a single special id
+        self.assertEqual(self._count(ids, _FakeToolCallTokenizer.OPEN_ID), 1)
+        self.assertEqual(self.tm.tokenizer.decode(ids), text)
+
+    def test_multi_turn_two_user_turns_both_discretized(self):
+        # Both user turns must be discretized; no user <tool_call> stays special.
+        text = "<tool_call>MID<tool_call>"
+        messages = [
+            {"role": "user", "content": "<tool_call>"},
+            {"role": "user", "content": "<tool_call>"},
+        ]
+        ids = self.chat._encode_with_user_tags_discretized(text, messages)
+        self.assertEqual(self._count(ids, _FakeToolCallTokenizer.OPEN_ID), 0)
+        self.assertEqual(self.tm.tokenizer.decode(ids), text)
+
+    def test_multi_turn_identical_user_content_located_separately(self):
+        # Identical repeated user content: search_from advances so the second
+        # occurrence is located separately (not collapsed onto the first).
+        text = "SAME between SAME"
+        messages = [
+            {"role": "user", "content": "SAME"},
+            {"role": "user", "content": "SAME"},
+        ]
+        spans = self.chat._locate_user_content_spans(text, messages)
+        self.assertEqual(len(spans), 2)
+        self.assertEqual(spans[0], (0, 4))
+        self.assertEqual(spans[1], (13, 17))
+
+    def test_locate_spans_include_tool_role(self):
+        text = "SYS<tool_call>TOOLRESULT tail"
+        messages = [
+            {"role": "system", "content": "ignored"},
+            {"role": "tool", "content": "TOOLRESULT"},
+        ]
+        spans = self.chat._locate_user_content_spans(text, messages)
+        self.assertEqual(len(spans), 1)
+        start, end = spans[0]
+        self.assertEqual(text[start:end], "TOOLRESULT")
+
+    def test_end_to_end_tool_tag_discretized(self):
+        # Structure carries one <tool_call> (kept as special); a tool result
+        # carries one (must be discretized). Result: exactly one special remains.
+        text = "STRUCT<tool_call>MID<tool_call>END"
+        messages = [{"role": "tool", "content": "<tool_call>"}]
+        ids = self.chat._encode_with_user_tags_discretized(text, messages)
+        self.assertEqual(self._count(ids, _FakeToolCallTokenizer.OPEN_ID), 1)
+        self.assertEqual(self.tm.tokenizer.decode(ids), text)
+
+    def test_locate_spans_mixed_user_and_tool_in_order(self):
+        text = "sys u=<tool_call> a1 t=<tool_call> tail"
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u=<tool_call>"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "tool", "content": "t=<tool_call>"},
+        ]
+        spans = self.chat._locate_user_content_spans(text, messages)
+        self.assertEqual(len(spans), 2)
+        self.assertEqual(text[spans[0][0] : spans[0][1]], "u=<tool_call>")
+        self.assertEqual(text[spans[1][0] : spans[1][1]], "t=<tool_call>")
+        self.assertLess(spans[0][1], spans[1][0])
+
+    def test_mixed_user_and_tool_tags_discretized_assistant_kept(self):
+        # User and tool turns each carry <tool_call> (both must be discretized);
+        # an assistant turn in between also carries <tool_call> (kept special,
+        # since discretization only targets untrusted-input roles).
+        text = "<tool_call>ASSISTANT<tool_call>TOOL<tool_call>"
+        messages = [
+            {"role": "user", "content": "<tool_call>"},
+            {"role": "assistant", "content": "ASSISTANT<tool_call>"},
+            {"role": "tool", "content": "TOOL<tool_call>"},
+        ]
+        ids = self.chat._encode_with_user_tags_discretized(text, messages)
+        # only the assistant-turn <tool_call> survives as a single special id
+        self.assertEqual(self._count(ids, _FakeToolCallTokenizer.OPEN_ID), 1)
+        self.assertEqual(self.tm.tokenizer.decode(ids), text)
+
+    def test_tool_close_tag_discretized(self):
+        text = "STRUCT</tool_call>TOOL</tool_call>END"
+        messages = [{"role": "tool", "content": "</tool_call>"}]
+        ids = self.chat._encode_with_user_tags_discretized(text, messages)
+        self.assertEqual(self._count(ids, _FakeToolCallTokenizer.CLOSE_ID), 1)
+        self.assertEqual(self.tm.tokenizer.decode(ids), text)
+
+
+class ToolCallSpecialTokenGateTestCase(unittest.TestCase):
+    OPEN_ID = _FakeToolCallTokenizer.OPEN_ID
+
+    def setUp(self):
+        self.tm = _MockTokenizerManager()
+        self.tm.server_args.tool_call_parser = "mimo"
+        self.tm.tokenizer.convert_tokens_to_ids = Mock(return_value=self.OPEN_ID)
+        self.template_manager = _MockTemplateManager()
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+
+    @contextmanager
+    def _enable(self, on):
+        # The switch is read once in __init__ and cached, so reconstruct the
+        # instance under the overridden env var to exercise the real read path.
+        with envs.SGLANG_REQUIRE_SPECIAL_TOOLCALL_TOKEN.override(on):
+            prev = self.chat
+            self.chat = OpenAIServingChat(self.tm, self.template_manager)
+            try:
+                yield
+            finally:
+                self.chat = prev
+
+    def test_special_id_resolved_for_mimo(self):
+        self.assertEqual(self.chat._toolcall_special_id, self.OPEN_ID)
+
+    def test_special_id_none_for_non_mimo(self):
+        self.tm.server_args.tool_call_parser = "qwen25"
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.assertIsNone(chat._toolcall_special_id)
+
+    def test_gate_off_never_blocks(self):
+        with self._enable(False):
+            self.assertFalse(self.chat._toolcall_gate_blocks([1, 2, 3]))
+
+    def test_gate_on_blocks_when_special_id_absent(self):
+        # discrete tokens (no 151657) -> gate blocks parsing
+        with self._enable(True):
+            self.assertTrue(self.chat._toolcall_gate_blocks([27, 14172, 13429, 29]))
+
+    def test_gate_on_allows_when_special_id_present(self):
+        with self._enable(True):
+            self.assertFalse(self.chat._toolcall_gate_blocks([1, self.OPEN_ID, 2]))
+
+    def test_gate_on_fails_open_when_no_output_ids(self):
+        with self._enable(True):
+            self.assertFalse(self.chat._toolcall_gate_blocks(None))
+            self.assertFalse(self.chat._toolcall_gate_blocks([]))
+
+    def test_gate_on_fails_open_for_non_mimo(self):
+        self.tm.server_args.tool_call_parser = "qwen25"
+        with self._enable(True):
+            # id unavailable -> cannot judge -> fail open
+            self.assertFalse(self.chat._toolcall_gate_blocks([27, 14172]))
+
+    def test_gate_blocks_injected_toolcall_but_allows_genuine(self):
+        # The non-streaming path gates BEFORE calling _process_tool_calls, so
+        # the blocking decision lives entirely in _toolcall_gate_blocks.
+        with self._enable(True):
+            # injected discrete ids (no genuine OPEN_ID) -> blocked
+            self.assertTrue(self.chat._toolcall_gate_blocks([27, 14172, 13429, 29]))
+            # genuine call carries the single OPEN_ID -> allowed
+            self.assertFalse(self.chat._toolcall_gate_blocks([27, self.OPEN_ID, 29]))
 
 
 if __name__ == "__main__":

@@ -35,6 +35,7 @@ import torch
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
+    IncLockRefResult,
     InsertParams,
     MatchPrefixParams,
     MatchResult,
@@ -844,6 +845,7 @@ def _make_hicache_swa_cache(
     mapping[host_indices] = swa_host_indices
     cache.token_to_kv_pool_host = SimpleNamespace(full_to_swa_index_mapping=mapping)
     cache.sliding_window_size = sliding_window_size
+    cache.is_hybrid_swa = sliding_window_size > 0
     cache.page_size = page_size
     cache.is_hybrid = True
     return cache
@@ -906,7 +908,7 @@ def _prepare_hicache_load_back(cache):
     cache.debug_mode = False
     cache.ongoing_load_back = {}
     cache.evictable_size_ = 0
-    cache.inc_lock_ref = lambda node: 0
+    cache.inc_lock_ref = lambda node: IncLockRefResult(delta=0)
     cache.dec_lock_ref = lambda node: None
     cache.evict = lambda lack_full_size, lack_swa_size: None
     cache._on_tree_value_added = lambda node: None
@@ -1023,6 +1025,7 @@ class TestHiCacheLoadBackSwaMask(unittest.TestCase):
         )
         allocator = _RecordingDeviceAllocator()
         controller = HiCacheController.__new__(HiCacheController)
+        controller.is_hybrid_swa = True
         controller.mem_pool_device_allocator = allocator
 
         device_indices, lack_full, lack_swa = controller.alloc_device(
@@ -1040,6 +1043,7 @@ class TestHiCacheLoadBackSwaMask(unittest.TestCase):
         host_indices = torch.arange(10, 14, dtype=torch.int64)
         allocator = _RecordingDeviceAllocator()
         controller = HiCacheController.__new__(HiCacheController)
+        controller.is_hybrid_swa = True
         controller.mem_pool_device_allocator = allocator
         mapping = torch.zeros(14, dtype=torch.int64)
         mapping[host_indices] = torch.tensor([0, 201, 0, 203])
@@ -1064,7 +1068,7 @@ class TestHiCacheDeviceSwaRefill(unittest.TestCase):
         cache._swa_protected_size = 0
         cache.ongoing_load_back = {}
         cache.cache_controller = _RecordingSwaRefillController()
-        cache.inc_lock_ref = lambda node: 0
+        cache.inc_lock_ref = lambda node: IncLockRefResult(delta=0)
         return cache
 
     def test_refill_device_swa_uses_host_tail_for_device_full_hit(self):

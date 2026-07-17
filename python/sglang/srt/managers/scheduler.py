@@ -2593,6 +2593,12 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            # Skip expensive match_prefix when soft token budget is
+            # exhausted (OTHER). Hard exhaustion (NO_TOKEN) is handled
+            # by add_one_req below.
+            if adder.budget_state() == AddReqResult.OTHER:
+                break
+
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
                     # For overlapping loading of LoRA weights with computation, we will load each adapter one at a time,

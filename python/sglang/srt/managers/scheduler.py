@@ -141,8 +141,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import (
+    ShmPointerMMData,
+    collect_shm_names_in_mm_inputs,
     has_shm_features,
     init_mm_embedding_cache,
+    materialize_shm_in_mm_inputs,
     unwrap_shm_features,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -248,6 +251,10 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
+
+# Sentinel marking a request whose background mm_inputs processing raised.
+# Distinct from None, which means "no bg result, fall back to sync path".
+_BG_MM_FAILED = object()
 
 
 @dataclass
@@ -890,6 +897,16 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+
+        # -- Pipelined mm processing state (used by overlap_disagg_prefill) --
+        self._skip_recv_shm_flush: bool = False
+        self._pending_shm_unlinks: List[str] = []
+        self._shm_unlink_generations: deque = deque()
+        # SHM blocks arrive per DP-attention group, so the unlink owner is the
+        # group leader (reduces to global rank 0 when DP attention is off).
+        self._is_shm_unlink_owner: bool = (
+            self.attn_tp_rank == 0 and self.attn_cp_rank == 0
+        )
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -1667,27 +1684,10 @@ class Scheduler(
                 prepare_abort(req, error_msg, status_code=status_code)
                 self.stream_output([req], req.return_logprob)
 
-        # Unwrap shared memory features AFTER all broadcasts complete,
-        # so that ShmPointerMMData metadata (not full tensor data) is what
-        # gets serialized during broadcast_pyobj.
-        if recv_reqs:
-            # Barrier before materialize()/shm_unlink(): broadcast_pyobj's
-            # source rank returns the original objects immediately (no
-            # pickle.loads), while receiver ranks are still deserializing
-            # ShmPointerMMData (__setstate__ -> shm_open).  Without a
-            # barrier the source can call materialize() / shm_unlink before
-            # receivers open the segment, giving
-            # FileNotFoundError: /psm_xxxx on receivers.
-            #
-            # Note: gloo's dist.broadcast is NOT a full barrier -- a receiver
-            # returns as soon as it has its own data, so a later broadcast
-            # on a different group does not reliably back-pressure earlier
-            # deserializations.  Therefore we must barrier on the exact
-            # group(s) that carried the ShmPointerMMData payload.
-            #
-            #   non-DP-attention:      tp_cpu_group
-            #   DP-attention:          attn_tp_cpu_group (work_reqs broadcast)
-            #                        + attn_cp_cpu_group if attn_cp_size > 1
+        # Unwrap SHM features after all broadcasts, so broadcast_pyobj
+        # serializes ShmPointerMMData metadata rather than full tensors.
+        # Pipelined prefill (_skip_recv_shm_flush) does this in the bg thread.
+        if recv_reqs and not self._skip_recv_shm_flush:
             if (
                 self.tp_size > 1
                 and self.model_config.is_multimodal
@@ -1842,6 +1842,99 @@ class Scheduler(
         else:
             return MultimodalInputs.from_processor_output(mm_inputs_dict)
 
+    # ── Pipelined mm processing helpers (overlap_disagg_prefill) ──────────
+
+    def _rotate_shm_generation(self):
+        """Move pending SHM names into the generation queue."""
+        if self._pending_shm_unlinks:
+            self._shm_unlink_generations.append(list(self._pending_shm_unlinks))
+            self._pending_shm_unlinks.clear()
+
+    def _flush_oldest_shm_generation(self):
+        """Unlink the oldest SHM generation once >= 2 are queued.
+
+        Keeping one extra generation guarantees a cross-rank sync (the Gloo
+        broadcast in recv_requests) has elapsed since those blocks were read.
+        """
+        if len(self._shm_unlink_generations) >= 2:
+            old_names = self._shm_unlink_generations.popleft()
+            for name in old_names:
+                ShmPointerMMData.unlink_shm(name)
+
+    def _drain_shm_unlinks(self):
+        """Unlink every remaining SHM block, ignoring the >= 2 guard (teardown)."""
+        self._rotate_shm_generation()
+        while self._shm_unlink_generations:
+            for name in self._shm_unlink_generations.popleft():
+                ShmPointerMMData.unlink_shm(name)
+
+    def _extract_mm_inputs(self, recv_reqs):
+        """Extract mm_inputs from recv_reqs for background processing."""
+        mm_req_indices = []
+        mm_inputs_list = []
+        for i, req in enumerate(recv_reqs):
+            if isinstance(req, TokenizedGenerateReqInput) and getattr(
+                req, "mm_inputs", None
+            ) is not None:
+                mm_req_indices.append(i)
+                mm_inputs_list.append(req.mm_inputs)
+        return mm_req_indices, mm_inputs_list
+
+    def _batch_process_mm_inputs_bg(self, mm_inputs_list):
+        """Background thread: convert raw mm_inputs and unwrap SHM.
+
+        Runs in a single-worker ThreadPoolExecutor with no Gloo calls, so it
+        cannot deadlock against the main thread's collectives.
+
+        Per-item failures are isolated behind a sentinel (aborted by the main
+        thread) rather than crashing the event loop; only the SHM-block owner
+        registers names for unlink.
+        """
+        results = []
+        for raw_mm in mm_inputs_list:
+            if raw_mm is None:
+                results.append(None)
+                continue
+            # Register names before materialization so a raise below (or an
+            # item later dropped by is_valid) still can't leak the blocks.
+            if self._is_shm_unlink_owner:
+                self._pending_shm_unlinks.extend(
+                    collect_shm_names_in_mm_inputs(raw_mm)
+                )
+            try:
+                mm = MultimodalInputs.from_processor_output(raw_mm)
+                materialize_shm_in_mm_inputs(mm)
+                results.append(mm)
+            except Exception as e:
+                logger.error(
+                    "Background mm_inputs processing failed, aborting request: %s",
+                    e,
+                    exc_info=True,
+                )
+                results.append(_BG_MM_FAILED)
+        return results
+
+    def _submit_mm_processing(self, executor, recv_reqs):
+        """Submit mm_inputs to the background thread pool."""
+        mm_req_indices, mm_inputs_list = self._extract_mm_inputs(recv_reqs)
+        if mm_inputs_list:
+            mm_future = executor.submit(
+                self._batch_process_mm_inputs_bg, mm_inputs_list
+            )
+        else:
+            mm_future = None
+            mm_req_indices = None
+        return mm_future, mm_req_indices
+
+    def _collect_mm_results_and_dispatch(self, recv_reqs, mm_future, mm_indices):
+        """Wait for bg mm thread, attach results to requests, then dispatch."""
+        if mm_future is not None:
+            mm_results = mm_future.result()
+            for idx, result in zip(mm_indices, mm_results):
+                recv_reqs[idx]._bg_mm_result = result
+        self._rotate_shm_generation()
+        self.process_input_requests(recv_reqs)
+
     def _maybe_compute_mrope_positions(self, req) -> None:
         """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
         if self._mm_processor is None:
@@ -1987,7 +2080,18 @@ class Scheduler(
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
-            image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
+            # Use pre-processed result from pipelined bg thread if available.
+            image_inputs = getattr(recv_req, "_bg_mm_result", None)
+            if image_inputs is _BG_MM_FAILED:
+                # Background mm processing raised for this request; abort it
+                # instead of crashing the event loop for the whole batch.
+                error_msg = f"Failed to process multimodal inputs. {req.rid=}"
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
+            if image_inputs is None:
+                image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
 
             SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
 

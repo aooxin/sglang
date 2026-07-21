@@ -77,6 +77,7 @@ class VideoInput:
     num_frames: Optional[int] = None
     max_frames: Optional[int] = None
     min_frames: Optional[int] = None
+    max_frame_token: Optional[int] = None  # max token per frame (after temporal merge)
     do_include_last_frame: Optional[bool] = False
     start_time: Optional[float] = None
     end_time: Optional[float] = None
@@ -162,6 +163,7 @@ class VideoAudioInput:
     num_frames: Optional[int] = None
     max_frames: Optional[int] = None
     min_frames: Optional[int] = None
+    max_frame_token: Optional[int] = None  # max token per frame (after temporal merge)
     do_include_last_frame: Optional[bool] = False
     start_time: Optional[float] = None
     end_time: Optional[float] = None
@@ -755,6 +757,10 @@ class MiMoProcessor:
                 kwargs[k] = getattr(video, k)
             else:
                 kwargs[k] = self.default_video_processor_kwargs[k]
+
+        if video.max_frame_token is not None:
+            kwargs["max_frame_token"] = video.max_frame_token
+
         if video.num_frames is not None:
             kwargs["num_frames"] = video.num_frames
         elif video.fps is not None:
@@ -883,7 +889,12 @@ class MiMoProcessor:
     ):
 
         def smart_resize_video(
-            num_total_frames, min_pixels, max_pixels, total_max_pixels, **kwargs
+            num_total_frames,
+            min_pixels,
+            max_pixels,
+            total_max_pixels,
+            max_frame_token=None,
+            **kwargs,
         ):
             max_pixels_per_frame = (
                 total_max_pixels
@@ -891,33 +902,39 @@ class MiMoProcessor:
                 * self.temporal_compression_ratio
                 // num_total_frames
             )
+            if max_frame_token is not None:
+                spatial_factor = self.patch_size * self.merge_size
+                max_pixels_from_frame_token = max_frame_token * (spatial_factor**2)
+                max_pixels_per_frame = min(
+                    max_pixels_per_frame, max_pixels_from_frame_token
+                )
             max_pixels = max(min_pixels, min(max_pixels_per_frame, max_pixels))
             return min_pixels, max_pixels
 
         def segment_frame_selector(all_timestamps, start_time, end_time):
-            """Select frame indices in [start_time, end_time). If none found, pick the nearest frame to the left."""
+            """Select frame slice in [start_time, end_time).
+            Returns (start_idx, end_idx) for contiguous slicing.
+            If no frames in range, fall back to the nearest frame at or before start_time.
+            """
             if not isinstance(all_timestamps, torch.Tensor):
                 all_timestamps = torch.tensor(all_timestamps)
 
-            mask = (all_timestamps >= start_time) & (all_timestamps < end_time)
-            candidate_indices = torch.where(mask)[0]
+            start_idx = torch.searchsorted(
+                all_timestamps, start_time, side="left"
+            ).item()
+            end_idx = torch.searchsorted(all_timestamps, end_time, side="left").item()
 
-            if len(candidate_indices) == 0:
-                left_mask = all_timestamps <= start_time
-                left_indices = torch.where(left_mask)[0]
-                if len(left_indices) > 0:
-                    selected_frame_indices = left_indices[-1:].clone()
-                else:
-                    raise ValueError(
-                        f"No frames before start_time {start_time} in all_timestamps {all_timestamps.tolist()}"
-                    )
-            else:
-                selected_frame_indices = candidate_indices
-
-            assert (
-                len(selected_frame_indices) > 0
-            ), f"No frames selected for segment {start_time} - {end_time} in all_timestamps {all_timestamps.tolist()}"
-            return selected_frame_indices
+            if start_idx < end_idx:
+                return (start_idx, end_idx)
+            # No frames in [start_time, end_time): pick nearest frame at or before start_time
+            if start_idx > 0:
+                return (start_idx - 1, start_idx)
+            # start_idx == 0: first frame is at or after start_time
+            if all_timestamps[0].item() <= start_time:
+                return (0, 1)
+            raise ValueError(
+                f"No frames at or before start_time {start_time} in all_timestamps {all_timestamps.tolist()}"
+            )
 
         kwargs = self.prepare_video_kwargs(video_input)
         video = video_input.video
@@ -956,13 +973,13 @@ class MiMoProcessor:
             frames = video_tensor
             num_frames_seg = num_frames_sampled
         else:
-            selected_indices = segment_frame_selector(
+            slice_start, slice_end = segment_frame_selector(
                 timestamps_sampled, start_time, end_time
             )
 
-            timestamps_seg = timestamps_sampled[selected_indices]
-            frames = video_tensor[selected_indices]
-            num_frames_seg = len(timestamps_seg)
+            timestamps_seg = timestamps_sampled[slice_start:slice_end]
+            frames = video_tensor[slice_start:slice_end]
+            num_frames_seg = slice_end - slice_start
             start_time_seg = (
                 timestamps_seg[0].item()
                 if isinstance(timestamps_seg[0], torch.Tensor)
@@ -1243,7 +1260,8 @@ class MiMoProcessor:
             segment_audio_token_len = (
                 min(audio_end_token_idx, audio_token_len) - audio_start_token_idx
             )
-            assert segment_audio_token_len > 0
+            # Can be 0 when the last video segment extends beyond the audio duration
+            assert segment_audio_token_len >= 0
             segment_audio = (
                 processed_audio[
                     audio_start_token_idx : audio_start_token_idx
@@ -1560,10 +1578,14 @@ class MiMoProcessor:
         return flatten_patches, thw_grids
 
     @staticmethod
-    def format_timestamp(timestamp: float):
+    def format_timestamp(timestamp: float, with_ms: bool = False):
+        timestamp = float(timestamp)
         minutes = int(timestamp // 60)
         seconds = int(timestamp % 60)
-        return f"{minutes:02d}:{seconds:02d}"
+        if not with_ms:
+            return f"{minutes:02d}:{seconds:02d}"
+        milliseconds = int(round((timestamp - int(timestamp)) * 1000))
+        return f"{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
 
     @staticmethod
     def smart_resize(

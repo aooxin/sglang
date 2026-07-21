@@ -5,7 +5,7 @@ import dataclasses
 import logging
 import threading
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -132,8 +132,9 @@ class CommonKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
-        self._socket_cache: Dict[str, zmq.Socket] = {}
-        self._monitor_cache: Dict[str, zmq.Socket] = {}
+        self._max_cached_sockets = 128
+        self._socket_cache: "OrderedDict[str, zmq.Socket]" = OrderedDict()
+        self._monitor_cache: "OrderedDict[str, zmq.Socket]" = OrderedDict()
         self._socket_lock = threading.Lock()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -391,12 +392,22 @@ class CommonKVManager(BaseKVManager):
                     except zmq.ZMQError:
                         disconnected = True
                 if not disconnected:
+                    self._socket_cache.move_to_end(endpoint)
+                    self._monitor_cache.move_to_end(endpoint)
                     return sock
                 sock.close(linger=0)
                 if monitor is not None:
                     monitor.close()
                 self._socket_cache.pop(endpoint, None)
                 self._monitor_cache.pop(endpoint, None)
+
+            # Evict least-recently-used endpoints to stay under the cap.
+            while len(self._socket_cache) >= self._max_cached_sockets:
+                old_ep, old_sock = self._socket_cache.popitem(last=False)
+                old_sock.close(linger=0)
+                old_monitor = self._monitor_cache.pop(old_ep, None)
+                if old_monitor is not None:
+                    old_monitor.close()
 
             sock = self._zmq_ctx.socket(zmq.PUSH)
             if is_ipv6:

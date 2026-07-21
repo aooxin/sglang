@@ -2318,9 +2318,11 @@ class SWATokenToKVPoolHost:
             return None, None, max(0, lack_full_size), max(0, lack_swa_size)
 
         full_host_indices = self.full_pool_host.alloc(full_need_size)
+        assert full_host_indices is not None
         # 注意: 此时并不做 mapping，而会在 cc._storage_hit_query 之后确定要真正要 batch_get 的 SWA 区间之后再做 mapping
         self.full_to_swa_index_mapping[full_host_indices] = 0
         swa_host_indices = self.swa_pool_host.alloc(swa_need_size)
+        assert swa_host_indices is not None
 
         return full_host_indices, swa_host_indices, 0, 0
 

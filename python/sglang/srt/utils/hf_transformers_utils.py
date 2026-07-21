@@ -97,6 +97,26 @@ from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_P
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, mistral_utils
 from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
+_fastokens_patched = False
+
+
+def _ensure_fastokens_patched():
+    """Monkey-patch transformers to use the fastokens backend once."""
+    global _fastokens_patched
+    if _fastokens_patched:
+        return
+    try:
+        import fastokens
+    except ImportError:
+        raise ImportError(
+            "The fastokens package is required when --tokenizer-backend=fastokens. "
+            "Install it with: pip install 'sglang[fastokens]'"
+        ) from None
+
+    fastokens.patch_transformers()
+    _fastokens_patched = True
+    logger.info("fastokens backend enabled; transformers patched successfully")
+
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     AfmoeConfig,
     BailingHybridConfig,
@@ -773,9 +793,13 @@ def get_tokenizer(
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
+    tokenizer_backend: str = "huggingface",
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
+    if tokenizer_backend == "fastokens":
+        _ensure_fastokens_patched()
+
     if tokenizer_name.endswith(".json"):
         from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
 
@@ -856,7 +880,11 @@ def get_tokenizer(
     # Transformers v5 may silently fall back to a generic TokenizersBackend
     # when trust_remote_code=False and the model requires a custom tokenizer.
     # Detect this and auto-retry with trust_remote_code=True.
-    if not trust_remote_code and type(tokenizer).__name__ == "TokenizersBackend":
+    if (
+        not trust_remote_code
+        and type(tokenizer).__name__ == "TokenizersBackend"
+        and tokenizer_backend != "fastokens"
+    ):
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name,
             *args,
@@ -1187,8 +1215,12 @@ def get_processor(
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
     use_fast: Optional[bool] = True,
+    tokenizer_backend: str = "huggingface",
     **kwargs,
 ):
+    if tokenizer_backend == "fastokens":
+        _ensure_fastokens_patched()
+
     # pop 'revision' from kwargs if present.
     revision = kwargs.pop("revision", tokenizer_revision)
     if (

@@ -24,6 +24,7 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
     apt-get install --only-upgrade -y sudo && \
     rm -rf /var/lib/apt/lists/*
 
+# for tokenizer: fastokens
 # for debugging: py-spy, nvtx
 # for omni: torchcodec, joblib, accelerate, decord, apache-tvm-ffi
 RUN python3 -m pip install --no-cache-dir --break-system-packages --no-build-isolation --no-deps \
@@ -33,7 +34,8 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages --no-build-iso
     joblib==1.5.3 \
     accelerate==1.12.0 \
     decord==0.6.0 \
-    "apache-tvm-ffi>=0.1.5,<0.2"
+    "apache-tvm-ffi>=0.1.5,<0.2" \
+    'fastokens>=0.2.0'
 
 # cleanup sglang workspace
 RUN rm -fr /sgl-workspace/sglang

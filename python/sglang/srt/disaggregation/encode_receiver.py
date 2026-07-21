@@ -702,6 +702,7 @@ class MMReceiverBase(ABC):
                         tokenizer_mode=server_args.tokenizer_mode,
                         trust_remote_code=server_args.trust_remote_code,
                         revision=server_args.revision,
+                        tokenizer_backend=server_args.tokenizer_backend,
                         use_fast=not server_args.disable_fast_image_processor,
                     )
                 except ValueError as e:
@@ -715,6 +716,7 @@ class MMReceiverBase(ABC):
                             tokenizer_mode=server_args.tokenizer_mode,
                             trust_remote_code=server_args.trust_remote_code,
                             revision=server_args.revision,
+                            tokenizer_backend=server_args.tokenizer_backend,
                             use_fast=True,
                         )
                     else:

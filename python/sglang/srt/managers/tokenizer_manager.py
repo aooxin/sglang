@@ -298,6 +298,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    tokenizer_backend=server_args.tokenizer_backend,
                 )
                 self._initialize_multi_item_delimiter_text()
 
@@ -2612,6 +2613,7 @@ def _get_processor_wrapper(server_args):
             tokenizer_mode=server_args.tokenizer_mode,
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
+            tokenizer_backend=server_args.tokenizer_backend,
             use_fast=not server_args.disable_fast_image_processor,
         )
     except ValueError as e:
@@ -2625,6 +2627,7 @@ def _get_processor_wrapper(server_args):
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                tokenizer_backend=server_args.tokenizer_backend,
                 use_fast=True,
             )
         else:

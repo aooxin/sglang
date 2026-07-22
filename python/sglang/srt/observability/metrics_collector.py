@@ -2182,6 +2182,29 @@ class EncoderMetricsCollector:
             documentation="Total files processed (hit + miss).",
             labelnames=list(labels.keys()) + ["modality"],
         )
+        self.cache_hit_rate = Gauge(
+            name="sglang:encoder_cache_hit_rate",
+            documentation="Per-request encoder cache hit rate (hit_tokens / total_tokens).",
+            labelnames=list(labels.keys()) + ["modality"],
+            multiprocess_mode="mostrecent",
+        )
+        # SHM mm_cache lookup / insert latency (the mm_cache_lock-guarded
+        # get_single / set, including the SHM tensor copy in shared mode).
+        _cache_latency_buckets = [
+            0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30
+        ]
+        self.cache_read_seconds = Histogram(
+            name="sglang:encoder_cache_read_seconds",
+            documentation="mm cache read (lookup) latency.",
+            labelnames=list(labels.keys()) + ["modality"],
+            buckets=_cache_latency_buckets,
+        )
+        self.cache_write_seconds = Histogram(
+            name="sglang:encoder_cache_write_seconds",
+            documentation="mm cache write (insert) latency.",
+            labelnames=list(labels.keys()) + ["modality"],
+            buckets=_cache_latency_buckets,
+        )
 
         # Total encoder requests by modality and status
         self.requests_total = Counter(
@@ -2276,6 +2299,10 @@ class EncoderMetricsCollector:
         self._inc_cache_counter(self.cache_total_tokens_total, modality, total_tokens)
         if hit_tokens > 0:
             self._inc_cache_counter(self.cache_hit_tokens_total, modality, hit_tokens)
+        if total_tokens > 0:
+            self.cache_hit_rate.labels(**self.labels, modality=modality).set(
+                hit_tokens / total_tokens
+            )
 
     def record_cache_files(
         self, hit_files: int, total_files: int, modality: str = "image"
@@ -2287,6 +2314,20 @@ class EncoderMetricsCollector:
     def set_cache_state(self, current_size: int, num_entries: int) -> None:
         self.cache_size_mb.labels(**self.labels).set(current_size / (1024 * 1024))
         self.cache_entries.labels(**self.labels).set(num_entries)
+
+    def observe_cache_read(
+        self, latency_seconds: float, modality: str = "image"
+    ) -> None:
+        self.cache_read_seconds.labels(**self.labels, modality=modality).observe(
+            latency_seconds
+        )
+
+    def observe_cache_write(
+        self, latency_seconds: float, modality: str = "image"
+    ) -> None:
+        self.cache_write_seconds.labels(**self.labels, modality=modality).observe(
+            latency_seconds
+        )
 
     def observe_queue_wait(
         self, latency_seconds: float, modality: str = "image"

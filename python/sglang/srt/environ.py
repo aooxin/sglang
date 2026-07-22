@@ -482,7 +482,9 @@ class Envs:
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
-
+    SGLANG_MM_CACHE_SHM = EnvBool(False)
+    # Key the local SHM mm_cache only on the URL-basename SHA1; non-SHA1 items skip the cache (no fallback).
+    SGLANG_MM_CACHE_URL_SHA1_ONLY = EnvBool(False)
 
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)

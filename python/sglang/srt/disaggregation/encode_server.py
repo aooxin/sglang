@@ -3,10 +3,12 @@ import concurrent.futures
 import contextlib
 import copy
 import ctypes
+import hashlib
 import logging
 import multiprocessing as mp
 import os
 import pickle
+import re
 import time
 import traceback
 from collections import defaultdict
@@ -181,6 +183,81 @@ def _build_mm_aux_data(mm_inputs, model_type=None):
     return {attr: mm_inputs.get(attr) for attr in video_meta_attrs_for(model_type)}
 
 
+def _describe_mm_source(mm_items, max_len: int = 96) -> str:
+    def _one(item) -> str:
+        if isinstance(item, str):
+            # data URI: keep the scheme/mime prefix, drop the base64 payload.
+            if item.startswith("data:"):
+                return f"{item.split(',', 1)[0]},<{len(item)}B>"
+            if len(item) > max_len:
+                return f"{item[:max_len]}...(<{len(item)}B>)"
+            return item
+        if isinstance(item, dict):
+            for k in ("url", "image_url", "video_url", "audio_url", "path", "name"):
+                v = item.get(k)
+                if isinstance(v, dict):
+                    v = v.get("url") or v.get("path")
+                if isinstance(v, str) and v:
+                    return _one(v)
+            return f"<dict keys={list(item.keys())[:5]}>"
+        return f"<{type(item).__name__}>"
+
+    if isinstance(mm_items, (list, tuple)):
+        flat = []
+        for it in mm_items:
+            flat.extend(it if isinstance(it, (list, tuple)) else [it])
+        descs = [_one(x) for x in flat[:4]]
+        if len(flat) > 4:
+            descs.append(f"...(+{len(flat) - 4})")
+        return "[" + ", ".join(descs) + "]"
+    return _one(mm_items)
+
+
+_SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _item_to_url(item) -> Optional[str]:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        for k in ("url", "image_url", "video_url", "audio_url", "path", "name"):
+            v = item.get(k)
+            if isinstance(v, dict):
+                v = v.get("url") or v.get("path")
+            if isinstance(v, str) and v:
+                return v
+        return None
+    return getattr(item, "url", None)
+
+
+def _item_preprocess_kwargs(item) -> Optional[dict]:
+    if isinstance(item, dict):
+        return item.get("preprocess_kwargs")
+    return getattr(item, "preprocess_kwargs", None)
+
+
+def _extract_url_sha1_key(
+    item,
+    include_preprocess_kwargs: bool = False,
+    preprocess_kwargs: Optional[dict] = None,
+) -> Optional[int]:
+    # None => no 40-hex SHA1 in the URL basename => skip the cache (no fallback).
+    url_str = _item_to_url(item)
+    if not url_str:
+        return None
+    name = os.path.splitext(os.path.basename(url_str.split("?")[0]))[0]
+    if not _SHA1_RE.fullmatch(name):
+        return None
+    url_hash = int(name, 16)
+    if not include_preprocess_kwargs:
+        return url_hash
+    # URL-string items carry no kwargs; caller passes them from the parallel
+    # mm_items_preprocess_kwargs. Fall back to item-carried kwargs for dicts.
+    pp = preprocess_kwargs if preprocess_kwargs is not None else _item_preprocess_kwargs(item)
+    pp_str = str(sorted(pp.items())) if pp else ""
+    return int(hashlib.sha1(f"{url_hash}:{pp_str}".encode()).hexdigest(), 16)
+
+
 class MMEncoder:
     def __init__(
         self,
@@ -188,6 +265,7 @@ class MMEncoder:
         schedule_path=None,
         dist_init_method=None,
         rank: int = 0,
+        shm_resources=None,
     ):
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
@@ -249,8 +327,10 @@ class MMEncoder:
         self.sync_context = zmq.Context()  # Reuse sync context for thread pool
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
-        embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
-        self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
+        embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
+        self.mm_cache = MultiModalStaticCache(
+            embedding_cache_size * 1024 * 1024, shm_resources=shm_resources
+        )
         self.mm_cache_lock = asyncio.Lock()
 
         self.io_executor = concurrent.futures.ThreadPoolExecutor(
@@ -367,9 +447,7 @@ class MMEncoder:
 
         hf_cfg = self.model_config.hf_config
         thinker_cfg = _read(hf_cfg, "thinker_config")
-        pc = _read(thinker_cfg, "processor_config") or _read(
-            hf_cfg, "processor_config"
-        )
+        pc = _read(thinker_cfg, "processor_config") or _read(hf_cfg, "processor_config")
         sr = _read(pc, "audio_sampling_rate")
         if sr:
             return int(sr)
@@ -689,7 +767,6 @@ class MMEncoder:
             return hashes
 
         offset = 0
-        logger.info(f"{mm_feature.shape=} with {modality=}")
         for grid in grid_thw:
             num_patches = self.get_num_patches(grid, modality)
             feature_slice = mm_feature[offset : offset + num_patches]
@@ -771,6 +848,50 @@ class MMEncoder:
 
         sub_grids = [grid_thw[i] for i in indices]
         return self.slice_embedding(new_embeddings, sub_grids, modality)
+
+    async def _encode_missing_with_cache(
+        self,
+        mm_feature,
+        mm_inputs: dict,
+        grid_dim: List,
+        modality: Modality,
+        get_feat,
+        forward_timing: Optional[dict] = None,
+        log_metrics: bool = True,
+    ) -> List[torch.Tensor]:
+        # Content-feature-hash cache. TP-safe: missing_indices is deterministic across ranks.
+        total = len(grid_dim)
+        if not self.server_args.enable_prefix_mm_cache:
+            return await self._encode_missing(
+                mm_feature, mm_inputs, list(range(total)), modality, get_feat,
+                forward_timing=forward_timing,
+                log_metrics=log_metrics,
+            )
+
+        keys = self._calculate_hashes_from_features(mm_feature, grid_dim, modality)
+        final_slices: List[Optional[torch.Tensor]] = [None] * total
+        missing_indices: List[int] = []
+
+        async with self.mm_cache_lock:
+            for i, k in enumerate(keys):
+                hit = self.mm_cache.get_single(k)
+                if hit is not None:
+                    final_slices[i] = hit.embedding
+                else:
+                    missing_indices.append(i)
+
+        if missing_indices:
+            new_slices = await self._encode_missing(
+                mm_feature, mm_inputs, missing_indices, modality, get_feat,
+                forward_timing=forward_timing,
+                log_metrics=log_metrics,
+            )
+            async with self.mm_cache_lock:
+                for idx, emb in zip(missing_indices, new_slices):
+                    final_slices[idx] = emb
+                    self.mm_cache.set(keys[idx], EmbeddingResult(embedding=emb))
+
+        return final_slices
 
     async def encode_with_global_cache(
         self,
@@ -1143,9 +1264,7 @@ class MMEncoder:
             raise ValueError("No audio processor available")
 
         audio_config = self.vision_config.get("audio", {})
-        processor_input = self.audio_processor.feature_extractor(
-            audios, **audio_config
-        )
+        processor_input = self.audio_processor.feature_extractor(audios, **audio_config)
         processor_input["feature_attention_mask"] = processor_input.pop(
             "attention_mask"
         )
@@ -1159,10 +1278,17 @@ class MMEncoder:
             pp_timing["preprocess"] += time.perf_counter() - _pp_start
         return processor_input
 
-    async def _encode(
-        self, mm_items, modality: Modality, mm_items_preprocess_kwargs=None,
+    async def _encode_group(
+        self,
+        mm_items,
+        modality: Modality,
+        content_hash_lookup: bool = True,
+        mm_items_preprocess_kwargs=None,
         log_metrics: bool = True,
-    ) -> torch.Tensor:
+    ) -> Tuple[object, torch.Tensor, dict, Optional[int], bool]:
+        # Shared encode core (download+preprocess+ViT). Does NOT store.
+        # Returns (grid, embedding, aux, content_mm_hash, cache_hit); in content
+        # mode it also does the content-hash lookup (cache_hit True on a hit).
         modality_str = modality.name.lower()
         mc = encoder_metrics_collector if log_metrics else None
         stage_timing = {} if mc is not None else None
@@ -1176,48 +1302,227 @@ class MMEncoder:
         except Exception as e:
             raise BadRequestError(f"Failed to process mm items: {str(e)}")
         _observe_single_request_load(mc, stage_timing, modality_str)
-        try:
-            # support mm_cache
-            mm_embedding = None
-            mm_hash = None
 
-            mm_item = MultimodalDataItem.from_dict(
-                {
-                    "modality": modality,
-                    "feature": _convert(_get_mm_feature(mm_inputs, modality)),
-                }
+        mm_embedding = None
+        cache_hit = False
+        content_mm_hash = None
+        cache_enabled = self.server_args.enable_prefix_mm_cache
+        url_sha1_only = envs.SGLANG_MM_CACHE_URL_SHA1_ONLY.get()
+
+        mm_item = MultimodalDataItem.from_dict(
+            {
+                "modality": modality,
+                "feature": _convert(_get_mm_feature(mm_inputs, modality)),
+            }
+        )
+        for k, v in mm_inputs.items():
+            if k in _mm_feature_attrs[modality]:
+                continue
+            mm_item.set(k, _convert(v))
+
+        # Content-hash lookup needs the preprocessed feature, so it happens here (SHA1 mode looks up earlier).
+        if content_hash_lookup and cache_enabled and not url_sha1_only:
+            mm_item.set_pad_value()
+            content_mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
+            _t0 = time.perf_counter()
+            async with self.mm_cache_lock:
+                mm_cache = self.mm_cache.get_single(content_mm_hash)
+                if mm_cache is not None:
+                    mm_embedding = mm_cache.embedding
+                    cache_hit = True
+            if mc is not None:
+                mc.observe_cache_read(time.perf_counter() - _t0, modality=modality_str)
+
+        if mm_embedding is None:
+            forward_start = time.perf_counter()
+            with torch.inference_mode():
+                mm_embedding = get_feature_fn([mm_item])
+                mm_embedding = mm_embedding.cpu()
+            if len(mm_embedding.shape) != 2:
+                mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+            if mc is not None:
+                mc.observe_model_forward(
+                    time.perf_counter() - forward_start, modality=modality_str
+                )
+
+        aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
+
+        if modality == Modality.VIDEO and mm_inputs.get("video_audio_features"):
+            target = (
+                self.model.thinker if hasattr(self.model, "thinker") else self.model
             )
-            for k, v in mm_inputs.items():
-                if k in _mm_feature_attrs[modality]:
-                    continue
-                mm_item.set(k, _convert(v))
-
-            cache_hit = False
-            if self.server_args.enable_prefix_mm_cache:
-                mm_item.set_pad_value()
-                mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
-                async with self.mm_cache_lock:
-                    mm_cache = self.mm_cache.get([mm_item.hash])
-                    if mm_cache is not None:
-                        mm_embedding = mm_cache.embedding
-                        cache_hit = True
-
-            if mm_embedding is None:
-                forward_start = time.perf_counter()
-                with torch.inference_mode():
-                    mm_embedding: torch.Tensor = get_feature_fn([mm_item])
-                    mm_embedding = mm_embedding.cpu()
-                if len(mm_embedding.shape) != 2:
-                    mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+            encode_video_audio_fn = getattr(target, "encode_video_audio", None)
+            if encode_video_audio_fn is not None:
+                audio_forward_start = time.perf_counter()
+                audio_embedding = encode_video_audio_fn(mm_inputs)
                 if mc is not None:
                     mc.observe_model_forward(
-                        time.perf_counter() - forward_start, modality=modality_str
+                        time.perf_counter() - audio_forward_start, modality="audio"
                     )
+                if audio_embedding is not None:
+                    aux_data["video_audio_embedding"] = audio_embedding
+            else:
+                logger.warning(
+                    "Videos carry audio tracks but model has no "
+                    "encode_video_audio; dropping audio for EPD encoding."
+                )
 
-            if (
-                self.server_args.enable_prefix_mm_cache
-                and mc is not None
-            ):
+        grid_dim = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+        return grid_dim, mm_embedding, aux_data, content_mm_hash, cache_hit
+
+    @staticmethod
+    def _recombine_video(per_video: List[Tuple]) -> Tuple[object, torch.Tensor, dict]:
+        # Recombine per-video in original order, byte-identical to the whole-request path.
+        grids = [g for g, _, _ in per_video]
+        embs = [e for _, e, _ in per_video]
+        grid_dim = grids[0] if len(grids) == 1 else torch.cat(grids, dim=0)
+        mm_embedding = embs[0] if len(embs) == 1 else torch.cat(embs, dim=0)
+
+        # Preserve aux key order as first seen across videos.
+        aux_keys: List[str] = []
+        for _, _, a in per_video:
+            for k in a.keys():
+                if k not in aux_keys:
+                    aux_keys.append(k)
+
+        aux_data: dict = {}
+        for k in aux_keys:
+            parts = [a[k] for _, _, a in per_video if a.get(k) is not None]
+            if not parts:
+                continue
+            if isinstance(parts[0], torch.Tensor):
+                aux_data[k] = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+            elif isinstance(parts[0], (list, tuple)):
+                chained: list = []
+                for p in parts:
+                    chained.extend(list(p))
+                aux_data[k] = chained
+            else:
+                # Scalars / other: collect into a list (one per contributing video).
+                aux_data[k] = parts if len(parts) > 1 else parts[0]
+        return grid_dim, mm_embedding, aux_data
+
+    async def _encode_video_per_item(
+        self,
+        leaves: List,
+        sha1_keys: List[int],
+        mm_items_preprocess_kwargs=None,
+    ) -> Tuple[object, torch.Tensor, dict]:
+        # Per-video URL-SHA1 cache: hits skip download+preprocess+ViT, only misses are encoded.
+        mc = encoder_metrics_collector
+        n = len(leaves)
+        per_video: List[Optional[Tuple]] = [None] * n  # (grid, embedding, aux)
+        miss_pos: List[int] = []
+
+        _t0 = time.perf_counter()
+        async with self.mm_cache_lock:
+            for i, k in enumerate(sha1_keys):
+                hit = self.mm_cache.get_single(k)
+                # Require grid; legacy entries without it are re-encoded.
+                if hit is not None and hit.grid is not None:
+                    per_video[i] = (hit.grid, hit.embedding, hit.aux or {})
+                else:
+                    miss_pos.append(i)
+        if mc is not None:
+            mc.observe_cache_read(time.perf_counter() - _t0, modality="video")
+            hits = n - len(miss_pos)
+            mc.record_cache_files(hits, n, modality="video")
+
+        # Encode each miss video on its own so its cache entry is a genuine single-video result.
+        for pos in miss_pos:
+            # preprocess_kwargs is index-aligned with leaves; pass this video's
+            # entry as a single-element list so its sampling params still apply.
+            pk = (
+                [mm_items_preprocess_kwargs[pos]]
+                if mm_items_preprocess_kwargs is not None
+                and pos < len(mm_items_preprocess_kwargs)
+                else None
+            )
+            grid_dim, mm_embedding, aux_data, _, _ = await self._encode_group(
+                [leaves[pos]],
+                Modality.VIDEO,
+                content_hash_lookup=False,
+                mm_items_preprocess_kwargs=pk,
+            )
+            per_video[pos] = (grid_dim, mm_embedding, aux_data)
+            async with self.mm_cache_lock:
+                self.mm_cache.set(
+                    sha1_keys[pos],
+                    EmbeddingResult(
+                        embedding=mm_embedding, grid=grid_dim, aux=aux_data
+                    ),
+                )
+
+        if self.profiler is not None:
+            self.profiler.step()
+        return self._recombine_video(per_video)
+
+    async def _encode(
+        self, mm_items, modality: Modality, mm_items_preprocess_kwargs=None,
+        log_metrics: bool = True,
+    ) -> torch.Tensor:
+        modality_str = modality.name.lower()
+        mc = encoder_metrics_collector if log_metrics else None
+
+        cache_enabled = self.server_args.enable_prefix_mm_cache
+        url_sha1_only = envs.SGLANG_MM_CACHE_URL_SHA1_ONLY.get()
+        mm_source = _describe_mm_source(mm_items) if cache_enabled else None
+
+        # SHA1-only mode keys the whole request on URL SHA1s (known pre-download); any non-SHA1 item skips the cache.
+        sha1_skip = False
+        sha1_keys = None
+        mm_hash = None
+        if cache_enabled and url_sha1_only:
+            leaves = MMEncoder._flatten_nested_items(mm_items)
+            # VIDEO folds per-video sampling params into the key so they don't
+            # collide; params come from the leaf-aligned parallel list.
+            include_pp = modality == Modality.VIDEO
+            pp_list = mm_items_preprocess_kwargs or []
+            sha1_keys = [
+                _extract_url_sha1_key(
+                    it,
+                    include_preprocess_kwargs=include_pp,
+                    preprocess_kwargs=pp_list[i] if i < len(pp_list) else None,
+                )
+                for i, it in enumerate(leaves)
+            ]
+            if not leaves or any(k is None for k in sha1_keys):
+                sha1_skip = True
+                logger.info(
+                    f"[mm_cache] SKIP (no url-sha1) modality={modality.name} "
+                    f"url={mm_source} mode=sha1"
+                )
+            # VIDEO multi-leaf: cache per-video so a request can reuse one cached video. TP-safe.
+            elif modality == Modality.VIDEO and len(leaves) > 1:
+                return await self._encode_video_per_item(
+                    leaves, sha1_keys, mm_items_preprocess_kwargs
+                )
+            else:
+                _t0 = time.perf_counter()
+                async with self.mm_cache_lock:
+                    hit = self.mm_cache.get_single(
+                        mm_hash := MultiModalStaticCache.combine_hashes(sha1_keys)
+                    )
+                if mc is not None:
+                    mc.observe_cache_read(time.perf_counter() - _t0, modality=modality_str)
+                # Require grid; legacy entries without it fall through to recompute.
+                if hit is not None and hit.grid is not None:
+                    if self.profiler is not None:
+                        self.profiler.step()
+                    return (hit.grid, hit.embedding, hit.aux or {})
+
+        try:
+            grid_dim, mm_embedding, aux_data, content_mm_hash, cache_hit = (
+                await self._encode_group(
+                    mm_items,
+                    modality,
+                    mm_items_preprocess_kwargs=mm_items_preprocess_kwargs,
+                )
+            )
+            if mm_hash is None:
+                mm_hash = content_mm_hash
+
+            if cache_enabled and mc is not None:
                 total_tokens = int(mm_embedding.shape[0])
                 hit_tokens = total_tokens if cache_hit else 0
                 mc.record_cache_tokens(
@@ -1227,16 +1532,21 @@ class MMEncoder:
                     1 if cache_hit else 0, 1, modality=modality_str
                 )
 
-            if self.server_args.enable_prefix_mm_cache:
+            # Store grid + aux so a later pre-download hit can rebuild EmbeddingData without preprocess.
+            if cache_enabled and not sha1_skip:
+                _t0 = time.perf_counter()
                 async with self.mm_cache_lock:
                     entries_before = len(self.mm_cache)
                     already_present = self.mm_cache.has(mm_hash)
-                    inserted = self.mm_cache.set(
-                        mm_hash, EmbeddingResult(embedding=mm_embedding)
+                    stored = self.mm_cache.set(
+                        mm_hash,
+                        EmbeddingResult(
+                            embedding=mm_embedding, grid=grid_dim, aux=aux_data
+                        ),
                     )
                     entries_after = len(self.mm_cache)
                     if mc is not None:
-                        added = 0 if already_present else (1 if inserted else 0)
+                        added = 0 if already_present else (1 if stored else 0)
                         evictions = max(
                             0, added - (entries_after - entries_before)
                         )
@@ -1247,33 +1557,15 @@ class MMEncoder:
                         mc.set_cache_state(
                             self.mm_cache.current_size, entries_after
                         )
+                if mc is not None:
+                    mc.observe_cache_write(
+                        time.perf_counter() - _t0, modality=modality_str
+                    )
             if self.profiler is not None:
                 self.profiler.step()
 
-            aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
-
-            if modality == Modality.VIDEO and mm_inputs.get("video_audio_features"):
-                target = (
-                    self.model.thinker if hasattr(self.model, "thinker") else self.model
-                )
-                encode_video_audio_fn = getattr(target, "encode_video_audio", None)
-                if encode_video_audio_fn is not None:
-                    audio_forward_start = time.perf_counter()
-                    audio_embedding = encode_video_audio_fn(mm_inputs)
-                    if mc is not None:
-                        mc.observe_model_forward(
-                            time.perf_counter() - audio_forward_start, modality="audio"
-                        )
-                    if audio_embedding is not None:
-                        aux_data["video_audio_embedding"] = audio_embedding
-                else:
-                    logger.warning(
-                        "Videos carry audio tracks but model has no "
-                        "encode_video_audio; dropping audio for EPD encoding."
-                    )
-
             return (
-                _get_mm_grid_dim(mm_inputs, modality, self.model_type),
+                grid_dim,
                 mm_embedding,
                 aux_data,
             )
@@ -1445,14 +1737,151 @@ class MMEncoder:
     async def batch_encode(
         self, requests: List[dict], modality: Modality, log_metrics: bool = True
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
-        """Cross-request encoder fusion (image/audio). No cache path."""
+        # IMAGE/AUDIO cross-request fusion. URL-SHA1 mode → _batch_encode_sha1, else _legacy_batch_encode.
+        fast = (
+            self.server_args.enable_prefix_mm_cache
+            and envs.SGLANG_MM_CACHE_URL_SHA1_ONLY.get()
+        )
+        if fast:
+            return await self._batch_encode_sha1(
+                requests, modality, log_metrics=log_metrics
+            )
+        return await self._legacy_batch_encode(
+            requests, modality, log_metrics=log_metrics
+        )
+
+    async def _batch_encode_sha1(
+        self, requests: List[dict], modality: Modality, log_metrics: bool = True
+    ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
+        # URL-SHA1 fast path: look up before download; only misses are encoded. TP-safe.
+        mc = encoder_metrics_collector if log_metrics else None
+        modality_str = modality.name.lower()
         items_per_req, flat_items = [], []
         for req in requests:
             leaves = MMEncoder._flatten_nested_items(req["mm_items"])
             items_per_req.append(len(leaves))
             flat_items.extend(leaves)
-        total = sum(items_per_req)
 
+        total = len(flat_items)
+        keys = [_extract_url_sha1_key(it) for it in flat_items]
+        cached_emb: List[Optional[torch.Tensor]] = [None] * total
+        cached_grid: List[Optional[torch.Tensor]] = [None] * total
+        miss_indices: List[int] = []
+        skip_indices: List[int] = []  # no url-sha1: encode but never store
+
+        _t0 = time.perf_counter()
+        async with self.mm_cache_lock:
+            for i, k in enumerate(keys):
+                if k is None:
+                    skip_indices.append(i)
+                    miss_indices.append(i)
+                    continue
+                hit = self.mm_cache.get_single(k)
+                # Require grid; legacy entries without it are recomputed and re-stored.
+                if hit is not None and hit.grid is not None:
+                    cached_emb[i], cached_grid[i] = hit.embedding, hit.grid
+                else:
+                    miss_indices.append(i)
+        if mc is not None:
+            mc.observe_cache_read(time.perf_counter() - _t0, modality=modality_str)
+            hits = total - len(miss_indices)
+            mc.record_cache_tokens(hits, total, modality=modality_str)
+            mc.record_cache_files(hits, total, modality=modality_str)
+
+        # Download + preprocess + ViT only for the misses.
+        if miss_indices:
+            miss_items = [flat_items[i] for i in miss_indices]
+            try:
+                mm_inputs, get_feat = await self._process_mm_items(miss_items, modality)
+            except NotImplementedError as e:
+                return self._batch_set_error(
+                    requests, modality, InternalError(f"Not implemented error: {e}")
+                )
+            except Exception as e:
+                return self._batch_set_error(
+                    requests,
+                    modality,
+                    BadRequestError(f"Failed to process mm items: {e}"),
+                )
+
+            try:
+                mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
+                miss_grid = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+                # IMAGE/AUDIO expect one item per grid entry; otherwise the index<->grid map is unsafe.
+                if len(miss_grid) != len(miss_items):
+                    logger.info(
+                        f"[mm_cache] batch SKIP-FAST (sha1; miss items/grid "
+                        f"mismatch items={len(miss_items)} grid={len(miss_grid)}) "
+                        f"modality={modality.name}"
+                    )
+                    return await self._legacy_batch_encode(requests, modality)
+
+                miss_slices = await self._encode_missing(
+                    mm_feature,
+                    mm_inputs,
+                    list(range(len(miss_items))),
+                    modality,
+                    get_feat,
+                )
+
+                skip_set = set(skip_indices)
+                _t0 = time.perf_counter()
+                async with self.mm_cache_lock:
+                    for j, gidx in enumerate(miss_indices):
+                        emb = miss_slices[j]
+                        g = miss_grid[j : j + 1]
+                        cached_emb[gidx], cached_grid[gidx] = emb, g
+                        if gidx in skip_set:
+                            continue
+                        self.mm_cache.set(
+                            keys[gidx], EmbeddingResult(embedding=emb, grid=g)
+                        )
+                if mc is not None:
+                    mc.observe_cache_write(
+                        time.perf_counter() - _t0, modality=modality_str
+                    )
+                    mc.set_cache_state(self.mm_cache.current_size, len(self.mm_cache))
+            except Exception as e:
+                return self._batch_set_error(
+                    requests, modality, InternalError(f"Internal encoding error: {e}")
+                )
+
+        if self.profiler is not None:
+            for _ in requests:
+                self.profiler.step()
+
+        # No aux_data: batch_encode only handles IMAGE/AUDIO.
+        results = []
+        offset = 0
+        for req, n in zip(requests, items_per_req):
+            es = cached_emb[offset : offset + n]
+            gs = cached_grid[offset : offset + n]
+            emb = es[0] if n == 1 else torch.cat(es, dim=0)
+            grid = gs[0] if n == 1 else torch.cat(gs, dim=0)
+            if self.rank == 0:
+                self.embedding_to_send[req["req_id"]] = EmbeddingData(
+                    req["req_id"],
+                    req["num_parts"],
+                    req["part_idx"],
+                    grid,
+                    modality,
+                    emb,
+                )
+            results.append((emb.nbytes, emb.shape[0], emb.shape[1], None, None))
+            offset += n
+        return results
+
+    async def _legacy_batch_encode(
+        self, requests: List[dict], modality: Modality, log_metrics: bool = True
+    ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
+        # Whole-batch path: download+preprocess all, then content-hash cache.
+        items_per_req, flat_items = [], []
+        for req in requests:
+            leaves = MMEncoder._flatten_nested_items(req["mm_items"])
+            items_per_req.append(len(leaves))
+            flat_items.extend(leaves)
+
+        total = sum(items_per_req)
         mc = encoder_metrics_collector if log_metrics else None
         modality_str = modality.name.lower()
         if mc is not None:
@@ -1479,10 +1908,10 @@ class MMEncoder:
             grid_dim = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
 
             forward_timing = {} if mc is not None else None
-            final_slices = await self._encode_missing(
+            final_slices = await self._encode_missing_with_cache(
                 mm_feature,
                 mm_inputs,
-                list(range(total)),
+                grid_dim,
                 modality,
                 get_feat,
                 forward_timing=forward_timing,
@@ -1509,9 +1938,7 @@ class MMEncoder:
             if self.profiler is not None:
                 for _ in requests:
                     self.profiler.step()
-            # No aux_data here: batch_encode only handles IMAGE/AUDIO
-            # (_BATCHABLE_MODALITIES), and _build_mm_aux_data only extracts
-            # video-meta fields — which never appear in image/audio mm_inputs.
+            # No aux_data: batch_encode only handles IMAGE/AUDIO.
             results = []
             offset = 0
             for req, n in zip(requests, items_per_req):
@@ -2476,9 +2903,7 @@ class DPDispatcher:
                 self._dead_ranks.add(rank)
                 reason = f"DP worker rank={rank} died (exitcode={proc.exitcode})"
                 self._fail_pending_for_rank(rank, reason, "WorkerDied")
-                dead_rids = [
-                    r for r, rk in self.req_id_to_rank.items() if rk == rank
-                ]
+                dead_rids = [r for r, rk in self.req_id_to_rank.items() if rk == rank]
                 for rid in dead_rids:
                     self._pending_send_at.pop(rid, None)
                 self.req_id_to_rank = {
@@ -2677,6 +3102,7 @@ async def run_dp_worker(
     gpu_id: int,
     dispatch_path: str,
     result_path: str,
+    shm_resources=None,
 ):
     logger.info(
         f"DP worker {dp_rank} starting on gpu_id={gpu_id} "
@@ -2689,7 +3115,12 @@ async def run_dp_worker(
     args = copy.deepcopy(server_args)
     args.base_gpu_id = gpu_id
     args.tp_size = 1
-    enc = MMEncoder(args, dist_init_method=f"tcp://127.0.0.1:{get_free_port()}", rank=0)
+    enc = MMEncoder(
+        args,
+        dist_init_method=f"tcp://127.0.0.1:{get_free_port()}",
+        rank=0,
+        shm_resources=shm_resources,
+    )
 
     global encoder_metrics_collector
     if server_args.enable_metrics:
@@ -2776,11 +3207,14 @@ def launch_dp_worker(
     gpu_id: int,
     dispatch_path: str,
     result_path: str,
+    shm_resources=None,
 ):
     try:
         configure_logger(server_args, prefix=f" encode_dp_worker[{dp_rank}]")
         asyncio.run(
-            run_dp_worker(server_args, dp_rank, gpu_id, dispatch_path, result_path)
+            run_dp_worker(
+                server_args, dp_rank, gpu_id, dispatch_path, result_path, shm_resources
+            )
         )
     except KeyboardInterrupt:
         logger.info(f"DP worker {dp_rank} exiting")
@@ -2913,6 +3347,17 @@ def _launch_server_dp(server_args: ServerArgs):
         for r in range(dp_size)
     ]
 
+    shm_resources = None
+    if server_args.enable_prefix_mm_cache and envs.SGLANG_MM_CACHE_SHM.get():
+        mgr = ctx.Manager()
+        shm_resources = {
+            "index": mgr.dict(),
+            "lru": mgr.list(),
+            "size": mgr.Value("l", 0),
+            "lock": ctx.Lock(),
+        }
+        logger.info(f"Shared mm_cache enabled across {dp_size} DP workers")
+
     # Register atexit BEFORE spawn loop so partial spawns get reaped on
     # exception (atexit holds the list ref and reads it at exit time).
     import atexit
@@ -2925,6 +3370,21 @@ def _launch_server_dp(server_args: ServerArgs):
                 p.kill()
         for p in worker_processes:
             p.join(timeout=5)
+        if shm_resources is not None:
+            from multiprocessing.shared_memory import SharedMemory
+
+            for meta in list(shm_resources["index"].values()):
+                names = [meta.get("shm_name")]
+                names += [seg.get("shm_name") for seg in meta.get("aux_segments", [])]
+                for name in names:
+                    if not name:
+                        continue
+                    try:
+                        shm = SharedMemory(name=name, create=False)
+                        shm.close()
+                        shm.unlink()
+                    except FileNotFoundError:
+                        pass
 
     atexit.register(_kill_workers)
 
@@ -2944,6 +3404,7 @@ def _launch_server_dp(server_args: ServerArgs):
                     gpu_id,
                     f"ipc:///tmp/{ipc_prefix}_dp_dispatch_{dp_rank}",
                     result_path,
+                    shm_resources,
                 ),
                 daemon=False,
             )

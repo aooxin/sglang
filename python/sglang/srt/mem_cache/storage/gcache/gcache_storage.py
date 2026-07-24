@@ -242,6 +242,10 @@ class GcacheStorage(HiCacheStorage):
             raise RuntimeError("Gcache store is not initialized.")
         ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
+        logger.info(
+            f"gcache register_memory: {hint_buffer} "
+            f"ptr=0x{ptr:x}, end=0x{ptr + size:x}, size={size} ({size / (1 << 30):.3f} GB)"
+        )
         ret_code = self.gcache_client.register_memory(ptr, size)
         if ret_code:
             logger.error(f"Failed to register {hint_buffer}, error code: {ret_code}")

@@ -3220,7 +3220,7 @@ class ServerArgs:
                     )
                     self.load_format = "auto"
             elif (
-                self.remote_instance_weight_loader_seed_instance_ip is None
+                not self.remote_instance_weight_loader_seed_instance_ip
                 or self.remote_instance_weight_loader_seed_instance_service_port is None
             ):
                 logger.warning(

@@ -8,6 +8,7 @@ import dataclasses
 import fnmatch
 import gc
 import glob
+import inspect
 import json
 import logging
 import math
@@ -37,10 +38,15 @@ import torch
 
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
+    get_remote_instance_model_idx,
     get_remote_instance_transfer_engine_info_per_rank,
-    register_memory_region,
+    register_memory_region_with_handles,
+    trigger_transferring_weights_request,
+    unregister_memory_region,
 )
+from sglang.srt.observability.startup_func_log_and_timer import startup_timer
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.network import NetworkAddress
 
 # Try to import accelerate (optional dependency)
 try:
@@ -73,9 +79,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-    trigger_transferring_weights_request,
-)
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
     post_load_weights,
@@ -271,7 +274,15 @@ def _initialize_model(
         kwargs["sparse_head"] = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.get()
         kwargs["model_path"] = model_config.model_path
 
-    if load_config.draft_model_idx is not None:
+    # Only the MTP model classes that stack multiple draft layers in one
+    # module (e.g. Step3p5MTP, MiMoV2MTP) declare `draft_model_idx` in their
+    # __init__ to pick which layer to build. Other draft/MTP classes (single-
+    # layer EAGLE, DeepSeek/GLM/Qwen NextN, etc.) don't, so passing the kwarg
+    # unconditionally would raise TypeError.
+    if (
+        load_config.draft_model_idx is not None
+        and "draft_model_idx" in inspect.signature(model_class.__init__).parameters
+    ):
         kwargs["draft_model_idx"] = load_config.draft_model_idx
 
     return model_class(**kwargs)
@@ -2082,15 +2093,45 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        if load_config.model_loader_extra_config:
-            raise ValueError(
-                f"Model loader extra config is not supported for "
-                f"load format {load_config.load_format}"
-            )
+        self.remote_instance_transfer_engine_weight_info = None
+        self.remote_instance_registered_memory_addrs = []
+
+    def _unregister_remote_instance_memory(self) -> None:
+        if not self.remote_instance_registered_memory_addrs:
+            return
+        unregister_memory_region(
+            self.load_config.remote_instance_weight_loader_transfer_engine,
+            self.remote_instance_registered_memory_addrs,
+        )
+        self.remote_instance_registered_memory_addrs = []
         self.remote_instance_transfer_engine_weight_info = None
 
     def download_model(self, model_config: ModelConfig) -> None:
         raise NotImplementedError
+
+    def _probe_transfer_engine_seed(self, load_config: LoadConfig):
+        model_idx = get_remote_instance_model_idx(load_config.draft_model_idx)
+        seed_url = NetworkAddress(
+            load_config.remote_instance_weight_loader_seed_instance_ip,
+            load_config.remote_instance_weight_loader_seed_instance_service_port,
+        ).to_url()
+        seed_transfer_engine_session_id, seed_transfer_engine_weight_info = (
+            get_remote_instance_transfer_engine_info_per_rank(
+                seed_url, load_config.tp_rank, model_idx
+            )
+        )
+        if (
+            seed_transfer_engine_session_id is None
+            or seed_transfer_engine_weight_info is None
+        ):
+            raise RuntimeError(
+                f"Cannot get transfer engine session or weight info for "
+                f"tp_rank={load_config.tp_rank}, model_idx={model_idx}."
+            )
+        return (
+            seed_transfer_engine_session_id,
+            seed_transfer_engine_weight_info,
+        )
 
     def load_model(
         self,
@@ -2098,79 +2139,139 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
+        """Load model weights from a remote instance.
+
+        On any failure the method cleans up registered transfer-engine memory
+        and raises an exception.  The caller is expected to handle fallback
+        (e.g. retry with DefaultModelLoader).  No fallback logic lives here
+        so the loader stays single-responsibility and never needs to import
+        an alternative loader.
+        """
         logger.info("Loading weights from remote instance ...")
         load_config = self.load_config
 
         assert load_config.load_format == LoadFormat.REMOTE_INSTANCE, (
-            f"Model loader {self.load_config.load_format} is not supported for "
-            f"load format {load_config.load_format}"
+            f"RemoteInstanceModelLoader does not support "
+            f"load_format={load_config.load_format}"
         )
 
-        quant_config = _get_quantization_config(model_config, self.load_config)
-        with set_default_torch_dtype(model_config.dtype):
-            with torch.device(device_config.device):
-                model = _initialize_model(model_config, self.load_config, quant_config)
-
+        # 1. Probe seed instance (transfer_engine backend only).
+        transfer_engine_seed_info = None
         if (
-            load_config.remote_instance_weight_loader_backend
-            == RemoteInstanceWeightLoaderBackend.NCCL
-        ):
-            model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
-            with create_remote_connector(model_weights, device_config.device) as client:
-                connector_type = get_connector_type(client)
-                if connector_type == ConnectorType.INSTANCE:
-                    self.load_model_from_remote_instance_by_nccl(
-                        model, client, model_config, device_config
-                    )
-                else:
-                    raise ValueError(
-                        f"Unsupported connector type {connector_type} for "
-                        f"remote tensor model loading."
-                    )
-        elif (
             load_config.remote_instance_weight_loader_backend
             == RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE
         ):
-            if load_config.remote_instance_weight_loader_transfer_engine is None:
-                raise RuntimeError(
-                    "Transfer engine is not initialized for remote instance "
-                    "model loader with `transfer_engine` backend. "
-                )
-            logger.info(
-                "TransferEngine registering memory regions (this may take a few seconds)..."
-            )
-            # register memory region
-            self.remote_instance_transfer_engine_weight_info = register_memory_region(
-                model, load_config.remote_instance_weight_loader_transfer_engine
-            )
-            logger.info(
-                "TransferEngine memory regions have been successfully registered."
-            )
+            transfer_engine_seed_info = self._probe_transfer_engine_seed(load_config)
 
-            # transfer weights
-            success = self.load_model_from_remote_instance_by_transfer_engine(
-                model,
-                load_config.remote_instance_weight_loader_transfer_engine,
-                f"http://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_seed_instance_service_port}",
+        # 2. Initialize model (empty) on device.
+        quant_config = _get_quantization_config(model_config, self.load_config)
+        try:
+            with set_default_torch_dtype(model_config.dtype):
+                with torch.device(device_config.device):
+                    model = _initialize_model(
+                        model_config, self.load_config, quant_config
+                    )
+        except Exception:
+            logger.error(
+                "Failed to initialize model for remote loading (load_format=%s).",
+                load_config.load_format,
+                exc_info=True,
+            )
+            raise
+
+        # 3. Transfer weights from remote instance.
+        try:
+            return self._try_load_from_remote_instance(
+                model=model,
+                model_config=model_config,
+                device_config=device_config,
+                load_config=load_config,
+                transfer_engine_seed_info=transfer_engine_seed_info,
+            )
+        except Exception:
+            logger.error(
+                "Remote instance weight transfer failed (backend=%s).",
+                load_config.remote_instance_weight_loader_backend,
+                exc_info=True,
+            )
+            self._unregister_remote_instance_memory()
+            del model
+            raise
+
+    def _try_load_from_remote_instance(
+        self,
+        model: nn.Module,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+        load_config: LoadConfig,
+        transfer_engine_seed_info=None,
+    ) -> nn.Module:
+        """Execute the actual weight transfer; raises on failure."""
+        try:
+            if (
+                load_config.remote_instance_weight_loader_backend
+                == RemoteInstanceWeightLoaderBackend.NCCL
+            ):
+                model_weights = f"instance://{load_config.remote_instance_weight_loader_seed_instance_ip}:{load_config.remote_instance_weight_loader_send_weights_group_ports[load_config.tp_rank]}"
+                with create_remote_connector(
+                    model_weights, device_config.device
+                ) as client:
+                    connector_type = get_connector_type(client)
+                    if connector_type == ConnectorType.INSTANCE:
+                        self.load_model_from_remote_instance_by_nccl(
+                            model, client, model_config, device_config
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unsupported connector type {connector_type} for "
+                            f"remote tensor model loading."
+                        )
+            elif (
+                load_config.remote_instance_weight_loader_backend
+                == RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE
+            ):
+                if load_config.remote_instance_weight_loader_transfer_engine is None:
+                    raise RuntimeError(
+                        "Transfer engine is not initialized for remote instance "
+                        "model loader with `transfer_engine` backend. "
+                    )
+                seed_session_id, seed_weight_info = transfer_engine_seed_info
+                success = self.load_model_from_remote_instance_by_transfer_engine(
+                    model,
+                    load_config.remote_instance_weight_loader_transfer_engine,
+                    seed_session_id,
+                    seed_weight_info,
+                )
+                if not success:
+                    raise RuntimeError(
+                        "Failed to load weights from remote instance via transfer engine."
+                    )
+            elif (
+                load_config.remote_instance_weight_loader_backend
+                == RemoteInstanceWeightLoaderBackend.MODELEXPRESS
+            ):
+                self.load_model_from_modelexpress(
+                    model,
+                    load_config,
+                    device_config,
+                )
+            else:
+                raise ValueError("Invalid remote instance weight loader backend.")
+
+            return model.eval()
+        except Exception as e:
+            logger.error(
+                "Weight transfer failed in _try_load_from_remote_instance "
+                "(backend=%s, tp_rank=%s, seed=%s:%s): %s",
+                load_config.remote_instance_weight_loader_backend,
                 load_config.tp_rank,
+                load_config.remote_instance_weight_loader_seed_instance_ip,
+                load_config.remote_instance_weight_loader_seed_instance_service_port,
+                e,
+                exc_info=True,
             )
-            if not success:
-                raise RuntimeError(
-                    "Failed to load weights from remote instance via transfer engine."
-                )
-        elif (
-            load_config.remote_instance_weight_loader_backend
-            == RemoteInstanceWeightLoaderBackend.MODELEXPRESS
-        ):
-            self.load_model_from_modelexpress(
-                model,
-                load_config,
-                device_config,
-            )
-        else:
-            raise ValueError("Invalid remote instance weight loader backend.")
-
-        return model.eval()
+            del model
+            raise
 
     def load_model_from_remote_instance_by_nccl(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
@@ -2224,20 +2325,12 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         torch.cuda.empty_cache()
 
     def load_model_from_remote_instance_by_transfer_engine(
-        self, model, transfer_engine, seed_url, tp_rank
+        self,
+        model,
+        transfer_engine,
+        seed_transfer_engine_session_id,
+        seed_transfer_engine_weight_info,
     ) -> bool:
-        # get remote weights metadata from source instance
-        seed_transfer_engine_session_id, seed_transfer_engine_weight_info = (
-            get_remote_instance_transfer_engine_info_per_rank(seed_url, tp_rank)
-        )
-        if (
-            seed_transfer_engine_session_id is None
-            or seed_transfer_engine_weight_info is None
-        ):
-            logger.error("Cannot get transfer engine session or weight info.")
-            return False
-
-        # prepare local/remote RDMA keys
         seed_ptr_list = []
         client_ptr_list = []
         client_len_list = []
@@ -2263,6 +2356,12 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             seed_ptr_list.append(seed_ptr)
             client_ptr_list.append(client_ptr)
             client_len_list.append(client_len)
+
+        with startup_timer("registering TransferEngine memory regions"):
+            (
+                self.remote_instance_transfer_engine_weight_info,
+                self.remote_instance_registered_memory_addrs,
+            ) = register_memory_region_with_handles(model, transfer_engine)
 
         # load weights from source instance through TransferEngine
         ret = transfer_engine.batch_transfer_sync_read(
@@ -2306,9 +2405,10 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         logger.info(
             "ModelExpress: registering memory regions for tp_rank=%d...", tp_rank
         )
-        self.remote_instance_transfer_engine_weight_info = register_memory_region(
-            model, transfer_engine
-        )
+        (
+            self.remote_instance_transfer_engine_weight_info,
+            self.remote_instance_registered_memory_addrs,
+        ) = register_memory_region_with_handles(model, transfer_engine)
 
         # Wait for seed to be ready via ModelExpress
         mx_client = MxClient(server_url=load_config.modelexpress_url)
@@ -2527,8 +2627,8 @@ class RemoteModelLoader(BaseModelLoader):
         load_config = self.load_config
 
         assert load_config.load_format == LoadFormat.REMOTE, (
-            f"Model loader {self.load_config.load_format} is not supported for "
-            f"load format {load_config.load_format}"
+            f"RemoteModelLoader does not support "
+            f"load_format={load_config.load_format}"
         )
 
         model_weights = model_config.model_path

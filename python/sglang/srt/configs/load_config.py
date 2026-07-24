@@ -93,7 +93,6 @@ class LoadConfig:
         None  # Path to rollout quantization profile (e.g., /root/profile.7b.pt)
     )
 
-    # For multi-layer MTP
     draft_model_idx: Optional[int] = None
 
     def __post_init__(self):

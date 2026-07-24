@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
 )
 from sglang.srt.nvtx_utils import nvtx_annotated_method
+from sglang.srt.observability.startup_func_log_and_timer import startup_timer
 from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -2167,28 +2168,30 @@ class SWATokenToKVPoolHost:
         if host_to_device_ratio_swa is None:
             host_to_device_ratio_swa = host_to_device_ratio
         # full layers host pool
-        self.full_pool_host = MHATokenToKVPoolHost(
-            device_pool=self.device_pool.full_kv_pool,
-            host_to_device_ratio=host_to_device_ratio,
-            host_size=host_size,
-            page_size=page_size,
-            layout=layout,
-            pin_memory=pin_memory,
-            device=self.device,
-            allocator_type=allocator_type,
-        )
+        with startup_timer("Initializing full pool host cache"):
+            self.full_pool_host = MHATokenToKVPoolHost(
+                device_pool=self.device_pool.full_kv_pool,
+                host_to_device_ratio=host_to_device_ratio,
+                host_size=host_size,
+                page_size=page_size,
+                layout=layout,
+                pin_memory=pin_memory,
+                device=self.device,
+                allocator_type=allocator_type,
+            )
 
         # swa layers host pool (different kv shape handled by swa_kv_pool)
-        self.swa_pool_host = MHATokenToKVPoolHost(
-            device_pool=self.device_pool.swa_kv_pool,
-            host_to_device_ratio=host_to_device_ratio_swa,
-            host_size=host_size_swa,
-            page_size=page_size,
-            layout=layout,
-            pin_memory=pin_memory,
-            device=self.device,
-            allocator_type=allocator_type,
-        )
+        with startup_timer("Initializing SWA pool host cache"):
+            self.swa_pool_host = MHATokenToKVPoolHost(
+                device_pool=self.device_pool.swa_kv_pool,
+                host_to_device_ratio=host_to_device_ratio_swa,
+                host_size=host_size_swa,
+                page_size=page_size,
+                layout=layout,
+                pin_memory=pin_memory,
+                device=self.device,
+                allocator_type=allocator_type,
+            )
         self.h2d_block_quota = self.full_pool_host.h2d_block_quota
         self.d2h_block_quota = self.full_pool_host.d2h_block_quota
 

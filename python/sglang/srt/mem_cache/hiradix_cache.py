@@ -51,6 +51,7 @@ from sglang.srt.mem_cache.simple_swa_radix_cache import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
+from sglang.srt.observability.startup_func_log_and_timer import startup_timer
 from sglang.srt.utils.common import floor_align
 
 if TYPE_CHECKING:
@@ -134,16 +135,17 @@ class BaseHiRadixCache(abc.ABC):
                 allocator_type=server_args.hicache_storage_backend,
             )
         elif isinstance(self.kv_cache, SWAKVPool):
-            self.token_to_kv_pool_host = SWATokenToKVPoolHost(
-                self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                device=params.token_to_kv_pool_allocator.device,
-                allocator_type=server_args.hicache_storage_backend,
-            )
+            with startup_timer("L2 cache init"):
+                self.token_to_kv_pool_host = SWATokenToKVPoolHost(
+                    self.kv_cache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    device=params.token_to_kv_pool_allocator.device,
+                    allocator_type=server_args.hicache_storage_backend,
+                )
         else:
             raise ValueError(f"BaseHiRadixCache only supports MHA, MLA and SWA yet")
 
@@ -169,23 +171,24 @@ class BaseHiRadixCache(abc.ABC):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        self.cache_controller = HiCacheController(
-            params.token_to_kv_pool_allocator,
-            self.token_to_kv_pool_host,
-            self.page_size,
-            self.tp_group,
-            load_cache_event=self.load_cache_event,
-            write_policy=server_args.hicache_write_policy,
-            io_backend=server_args.hicache_io_backend,
-            storage_backend=server_args.hicache_storage_backend,
-            prefetch_threshold=prefetch_threshold,
-            model_name=server_args.served_model_name,
-            storage_backend_extra_config=extra_config,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
-            enable_storage_metrics=self.enable_storage_metrics,
-            sliding_window_size=params.sliding_window_size,
-        )
+        with startup_timer("L3 cache init and attach storage backend"):
+            self.cache_controller = HiCacheController(
+                params.token_to_kv_pool_allocator,
+                self.token_to_kv_pool_host,
+                self.page_size,
+                self.tp_group,
+                load_cache_event=self.load_cache_event,
+                write_policy=server_args.hicache_write_policy,
+                io_backend=server_args.hicache_io_backend,
+                storage_backend=server_args.hicache_storage_backend,
+                prefetch_threshold=prefetch_threshold,
+                model_name=server_args.served_model_name,
+                storage_backend_extra_config=extra_config,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                enable_storage_metrics=self.enable_storage_metrics,
+                sliding_window_size=params.sliding_window_size,
+            )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
             prefetch_threshold=prefetch_threshold,

@@ -204,6 +204,7 @@ from sglang.srt.observability.scheduler_metrics_mixin import (
     PrefillStats,
     SchedulerMetricsMixin,
 )
+from sglang.srt.observability.startup_func_log_and_timer import startup_timer
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -813,11 +814,12 @@ class Scheduler(
                     # hybrid + HiCache: use HiSimpleSWARadixCache for L2/L3 + SWA.
                     from sglang.srt.mem_cache.hiradix_cache import HiSimpleSWARadixCache
 
-                    self.tree_cache = HiSimpleSWARadixCache(
-                        params=params,
-                        # TODO(yingchun): 不需要 server_args
-                        server_args=server_args,
-                    )
+                    with startup_timer("Initializing HiSimpleSWARadixCache"):
+                        self.tree_cache = HiSimpleSWARadixCache(
+                            params=params,
+                            # TODO(yingchun): 不需要 server_args
+                            server_args=server_args,
+                        )
                     self.tp_worker.register_hicache_layer_transfer_counter(
                         self.tree_cache.cache_controller.layer_done_counter
                     )

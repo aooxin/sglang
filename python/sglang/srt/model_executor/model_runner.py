@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import gc
 import inspect
@@ -141,15 +142,21 @@ from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    RemoteInstanceModelLoader,
+    get_model_loader,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
-    register_memory_region,
+    get_remote_instance_model_idx,
+    register_memory_region_with_handles,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.nvtx_utils import nvtx_annotated_method
+from sglang.srt.observability.startup_func_log_and_timer import startup_timer
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -352,6 +359,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
         self.remote_instance_transfer_engine_weight_info = None
+        self.remote_instance_registered_memory_addrs = []
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.eagle_use_aux_hidden_state = False
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
@@ -520,13 +528,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if (
             self.server_args.remote_instance_weight_loader_use_transfer_engine()
             and self.remote_instance_transfer_engine is not None
-            and self.remote_instance_transfer_engine_weight_info is None
         ):
-            # Register memory and upstream the transfer engine info to the bootstrap server
-            self.remote_instance_transfer_engine_weight_info = register_memory_region(
-                self.model, self.remote_instance_transfer_engine
-            )
-            self._register_to_engine_info_bootstrap()
+            # Register memory if the loader has not already done so. Remote-instance
+            # transfer_engine clients register before RDMA read, but still need to
+            # publish their local metadata when configured to become a seed.
+            if self.remote_instance_transfer_engine_weight_info is None:
+                (
+                    self.remote_instance_transfer_engine_weight_info,
+                    self.remote_instance_registered_memory_addrs,
+                ) = register_memory_region_with_handles(
+                    self.model, self.remote_instance_transfer_engine
+                )
+            if (
+                self.server_args.remote_instance_weight_loader_start_seed_via_transfer_engine
+            ):
+                # Both main and draft worker register; see
+                # get_remote_instance_model_idx() for the (tp_rank, model_idx)
+                # composite key convention that prevents overwrites.
+                self._register_to_engine_info_bootstrap()
 
         # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
         # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
@@ -711,6 +730,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             local_ip, self.remote_instance_transfer_engine.get_rpc_port()
         ).to_host_port_str()
 
+    def _propagate_loader_weight_info(self) -> None:
+        if not isinstance(self.loader, RemoteInstanceModelLoader):
+            return
+        self.remote_instance_transfer_engine_weight_info = (
+            self.loader.remote_instance_transfer_engine_weight_info
+        )
+        self.remote_instance_registered_memory_addrs = (
+            self.loader.remote_instance_registered_memory_addrs
+        )
+
     def _register_to_engine_info_bootstrap(self):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
 
@@ -732,8 +761,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         bootstrap_na = NetworkAddress(bootstrap_host, bootstrap_port)
         url = f"{bootstrap_na.to_url()}/register_transfer_engine_info"
 
+        model_idx = get_remote_instance_model_idx(self.draft_model_idx)
+
         payload = {
             "tp_rank": self.tp_rank,
+            "model_idx": model_idx,
             "transfer_engine_info": {
                 "session_id": self.remote_instance_transfer_engine_session_id,
                 "weights_info_dict": self.remote_instance_transfer_engine_weight_info,
@@ -741,20 +773,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         }
 
         try:
-            resp = http_requests.put(url, json=payload, timeout=5)
+            resp = http_requests.put(
+                url,
+                json=payload,
+                timeout=envs.SGLANG_REMOTE_INSTANCE_WEIGHT_LOADER_REQUEST_TIMEOUT.get(),
+            )
             if resp.status_code == 200:
                 logger.info(
-                    f"Registered transfer engine info for tp_rank={self.tp_rank} "
-                    f"with bootstrap server at {bootstrap_na}"
+                    f"Registered transfer engine info for tp_rank={self.tp_rank}, "
+                    f"model_idx={model_idx} with bootstrap server at {bootstrap_na}"
                 )
             else:
                 logger.error(
-                    f"Failed to register transfer engine info for tp_rank={self.tp_rank}: "
-                    f"{resp.status_code}, {resp.text}"
+                    f"Failed to register transfer engine info for tp_rank={self.tp_rank}, "
+                    f"model_idx={model_idx}: {resp.status_code}, {resp.text}"
                 )
         except Exception as e:
             logger.error(
-                f"Failed to register transfer engine info for tp_rank={self.tp_rank}: {e}"
+                f"Failed to register transfer engine info for tp_rank={self.tp_rank}, "
+                f"model_idx={model_idx}: {e}"
             )
 
     def _publish_modelexpress_metadata(self):
@@ -1149,22 +1186,59 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
             self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
         )
-        with self.memory_saver_adapter.region(
-            GPU_MEMORY_TYPE_WEIGHTS,
-            enable_cpu_backup=enable_cpu_backup,
-        ):
-            self.loader = get_model_loader(
-                load_config=self.load_config,
-                model_config=self.model_config,
+
+        self.loader = get_model_loader(
+            load_config=self.load_config,
+            model_config=self.model_config,
+        )
+        device_config = DeviceConfig(self.device, self.gpu_id)
+
+        try:
+            with self.memory_saver_adapter.region(
+                GPU_MEMORY_TYPE_WEIGHTS,
+                enable_cpu_backup=enable_cpu_backup,
+            ):
+                with startup_timer("model_loader.load_model"):
+                    self.model = self.loader.load_model(
+                        model_config=self.model_config,
+                        device_config=device_config,
+                    )
+                self._propagate_loader_weight_info()
+        except Exception:
+            if self.server_args.load_format != LoadFormat.REMOTE_INSTANCE:
+                raise
+
+            logger.warning(
+                "Remote instance loading failed. "
+                "Falling back to local loader with load_format='auto' "
+                "(model_path=%s).",
+                self.model_config.model_path,
+                exc_info=True,
             )
-            self.model = self.loader.load_model(
-                model_config=self.model_config,
-                device_config=DeviceConfig(self.device, self.gpu_id),
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            fallback_config = dataclasses.replace(
+                self.load_config,
+                load_format=LoadFormat.AUTO,
+                remote_instance_weight_loader_transfer_engine=None,
+                model_loader_extra_config=(
+                    self.load_config.model_loader_extra_config or {}
+                ),
             )
-            if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
-                self.remote_instance_transfer_engine_weight_info = (
-                    self.loader.remote_instance_transfer_engine_weight_info
+            self.loader = get_model_loader(fallback_config, self.model_config)
+
+            with self.memory_saver_adapter.region(
+                GPU_MEMORY_TYPE_WEIGHTS,
+                enable_cpu_backup=enable_cpu_backup,
+            ):
+                self.model = self.loader.load_model(
+                    model_config=self.model_config,
+                    device_config=device_config,
                 )
+
         # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
         # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
         if _is_npu:
@@ -1174,19 +1248,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Publish metadata to ModelExpress if running as seed source
         if self.server_args.modelexpress_source:
             # Seed loads via DefaultModelLoader (load_format=auto), which doesn't
-            # call register_memory_region(). Do it here so weight_info is populated.
+            # register memory. Do it here so weight_info is populated.
             if (
                 self.remote_instance_transfer_engine_weight_info is None
                 and self.remote_instance_transfer_engine is not None
             ):
                 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-                    register_memory_region,
+                    register_memory_region_with_handles,
                 )
 
-                self.remote_instance_transfer_engine_weight_info = (
-                    register_memory_region(
-                        self.model, self.remote_instance_transfer_engine
-                    )
+                (
+                    self.remote_instance_transfer_engine_weight_info,
+                    self.remote_instance_registered_memory_addrs,
+                ) = register_memory_region_with_handles(
+                    self.model, self.remote_instance_transfer_engine
                 )
             self._publish_modelexpress_metadata()
 

@@ -9,13 +9,33 @@ from typing import List
 
 import requests
 
+from sglang.srt.environ import envs
+
 logger = logging.getLogger(__name__)
+
+
+MAIN_MODEL_IDX = -1
 
 
 class RemoteInstanceWeightLoaderBackend(str, enum.Enum):
     NCCL = "nccl"
     TRANSFER_ENGINE = "transfer_engine"
     MODELEXPRESS = "modelexpress"
+
+
+def get_remote_instance_model_idx(draft_model_idx: int = None) -> int:
+    """Return the model index used to key bootstrap server entries.
+
+    Convention:
+        draft_model_idx is None  → MAIN_MODEL_IDX  (main model, not a draft worker)
+        draft_model_idx is int   → draft_model_idx (draft model layer index, 0-indexed)
+
+    Under speculative decoding the same tp_rank may host multiple ModelRunners
+    (one main model + one or more draft models).  The bootstrap server uses
+    (tp_rank, model_idx) as a composite key so each runner's registration is
+    isolated.
+    """
+    return draft_model_idx if draft_model_idx is not None else MAIN_MODEL_IDX
 
 
 def trigger_init_weights_send_group_for_remote_instance_request(
@@ -45,6 +65,7 @@ def trigger_init_weights_send_group_for_remote_instance_request(
                 "group_name": f"send_weights_{remote_instance_weight_loader_client_id}",
                 "backend": "nccl",
             },
+            timeout=envs.SGLANG_REMOTE_INSTANCE_WEIGHT_LOADER_REQUEST_TIMEOUT.get(),
         )
     except Exception as e:
         logger.error(
@@ -73,19 +94,24 @@ def trigger_transferring_weights_request(
                 ),
                 "group_name": f"send_weights_{remote_instance_weight_loader_client_id}",
             },
+            timeout=envs.SGLANG_REMOTE_INSTANCE_WEIGHT_LOADER_REQUEST_TIMEOUT.get(),
         )
     except Exception as e:
         logger.error(f"Failed to trigger send weights to remote instance request: {e}")
         raise
 
 
-def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
+def get_remote_instance_transfer_engine_info_per_rank(
+    seed_url: str, rank: int, model_idx: int = MAIN_MODEL_IDX
+):
     try:
         response = requests.get(
             f"{seed_url}/get_remote_instance_transfer_engine_info",
             params={
                 "rank": rank,
+                "model_idx": model_idx,
             },
+            timeout=envs.SGLANG_REMOTE_INSTANCE_WEIGHT_LOADER_REQUEST_TIMEOUT.get(),
         )
 
         if response.status_code == 200:
@@ -107,24 +133,50 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
 
 
 def register_memory_region(model, transfer_engine):
+    weight_mr_dict, _ = register_memory_region_with_handles(model, transfer_engine)
+    return weight_mr_dict
+
+
+def register_memory_region_with_handles(model, transfer_engine):
     if importlib.util.find_spec("torch") is None:
         return register_memory_region_v1(model, transfer_engine)
     else:
         return register_memory_region_v2(model, transfer_engine)
 
 
+def unregister_memory_region(transfer_engine, registered_memory_addrs):
+    if not registered_memory_addrs:
+        return
+
+    for address in registered_memory_addrs:
+        try:
+            ret = transfer_engine.unregister_memory(address)
+        except Exception as e:
+            logger.warning(
+                f"Failed to unregister memory region at address {address}: {e}"
+            )
+            continue
+        if ret != 0:
+            logger.warning(
+                f"unregister memory failed for address {address}, error: {ret}"
+            )
+
+
 def register_memory_region_v1(model, transfer_engine):
     start_tic = time.time()
 
     weight_mr_dict = {}
+    registered_memory_addrs = []
     for name, weight in model.named_parameters():
         ret = transfer_engine.register_memory(
             weight.data_ptr(), weight.numel() * weight.element_size()
         )
         if ret != 0:
+            unregister_memory_region(transfer_engine, registered_memory_addrs)
             raise RuntimeError(
                 f"register memory failed for weight {name}, error: {ret}"
             )
+        registered_memory_addrs.append(weight.data_ptr())
         weight_mr_dict[name] = (
             weight.data_ptr(),
             weight.numel(),
@@ -133,7 +185,7 @@ def register_memory_region_v1(model, transfer_engine):
 
     end_tic = time.time()
     logger.debug(f"Register memory region time: {(end_tic - start_tic):.4f}s")
-    return weight_mr_dict
+    return weight_mr_dict, registered_memory_addrs
 
 
 def register_memory_region_v2(model, transfer_engine):
@@ -181,14 +233,17 @@ def register_memory_region_v2(model, transfer_engine):
             weight_blocks_for_reg_mr.append(current_weight_block)
 
     # Register merged memory blocks that hold weights.
+    registered_memory_addrs = []
     for weight_block in weight_blocks_for_reg_mr:
         address, size = weight_block
         ret = transfer_engine.register_memory(address, size)
         if ret != 0:
+            unregister_memory_region(transfer_engine, registered_memory_addrs)
             raise RuntimeError(
                 f"register memory failed for weight block at address {address} with size {size}, error: {ret}"
             )
+        registered_memory_addrs.append(address)
 
     end_tic = time.time()
     logger.debug(f"Register memory region v2 time: {(end_tic - start_tic):.4f}s")
-    return weight_mr_dict
+    return weight_mr_dict, registered_memory_addrs

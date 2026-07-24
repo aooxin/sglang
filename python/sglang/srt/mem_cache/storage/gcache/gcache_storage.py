@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache, SWATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
+from sglang.srt.observability.startup_func_log_and_timer import startup_timer
 
 logger = logging.getLogger(__name__)
 
@@ -263,10 +264,19 @@ class GcacheStorage(HiCacheStorage):
         ], "gcache store storage backend only support page first or page first direct layout"
         try:
             # If k and v head dim are inconsistent, host_k_buffer and host_v_buffer are two separate memory addresses when allocating memory, so they need to be registered separately
-            self.register_buffer(self.mem_pool_host.full_pool_host.k_buffer, "full K buffer")
-            self.register_buffer(self.mem_pool_host.full_pool_host.v_buffer, "full V buffer")
-            self.register_buffer(self.mem_pool_host.swa_pool_host.k_buffer, "SWA K buffer")
-            self.register_buffer(self.mem_pool_host.swa_pool_host.v_buffer, "SWA V buffer")
+            with startup_timer("Gcache register buffer"):
+                self.register_buffer(
+                    self.mem_pool_host.full_pool_host.k_buffer, "full K buffer"
+                )
+                self.register_buffer(
+                    self.mem_pool_host.full_pool_host.v_buffer, "full V buffer"
+                )
+                self.register_buffer(
+                    self.mem_pool_host.swa_pool_host.k_buffer, "SWA K buffer"
+                )
+                self.register_buffer(
+                    self.mem_pool_host.swa_pool_host.v_buffer, "SWA V buffer"
+                )
 
         except TypeError as err:
             logger.error("Failed to register buffer to Gcache Store: %s", err)

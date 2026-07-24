@@ -45,6 +45,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.observability.startup_func_log_and_timer import startup_timer
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -773,10 +774,13 @@ class HiCacheController:
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
         try:
-            self.storage_backend = StorageBackendFactory.create_backend(
-                storage_backend, self.storage_config, self.mem_pool_host
-            )
-            self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+            with startup_timer(
+                f"create_storage_backend: {storage_backend} and register_mem_pool_host"
+            ):
+                self.storage_backend = StorageBackendFactory.create_backend(
+                    storage_backend, self.storage_config, self.mem_pool_host
+                )
+                self.storage_backend.register_mem_pool_host(self.mem_pool_host)
 
             self.enable_storage = True
             # todo: threshold policy for prefetching

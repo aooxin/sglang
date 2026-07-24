@@ -20,6 +20,8 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import MAIN_MODEL_IDX
+
 logger = logging.getLogger(__name__)
 
 
@@ -38,8 +40,9 @@ class EngineInfoBootstrapServer:
         self.host = host
         self.port = port
 
-        # Storage: {tp_rank: (session_id, weights_info_dict)}
-        self.transfer_engine_info: Dict[int, Tuple] = {}
+        # Storage: {(tp_rank, model_idx): (session_id, weights_info_dict)}.
+        # For model_idx semantics, see get_remote_instance_model_idx().
+        self.transfer_engine_info: Dict[Tuple[int, int], Tuple] = {}
         self.lock = threading.Lock()
 
         app = FastAPI()
@@ -52,19 +55,22 @@ class EngineInfoBootstrapServer:
         def register_transfer_engine_info(data: dict):
             try:
                 tp_rank = data["tp_rank"]
+                # Backward-compatible default: missing model_idx => main model.
+                model_idx = data.get("model_idx", MAIN_MODEL_IDX)
                 info = data["transfer_engine_info"]
                 session_id = info["session_id"]
                 weights_info_dict = info["weights_info_dict"]
 
+                key = (tp_rank, model_idx)
                 with self.lock:
-                    self.transfer_engine_info[tp_rank] = (
+                    self.transfer_engine_info[key] = (
                         session_id,
                         weights_info_dict,
                     )
 
                 logger.info(
                     f"Registered transfer engine info for tp_rank={tp_rank}, "
-                    f"session_id={session_id}"
+                    f"model_idx={model_idx}, session_id={session_id}"
                 )
                 return PlainTextResponse("OK")
             except Exception as e:
@@ -72,20 +78,28 @@ class EngineInfoBootstrapServer:
                 raise HTTPException(status_code=400, detail=str(e))
 
         @app.get("/get_transfer_engine_info")
-        def get_transfer_engine_info(rank: int):
+        def get_transfer_engine_info(rank: int, model_idx: int = MAIN_MODEL_IDX):
             if rank < 0:
                 raise HTTPException(status_code=400, detail="Invalid rank parameter")
 
+            key = (rank, model_idx)
             with self.lock:
-                info = self.transfer_engine_info.get(rank)
+                info = self.transfer_engine_info.get(key)
 
             if info is None:
                 raise HTTPException(
                     status_code=404,
-                    detail=f"No transfer engine info for rank {rank}",
+                    detail=(
+                        f"No transfer engine info for rank={rank}, "
+                        f"model_idx={model_idx}"
+                    ),
                 )
 
-            return {"rank": rank, "remote_instance_transfer_engine_info": list(info)}
+            return {
+                "rank": rank,
+                "model_idx": model_idx,
+                "remote_instance_transfer_engine_info": list(info),
+            }
 
         config = uvicorn.Config(app, host=host, port=port, log_level="warning")
         self._server = uvicorn.Server(config)
@@ -100,6 +114,8 @@ class EngineInfoBootstrapServer:
         self._server.should_exit = True
         self._thread.join(timeout=5)
 
-    def get_transfer_engine_info(self, rank: int) -> Optional[Tuple]:
+    def get_transfer_engine_info(
+        self, rank: int, model_idx: int = MAIN_MODEL_IDX
+    ) -> Optional[Tuple]:
         """Direct in-process access for co-located HTTP server (no HTTP round-trip)."""
-        return self.transfer_engine_info.get(rank)
+        return self.transfer_engine_info.get((rank, model_idx))

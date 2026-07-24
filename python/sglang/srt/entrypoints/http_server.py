@@ -153,6 +153,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.model_loader.remote_instance_weight_loader_utils import MAIN_MODEL_IDX
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.trace import (
     process_tracing_init,
@@ -998,18 +999,33 @@ async def send_weights_to_remote_instance(
 
 @app.get("/get_remote_instance_transfer_engine_info")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def get_remote_instance_transfer_engine_info(rank: int = None):
-    """Get the server information (deprecated - use /remote_instance_transfer_engine_info instead)."""
+async def get_remote_instance_transfer_engine_info(
+    rank: int = None, model_idx: int = MAIN_MODEL_IDX
+):
+    """Deprecated — see /remote_instance_transfer_engine_info for param docs."""
     logger.warning(
         "Endpoint '/get_remote_instance_transfer_engine_info' is deprecated and will be removed in a future version. "
         "Please use '/remote_instance_transfer_engine_info' instead."
     )
-    return await remote_instance_transfer_engine_info(rank=rank)
+    return await remote_instance_transfer_engine_info(rank=rank, model_idx=model_idx)
 
 
 @app.get("/remote_instance_transfer_engine_info")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def remote_instance_transfer_engine_info(rank: int = None):
+async def remote_instance_transfer_engine_info(
+    rank: int = None, model_idx: int = MAIN_MODEL_IDX
+):
+    """Return transfer-engine metadata registered for the given (rank, model_idx).
+
+    ``model_idx`` distinguishes among multiple models that share the same
+    ``tp_rank`` under speculative decoding:
+
+        - **MAIN_MODEL_IDX (-1)**: the main (target) model.
+        - **0, 1, …**: draft model layer index (multi-layer MTP / EAGLE).
+
+    The bootstrap server keys registrations by ``(tp_rank, model_idx)``, so
+    queries must supply the correct index to retrieve the matching metadata.
+    """
     if rank is None or rank < 0:
         return ORJSONResponse(
             {"error": {"message": "Missing or invalid rank parameter"}},
@@ -1020,16 +1036,26 @@ async def remote_instance_transfer_engine_info(rank: int = None):
     try:
         resp = requests.get(
             f"{server_args.engine_info_bootstrap_url}/get_transfer_engine_info",
-            params={"rank": rank},
-            timeout=5,
+            params={"rank": rank, "model_idx": model_idx},
+            timeout=envs.SGLANG_REMOTE_INSTANCE_WEIGHT_LOADER_REQUEST_TIMEOUT.get(),
         )
         if resp.status_code == 200:
             return resp.json()
     except (requests.exceptions.RequestException, ValueError) as e:
-        logger.warning(f"Failed to get transfer engine info for rank {rank}: {e}")
+        logger.warning(
+            f"Failed to get transfer engine info for rank={rank}, "
+            f"model_idx={model_idx}: {e}"
+        )
 
     return ORJSONResponse(
-        {"error": {"message": f"Failed to get transfer engine info for rank {rank}"}},
+        {
+            "error": {
+                "message": (
+                    f"Failed to get transfer engine info for rank={rank}, "
+                    f"model_idx={model_idx}"
+                )
+            }
+        },
         status_code=HTTPStatus.BAD_REQUEST,
     )
 

@@ -361,7 +361,7 @@ class TpModelWorker(BaseTpWorker):
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             memory_pool_config=self.memory_pool_config,
-            draft_model_idx=0 if self.is_multi_layer_eagle else None,
+            draft_model_idx=(0 if self.is_draft_worker else None),
         )
 
     def _init_multi_layer_eagle_model_runners(self):

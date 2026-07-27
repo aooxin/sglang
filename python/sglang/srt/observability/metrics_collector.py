@@ -304,7 +304,6 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-
         self.max_total_num_tokens = Gauge(
             name="sglang:max_total_num_tokens",
             documentation="Maximum total number of tokens in the KV cache pool.",
@@ -1468,6 +1467,14 @@ class TokenizerMetricsCollector:
                     default_bucket_prompt_tokens,
                 ),
             )
+            self.uncached_tokens_histogram = Histogram(
+                name="sglang:uncached_tokens_histogram",
+                documentation="Histogram of uncached prompt token length per request.",
+                labelnames=labels.keys(),
+                buckets=generate_buckets(
+                    server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
+                ),
+            )
 
         self.cached_tokens_total = Counter(
             name="sglang:cached_tokens_total",
@@ -1721,6 +1728,9 @@ class TokenizerMetricsCollector:
             self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
             self.generation_tokens_histogram.labels(**labels).observe(
                 float(generation_tokens)
+            )
+            self.uncached_tokens_histogram.labels(**labels).observe(
+                float(max(prompt_tokens - cached_tokens, 0))
             )
         self.num_retractions.labels(**labels).observe(retraction_count)
 

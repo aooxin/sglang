@@ -2200,7 +2200,7 @@ class Scheduler(
                     prefix_keys,
                 )
                 if prefetch_started:
-                    req.time_stats.set_hicache_prefetch_wait_start_time()
+                    req.time_stats.set_hicache_prefetch_wait_total_start_time()
                     req.time_stats.trace_ctx.trace_slice_add_attr(
                         {
                             "hicache_prefetch_started.prefetch_tokens": len(
@@ -2749,25 +2749,48 @@ class Scheduler(
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
                 )
-                hicache_prefetch_wait_duration = (
-                    req.time_stats.set_hicache_prefetch_wait_finish_time()
+                hicache_prefetch_wait_total_duration = (
+                    req.time_stats.set_hicache_prefetch_wait_total_finish_time()
                 )
                 hicache_prefetch_io_duration = (
                     self.tree_cache.pop_prefetch_io_duration(req.rid)
                 )
+                hicache_prefetch_stage_durations = (
+                    self.tree_cache.pop_prefetch_stage_durations(req.rid)
+                )
                 req.time_stats.add_hicache_prefetch_io_duration(
                     hicache_prefetch_io_duration
                 )
-                if hicache_prefetch_wait_duration is not None:
+                req.time_stats.add_hicache_prefetch_stage_durations(
+                    hicache_prefetch_stage_durations
+                )
+                if hicache_prefetch_wait_total_duration is not None:
                     req.time_stats.observe_per_stage_req_latency(
-                        RequestStage.HICACHE_PREFETCH_WAIT,
-                        hicache_prefetch_wait_duration,
+                        RequestStage.HICACHE_PREFETCH_WAIT_TOTAL,
+                        hicache_prefetch_wait_total_duration,
                     )
-                if hicache_prefetch_io_duration is not None:
-                    req.time_stats.observe_per_stage_req_latency(
-                        RequestStage.HICACHE_PREFETCH_IO,
-                        hicache_prefetch_io_duration,
+                if (
+                    hicache_prefetch_io_duration is not None
+                    and "io" not in hicache_prefetch_stage_durations
+                ):
+                    hicache_prefetch_stage_durations["io"] = (
+                        hicache_prefetch_io_duration
                     )
+                prefetch_stage_mapping = {
+                    "queue": RequestStage.HICACHE_PREFETCH_QUEUE,
+                    "query": RequestStage.HICACHE_PREFETCH_QUERY,
+                    "resolve": RequestStage.HICACHE_PREFETCH_RESOLVE,
+                    "io_queue": RequestStage.HICACHE_PREFETCH_IO_QUEUE,
+                    "io": RequestStage.HICACHE_PREFETCH_IO,
+                    "commit": RequestStage.HICACHE_PREFETCH_COMMIT,
+                }
+                for stage_name, request_stage in prefetch_stage_mapping.items():
+                    stage_duration = hicache_prefetch_stage_durations.get(stage_name)
+                    if stage_duration is not None and stage_duration >= 0:
+                        req.time_stats.observe_per_stage_req_latency(
+                            request_stage,
+                            stage_duration,
+                        )
                 req.storage_full_hit_tokens = self.tree_cache.pop_storage_full_hit(
                     req.rid
                 )
@@ -2779,14 +2802,39 @@ class Scheduler(
                 )
                 if prefetch_trace_attrs:
                     req.time_stats.trace_ctx.trace_slice_add_attr(prefetch_trace_attrs)
-                if hicache_prefetch_wait_duration is not None:
+                if hicache_prefetch_wait_total_duration is not None:
                     req.time_stats.trace_ctx.trace_slice_add_attr(
                         {
-                            "hicache_prefetch_wait_done.total_ms": round(
-                                hicache_prefetch_wait_duration * 1000, 2
+                            "hicache_prefetch_wait_total_done.total_ms": round(
+                                hicache_prefetch_wait_total_duration * 1000, 2
                             ),
-                            "hicache_prefetch_wait_done.io_ms": round(
+                            "hicache_prefetch_wait_total_done.queue_ms": round(
+                                hicache_prefetch_stage_durations.get("queue", 0)
+                                * 1000,
+                                2,
+                            ),
+                            "hicache_prefetch_wait_total_done.query_ms": round(
+                                hicache_prefetch_stage_durations.get("query", 0)
+                                * 1000,
+                                2,
+                            ),
+                            "hicache_prefetch_wait_total_done.resolve_ms": round(
+                                hicache_prefetch_stage_durations.get("resolve", 0)
+                                * 1000,
+                                2,
+                            ),
+                            "hicache_prefetch_wait_total_done.io_queue_ms": round(
+                                hicache_prefetch_stage_durations.get("io_queue", 0)
+                                * 1000,
+                                2,
+                            ),
+                            "hicache_prefetch_wait_total_done.io_ms": round(
                                 (hicache_prefetch_io_duration or 0) * 1000, 2
+                            ),
+                            "hicache_prefetch_wait_total_done.commit_ms": round(
+                                hicache_prefetch_stage_durations.get("commit", 0)
+                                * 1000,
+                                2,
                             ),
                         },
                     )

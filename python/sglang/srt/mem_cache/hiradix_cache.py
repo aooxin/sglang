@@ -247,6 +247,7 @@ class BaseHiRadixCache(abc.ABC):
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
         self.prefetch_io_duration_by_reqid = {}
+        self.prefetch_stage_durations_by_reqid: dict[str, dict[str, float]] = {}
         self.storage_full_hit_by_reqid = {}
         self.storage_swa_hit_by_reqid = {}
         # track per-request tokens loaded from storage (L3 hits)
@@ -570,13 +571,17 @@ class BaseHiRadixCache(abc.ABC):
         def _drain_revoke():
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
                 self.prefetch_io_duration_by_reqid.pop(req_id, None)
+                self.prefetch_stage_durations_by_reqid.pop(req_id, None)
                 self.storage_full_hit_by_reqid.pop(req_id, None)
                 self.storage_swa_hit_by_reqid.pop(req_id, None)
                 self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
                 self.prefetch_trace_attrs_by_reqid.pop(req_id, None)
                 info = self.ongoing_prefetch.pop(req_id, None)
                 if info is not None:
-                    last_host_node, key, _, _ = info
+                    last_host_node, key, _, operation = info
+                    self.prefetch_stage_durations_by_reqid[req_id] = (
+                        operation.get_stage_durations(finish_time=time.monotonic())
+                    )
                     last_host_node.release_host()
                     cc.prefetch_tokens_occupied -= len(key)
                     if cc.prefetch_tokens_occupied < 0:
@@ -700,6 +705,7 @@ class BaseHiRadixCache(abc.ABC):
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
         self.prefetch_io_duration_by_reqid.clear()
+        self.prefetch_stage_durations_by_reqid.clear()
         self.storage_full_hit_by_reqid.clear()
         self.storage_swa_hit_by_reqid.clear()
         # Clear per-request tracking dicts
@@ -1721,6 +1727,9 @@ class BaseHiRadixCache(abc.ABC):
         last_host_node.release_host()
         io_duration = operation.get_io_duration()
         self.prefetch_io_duration_by_reqid[req_id] = io_duration
+        self.prefetch_stage_durations_by_reqid[req_id] = operation.get_stage_durations(
+            finish_time=time.monotonic()
+        )
         self.storage_full_hit_by_reqid[req_id] = operation.full_hit_count
         self.storage_swa_hit_by_reqid[req_id] = operation.swa_hit_count
         del self.ongoing_prefetch[req_id]
@@ -1763,6 +1772,9 @@ class BaseHiRadixCache(abc.ABC):
 
     def pop_prefetch_io_duration(self, req_id: str) -> Optional[float]:
         return self.prefetch_io_duration_by_reqid.pop(req_id, None)
+
+    def pop_prefetch_stage_durations(self, req_id: str) -> dict[str, float]:
+        return self.prefetch_stage_durations_by_reqid.pop(req_id, {})
 
     def pop_prefetch_trace_attrs(self, req_id: str) -> dict[str, float | int]:
         return self.prefetch_trace_attrs_by_reqid.pop(req_id, {})
@@ -2249,6 +2261,7 @@ class BaseHiRadixCache(abc.ABC):
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request
         self.prefetch_io_duration_by_reqid.pop(rid, None)
+        self.prefetch_stage_durations_by_reqid.pop(rid, None)
         self.storage_full_hit_by_reqid.pop(rid, None)
         self.storage_swa_hit_by_reqid.pop(rid, None)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)

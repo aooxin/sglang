@@ -245,6 +245,10 @@ class PrefetchOperation(StorageOperation):
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
+        self.queue_exit_time = 0.0
+        self.query_start_time = 0.0
+        self.query_finish_time = 0.0
+        self.resolve_finish_time = 0.0
         self.io_start_time = 0.0
         self.io_finish_time = 0.0
 
@@ -270,6 +274,26 @@ class PrefetchOperation(StorageOperation):
     def is_terminated(self) -> bool:
         return self._terminated_flag
 
+    def mark_queue_exit(self):
+        with self._lock:
+            if self.queue_exit_time == 0.0:
+                self.queue_exit_time = time.monotonic()
+
+    def mark_resolve_finish(self):
+        with self._lock:
+            if self.resolve_finish_time == 0.0:
+                self.resolve_finish_time = time.monotonic()
+
+    def mark_query_start(self):
+        with self._lock:
+            if self.query_start_time == 0.0:
+                self.query_start_time = time.monotonic()
+
+    def mark_query_finish(self):
+        with self._lock:
+            if self.query_finish_time == 0.0:
+                self.query_finish_time = time.monotonic()
+
     def mark_io_start(self):
         with self._lock:
             if self.io_start_time == 0.0:
@@ -285,6 +309,41 @@ class PrefetchOperation(StorageOperation):
             if self.io_start_time == 0.0 or self.io_finish_time == 0.0:
                 return None
             return self.io_finish_time - self.io_start_time
+
+    def get_stage_durations(self, finish_time: Optional[float] = None) -> dict[str, float]:
+        with self._lock:
+            durations = {}
+            if self.queue_exit_time > 0.0:
+                queue = self.queue_exit_time - self.start_time
+                if queue >= 0:
+                    durations["queue"] = queue
+            if self.queue_exit_time > 0.0 and self.resolve_finish_time > 0.0:
+                resolve_start_time = max(self.query_finish_time, self.queue_exit_time)
+                resolve = self.resolve_finish_time - resolve_start_time
+                if resolve >= 0:
+                    durations["resolve"] = resolve
+            if self.query_start_time > 0.0 and self.query_finish_time > 0.0:
+                query = self.query_finish_time - self.query_start_time
+                if query >= 0:
+                    durations["query"] = query
+            if self.io_start_time > 0.0 and self.io_finish_time > 0.0:
+                io_duration = self.io_finish_time - self.io_start_time
+                if io_duration >= 0:
+                    durations["io"] = io_duration
+            if self.resolve_finish_time > 0.0 and self.io_start_time > 0.0:
+                io_queue = self.io_start_time - self.resolve_finish_time
+                if io_queue >= 0:
+                    durations["io_queue"] = io_queue
+            if finish_time is not None:
+                commit_start_time = max(
+                    self.resolve_finish_time,
+                    self.io_finish_time,
+                    self.queue_exit_time,
+                )
+                commit = finish_time - commit_start_time
+                if commit_start_time > 0.0 and commit >= 0:
+                    durations["commit"] = commit
+            return durations
 
 
 class FaultInjector:
@@ -1824,14 +1883,17 @@ class HiCacheController:
                 self._log_queue_length("prefetch_queue", self.prefetch_queue.qsize())
                 if operation is None:
                     continue
+                operation.mark_queue_exit()
 
                 # 通过 batch_exists 查看 storage 上存在的 KV cache（含 SWA 的有效区间 mask）
+                operation.mark_query_start()
                 (
                     hash_value,
                     hit_info,
                     full_query_count,
                     raw_query_hit_count,
                 ) = self._storage_hit_query(operation)
+                operation.mark_query_finish()
                 storage_hit_count = int(hit_info[-1].item())
                 hit_pages = storage_hit_count // self.page_size
                 operation.full_hit_count = full_query_count
@@ -1868,6 +1930,7 @@ class HiCacheController:
                 #  可以把阈值设置成 0
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
+                    operation.mark_resolve_finish()
                     self._put_prefetch_revoke(operation.request_id)
                     revoke_tokens = len(operation.host_indices)
                     self.append_host_mem_release(operation.host_indices)
@@ -1894,6 +1957,7 @@ class HiCacheController:
                             self.sliding_window_pages,
                         )
                     if swa_valid_len < self.sliding_window_pages:
+                        operation.mark_resolve_finish()
                         self._put_prefetch_revoke(operation.request_id)
                         revoke_tokens = len(operation.host_indices)
                         self.append_host_mem_release(operation.host_indices)
@@ -1940,6 +2004,7 @@ class HiCacheController:
                 logger.debug(
                     f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                 )
+                operation.mark_resolve_finish()
                 self.prefetch_buffer.put(operation)
 
             except Empty:

@@ -124,13 +124,46 @@ class RequestStage:
         # equal to "observe_queue_time"
         metrics_is_observed=False,
     )
-    HICACHE_PREFETCH_WAIT = RequestStageConfig(
-        "hicache_prefetch_wait",
+    # Total wall-clock time from a storage prefetch operation entering the async queue
+    # to the scheduler consuming its result.
+    HICACHE_PREFETCH_WAIT_TOTAL = RequestStageConfig(
+        "hicache_prefetch_wait_total",
         level=1,
         metrics_is_observed=True,
     )
+    # Time spent waiting in the HiCache prefetch queue before the worker picks it up.
+    HICACHE_PREFETCH_QUEUE = RequestStageConfig(
+        "hicache_prefetch_queue",
+        level=1,
+        metrics_is_observed=True,
+    )
+    # Time spent querying storage metadata to find prefetched KV page hits.
+    HICACHE_PREFETCH_QUERY = RequestStageConfig(
+        "hicache_prefetch_query",
+        level=1,
+        metrics_is_observed=True,
+    )
+    # Time spent on TP/SWA eligibility and enqueue/revoke decisions after query.
+    HICACHE_PREFETCH_RESOLVE = RequestStageConfig(
+        "hicache_prefetch_resolve",
+        level=1,
+        metrics_is_observed=True,
+    )
+    # Time spent waiting in the IO buffer before storage-to-host IO starts.
+    HICACHE_PREFETCH_IO_QUEUE = RequestStageConfig(
+        "hicache_prefetch_io_queue",
+        level=1,
+        metrics_is_observed=True,
+    )
+    # Time spent reading prefetched KV pages from storage into host memory.
     HICACHE_PREFETCH_IO = RequestStageConfig(
         "hicache_prefetch_io",
+        level=1,
+        metrics_is_observed=True,
+    )
+    # Time from prefetch worker completion/revoke to scheduler committing the result.
+    HICACHE_PREFETCH_COMMIT = RequestStageConfig(
+        "hicache_prefetch_commit",
         level=1,
         metrics_is_observed=True,
     )
@@ -566,9 +599,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     last_prefill_finished_time: float = 0.0
 
     # hicache prefetch timing
-    hicache_prefetch_wait_start_time: float = 0.0
+    hicache_prefetch_wait_total_start_time: float = 0.0
     hicache_prefetch_wait_total_duration: float = 0.0
+    hicache_prefetch_queue_total_duration: float = 0.0
+    hicache_prefetch_query_total_duration: float = 0.0
+    hicache_prefetch_resolve_total_duration: float = 0.0
+    hicache_prefetch_io_queue_total_duration: float = 0.0
     hicache_prefetch_io_total_duration: float = 0.0
+    hicache_prefetch_commit_total_duration: float = 0.0
     hicache_prefetch_count: int = 0
 
     # other
@@ -786,29 +824,44 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if forward_mode.is_decode():
             self.last_decode_scheduled_time = ts
 
-    def set_hicache_prefetch_wait_start_time(self, ts=None):
+    def set_hicache_prefetch_wait_total_start_time(self, ts=None):
         if ts is None:
             ts = time.perf_counter()
-        if self.hicache_prefetch_wait_start_time == 0.0:
-            self.hicache_prefetch_wait_start_time = ts
+        if self.hicache_prefetch_wait_total_start_time == 0.0:
+            self.hicache_prefetch_wait_total_start_time = ts
             self.hicache_prefetch_count += 1
 
-    def set_hicache_prefetch_wait_finish_time(self, ts=None):
-        if self.hicache_prefetch_wait_start_time == 0.0:
+    def set_hicache_prefetch_wait_total_finish_time(self, ts=None):
+        if self.hicache_prefetch_wait_total_start_time == 0.0:
             return None
         if ts is None:
             ts = time.perf_counter()
-        duration = ts - self.hicache_prefetch_wait_start_time
+        duration = ts - self.hicache_prefetch_wait_total_start_time
         if duration < 0:
             return None
         self.hicache_prefetch_wait_total_duration += duration
-        self.hicache_prefetch_wait_start_time = 0.0
+        self.hicache_prefetch_wait_total_start_time = 0.0
         return duration
 
     def add_hicache_prefetch_io_duration(self, duration):
         if duration is None or duration < 0:
             return
         self.hicache_prefetch_io_total_duration += duration
+
+    def add_hicache_prefetch_stage_durations(self, durations):
+        for stage, duration in durations.items():
+            if duration is None or duration < 0:
+                continue
+            if stage == "queue":
+                self.hicache_prefetch_queue_total_duration += duration
+            elif stage == "query":
+                self.hicache_prefetch_query_total_duration += duration
+            elif stage == "resolve":
+                self.hicache_prefetch_resolve_total_duration += duration
+            elif stage == "io_queue":
+                self.hicache_prefetch_io_queue_total_duration += duration
+            elif stage == "commit":
+                self.hicache_prefetch_commit_total_duration += duration
 
     def set_completion_time(self, ts=None):
         if ts is None:
@@ -978,12 +1031,47 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             if self.hicache_prefetch_io_total_duration > 0
             else None
         )
+        io_queue_dur = (
+            self.hicache_prefetch_io_queue_total_duration
+            if self.hicache_prefetch_io_queue_total_duration > 0
+            else None
+        )
+        queue_dur = (
+            self.hicache_prefetch_queue_total_duration
+            if self.hicache_prefetch_queue_total_duration > 0
+            else None
+        )
+        resolve_dur = (
+            self.hicache_prefetch_resolve_total_duration
+            if self.hicache_prefetch_resolve_total_duration > 0
+            else None
+        )
+        query_dur = (
+            self.hicache_prefetch_query_total_duration
+            if self.hicache_prefetch_query_total_duration > 0
+            else None
+        )
+        commit_dur = (
+            self.hicache_prefetch_commit_total_duration
+            if self.hicache_prefetch_commit_total_duration > 0
+            else None
+        )
         if wait_dur is not None or io_dur is not None:
             wait_msg = self.format_duration(wait_dur) if wait_dur is not None else "NA"
+            queue_msg = self.format_duration(queue_dur) if queue_dur is not None else "NA"
+            query_msg = self.format_duration(query_dur) if query_dur is not None else "NA"
+            resolve_msg = self.format_duration(resolve_dur) if resolve_dur is not None else "NA"
+            io_queue_msg = self.format_duration(io_queue_dur) if io_queue_dur is not None else "NA"
             io_msg = self.format_duration(io_dur) if io_dur is not None else "NA"
+            commit_msg = self.format_duration(commit_dur) if commit_dur is not None else "NA"
             hicache_prefetch_msg = (
-                f", hicache_prefetch_wait={wait_msg}"
+                f", hicache_prefetch_wait_total={wait_msg}"
+                f", hicache_prefetch_queue={queue_msg}"
+                f", hicache_prefetch_query={query_msg}"
+                f", hicache_prefetch_resolve={resolve_msg}"
+                f", hicache_prefetch_io_queue={io_queue_msg}"
                 f", hicache_prefetch_io={io_msg}"
+                f", hicache_prefetch_commit={commit_msg}"
                 f", hicache_prefetch_count={self.hicache_prefetch_count}"
             )
         return hicache_prefetch_msg

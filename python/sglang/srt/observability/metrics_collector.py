@@ -834,6 +834,15 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        self.prefill_flops_total = Counter(
+            name="sglang:prefill_flops_total",
+            documentation=(
+                "Estimated total prefill FLOPs, computed per request from "
+                "new (extend) token length and cached (prefix) token length."
+            ),
+            labelnames=labels.keys(),
+        )
+
         self.dp_cooperation_realtime_tokens_total = Counter(
             name="sglang:dp_cooperation_realtime_tokens_total",
             documentation=(
@@ -1208,6 +1217,10 @@ class SchedulerMetricsCollector:
                 category=category,
                 **dp_cooperation_info.to_labels(),
             ).inc(t)
+
+    def increment_prefill_flops(self, flops: float) -> None:
+        if flops > 0:
+            self.prefill_flops_total.labels(**self.labels).inc(flops)
 
     def increment_estimated_perf(
         self,

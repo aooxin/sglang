@@ -50,6 +50,25 @@ TREE_CACHE_INFO_INTERVAL = float(
 )
 
 
+# Constants for the per-request prefill FLOPs formula:
+# flops = COEFF * (LINEAR_TERM * n + n * (2c + n + 1))
+# where n = new (extend) tokens, c = cached (prefix) tokens.
+# NOTE: The constants are model/deployment specific, controlled by env vars
+# SGLANG_PREFILL_FLOPS_COEFF / SGLANG_PREFILL_FLOPS_LINEAR_TERM.
+# Defaults are for MiMo-V2.5-Pro with dp=2, ep=16, attn_tp=8.
+# For MiMo-V2.5 with dp=2, ep=8, attn_tp=4, set 92207 / 112187.
+PREFILL_FLOPS_COEFF = envs.SGLANG_PREFILL_FLOPS_COEFF.get()
+PREFILL_FLOPS_LINEAR_TERM = envs.SGLANG_PREFILL_FLOPS_LINEAR_TERM.get()
+
+
+def estimate_prefill_flops(extend_lens: List[int], prefix_lens: List[int]) -> int:
+    """Estimate total prefill FLOPs of a batch, summed over requests."""
+    return sum(
+        PREFILL_FLOPS_COEFF * (PREFILL_FLOPS_LINEAR_TERM * n + n * (2 * c + n + 1))
+        for n, c in zip(extend_lens, prefix_lens)
+    )
+
+
 @dataclasses.dataclass
 class PrefillStats:
     """Stats for logging prefill batch metrics."""
@@ -60,6 +79,7 @@ class PrefillStats:
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
+    total_flops: int = 0  # estimated prefill FLOPs of this batch
 
     @classmethod
     def from_adder(
@@ -450,6 +470,7 @@ class SchedulerMetricsMixin:
                 prefill_cache_tokens=prefill_stats.log_hit_tokens,
                 dp_cooperation_info=dp_cooperation_info,
             )
+            self.metrics_collector.increment_prefill_flops(prefill_stats.total_flops)
             if self.enable_mfu_metrics:
                 flops, read_bytes, write_bytes = self._estimate_prefill_perf(
                     prefill_stats.log_input_tokens

@@ -588,6 +588,13 @@ class Envs:
     # Hybrid-SWA
     SGLANG_SWA_EVICT_LENGTH_PER_STEP = EnvInt(128)
 
+    # Prefill FLOPs metric formula constants (model/deployment specific).
+    # See observability/scheduler_metrics_mixin.py::estimate_prefill_flops.
+    # Defaults are for MiMo-V2.5-Pro with dp=2, ep=16, attn_tp=8.
+    # For MiMo-V2.5 with dp=2, ep=8, attn_tp=4, set 92207 / 112187.
+    SGLANG_PREFILL_FLOPS_COEFF = EnvInt(102452)
+    SGLANG_PREFILL_FLOPS_LINEAR_TERM = EnvInt(127737)
+
 
 envs = Envs()
 EnvField._allow_set_name = False

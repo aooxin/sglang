@@ -203,6 +203,7 @@ from sglang.srt.observability.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
     PrefillStats,
     SchedulerMetricsMixin,
+    estimate_prefill_flops,
 )
 from sglang.srt.observability.startup_func_log_and_timer import startup_timer
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
@@ -2882,6 +2883,9 @@ class Scheduler(
         # Record prefill stats for logging after forward
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder, self.running_batch.reqs, self.enable_priority_scheduling
+        )
+        new_batch.prefill_stats.total_flops = estimate_prefill_flops(
+            new_batch.extend_lens, new_batch.prefix_lens
         )
 
         # Mixed-style chunked prefill

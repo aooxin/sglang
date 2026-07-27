@@ -576,12 +576,15 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
-    def free(self, free_index: torch.Tensor):
+    def free(self, free_index: torch.Tensor, is_page_aligned: bool = False):
         if free_index.numel() == 0:
             return
 
         if self.is_not_in_free_group:
-            free_page_indices = torch.unique(free_index // self.page_size)
+            if is_page_aligned:
+                free_page_indices = free_index[:: self.page_size] // self.page_size
+            else:
+                free_page_indices = torch.unique(free_index // self.page_size)
 
             if self.debug_mode:
                 self._bitmap_assert_free(free_page_indices)

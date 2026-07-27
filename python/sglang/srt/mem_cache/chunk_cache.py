@@ -71,7 +71,15 @@ class ChunkCache(BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
-        self.token_to_kv_pool_allocator.free(kv_indices)
+        allocator = self.token_to_kv_pool_allocator
+        if isinstance(allocator, SWATokenToKVPoolAllocator):
+            swa_start = req.swa_evicted_seqlen
+            allocator.free_full_and_swa_no_filter(
+                full_free_index=kv_indices,
+                swa_free_index=kv_indices[swa_start:],
+            )
+        else:
+            allocator.free(kv_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         kv_indices = self.req_to_token_pool.req_to_token[

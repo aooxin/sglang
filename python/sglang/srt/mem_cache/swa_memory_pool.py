@@ -306,6 +306,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 torch.tensor([-1], dtype=torch.int64, device=device),
             ]
         )
+        self._mapping_zero_scalar = torch.zeros(
+            (), dtype=torch.int64, device=device
+        )
 
         self.need_sort = need_sort
         self.free_pages = None
@@ -595,6 +598,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+
+    def free_full_and_swa_no_filter(
+        self,
+        full_free_index: torch.Tensor,
+        swa_free_index: torch.Tensor,
+    ) -> None:
+        if full_free_index.numel() == 0:
+            return
+        self.full_attn_allocator.free(full_free_index, is_page_aligned=True)
+        if swa_free_index.numel() > 0:
+            swa_indices = self.full_to_swa_index_mapping[swa_free_index]
+            if self.debug_mode:
+                assert (swa_indices > 0).all().item()
+            self.swa_attn_allocator.free(swa_indices, is_page_aligned=True)
+        self.full_to_swa_index_mapping[full_free_index] = self._mapping_zero_scalar
 
     def free_swa(self, free_index: torch.Tensor) -> int:
         swa_indices = self.full_to_swa_index_mapping[free_index]

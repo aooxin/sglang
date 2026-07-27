@@ -1195,10 +1195,48 @@ class HiCacheController:
         swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[host_indices]
         ensure_swa_length = min(host_hit_length, self.sliding_window_size)
         # TODO(yingchun): this assert has D2H op
-        assert swa_host_indices[-ensure_swa_length:].min().item() > 0, (
-            f"Last {ensure_swa_length} SWA slots must be valid, "
-            f"got {swa_host_indices[-ensure_swa_length:].tolist()}"
-        )
+        if swa_host_indices[-ensure_swa_length:].min().item() <= 0:
+            # [SWA-DIAG] 炸前 dump 整段 mapping 的逐页概览，用于区分：
+            #   - 常量页（如整页为 1）→ 页号被按 token 粒度误写
+            #   - 递增序列页 → arange 类张量被误写入 mapping
+            #   - 零散 0 → 上游 free/unmapping 提前清了 mapping
+            ps = self.mem_pool_host.page_size
+            n = swa_host_indices.numel()
+            pad = (-n) % ps
+            padded = (
+                torch.cat([swa_host_indices.new_full((pad,), -999), swa_host_indices])
+                if pad
+                else swa_host_indices
+            )
+            pages = padded.view(-1, ps)
+            page_summary = [
+                (
+                    int(p[0]),
+                    int(p.min()),
+                    int(p.max()),
+                    int(p.count_nonzero()),
+                )
+                for p in pages
+            ]
+            logger.error(
+                "[SWA-DIAG] assert_host_indices failed. host_hit_length=%d "
+                "ensure_swa_length=%d segment_len=%d page_size=%d pad=%d "
+                "per_page(first,min,max,nonzero)=%s host_indices_head=%s "
+                "host_indices_tail=%s tail_window_raw=%s",
+                host_hit_length,
+                ensure_swa_length,
+                n,
+                ps,
+                pad,
+                page_summary,
+                host_indices[:8].tolist(),
+                host_indices[-8:].tolist(),
+                swa_host_indices[-ensure_swa_length:].tolist(),
+            )
+            raise AssertionError(
+                f"Last {ensure_swa_length} SWA slots must be valid, "
+                f"got {swa_host_indices[-ensure_swa_length:].tolist()}"
+            )
 
     def alloc_device(
         self,
@@ -1251,6 +1289,16 @@ class HiCacheController:
         assert self.is_hybrid_swa
         swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[host_indices]
         swa_host_valid_mask = swa_host_indices.bool()
+        # [SWA-DIAG] host mapping gather is a concurrent-readable snapshot, so
+        # log-only (a torn read here is not necessarily a persistent bug); the
+        # deterministic post-write is asserted inside alloc_missing_swa_for_full_indices.
+        from sglang.srt.mem_cache.memory_pool_host import log_subpage_swa_pattern
+
+        log_subpage_swa_pattern(
+            swa_host_valid_mask,
+            self.mem_pool_host.page_size,
+            "HiCacheController.refill_device_swa(swa_host_valid_mask)",
+        )
         swa_device_indices = self.mem_pool_device_allocator.full_to_swa_index_mapping[
             device_indices
         ]
@@ -1455,7 +1503,7 @@ class HiCacheController:
             self.mem_pool_host_draft = draft_host_kv_pool
 
     def evict_host(
-            self, host_indices: torch.Tensor, backup_only: bool = True
+        self, host_indices: torch.Tensor, backup_only: bool = True
     ) -> Tuple[int, int]:
         assert host_indices is not None
         if not backup_only:
@@ -1564,8 +1612,18 @@ class HiCacheController:
         )
 
     def append_swa_only_host_mem_release(
-        self, swa_only_to_release: Optional[torch.Tensor]
+        self,
+        swa_only_to_release: Optional[torch.Tensor],
+        allow_all_zero: bool = True,
     ):
+        """Release SWA-only host slots, validating per-page uniformity.
+
+        allow_all_zero encodes the caller's provenance and picks the invariant:
+        - False: input is a pristine ``swa_pool_host.alloc()`` result; every
+          page must be all-valid (count == page_size). Any zero is corruption.
+        - True: input is a ``full_to_swa_index_mapping`` lookup; unmapped full
+          pages legitimately read as 0, so a page may be all-zero or all-valid.
+        """
         if swa_only_to_release is None:
             assert (
                 not self.is_hybrid_swa
@@ -1577,9 +1635,59 @@ class HiCacheController:
         page_size = self.mem_pool_host.page_size
         paged = swa_only_to_release.view(-1, page_size)
         valid_count_per_page = paged.count_nonzero(dim=1)
-        assert (
-            (valid_count_per_page == 0) | (valid_count_per_page == page_size)
-        ).all(), f"Each page must be all-zero or all-valid, got {valid_count_per_page.tolist()}"
+        bad_page_mask = (valid_count_per_page != 0) & (
+            valid_count_per_page != page_size
+        )
+        # [SWA-DIAG] 纯 alloc 结果中出现全零页：对 pristine 来源而言 0 是腐败
+        # 信号（alloc 结果每页必须全 valid），且这些 slot 会被 valid_page_mask
+        # 过滤掉 → 泄露。与混合页同等严重，dump 后 fail-fast。
+        if not allow_all_zero:
+            zero_page_mask = valid_count_per_page == 0
+            if bool(zero_page_mask.any()):
+                zero_idx = zero_page_mask.nonzero(as_tuple=False).view(-1)
+                logger.error(
+                    "[SWA-DIAG] append_swa_only_host_mem_release: all-zero pages "
+                    "in pristine-alloc input (allow_all_zero=False). num_pages=%d "
+                    "zero_pages(idx)=%s valid_count_per_page=%s "
+                    "swa_available=%s full_available=%s raw_head=%s",
+                    paged.shape[0],
+                    zero_idx.tolist()[:64],
+                    valid_count_per_page.tolist(),
+                    self.mem_pool_host.swa_pool_host.available_size(),
+                    self.mem_pool_host.full_pool_host.available_size(),
+                    swa_only_to_release[:128].tolist(),
+                    stack_info=True,
+                )
+                raise AssertionError(
+                    f"All-zero pages in pristine-alloc input "
+                    f"(allow_all_zero=False), got {valid_count_per_page.tolist()}"
+                )
+        if bool(bad_page_mask.any()):
+            # [SWA-DIAG] 炸前 dump 混合页的原始值，用于区分：
+            #   - 常量/递增值 → 页号被按 token 粒度误写入 mapping
+            #   - 部分真实 slot 值 + 部分 0 → 上游 mask 非页对齐
+            bad_idx = bad_page_mask.nonzero(as_tuple=False).view(-1)
+            logger.error(
+                "[SWA-DIAG] append_swa_only_host_mem_release: mixed pages "
+                "(allow_all_zero=%s). num_pages=%d bad_pages(idx)=%s "
+                "valid_count_per_page=%s numel=%d min=%s max=%s "
+                "swa_available=%s full_available=%s raw_head=%s bad_pages_raw=%s",
+                allow_all_zero,
+                paged.shape[0],
+                bad_idx.tolist()[:64],
+                valid_count_per_page.tolist(),
+                swa_only_to_release.numel(),
+                int(swa_only_to_release.min()),
+                int(swa_only_to_release.max()),
+                self.mem_pool_host.swa_pool_host.available_size(),
+                self.mem_pool_host.full_pool_host.available_size(),
+                swa_only_to_release[:128].tolist(),
+                paged[bad_idx[:8]].tolist(),
+            )
+            raise AssertionError(
+                f"Each page must be all-zero or all-valid, "
+                f"got {valid_count_per_page.tolist()}"
+            )
 
         valid_page_mask = valid_count_per_page > 0
         if valid_page_mask.any():
@@ -1601,7 +1709,7 @@ class HiCacheController:
             full_host_indices_to_release
         )
         self.append_host_mem_release(full_host_indices_to_release)
-        self.append_swa_only_host_mem_release(swa_host_indices)
+        self.append_swa_only_host_mem_release(swa_host_indices, allow_all_zero=True)
 
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
@@ -1667,7 +1775,9 @@ class HiCacheController:
 
                 # Get one batch token, and update the completed_tokens if succeed
                 t0_io = time.perf_counter()
-                self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
+                self.page_get_func(
+                    operation, batch_hashes, batch_host_indices, extra_info
+                )
                 if self.metrics_collector is not None:
                     self.metrics_collector.log_prefetch_io_latency(
                         time.perf_counter() - t0_io
@@ -1766,7 +1876,9 @@ class HiCacheController:
                 best = l
         return best
 
-    def _storage_hit_query(self, operation) -> tuple[list[str], Optional[torch.Tensor], int, int]:
+    def _storage_hit_query(
+        self, operation
+    ) -> tuple[list[str], Optional[torch.Tensor], int, int]:
         """
         Query storage for prefix-hit pages.
 
@@ -1923,7 +2035,9 @@ class HiCacheController:
                         or int(hit_info[:hit_pages].sum()) == pre_mask_true_count
                     )
 
-                valid_swa_mask = hit_info[:hit_pages].bool() if self.is_hybrid_swa else None
+                valid_swa_mask = (
+                    hit_info[:hit_pages].bool() if self.is_hybrid_swa else None
+                )
 
                 # 没有达到 prefetch 阈值，则放弃从 storage 预取
                 # TODO(yingchun): 跳过预取可能造成在树上回退很长，硬算过长。
@@ -1934,9 +2048,13 @@ class HiCacheController:
                     self._put_prefetch_revoke(operation.request_id)
                     revoke_tokens = len(operation.host_indices)
                     self.append_host_mem_release(operation.host_indices)
-                    self.append_swa_only_host_mem_release(operation.swa_host_indices)
+                    self.append_swa_only_host_mem_release(
+                        operation.swa_host_indices, allow_all_zero=False
+                    )
                     if self.metrics_collector is not None:
-                        self.metrics_collector.log_revoke_tokens(revoke_tokens, reason="insufficient_l3_hits")
+                        self.metrics_collector.log_revoke_tokens(
+                            revoke_tokens, reason="insufficient_l3_hits"
+                        )
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
@@ -1962,10 +2080,12 @@ class HiCacheController:
                         revoke_tokens = len(operation.host_indices)
                         self.append_host_mem_release(operation.host_indices)
                         self.append_swa_only_host_mem_release(
-                            operation.swa_host_indices
+                            operation.swa_host_indices, allow_all_zero=False
                         )
                         if self.metrics_collector is not None:
-                            self.metrics_collector.log_revoke_tokens(revoke_tokens, reason="insufficient_swa_hits")
+                            self.metrics_collector.log_revoke_tokens(
+                                revoke_tokens, reason="insufficient_swa_hits"
+                            )
                         logger.debug(
                             f"Revoking prefetch for request {operation.request_id} due to insufficient SWA hits ({swa_valid_len})."
                         )
@@ -1996,7 +2116,9 @@ class HiCacheController:
                     )
                     # free the SWA ONLY pre-allocated memory for pages that are not hit
                     if surplus_swa is not None:
-                        self.append_swa_only_host_mem_release(surplus_swa)
+                        self.append_swa_only_host_mem_release(
+                            surplus_swa, allow_all_zero=False
+                        )
                     # Reset swa_host_indices to None after being mapped
                     operation.swa_host_indices = None
                     operation.swa_valid_mask = trimmed_swa_mask

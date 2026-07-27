@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
     NSATokenToKVPoolHost,
     SWATokenToKVPoolHost,
+    assert_page_uniform_swa_pattern,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -260,7 +261,9 @@ class BaseHiRadixCache(abc.ABC):
         )
         self.load_back_threshold = 10
         self.sliding_window_size = params.sliding_window_size
-        self.is_hybrid_swa = self.sliding_window_size is not None and self.sliding_window_size > 0
+        self.is_hybrid_swa = (
+            self.sliding_window_size is not None and self.sliding_window_size > 0
+        )
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -817,7 +820,11 @@ class BaseHiRadixCache(abc.ABC):
         )
 
     def rewrite_swa_backup(
-        self, node: TreeNode, new_swa_mask: torch.Tensor, write_back=False
+        self,
+        node: TreeNode,
+        new_swa_mask: torch.Tensor,
+        write_back=False,
+        reason: str = "",
     ):
         """
         补齐 node 在 host 上缺失的 SWA backup。
@@ -859,6 +866,12 @@ class BaseHiRadixCache(abc.ABC):
 
         # allocate and amp new_swa_host_indices
         num_new_swa = int(new_swa_mask.count_nonzero())
+        assert_page_uniform_swa_pattern(
+            new_swa_mask,
+            self.page_size,
+            "HiRadixCache.rewrite_swa_backup(new_swa_mask)",
+            extra=f"reason={reason} node_len={len(node.value)}",
+        )
         assert num_new_swa % self.page_size == 0
 
         # 只申请 SWA host slot
@@ -890,6 +903,18 @@ class BaseHiRadixCache(abc.ABC):
         self.token_to_kv_pool_host.full_to_swa_index_mapping[
             full_host_indices[new_swa_mask]
         ] = new_swa_host_indices
+
+        # [SWA-DIAG] 写后校验：这次 token 粒度 scatter 之后，整个 node 的 host
+        # mapping 必须保持逐页均匀，否则后续 release 会触发
+        # "all-zero or all-valid" 断言。在源头抓。
+        assert_page_uniform_swa_pattern(
+            self.token_to_kv_pool_host.full_to_swa_index_mapping[
+                full_host_indices
+            ].bool(),
+            self.page_size,
+            "HiRadixCache.rewrite_swa_backup(post_mapping)",
+            extra=f"reason={reason}",
+        )
 
         # write to host
         # TODO: optimize to avoid rewrite full attn
@@ -1174,11 +1199,16 @@ class BaseHiRadixCache(abc.ABC):
                 swa_device_only_count = int(swa_device_only_mask.count_nonzero())
                 if swa_device_only_count > 0:
                     if self.enable_storage_metrics:
-                        self.storage_metrics_collector.log_rewrite_swa_backup(swa_device_only_count,
-                        reason="evict_write_back",)
+                        self.storage_metrics_collector.log_rewrite_swa_backup(
+                            swa_device_only_count,
+                            reason="evict_write_back",
+                        )
                     # rewrite swa backup
                     freed_full, freed_swa = self.rewrite_swa_backup(
-                        x, swa_device_only_mask, write_back=True
+                        x,
+                        swa_device_only_mask,
+                        write_back=True,
+                        reason="evict_write_back",
                     )
                     full_evicted += freed_full
                     swa_evicted += freed_swa
@@ -1383,7 +1413,9 @@ class BaseHiRadixCache(abc.ABC):
                     host_indices=host_indices,
                     host_hit_length=self.sliding_window_size,
                 )
-            self.evict(EvictParams(num_tokens=lack_full_size, swa_num_tokens=lack_swa_size))
+            self.evict(
+                EvictParams(num_tokens=lack_full_size, swa_num_tokens=lack_swa_size)
+            )
             if self.debug_mode:
                 self.cache_controller.assert_host_indices(
                     host_indices=host_indices,
@@ -1537,15 +1569,21 @@ class BaseHiRadixCache(abc.ABC):
 
         n_swa_only_release = None
         if cc.is_hybrid_swa:
-            n_revoke, n_backup, n_release, n_swa_only_release, n_host_full_available_size, n_host_swa_available_size = map(
-                int, qsizes.tolist()
-            )
+            (
+                n_revoke,
+                n_backup,
+                n_release,
+                n_swa_only_release,
+                n_host_full_available_size,
+                n_host_swa_available_size,
+            ) = map(int, qsizes.tolist())
             assert (
                 n_host_full_available_size
                 == cc.mem_pool_host.full_pool_host.available_size()
             )
             assert (
-                n_host_swa_available_size == cc.mem_pool_host.swa_pool_host.available_size()
+                n_host_swa_available_size
+                == cc.mem_pool_host.swa_pool_host.available_size()
             )
         else:
             n_revoke, n_backup, n_release = map(int, qsizes.tolist())
@@ -1717,8 +1755,10 @@ class BaseHiRadixCache(abc.ABC):
                 matched_tree_host_indices, prefetch_host_indices
             )
             if num_spliced > 0 and self.enable_storage_metrics:
-                self.storage_metrics_collector.log_rewrite_swa_backup(num_spliced,
-                reason="prefetch_splice_to_tree",)
+                self.storage_metrics_collector.log_rewrite_swa_backup(
+                    num_spliced,
+                    reason="prefetch_splice_to_tree",
+                )
 
         self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
         self.cache_controller.append_full_and_swa_mem_release_separately(
@@ -1872,6 +1912,7 @@ class BaseHiRadixCache(abc.ABC):
             self._alloc_prefetch_host_indices(prefetch_length)
         )
         if full_host_indices is None:
+            assert swa_host_indices is None
             assert lack_full_size > 0 or lack_swa_size > 0
             if self.enable_hicache_metrics:
                 self._log_alloc_retry(
@@ -1894,6 +1935,7 @@ class BaseHiRadixCache(abc.ABC):
             last_host_node.release_host()
             # no sufficient host memory for prefetch
             return False
+        assert swa_host_indices is not None
         operation = self.cache_controller.prefetch(
             req_id,
             full_host_indices,
@@ -2109,8 +2151,10 @@ class BaseHiRadixCache(abc.ABC):
                     swa_host_only_count = int(swa_host_only_mask.count_nonzero())
                     if swa_host_only_count > 0:
                         if self.enable_storage_metrics:
-                            self.storage_metrics_collector.log_rewrite_swa_backup(swa_host_only_count,
-                            reason="insert_swa_host_only",)
+                            self.storage_metrics_collector.log_rewrite_swa_backup(
+                                swa_host_only_count,
+                                reason="insert_swa_host_only",
+                            )
 
                     # if new device page have swa but the host page DO NOT.
                     # It seems quite possible
@@ -2122,9 +2166,13 @@ class BaseHiRadixCache(abc.ABC):
                             pass
                         else:
                             if self.enable_storage_metrics:
-                                self.storage_metrics_collector.log_rewrite_swa_backup(swa_device_only_count,
-                                reason="insert_evicted_node",)
-                            self.rewrite_swa_backup(node, swa_device_only_mask)
+                                self.storage_metrics_collector.log_rewrite_swa_backup(
+                                    swa_device_only_count,
+                                    reason="insert_evicted_node",
+                                )
+                            self.rewrite_swa_backup(
+                                node, swa_device_only_mask, reason="insert_evicted_node"
+                            )
                 self.evictable_size_ += len(node.value)
                 self._on_tree_value_added(node)
             else:
@@ -2153,9 +2201,15 @@ class BaseHiRadixCache(abc.ABC):
                             )
                             if swa_device_only_count > 0:
                                 if self.enable_storage_metrics:
-                                    self.storage_metrics_collector.log_rewrite_swa_backup(swa_device_only_count,
-                                    reason="insert_splice_swa",)
-                                self.rewrite_swa_backup(node, swa_device_only_mask)
+                                    self.storage_metrics_collector.log_rewrite_swa_backup(
+                                        swa_device_only_count,
+                                        reason="insert_splice_swa",
+                                    )
+                                self.rewrite_swa_backup(
+                                    node,
+                                    swa_device_only_mask,
+                                    reason="insert_splice_swa",
+                                )
                 self._inc_hit_count(node, chunked)
                 total_prefix_length += prefix_len
 

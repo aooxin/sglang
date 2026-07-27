@@ -6,7 +6,7 @@ import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -90,6 +90,10 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
+# Cached once at import: gating envs.SGLANG_SWA_DIAG_ENABLED.get() per alloc/free
+# would add an os.getenv lookup to the hot path, defeating the purpose.
+_SWA_DIAG_ENABLED = envs.SGLANG_SWA_DIAG_ENABLED.get()
+
 
 def synchronized(func):
     @wraps(func)
@@ -98,6 +102,79 @@ def synchronized(func):
             return func(self, *args, **kwargs)
 
     return wrapper
+
+
+def log_subpage_swa_pattern(
+    valid_mask: torch.Tensor,
+    page_size: int,
+    where: str,
+    extra: Union[str, Callable[[], str]] = "",
+) -> bool:
+    """Diagnostic (log-only): token-granular SWA validity patterns must be
+    page-uniform — every page all-True or all-False. A sub-page pattern here is
+    the direct generator of "mixed" full_to_swa_index_mapping pages, which later
+    blow up the all-zero-or-all-valid release asserts (cache_controller
+    append_swa_only_host_mem_release / assert_host_indices).
+
+    ``extra`` may be a callable for lazy construction: it is only evaluated on
+    the error path, so call sites can reference expensive data (e.g. ``.tolist()``
+    of a CUDA tensor, which forces a D2H sync) without paying on the happy path.
+
+    Returns True when a violation was found (and logged with stack).
+    """
+    if not _SWA_DIAG_ENABLED:
+        return False
+    n = valid_mask.numel()
+    if n == 0:
+        return False
+    if n % page_size != 0:
+        logger.error(
+            "[SWA-DIAG] %s: length %d not a multiple of page_size %d. %s",
+            where,
+            n,
+            page_size,
+            extra() if callable(extra) else extra,
+            stack_info=True,
+        )
+        return True
+    per_page = valid_mask.view(-1, page_size).sum(dim=1)
+    bad = (per_page != 0) & (per_page != page_size)
+    if not bool(bad.any()):
+        return False
+    bad_idx = bad.nonzero(as_tuple=False).view(-1)
+    counts = per_page.tolist()
+    logger.error(
+        "[SWA-DIAG] %s: sub-page SWA pattern detected. num_pages=%d "
+        "bad_pages(idx)=%s per_page_valid_counts=%s%s "
+        "first_bad_page_raw=%s %s",
+        where,
+        len(counts),
+        bad_idx.tolist()[:64],
+        counts[:256],
+        "...(truncated)" if len(counts) > 256 else "",
+        valid_mask.view(-1, page_size)[bad_idx[0]].tolist(),
+        extra() if callable(extra) else extra,
+        stack_info=True,
+    )
+    return True
+
+
+def assert_page_uniform_swa_pattern(
+    valid_mask: torch.Tensor,
+    page_size: int,
+    where: str,
+    extra: Union[str, Callable[[], str]] = "",
+) -> None:
+    """Fail-fast variant of log_subpage_swa_pattern for deterministic mapping
+    writes / input masks: a sub-page pattern at these sites is an actual bug
+    (not a concurrent torn read), so raise at the source instead of letting the
+    mixed page propagate to a much later release assert.
+    """
+    if log_subpage_swa_pattern(valid_mask, page_size, where, extra):
+        raise AssertionError(
+            f"[SWA-DIAG] {where}: sub-page SWA pattern at source; "
+            f"mapping write would produce mixed full_to_swa pages"
+        )
 
 
 class HostTensorAllocator(abc.ABC):
@@ -330,11 +407,34 @@ class HostKVCache(abc.ABC):
     def available_size(self):
         return self._free_slots_tail - self._free_slots_head
 
+    # [SWA-DIAG] Human-readable label for this pool instance, set by the owning
+    # SWATokenToKVPoolHost so alloc/free diagnostics can tell full vs swa apart.
+    _debug_pool_label: str = "host_pool"
+
+    # [SWA-DIAG] Compact snapshot of the free-slot ring's internal state, used
+    # only inside diagnostic logging when an invariant is violated.
+    def _debug_free_slots_state(self) -> str:
+        cap = len(self._free_slots_buf)
+        head = self._free_slots_head
+        tail = self._free_slots_tail
+        live = self._free_slots_buf[head:tail]
+        num_zero = int((live == 0).sum()) if live.numel() > 0 else 0
+        num_dup = (
+            int(live.numel() - torch.unique(live).numel()) if live.numel() > 0 else 0
+        )
+        return (
+            f"pool={self._debug_pool_label} size={self.size} page_size={self.page_size} "
+            f"capacity={cap} head={head} tail={tail} available={tail - head} "
+            f"live_zeros={num_zero}(should be 0) live_duplicates={num_dup}(should be 0)"
+        )
+
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         assert (
             need_size % self.page_size == 0
         ), "The requested size should be a multiple of the page size."
+        if need_size == 0:
+            return self._free_slots_buf[:0].clone()
         if need_size > self.available_size():
             return None
 
@@ -343,6 +443,43 @@ class HostKVCache(abc.ABC):
         ].clone()
         self._free_slots_head += need_size
 
+        # [SWA-DIAG] Consumption-point ring integrity check: legal slot values
+        # are >= page_size (ring is initialized with arange(page_size, ...)),
+        # and every page-sized block handed out must be a consecutive +1 run
+        # (all legitimate frees return whole contiguous pages). Since free()
+        # rejects illegal values and broken runs at entry, a violation here
+        # means the ring was corrupted through a channel other than the Python
+        # writers (e.g. a wild device-side write into this CUDA-resident
+        # buffer). Fail hard: handing out corrupted slots would silently write
+        # KV data to wrong host offsets. Gated: this is a per-alloc hot path.
+        if _SWA_DIAG_ENABLED:
+            pages = select_index.view(-1, self.page_size)
+            runs_ok = bool((pages[:, 1:] - pages[:, :-1] == 1).all())
+            min_val = int(pages[:, 0].min())
+            if not runs_ok or min_val < self.page_size:
+                bad_runs = (
+                    ((pages[:, 1:] - pages[:, :-1]) != 1)
+                    .any(dim=1)
+                    .nonzero(as_tuple=False)
+                    .view(-1)
+                )
+                logger.error(
+                    "[SWA-DIAG] %s.alloc: corrupted free-slot ring. need_size=%d "
+                    "min_page_start=%d bad_run_pages(idx)=%s first_bad_page=%s %s",
+                    type(self).__name__,
+                    need_size,
+                    min_val,
+                    bad_runs.tolist()[:64],
+                    pages[bad_runs[0]].tolist() if len(bad_runs) > 0 else None,
+                    self._debug_free_slots_state(),
+                    stack_info=True,
+                )
+                raise AssertionError(
+                    f"[SWA-DIAG] {type(self).__name__}.alloc: corrupted free-slot "
+                    f"ring (need_size={need_size}, min_page_start={min_val}, "
+                    f"runs_ok={runs_ok}); refusing to hand out corrupted slots"
+                )
+
         return select_index
 
     @synchronized
@@ -350,6 +487,59 @@ class HostKVCache(abc.ABC):
         n = len(indices)
         if n == 0:
             return 0
+        # [SWA-DIAG] Entry-point ring integrity check: freed values must be
+        # legal slot ids (>= page_size), whole pages, and each page must be a
+        # consecutive +1 run (all legitimate free paths preserve within-page
+        # slot order). Letting violations through would permanently poison the
+        # ring and defer the failure to a much later alloc() with the culprit's
+        # stack long gone, so this one must fail hard (dump first, then raise).
+        # Gated: this is a per-free hot path.
+        if _SWA_DIAG_ENABLED:
+            illegal_shape = n % self.page_size != 0
+            min_val = int(indices.min())
+            runs_ok = True
+            if not illegal_shape:
+                in_pages = indices.view(-1, self.page_size)
+                runs_ok = bool((in_pages[:, 1:] - in_pages[:, :-1] == 1).all())
+            if illegal_shape or min_val < self.page_size or not runs_ok:
+                logger.error(
+                    "[SWA-DIAG] %s.free: illegal free. n=%d (page_size=%d) min=%d "
+                    "runs_ok=%s values(head)=%s %s",
+                    type(self).__name__,
+                    n,
+                    self.page_size,
+                    min_val,
+                    runs_ok,
+                    indices[:128].tolist(),
+                    self._debug_free_slots_state(),
+                    stack_info=True,
+                )
+                raise AssertionError(
+                    f"[SWA-DIAG] {type(self).__name__}.free: illegal free "
+                    f"(n={n}, page_size={self.page_size}, min={min_val}, "
+                    f"runs_ok={runs_ok}) would poison the free-slot ring"
+                )
+            # Capacity guard: the compaction below only fixes a run-away tail
+            # pointer, NOT the case where live + n exceeds the buffer capacity.
+            # That can only happen after a double-free (more slots in flight
+            # than exist); proceeding would desync the ring accounting.
+            live_before = self._free_slots_tail - self._free_slots_head
+            if live_before + n > len(self._free_slots_buf):
+                logger.error(
+                    "[SWA-DIAG] %s.free: capacity overflow (double-free suspected): "
+                    "live(%d) + n(%d) > capacity(%d). %s",
+                    type(self).__name__,
+                    live_before,
+                    n,
+                    len(self._free_slots_buf),
+                    self._debug_free_slots_state(),
+                    stack_info=True,
+                )
+                raise AssertionError(
+                    f"[SWA-DIAG] {type(self).__name__}.free: capacity overflow "
+                    f"(live={live_before} + n={n} > capacity={len(self._free_slots_buf)}), "
+                    f"double-free suspected"
+                )
         # If tail would exceed buffer capacity, compact by shifting the
         # live region back to the front.  This happens rarely (only when
         # cumulative alloc+free cycles exhaust the index space).
@@ -362,7 +552,9 @@ class HostKVCache(abc.ABC):
             self._free_slots_head = 0
             self._free_slots_tail = live
         # Append freed indices to the tail (in-place, no alloc).
-        self._free_slots_buf[self._free_slots_tail : self._free_slots_tail + n] = indices
+        self._free_slots_buf[self._free_slots_tail : self._free_slots_tail + n] = (
+            indices
+        )
         self._free_slots_tail += n
         return n
 
@@ -937,36 +1129,36 @@ class MHATokenToKVPoolHost(HostKVCache):
             if self.layout in ["page_first", "page_first_direct"]:
                 # TODO(yingchun): 可预计算变量降低重复计算
                 k_element_size = (
-                        self.layer_num
-                        * self.dtype.itemsize
-                        * self.page_size
-                        * self.head_num
-                        * self.head_dim
+                    self.layer_num
+                    * self.dtype.itemsize
+                    * self.page_size
+                    * self.head_num
+                    * self.head_dim
                 )
                 v_element_size = (
-                        self.layer_num
-                        * self.dtype.itemsize
-                        * self.page_size
-                        * self.head_num
-                        * self.v_head_dim
+                    self.layer_num
+                    * self.dtype.itemsize
+                    * self.page_size
+                    * self.head_num
+                    * self.v_head_dim
                 )
                 element_size_list = []
                 for index in range(0, len(indices), self.page_size):
                     k_ptr = (
-                            k_base_ptr
-                            + indices[index]
-                            * self.layer_num
-                            * self.head_num
-                            * self.head_dim
-                            * self.dtype.itemsize
+                        k_base_ptr
+                        + indices[index]
+                        * self.layer_num
+                        * self.head_num
+                        * self.head_dim
+                        * self.dtype.itemsize
                     )
                     v_ptr = (
-                            v_base_ptr
-                            + indices[index]
-                            * self.layer_num
-                            * self.head_num
-                            * self.v_head_dim
-                            * self.dtype.itemsize
+                        v_base_ptr
+                        + indices[index]
+                        * self.layer_num
+                        * self.head_num
+                        * self.v_head_dim
+                        * self.dtype.itemsize
                     )
                     ptr_list.extend([k_ptr, v_ptr])
                     element_size_list.extend([k_element_size, v_element_size])
@@ -2194,6 +2386,8 @@ class SWATokenToKVPoolHost:
             )
         self.h2d_block_quota = self.full_pool_host.h2d_block_quota
         self.d2h_block_quota = self.full_pool_host.d2h_block_quota
+        self.full_pool_host._debug_pool_label = "full_pool_host"
+        self.swa_pool_host._debug_pool_label = "swa_pool_host"
 
         # Validate host pool capacities: in disaggregated prefill mode the
         # host pools buffer KV data evicted from the device before transfer to
@@ -2321,11 +2515,26 @@ class SWATokenToKVPoolHost:
             return None, None, max(0, lack_full_size), max(0, lack_swa_size)
 
         full_host_indices = self.full_pool_host.alloc(full_need_size)
-        assert full_host_indices is not None
+        # [SWA-DIAG] alloc() returns None only when need_size > available_size().
+        # We just checked availability above, so a None here means another
+        # allocator thread consumed the full ring between the check and this
+        # alloc (check-then-act race). Fail hard: proceeding would return a
+        # torn (full-None) result and write a bad mapping below.
+        assert full_host_indices is not None, (
+            f"race: full ring drained between availability check and alloc "
+            f"(need={full_need_size}, avail_now={self.full_pool_host.available_size()})"
+        )
         # 注意: 此时并不做 mapping，而会在 cc._storage_hit_query 之后确定要真正要 batch_get 的 SWA 区间之后再做 mapping
         self.full_to_swa_index_mapping[full_host_indices] = 0
         swa_host_indices = self.swa_pool_host.alloc(swa_need_size)
-        assert swa_host_indices is not None
+        # [SWA-DIAG] Same race on the swa ring: full already succeeded and the
+        # mapping was written, so a None swa index is a torn allocation the
+        # caller cannot handle (it unconditionally does len(swa)). Fail hard
+        # at the source instead of surfacing as a downstream TypeError.
+        assert swa_host_indices is not None, (
+            f"race: swa ring drained between availability check and alloc "
+            f"(need={swa_need_size}, avail_now={self.swa_pool_host.available_size()})"
+        )
 
         return full_host_indices, swa_host_indices, 0, 0
 
@@ -2341,6 +2550,11 @@ class SWATokenToKVPoolHost:
         swa_valid_mask = swa_device_indices != 0
         swa_need_size = int(swa_valid_mask.sum())
         assert swa_need_size % self.page_size == 0
+        assert_page_uniform_swa_pattern(
+            swa_valid_mask,
+            self.page_size,
+            "SWATokenToKVPoolHost.alloc_host(device swa_valid_mask)",
+        )
 
         lack_full_size = full_need_size - self.full_pool_host.available_size()
         lack_swa_size = swa_need_size - self.swa_pool_host.available_size()
@@ -2348,11 +2562,21 @@ class SWATokenToKVPoolHost:
             return None, max(0, lack_full_size), max(0, lack_swa_size)
 
         full_host_indices = self.full_pool_host.alloc(full_need_size)
-        assert full_host_indices is not None
+        # [SWA-DIAG] None after a passing availability check == another
+        # allocator drained the full ring in the check-then-act gap.
+        assert full_host_indices is not None, (
+            f"race: full ring drained between availability check and alloc "
+            f"(need={full_need_size}, avail_now={self.full_pool_host.available_size()})"
+        )
         swa_mapping = torch.zeros(full_need_size, dtype=torch.int64, device=self.device)
         if swa_need_size > 0:
             swa_host_indices = self.swa_pool_host.alloc(swa_need_size)
-            assert swa_host_indices is not None
+            # [SWA-DIAG] Same race on the swa ring; full is already allocated
+            # so this is a torn allocation, not a clean capacity shortfall.
+            assert swa_host_indices is not None, (
+                f"race: swa ring drained between availability check and alloc "
+                f"(need={swa_need_size}, avail_now={self.swa_pool_host.available_size()})"
+            )
             swa_mapping[swa_valid_mask] = swa_host_indices
         self.full_to_swa_index_mapping[full_host_indices] = swa_mapping
 
@@ -2365,6 +2589,16 @@ class SWATokenToKVPoolHost:
         self.full_pool_host.free(full_host_indices)
         swa_host_indices = self.full_to_swa_index_mapping[full_host_indices]
         swa_valid = swa_host_indices.bool()
+        # Earliest possible detection of mixed mapping pages: without this,
+        # the .bool() filter below silently frees the valid half of a mixed
+        # page and the corruption only surfaces much later at the release
+        # asserts in cache_controller.
+        log_subpage_swa_pattern(
+            swa_valid,
+            self.page_size,
+            "SWATokenToKVPoolHost.free(mapping gather)",
+            extra=lambda: f"full_head={full_host_indices[:8].tolist()}",
+        )
         swa_freed = int(swa_valid.sum())
         if swa_freed > 0:
             self.swa_pool_host.free(swa_host_indices[swa_valid])
@@ -2478,10 +2712,31 @@ class SWATokenToKVPoolHost:
         num_transferred = int(transfer_mask.count_nonzero())
         if num_transferred > 0:
             assert num_transferred % self.page_size == 0
+            # A sub-page transfer mask means tgt/src mapping pages are already
+            # mixed, or their page phases disagree; the scatter below would
+            # then propagate mixed pages further.
+            log_subpage_swa_pattern(
+                transfer_mask,
+                self.page_size,
+                "SWATokenToKVPoolHost.splice_swa_mapping(transfer_mask)",
+            )
             self.full_to_swa_index_mapping[tgt_full_indices[transfer_mask]] = src_swa[
                 transfer_mask
             ]
             self.full_to_swa_index_mapping[src_full_indices[transfer_mask]] = 0
+            # [SWA-DIAG] 写后校验：即使 transfer_mask 本身页对齐，若 tgt/src 的
+            # 页相位不一致，scatter 后 tgt 或 src 的 mapping 也可能变成混合页。
+            # 在源头抓，而不是等到 free 时才炸。
+            assert_page_uniform_swa_pattern(
+                self.full_to_swa_index_mapping[tgt_full_indices].bool(),
+                self.page_size,
+                "SWATokenToKVPoolHost.splice_swa_mapping(post_tgt_mapping)",
+            )
+            assert_page_uniform_swa_pattern(
+                self.full_to_swa_index_mapping[src_full_indices].bool(),
+                self.page_size,
+                "SWATokenToKVPoolHost.splice_swa_mapping(post_src_mapping)",
+            )
         return num_transferred
 
     def free_swa_only(self, swa_indices: torch.Tensor) -> int:

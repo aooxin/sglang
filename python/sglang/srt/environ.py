@@ -533,6 +533,11 @@ class Envs:
     SGLANG_SIMPLE_SWA_RESERVED_CHUNK = EnvInt(14 * 1024)
     SGLANG_SIMPLE_SWA_RESERVED_MAX_POINT = EnvInt(128 * 1024)
 
+    # Gate for SWA host-pool diagnostic invariant checks ([SWA-DIAG]). These
+    # run per alloc/free on the hot path; keep disabled in production and enable
+    # only when investigating SWA partial-page corruption.
+    SGLANG_SWA_DIAG_ENABLED = EnvBool(False)
+
     # Warmup
     SGLANG_WARMUP_TIMEOUT = EnvFloat(-1) # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
 

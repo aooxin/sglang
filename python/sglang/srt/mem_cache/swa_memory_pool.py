@@ -440,7 +440,22 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         swa_indices = self.swa_attn_allocator.alloc(refill_size)
         assert swa_indices is not None
+        from sglang.srt.mem_cache.memory_pool_host import (
+            assert_page_uniform_swa_pattern,
+            log_subpage_swa_pattern,
+        )
+
+        log_subpage_swa_pattern(
+            refill_mask,
+            self.page_size,
+            "SWATokenToKVPoolAllocator.alloc_missing_swa_for_full_indices(refill_mask)",
+        )
         self.full_to_swa_index_mapping[full_indices[refill_mask]] = swa_indices
+        assert_page_uniform_swa_pattern(
+            self.full_to_swa_index_mapping[full_indices].bool(),
+            self.page_size,
+            "SWATokenToKVPoolAllocator.alloc_missing_swa_for_full_indices(post_mapping)",
+        )
         return refill_mask, refill_size, 0
 
     def pre_alloc(self, need_size: int, chunked_size: int):
@@ -640,11 +655,31 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         transfer_mask: torch.Tensor = (tgt_swa == 0) & (src_swa != 0)
         num_transferred = int(transfer_mask.count_nonzero())
         if num_transferred > 0:
+            from sglang.srt.mem_cache.memory_pool_host import (
+                assert_page_uniform_swa_pattern,
+                log_subpage_swa_pattern,
+            )
+
+            log_subpage_swa_pattern(
+                transfer_mask,
+                self.page_size,
+                "SWATokenToKVPoolAllocator.splice_swa_mapping(transfer_mask)",
+            )
             assert num_transferred % self.page_size == 0
             self.full_to_swa_index_mapping[tgt_full_indices[transfer_mask]] = src_swa[
                 transfer_mask
             ]
             self.full_to_swa_index_mapping[src_full_indices[transfer_mask]] = 0
+            assert_page_uniform_swa_pattern(
+                self.full_to_swa_index_mapping[tgt_full_indices].bool(),
+                self.page_size,
+                "SWATokenToKVPoolAllocator.splice_swa_mapping(post_tgt_mapping)",
+            )
+            assert_page_uniform_swa_pattern(
+                self.full_to_swa_index_mapping[src_full_indices].bool(),
+                self.page_size,
+                "SWATokenToKVPoolAllocator.splice_swa_mapping(post_src_mapping)",
+            )
         return num_transferred
 
     def backup_state(self):

@@ -7,7 +7,7 @@ import math
 import os
 import typing as tp
 from dataclasses import dataclass
-from functools import wraps
+from functools import lru_cache, wraps
 from typing import List, Optional, Tuple
 
 import torch
@@ -25,12 +25,20 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_cuda
 
 if is_cuda():
-    from sgl_kernel.flash_attn import flash_attn_varlen_func
+    from sglang.srt.layers.attention.vision import flash_attn_func
+
+    @lru_cache(maxsize=1)
+    def _mm_attention_fa_ver() -> int:
+        # mm_attention_backend is fixed for the process lifetime, so cache the
+        # resulting FA version instead of doing a string compare on every forward.
+        return 4 if get_global_server_args().mm_attention_backend == "fa4" else 3
+
+    def flash_attn_varlen_func(*args, **kwargs):
+        return flash_attn_func(*args, ver=_mm_attention_fa_ver(), **kwargs)
 else:
 
     def flash_attn_varlen_func(*args, **kwargs):
         raise RuntimeError("MiMoAudioTokenizer requires CUDA to run.")
-
 
 logger = logging.getLogger(__name__)
 
@@ -524,10 +532,10 @@ class AudioEncoderAttention(nn.Module):
             query_states,
             key_states,
             value_states,
-            cu_seqlens,
-            cu_seqlens,
-            max_seqlen,
-            max_seqlen,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
             causal=self.causal,
             window_size=self.window_size,
         )

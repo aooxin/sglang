@@ -466,6 +466,22 @@ class VisionFlash4Attention(nn.Module):
             raise Exception("VisionFlash4Attention is only available for cuda")
         super().__init__()
 
+    @staticmethod
+    def merge_attn_sink(o: torch.Tensor, sink: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+        """Post-hoc merge an attention sink into FA output when the kernel itself
+        does not support sinks (e.g. FA4 falling back to sm80 path on RTX 5090).
+
+        Args:
+            o:    [T, H, D]      attention output from FA (base-e softmax)
+            sink: [H]            per-head sink logit
+            lse:  [H, T]         base-e log-sum-exp returned by FA varlen
+        Returns:
+            [T, H, D] — output with sink contribution folded in.
+        """
+        scale = torch.exp(sink.unsqueeze(1) - lse) + 1.0
+        # broadcast [H, T] -> [T, H, 1] and divide
+        return (o / scale.transpose(0, 1).unsqueeze(-1)).to(o.dtype)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -483,6 +499,9 @@ class VisionFlash4Attention(nn.Module):
         Returns:
              [b * s, h, head_size]
         """
+        window_size = kwargs.get("window_size", (-1, -1))
+        s_aux = kwargs.get("s_aux", None)
+
         if cu_seqlens is None:
             cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
         elif isinstance(cu_seqlens, SingletonCache):
@@ -496,18 +515,24 @@ class VisionFlash4Attention(nn.Module):
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
 
-        output = flash_attn_func(
-            q,
-            k,
-            v,
+        fa_kwargs = dict(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             softmax_scale=softmax_scale,
+            window_size=window_size,
             ver=4,
         )
 
+        if s_aux is not None:
+            # sm80 fallback (RTX 5090) does not support large learnable sinks.
+            # Run FA without sink, recover LSE, then fold sink in externally.
+            fa_kwargs["return_softmax_lse"] = True
+            output, lse = flash_attn_func(q, k, v, **fa_kwargs)
+            output = self.merge_attn_sink(output, s_aux, lse)
+        else:
+            output = flash_attn_func(q, k, v, **fa_kwargs)
         return output
 
 

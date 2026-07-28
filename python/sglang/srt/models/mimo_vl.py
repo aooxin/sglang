@@ -1,5 +1,4 @@
 """Inference-only MiMo vision model: attention + ViT."""
-
 from __future__ import annotations
 
 from functools import partial
@@ -452,7 +451,6 @@ class MiMoVisionTransformer(nn.Module):
     ) -> torch.Tensor:
         for layer_num, blk in enumerate(self.blocks):
             window_attn_type = self.vit_window_attn_types[layer_num]
-
             # window_attn_type = 1: col-based SWA
             if window_attn_type == 1 and (
                 layer_num == 0 or self.vit_window_attn_types[layer_num - 1] != 1

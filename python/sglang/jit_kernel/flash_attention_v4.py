@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Callable, Optional, Tuple, Union
 
 import torch
+from cutlass.base_dsl.typing import Int32
 
 from sglang.kernel_api_logging import debug_kernel_api
 
@@ -60,8 +61,10 @@ def flash_attn_varlen_func(
     if learnable_sink is None and sinks is not None:
         learnable_sink = sinks
 
-    if window_size == (-1, -1):
-        window_size = (None, None)
+    if window_size is not None:
+        window_size = tuple(
+            None if x is None or x == -1 else Int32(x) for x in window_size
+        )
 
     result = _flash_attn_varlen_func(
         q=q,

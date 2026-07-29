@@ -71,6 +71,8 @@ class GcacheStorage(HiCacheStorage):
         if obsolete_ifname and len(obsolete_ifname.split(",")) == 1:
             client_ifname = obsolete_ifname
 
+        rdma_allowed_devices = os.environ.get("HPN_IB_HCA", "")
+
         # # Each client uses one NIC
         # nic_names = client_ifname.split(",")
         # nic_index = (self.dp_rank * self.tp_size + self.tp_rank) % len(nic_names)
@@ -85,6 +87,7 @@ class GcacheStorage(HiCacheStorage):
             client_ifname,
             client_threads,
             traffic_class,
+            rdma_allowed_devices,
         )
 
         self.gcache_client = GCacheClient(conf_file=subprocess_config)
@@ -216,6 +219,7 @@ class GcacheStorage(HiCacheStorage):
         client_ifname: str,
         client_threads: str,
         traffic_class: str,
+        rdma_allowed_devices: str,
     ):
         config_map = {
             "master_addr": master_addr,
@@ -223,14 +227,17 @@ class GcacheStorage(HiCacheStorage):
             "client_ifname": client_ifname,
             "client_threads": client_threads,
             "traffic_class": traffic_class,
+            "rdma_allowed_devices": rdma_allowed_devices,
         }
         new_lines = []
         with open(config_file, "r", encoding="utf-8") as f:
             for line in f:
                 line_strip = line.strip()
-                for key, new_val in config_map.items():
+                for key, val in config_map.items():
+                    if val == "":
+                        continue
                     if line_strip.startswith(f"--{key}="):
-                        new_line = f"--{key}={new_val}\n"
+                        new_line = f"--{key}={val}\n"
                         new_lines.append(new_line)
                         break
                 else:

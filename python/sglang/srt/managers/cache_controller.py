@@ -235,12 +235,18 @@ class PrefetchOperation(StorageOperation):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         swa_host_indices: Optional[torch.Tensor] = None,
+        host_indices_ready_event: Optional[torch.cuda.Event] = None,
     ):
         self.request_id = request_id
         self.key = key
         self.swa_valid_mask: Optional[torch.Tensor] = None
         self.full_hit_count: int = 0
         self.swa_hit_count: int = 0
+        # CUDA event marking that the async index-tensor clones (host_indices /
+        # swa_host_indices) have completed on the producing (scheduler) stream.
+        # The prefetch thread waits on it once before reading these tensors,
+        # since the Python queue handoff carries no CUDA dependency.
+        self.host_indices_ready_event = host_indices_ready_event
 
         self._lock = threading.Lock()
         self._terminated_flag = False
@@ -1522,6 +1528,7 @@ class HiCacheController:
         key: "RadixKey",
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        host_indices_ready_event: Optional[torch.cuda.Event] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
@@ -1533,6 +1540,7 @@ class HiCacheController:
             last_hash,
             prefix_keys,
             swa_host_indices=swa_host_indices,
+            host_indices_ready_event=host_indices_ready_event,
         )
         self.prefetch_queue.put(operation)
         self._enqueue_key_refresh(prefix_keys)
@@ -1996,6 +2004,13 @@ class HiCacheController:
                 if operation is None:
                     continue
                 operation.mark_queue_exit()
+
+                # The index tensors were cloned asynchronously on the scheduler
+                # stream; this Python queue carries no CUDA dependency, so wait
+                # on the producer event before reading them on this thread's
+                # stream (count_nonzero / tolist below and downstream).
+                if operation.host_indices_ready_event is not None:
+                    operation.host_indices_ready_event.synchronize()
 
                 # 通过 batch_exists 查看 storage 上存在的 KV cache（含 SWA 的有效区间 mask）
                 operation.mark_query_start()

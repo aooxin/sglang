@@ -94,6 +94,8 @@ logger = logging.getLogger(__name__)
 # would add an os.getenv lookup to the hot path, defeating the purpose.
 _SWA_DIAG_ENABLED = envs.SGLANG_SWA_DIAG_ENABLED.get()
 
+_SWA_ALLOC_SYNC = envs.SGLANG_SWA_ALLOC_SYNC.get()
+
 
 def synchronized(func):
     @wraps(func)
@@ -2503,7 +2505,13 @@ class SWATokenToKVPoolHost:
     # - 对于后续未做 mapping 的部分，使用 free 可释放 full，使用 free_swa_only 可释放 swa
     def alloc_unmapped_host_by_len(
         self, full_need_size: int, swa_need_size: int = None
-    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, int]:
+    ) -> tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        int,
+        int,
+        Optional[torch.cuda.Event],
+    ]:
         assert full_need_size % self.page_size == 0
         if swa_need_size is None:
             swa_need_size = min(full_need_size, self.reserve_swa_size)
@@ -2512,7 +2520,7 @@ class SWATokenToKVPoolHost:
         lack_full_size = full_need_size - self.full_pool_host.available_size()
         lack_swa_size = swa_need_size - self.swa_pool_host.available_size()
         if lack_full_size > 0 or lack_swa_size > 0:
-            return None, None, max(0, lack_full_size), max(0, lack_swa_size)
+            return None, None, max(0, lack_full_size), max(0, lack_swa_size), None
 
         full_host_indices = self.full_pool_host.alloc(full_need_size)
         # [SWA-DIAG] alloc() returns None only when need_size > available_size().
@@ -2536,7 +2544,19 @@ class SWATokenToKVPoolHost:
             f"(need={swa_need_size}, avail_now={self.swa_pool_host.available_size()})"
         )
 
-        return full_host_indices, swa_host_indices, 0, 0
+        # Both full_host_indices and swa_host_indices are produced by an async
+        # .clone() on this (the scheduler) thread's current CUDA stream, from
+        # sub-pools that share self.device. They then cross to the prefetch
+        # thread via a plain Python queue, which carries no CUDA dependency, so
+        # the consumer must wait on this event before reading either on its own
+        # stream. The event is recorded after both clones, so it covers both;
+        # both indices share a device, so gating on full is sufficient.
+        host_indices_ready_event = None
+        if _SWA_ALLOC_SYNC and full_host_indices.is_cuda:
+            host_indices_ready_event = torch.cuda.Event()
+            host_indices_ready_event.record()
+
+        return full_host_indices, swa_host_indices, 0, 0, host_indices_ready_event
 
     def alloc_host(
         self,

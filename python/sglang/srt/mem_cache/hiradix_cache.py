@@ -875,7 +875,7 @@ class BaseHiRadixCache(abc.ABC):
         assert num_new_swa % self.page_size == 0
 
         # 只申请 SWA host slot
-        _, new_swa_host_indices, _, lack_swa_size = (
+        _, new_swa_host_indices, _, lack_swa_size, _ = (
             self.token_to_kv_pool_host.alloc_unmapped_host_by_len(0, num_new_swa)
         )
         if new_swa_host_indices is None:
@@ -887,7 +887,7 @@ class BaseHiRadixCache(abc.ABC):
                     lack_swa=True,
                 )
             self.evict_host(0, lack_swa_size)
-            _, new_swa_host_indices, _, lack_swa_size = (
+            _, new_swa_host_indices, _, lack_swa_size, _ = (
                 self.token_to_kv_pool_host.alloc_unmapped_host_by_len(0, num_new_swa)
             )
         if new_swa_host_indices is None:
@@ -1870,8 +1870,11 @@ class BaseHiRadixCache(abc.ABC):
     def _alloc_prefetch_host_indices(self, prefetch_length: int):
         """Allocate host indices for a prefetch operation.
 
-        Returns ``(full_host_indices, swa_host_indices, lack_full, lack_swa)``.
-        For non-SWA HiCache, swa_host_indices and lack_swa are always None / 0.
+        Returns ``(full_host_indices, swa_host_indices, lack_full, lack_swa,
+        host_indices_ready_event)``. For non-SWA HiCache, swa_host_indices / lack_swa /
+        host_indices_ready_event are always None / 0 / None. host_indices_ready_event (SWA
+        only) records the async index clones so the prefetch thread can wait on
+        them before reading the indices on its own stream.
         """
         # TODO(yingchun): 尽量通过 cache_controller 访问 pool
         mem_pool_host = self.cache_controller.mem_pool_host
@@ -1881,8 +1884,8 @@ class BaseHiRadixCache(abc.ABC):
         full_host_indices = mem_pool_host.alloc(prefetch_length)
         if full_host_indices is None:
             lack_full = prefetch_length - mem_pool_host.available_size()
-            return None, None, max(0, lack_full), 0
-        return full_host_indices, None, 0, 0
+            return None, None, max(0, lack_full), 0, None
+        return full_host_indices, None, 0, 0, None
 
     def prefetch_from_storage(
         self,
@@ -1908,7 +1911,7 @@ class BaseHiRadixCache(abc.ABC):
             return False
 
         last_host_node.protect_host()
-        full_host_indices, swa_host_indices, lack_full_size, lack_swa_size = (
+        full_host_indices, swa_host_indices, lack_full_size, lack_swa_size, host_indices_ready_event = (
             self._alloc_prefetch_host_indices(prefetch_length)
         )
         if full_host_indices is None:
@@ -1921,7 +1924,7 @@ class BaseHiRadixCache(abc.ABC):
                     lack_swa=lack_swa_size > 0,
                 )
             self.evict_host(lack_full_size, lack_swa_size)
-            full_host_indices, swa_host_indices, lack_full_size, lack_swa_size = (
+            full_host_indices, swa_host_indices, lack_full_size, lack_swa_size, host_indices_ready_event = (
                 self._alloc_prefetch_host_indices(prefetch_length)
             )
         if full_host_indices is None:
@@ -1943,6 +1946,7 @@ class BaseHiRadixCache(abc.ABC):
             aligned_key,
             last_hash,
             prefix_keys,
+            host_indices_ready_event=host_indices_ready_event,
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,

@@ -1735,6 +1735,7 @@ class MiMoProcessor:
 
 class MiMoV2Processor(BaseMultimodalProcessor):
     models = [MiMoV2ForCausalLM]
+    gpu_image_decode = False
 
     @staticmethod
     def _normalize_config_dict(config, name: str) -> dict:

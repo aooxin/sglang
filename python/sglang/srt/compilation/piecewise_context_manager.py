@@ -34,8 +34,10 @@ def get_pcg_capture_stream():
 def enable_piecewise_cuda_graph_compile():
     global _in_pcg_torch_compile
     _in_pcg_torch_compile = True
-    yield
-    _in_pcg_torch_compile = False
+    try:
+        yield
+    finally:
+        _in_pcg_torch_compile = False
 
 
 @contextmanager
@@ -72,6 +74,11 @@ class ForwardContext:
         self.moe_layers = None
         self.moe_fusions = None
         self.num_tokens: Optional[int] = None
+        # Real (unpadded) token count during piecewise CUDA graph replay.
+        # Set only when the attention backend has no native handling for
+        # padded inputs, so that unified_attention_with_output slices
+        # q/k/v to the real count before calling the backend.
+        self.num_real_tokens: Optional[int] = None
 
     def set_forward_batch(self, forward_batch: ForwardBatch):
         self.forward_batch = forward_batch

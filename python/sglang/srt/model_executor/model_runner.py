@@ -1007,6 +1007,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 attention_context_model_parallel_size=self.attn_cp_size,
                 moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
+                enable_piecewise_cuda_graph=not self.server_args.disable_piecewise_cuda_graph,
             )
             initialize_dp_attention(
                 server_args=self.server_args,
@@ -2545,6 +2546,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.info(
                 "Disable piecewise CUDA graph because --disable-piecewise-cuda-graph is set"
             )
+            return
+
+        # Draft models use decode CUDA graphs, not PCG
+        if self.is_draft_worker:
             return
 
         # Disable piecewise CUDA graph for non-language models

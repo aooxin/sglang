@@ -32,6 +32,7 @@ from sglang.srt.compilation.compile import install_torch_compiled
 from sglang.srt.compilation.piecewise_context_manager import (
     enable_piecewise_cuda_graph,
     enable_piecewise_cuda_graph_compile,
+    get_forward_context,
     set_forward_context,
     set_pcg_capture_stream,
 )
@@ -56,9 +57,16 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
     PPProxyTensors,
+    enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
+from sglang.srt.utils.common import (
+    require_attn_tp_gather,
+    require_gathered_buffer,
+    require_mlp_sync,
+    require_mlp_tp_gather,
+)
 
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions (e.g., is_arch_support_pdl).
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
@@ -79,6 +87,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
+    num_token_non_padded: Optional[torch.Tensor]
 
 
 @contextmanager
@@ -166,6 +175,19 @@ class PiecewiseCudaGraphRunner:
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
+        # DP attention flags
+        self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
+        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
+        self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
+        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
+
+        # The flashinfer backend natively handles padded inputs during replay
+        # (dummy request in init_forward_metadata). For all other backends
+        # (e.g. fa3), unified_attention_with_output slices q/k/v down to the
+        # real token count before calling the backend.
+        prefill_backend, _ = model_runner.server_args.get_attention_backends()
+        self.needs_real_token_slicing = prefill_backend != "flashinfer"
+
         set_torch_compile_config()
 
         assert (
@@ -198,6 +220,21 @@ class PiecewiseCudaGraphRunner:
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
+
+        # EAGLE speculative decoding: the target model's prefill (EXTEND) runs
+        # with capture_hidden_mode=FULL because the draft model consumes the
+        # target's full hidden states. Capture with FULL so `can_run` matches
+        # and PCG is actually used for the target prefill.
+        if model_runner.spec_algorithm.is_eagle():
+            self.capture_hidden_mode = CaptureHiddenMode.FULL
+        # Multi-layer EAGLE (e.g. mimo_v2) additionally requires the pre-norm
+        # hidden states. This flag is read inside the compiled region
+        # (model.forward), so capture must use the same value as replay to
+        # avoid a dynamo guard miss and runtime recompilation.
+        self.capture_return_hidden_states_before_norm = (
+            model_runner.spec_algorithm.is_eagle()
+            and model_runner.server_args.enable_multi_layer_eagle
+        )
 
         self.max_num_tokens = (
             max(self.capture_num_tokens) if self.capture_num_tokens else 8192
@@ -235,6 +272,36 @@ class PiecewiseCudaGraphRunner:
             )
             positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
 
+            # Non-padded token count (used by MoE topk to mask out padded
+            # tokens). It is read inside the compiled region, so capture and
+            # replay must both pass this same static buffer; passing None at
+            # capture but a real tensor at replay triggers a dynamo guard
+            # miss and runtime recompilation.
+            num_token_non_padded = (
+                torch.zeros((1,), dtype=torch.int32)
+                if enable_num_token_non_padded(self.model_runner.server_args)
+                else None
+            )
+
+            # DP attention buffers
+            if self.require_gathered_buffer:
+                if self.require_mlp_tp_gather:
+                    self.global_num_tokens_gpu = torch.zeros(
+                        (self.dp_size,), dtype=torch.int32
+                    )
+                    self.global_num_tokens_for_logprob_gpu = torch.zeros(
+                        (self.dp_size,), dtype=torch.int32
+                    )
+                else:
+                    assert self.require_attn_tp_gather
+                    self.global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
+                    self.global_num_tokens_for_logprob_gpu = torch.zeros(
+                        (1,), dtype=torch.int32
+                    )
+            else:
+                self.global_num_tokens_gpu = None
+                self.global_num_tokens_for_logprob_gpu = None
+
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
             if (
@@ -264,6 +331,7 @@ class PiecewiseCudaGraphRunner:
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
+            num_token_non_padded=num_token_non_padded,
         )
         self.buffers.share_buffers()
 
@@ -318,6 +386,19 @@ class PiecewiseCudaGraphRunner:
 
         self.raw_num_tokens = 0
 
+    def _compute_dp_buffer_len(self, num_tokens: int) -> Optional[int]:
+        """Compute global_dp_buffer_len and fill global_num_tokens_gpu for DP attention."""
+        if not self.require_gathered_buffer:
+            return None
+        # All entries are the same scalar; fill_ avoids a per-replay H2D copy.
+        self.global_num_tokens_gpu.fill_(num_tokens)
+        self.global_num_tokens_for_logprob_gpu.fill_(num_tokens)
+        if self.require_mlp_tp_gather:
+            return num_tokens * self.dp_size
+        else:
+            assert self.require_attn_tp_gather
+            return num_tokens
+
     def warmup_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
         buffers = self.buffers
@@ -348,6 +429,10 @@ class PiecewiseCudaGraphRunner:
             if buffers.mamba_track_seqlens is not None
             else None
         )
+        # Compute DP buffer length
+        global_dp_buffer_len = self._compute_dp_buffer_len(num_tokens)
+        if buffers.num_token_non_padded is not None:
+            buffers.num_token_non_padded.fill_(num_tokens)
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -378,15 +463,16 @@ class PiecewiseCudaGraphRunner:
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=positions,
-                global_num_tokens_gpu=None,
-                global_num_tokens_for_logprob_gpu=None,
+                global_num_tokens_gpu=self.global_num_tokens_gpu,
+                global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-                global_dp_buffer_len=None,
+                global_dp_buffer_len=global_dp_buffer_len,
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
+                capture_hidden_mode=self.capture_hidden_mode,
+                return_hidden_states_before_norm=self.capture_return_hidden_states_before_norm,
+                num_token_non_padded=buffers.num_token_non_padded,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
             )
@@ -394,8 +480,12 @@ class PiecewiseCudaGraphRunner:
         # Attention backend
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-        set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
-        set_is_extend_in_batch(False)
+        set_dp_buffer_len(
+            global_dp_buffer_len, num_tokens, forward_batch.dp_padding_mode.is_max_len()
+        )
+        # PCG uses the normal (extend) DeepEP path to keep dispatcher mode
+        # stable across capture and replay.
+        set_is_extend_in_batch(True)
         with set_forward_context(
             forward_batch,
             self.attention_layers,
@@ -413,9 +503,29 @@ class PiecewiseCudaGraphRunner:
         return torch.int64 if not is_npu() else torch.int32
 
     def can_run(self, forward_batch: ForwardBatch):
+        # DP attention sync check
+        if self.require_mlp_sync and not forward_batch.can_run_dp_cuda_graph:
+            return False
         # Disable piecewise cuda graph for input embeddings
         # TODO(yuwei): fix it
         if forward_batch.input_embeds is not None:
+            return False
+        # PCG graphs are captured with ForwardMode.EXTEND and spec_info=None.
+        # TARGET_VERIFY has different spec_info and capture_hidden_mode,
+        # so it must not use PCG-captured graphs.
+        if forward_batch.forward_mode.is_target_verify():
+            return False
+        # PCG graphs are captured with the runner's capture_hidden_mode.
+        # If the batch needs a different mode (e.g. FULL for speculative
+        # decoding), PCG replay would return wrong/missing hidden_states.
+        if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
+            return False
+        # This flag is read inside the compiled region; a mismatch with the
+        # captured value would trigger a dynamo recompile at runtime.
+        if (
+            forward_batch.return_hidden_states_before_norm
+            != self.capture_return_hidden_states_before_norm
+        ):
             return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
@@ -496,7 +606,9 @@ class PiecewiseCudaGraphRunner:
             buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
         )
 
-        global_dp_buffer_len = None
+        global_dp_buffer_len = self._compute_dp_buffer_len(num_tokens)
+        if buffers.num_token_non_padded is not None:
+            buffers.num_token_non_padded.fill_(num_tokens)
 
         if self.model_runner.server_args.enable_lora:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
@@ -535,15 +647,16 @@ class PiecewiseCudaGraphRunner:
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=positions,
-                global_num_tokens_gpu=None,
-                global_num_tokens_for_logprob_gpu=None,
+                global_num_tokens_gpu=self.global_num_tokens_gpu,
+                global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-                global_dp_buffer_len=None,
+                global_dp_buffer_len=global_dp_buffer_len,
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
+                capture_hidden_mode=self.capture_hidden_mode,
+                return_hidden_states_before_norm=self.capture_return_hidden_states_before_norm,
+                num_token_non_padded=buffers.num_token_non_padded,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
             )
@@ -563,9 +676,9 @@ class PiecewiseCudaGraphRunner:
                 num_tokens,
                 forward_batch.dp_padding_mode.is_max_len(),
             )
-            # FIXME: the implementation is hacky. `is_extend_in_batch`` is for determining the deepep mode.
-            # It is True in this context but we need to set it to use low latency deepep mode.
-            set_is_extend_in_batch(False)
+            # PCG uses the normal (extend) DeepEP path to keep dispatcher mode
+            # stable across capture and replay.
+            set_is_extend_in_batch(True)
 
             kwargs = {}
             with set_forward_context(
@@ -669,6 +782,24 @@ class PiecewiseCudaGraphRunner:
         if forward_batch.mrope_positions is not None:
             buffers.mrope_positions[:, :num_tokens].copy_(forward_batch.mrope_positions)
 
+        # Fill the real non-padded token count into the static buffer so the
+        # captured graph masks out the bucket-padding tokens in MoE routing.
+        # Note: `forward_batch.num_token_non_padded` was already localized by
+        # `adjust_num_token_non_padded_for_attn_tp` against the *real* token
+        # count, but the graph scatters tokens across attention-TP ranks by
+        # the *static* (bucket) length, so recompute the local count against
+        # `static_num_tokens` here (mirroring the decode CUDA graph runner).
+        if buffers.num_token_non_padded is not None:
+            if self.require_gathered_buffer:
+                tokens_per_rank = static_num_tokens // self.attn_tp_size
+                local_num_token_non_padded = min(
+                    max(num_tokens - tokens_per_rank * self.attn_tp_rank, 0),
+                    tokens_per_rank,
+                )
+            else:
+                local_num_token_non_padded = num_tokens
+            buffers.num_token_non_padded.fill_(local_num_token_non_padded)
+
         input_ids = buffers.input_ids[:static_num_tokens]
         input_embeds = (
             buffers.input_embeds[:static_num_tokens] if self.is_multimodal else None
@@ -681,6 +812,9 @@ class PiecewiseCudaGraphRunner:
         )
 
         next_token_logits_buffer = None
+
+        # Update DP buffer with padded token count
+        global_dp_buffer_len = self._compute_dp_buffer_len(static_num_tokens)
 
         # Normalize MIXED→EXTEND so dynamo's guard (captured with EXTEND=1) doesn't fail on MIXED=3.
         pcg_forward_mode = (
@@ -724,15 +858,19 @@ class PiecewiseCudaGraphRunner:
             extend_num_tokens=forward_batch.extend_num_tokens,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             positions=positions,
-            global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
-            global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
-            dp_padding_mode=forward_batch.dp_padding_mode,
-            global_dp_buffer_len=forward_batch.global_dp_buffer_len,
+            global_num_tokens_gpu=self.global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
+            # Use the same padding mode as capture (MAX_LEN), not the real
+            # batch's mode (SUM_LEN for extend with dp_size > 1), so replay
+            # sees the exact global state the graph was captured with.
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            global_dp_buffer_len=global_dp_buffer_len,
             mrope_positions=mrope_positions,
             spec_algorithm=forward_batch.spec_algorithm,
             spec_info=forward_batch.spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
-            num_token_non_padded=forward_batch.num_token_non_padded,
+            return_hidden_states_before_norm=forward_batch.return_hidden_states_before_norm,
+            num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
@@ -758,10 +896,20 @@ class PiecewiseCudaGraphRunner:
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
         with enable_piecewise_cuda_graph():
+            set_is_extend_in_batch(True)
             # Prepare static buffers first so set_forward_context can carry num_tokens
             # into call_begin_forward (via ForwardContext.num_tokens), eliminating the
             # need for a separate global and allowing pre-calculation of dummy-page count.
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            # Restore the static (bucket-sized) DP buffer state. The real
+            # batch's prepare_mlp_sync_batch has already overwritten the
+            # global buffer len / padding mode with dynamic values, which
+            # would mismatch the static shapes baked into the captured graph.
+            set_dp_buffer_len(
+                static_forward_batch.global_dp_buffer_len,
+                static_num_tokens,
+                static_forward_batch.dp_padding_mode.is_max_len(),
+            )
             # Replay
             with set_forward_context(
                 static_forward_batch,
@@ -771,6 +919,8 @@ class PiecewiseCudaGraphRunner:
                 self.moe_fusions,
                 num_tokens=static_num_tokens,
             ):
+                if self.needs_real_token_slicing:
+                    get_forward_context().num_real_tokens = self.raw_num_tokens
                 # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 output = self.model_runner.model.forward(

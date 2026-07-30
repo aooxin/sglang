@@ -968,13 +968,19 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         if is_in_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
-                return moe_forward_piecewise_cuda_graph_impl(
+                # Allocate the output inside the compiled region so that it is
+                # graph-pool managed (stable address across capture/replay);
+                # the split op below writes into it in place.
+                output = torch.empty_like(hidden_states)
+                moe_forward_piecewise_cuda_graph_impl(
                     hidden_states,
                     topk_output.topk_weights,
                     topk_output.topk_ids,
                     topk_output.router_logits,
+                    output,
                     self.layer_id,
                 )
+                return output
             elif TopKOutputChecker.format_is_bypassed(topk_output):
                 return fused_moe_bypassed_piecewise_cuda_graph_impl(
                     hidden_states,
@@ -1145,21 +1151,30 @@ class FusedMoE(torch.nn.Module):
             self.meta_overlap_args = None
 
 
-@register_custom_op(out_shape="hidden_states")
+@register_custom_op(mutates_args=["output"])
 def moe_forward_piecewise_cuda_graph_impl(
     hidden_states: torch.Tensor,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     router_logits: torch.Tensor,
+    output: torch.Tensor,
     layer_id: int,
-) -> torch.Tensor:
+) -> None:
+    # This op is a piecewise CUDA graph split point, so it runs eagerly
+    # between captured graph pieces. It must NOT return a freshly allocated
+    # tensor: the next captured piece bakes its input addresses into the
+    # cudagraph at capture time, and an eager allocation is not guaranteed
+    # to land at the same address at replay (-> illegal memory access).
+    # Instead, the caller pre-allocates `output` inside the compiled region
+    # (graph-pool managed, stable address) and we write into it in place.
     # only standard topk output is supported for piecewise cuda graph
     topk_output = StandardTopKOutput(
         topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
     )
     forward_context = get_forward_context()
     moe_layer = forward_context.moe_layers[layer_id]
-    return moe_layer.forward_impl(hidden_states, topk_output)
+    result = moe_layer.forward_impl(hidden_states, topk_output)
+    output.copy_(result)
 
 
 @register_custom_op(out_shape="hidden_states")

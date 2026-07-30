@@ -24,6 +24,7 @@ from typing import (
     NamedTuple,
     Optional,
     Protocol,
+    Tuple,
     TypeGuard,
     runtime_checkable,
 )
@@ -80,7 +81,52 @@ _use_fused_moe_gate = get_bool_env_var("SGLANG_USE_FUSED_MOE_GATE")
 if _is_cuda:
     if _use_fused_moe_gate:
         from moe_cuda import moe_fused_gate
-        from moe_fused_gate_pro import mimo_pro_moe_fused_gate
+        from moe_fused_gate_pro import (
+            mimo_pro_moe_fused_gate as _mimo_pro_moe_fused_gate,
+        )
+
+        from sglang.srt.utils.custom_op import register_custom_op
+
+        def _mimo_pro_moe_fused_gate_fake(
+            gating_output: torch.Tensor,
+            correction_bias: torch.Tensor,
+            topk: int,
+            renormalize: bool,
+            routed_scaling_factor: Optional[float],
+            apply_routed_scaling_factor_on_output: bool,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            num_tokens = gating_output.shape[0]
+            topk_weights = torch.empty(
+                (num_tokens, topk), dtype=torch.float32, device=gating_output.device
+            )
+            topk_ids = torch.empty(
+                (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+            )
+            return topk_weights, topk_ids
+
+        # mimo_pro_moe_fused_gate is a raw pybind function that dynamo cannot
+        # trace. Wrap it as a custom op so torch.compile (piecewise cuda graph)
+        # treats it as an opaque node.
+        @register_custom_op(
+            op_name="mimo_pro_moe_fused_gate",
+            fake_impl=_mimo_pro_moe_fused_gate_fake,
+        )
+        def mimo_pro_moe_fused_gate(
+            gating_output: torch.Tensor,
+            correction_bias: torch.Tensor,
+            topk: int,
+            renormalize: bool,
+            routed_scaling_factor: Optional[float],
+            apply_routed_scaling_factor_on_output: bool,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            return _mimo_pro_moe_fused_gate(
+                gating_output,
+                correction_bias,
+                topk=topk,
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            )
 
     try:
         from flashinfer.fused_moe import fused_topk_deepseek as _fused_topk_deepseek

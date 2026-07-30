@@ -1105,11 +1105,11 @@ class ServerArgs:
         if self.get_model_config().is_piecewise_cuda_graph_disabled_model:
             self.disable_piecewise_cuda_graph = True
         # 2. Speculative decoding
-        if self.speculative_algorithm is not None:
-            self.disable_piecewise_cuda_graph = True
+        # if self.speculative_algorithm is not None:
+        #     self.disable_piecewise_cuda_graph = True
         # 3. DP attention
-        if self.enable_dp_attention:
-            self.disable_piecewise_cuda_graph = True
+        # if self.enable_dp_attention:
+        #     self.disable_piecewise_cuda_graph = True
         # 4. Torch compile
         if self.enable_torch_compile:
             self.disable_piecewise_cuda_graph = True
@@ -1120,8 +1120,8 @@ class ServerArgs:
         if is_hip() or is_npu() or is_cpu() or is_mps() or is_xpu():
             self.disable_piecewise_cuda_graph = True
         # 7. MoE A2A backend
-        if self.moe_a2a_backend != "none":
-            self.disable_piecewise_cuda_graph = True
+        # if self.moe_a2a_backend != "none":
+        #     self.disable_piecewise_cuda_graph = True
         # 8. LoRA
         if self.lora_paths or self.enable_lora:
             self.disable_piecewise_cuda_graph = True
@@ -1139,21 +1139,22 @@ class ServerArgs:
         if self.dllm_algorithm is not None:
             self.disable_piecewise_cuda_graph = True
         # 12. CPU offload (breaks dynamo)
-        if self.cpu_offload_gb > 0 or self.enable_hierarchical_cache:
+        if self.cpu_offload_gb > 0:
             self.disable_piecewise_cuda_graph = True
         # 13. Deterministic inference
         if self.enable_deterministic_inference:
             self.disable_piecewise_cuda_graph = True
-        # 14. PD disaggregation
-        if self.disaggregation_mode != "null":
+        # 14. PD disaggregation (decode instances only; prefill instances
+        # benefit from piecewise cuda graph for extend batches)
+        if self.disaggregation_mode == "decode":
             self.disable_piecewise_cuda_graph = True
-        # 15. Symmetric memory (torch.cuda.use_mem_pool is untraceable by dynamo)
+        # 14. Symmetric memory (torch.cuda.use_mem_pool is untraceable by dynamo)
         if self.enable_symm_mem:
             self.disable_piecewise_cuda_graph = True
-        # 16. Expert distribution recorder
+        # 15. Expert distribution recorder
         if self.enable_eplb or self.expert_distribution_recorder_mode is not None:
             self.disable_piecewise_cuda_graph = True
-        # 17. Context parallel
+        # 16. Context parallel
         if self.attn_cp_size > 1:
             self.disable_piecewise_cuda_graph = True
 

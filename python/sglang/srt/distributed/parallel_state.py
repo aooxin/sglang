@@ -1715,6 +1715,7 @@ def initialize_model_parallel(
     moe_data_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    enable_piecewise_cuda_graph: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1875,7 +1876,10 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
+            # Piecewise cuda graph forces outplace pynccl all_reduce inside the
+            # captured region (see GroupCoordinator.all_reduce), so the attn_tp
+            # group must own a pynccl communicator when PCG is enabled.
+            use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_piecewise_cuda_graph,
             use_mscclpp_allreduce=False,
             use_custom_allreduce=False,
             use_torch_symm_mem_allreduce=False,

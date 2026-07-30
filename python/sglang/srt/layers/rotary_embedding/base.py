@@ -344,9 +344,13 @@ class RotaryEmbedding(MultiPlatformOp):
                     "Fused RoPE + KV cache store requires head_size == rotary_dim. "
                     "Partial rotary embedding should use the separate KV cache store path."
                 )
-            batch_size = positions.size(0)
-            q_rope = query.view(batch_size, -1, self.head_size)
-            k_rope = key.view(batch_size, -1, self.head_size)
+            # Use the tensor's own leading dim for the view instead of
+            # positions.size(0): under piecewise cuda graph compilation,
+            # positions and query carry independent dynamic-shape symbols,
+            # and mixing them in a view forces dynamo to specialize the
+            # token dim to a constant (breaking dynamic-shape compilation).
+            q_rope = query.view(query.shape[0], -1, self.head_size)
+            k_rope = key.view(key.shape[0], -1, self.head_size)
             if self.head_size != self.rotary_dim:
                 q_rope = q_rope[..., : self.rotary_dim]
                 k_rope = k_rope[..., : self.rotary_dim]

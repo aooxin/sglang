@@ -137,6 +137,7 @@ def prepare_mlp_sync_batch_raw(
     tp_group: GroupCoordinator,
     get_idle_batch: Callable[[], ScheduleBatch],
     disable_cuda_graph: bool,
+    disable_piecewise_cuda_graph: bool,
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
@@ -168,7 +169,9 @@ def prepare_mlp_sync_batch_raw(
         local_batch is None
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
-    ) and not disable_cuda_graph
+        # Piecewise CUDA graph also needs can_cuda_graph=1 for extend
+        or (not disable_piecewise_cuda_graph and local_batch.forward_mode.is_extend())
+    ) and not (disable_cuda_graph and disable_piecewise_cuda_graph)
 
     is_extend_in_batch = local_batch.forward_mode.is_extend() if local_batch else False
     if local_batch is not None:
@@ -237,6 +240,7 @@ class SchedulerDPAttnMixin:
             tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
+            disable_piecewise_cuda_graph=self.server_args.disable_piecewise_cuda_graph,
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             offload_tags=self.offload_tags,

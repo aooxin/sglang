@@ -74,13 +74,19 @@ class _MaybeIntermediateTensors:
 
 
 def _mark_dynamic_on_value(val, dims):
+    # Note: use the hard mark_dynamic (not maybe_mark_dynamic). Upstream
+    # #17739 switched to the soft variant, but that silently degrades to a
+    # fully static compile (one dynamo variant per bucket, empty
+    # sym_shape_indices, zero cudagraphs captured) whenever any traced code
+    # forces specialization of the token dim. With the hard mark, such code
+    # raises ConstraintViolationError at startup, pointing at the culprit.
     if isinstance(val, torch.Tensor):
-        torch._dynamo.maybe_mark_dynamic(val, _normalize_dims(dims, val.ndim))
+        torch._dynamo.mark_dynamic(val, _normalize_dims(dims, val.ndim))
     else:
         mit = _MaybeIntermediateTensors(val)
         if mit.is_intermediate:
             for t in mit.obj.tensors.values():
-                torch._dynamo.maybe_mark_dynamic(t, _normalize_dims(dims, t.ndim))
+                torch._dynamo.mark_dynamic(t, _normalize_dims(dims, t.ndim))
         # else: ignore (None or non-tensor)
 
 

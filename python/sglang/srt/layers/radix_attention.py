@@ -22,7 +22,10 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context,
+    is_in_piecewise_cuda_graph,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -161,6 +164,44 @@ def unified_attention_with_output(
         kwargs["k_rope"] = k_rope
     if sinks is not None:
         kwargs["sinks"] = sinks
+
+    n = context.num_real_tokens
+    if is_in_piecewise_cuda_graph() and n is not None and n < query.shape[0]:
+        # Piecewise CUDA graph replay with an attention backend that has no
+        # native handling for padded inputs: slice q/k/v (and out_cache_loc)
+        # down to the real token count before calling the backend, then write
+        # the result back into the padded output buffer. The padding rows of
+        # `output` keep their previous (stale) content, which is fine because
+        # downstream consumers mask them out.
+        old_out_cache_loc = forward_batch.out_cache_loc
+        old_out_cache_loc_swa = forward_batch.out_cache_loc_swa
+        old_pool_swa_loc = getattr(forward_batch.token_to_kv_pool, "swa_loc", None)
+        forward_batch.out_cache_loc = old_out_cache_loc[:n]
+        if old_out_cache_loc_swa is not None:
+            forward_batch.out_cache_loc_swa = old_out_cache_loc_swa[:n]
+        if old_pool_swa_loc is not None:
+            forward_batch.token_to_kv_pool.set_swa_loc(old_pool_swa_loc[:n])
+        if q_rope is not None:
+            kwargs["q_rope"] = q_rope[:n]
+        if k_rope is not None:
+            kwargs["k_rope"] = k_rope[:n]
+        try:
+            ret = forward_batch.attn_backend.forward(
+                query[:n],
+                key[:n] if key is not None else None,
+                value[:n] if value is not None else None,
+                attention_layer,
+                forward_batch,
+                save_kv_cache,
+                **kwargs,
+            )
+        finally:
+            forward_batch.out_cache_loc = old_out_cache_loc
+            forward_batch.out_cache_loc_swa = old_out_cache_loc_swa
+            if old_pool_swa_loc is not None:
+                forward_batch.token_to_kv_pool.set_swa_loc(old_pool_swa_loc)
+        output[:n].view(ret.shape).copy_(ret)
+        return
 
     ret = forward_batch.attn_backend.forward(
         query, key, value, attention_layer, forward_batch, save_kv_cache, **kwargs

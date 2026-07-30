@@ -726,6 +726,8 @@ class ServerArgs:
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
     encoder_urls: List[str] = dataclasses.field(default_factory=list)
     enable_adaptive_dispatch_to_encoder: bool = False
+    enable_encoder_endpoint_discovery: bool = False
+    enable_encoder_url_sha1_header: bool = False
 
     # For model weight update and weight loading
     custom_weight_loader: Optional[List[str]] = None
@@ -3335,6 +3337,15 @@ class ServerArgs:
         if self.language_only and len(self.encoder_urls) == 0:
             raise ValueError(
                 "requires at least one encoder urls to be set via --encoder-urls"
+            )
+
+        if (
+            self.enable_encoder_url_sha1_header
+            and self.enable_encoder_endpoint_discovery
+        ):
+            raise ValueError(
+                "--enable-encoder-url-sha1-header and "
+                "--enable-encoder-endpoint-discovery are mutually exclusive."
             )
 
         # Validate IB devices when mooncake backend is used
@@ -5998,6 +6009,16 @@ class ServerArgs:
             default=ServerArgs.enable_adaptive_dispatch_to_encoder,
             action="store_true",
             help="When enabled, adaptively dispatch: multi-image requests go to encoder in language_only epd mode, single-image requests are processed locally.",
+        )
+        parser.add_argument(
+            "--enable-encoder-endpoint-discovery",
+            action="store_true",
+            help="Route mm items to encoder pods by SHA1 consistent hash via K8s endpoint watch.",
+        )
+        parser.add_argument(
+            "--enable-encoder-url-sha1-header",
+            action="store_true",
+            help="Attach X-Model-Encoder-URL-Sha1 header to /encode requests for gateway routing.",
         )
 
         # Custom weight loader

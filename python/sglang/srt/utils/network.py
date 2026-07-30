@@ -183,6 +183,7 @@ def get_zmq_socket_on_host(
     context: zmq.Context,
     socket_type: zmq.SocketType,
     host: Optional[str] = None,
+    configure: bool = True,
 ) -> Tuple[int, zmq.Socket]:
     """Create and configure a ZeroMQ socket.
 
@@ -193,12 +194,18 @@ def get_zmq_socket_on_host(
             "127.0.0.1" (localhost-only) to avoid exposing unauthenticated
             sockets to the network (CVE-2026-3060). Callers that need
             cross-machine reachability must pass an explicit host.
+        configure: Whether to apply config_socket (HWM + fixed SNDBUF/RCVBUF).
+            Pass False for high-throughput TCP transfers (e.g. E->P embeddings)
+            so the kernel's TCP autotuning is left on — a fixed SO_SNDBUF/RCVBUF
+            disables autotuning and, if larger than net.core.[rw]mem_max, is
+            truncated to a tiny window that caps throughput.
 
     Returns:
         Tuple of (port, socket) where port is the randomly assigned TCP port.
     """
     socket = context.socket(socket_type)
-    config_socket(socket, socket_type)
+    if configure:
+        config_socket(socket, socket_type)
     if host is None:
         host = "127.0.0.1"
     if is_valid_ipv6_address(host):

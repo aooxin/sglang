@@ -1,8 +1,11 @@
 import asyncio
+import hashlib
 import itertools
 import logging
+import os
 import pickle
 import random
+import re
 import threading
 import time
 import uuid
@@ -453,8 +456,10 @@ class WaitingImageRequest:
         self.host_name = host_name
         self.receive_count = receive_count
         self.num_items_assigned = recv_req.num_items_assigned
+        # configure=False: keep kernel TCP autotuning for the E->P embedding
+        # bulk transfer (a fixed RCVBUF caps throughput, see get_zmq_socket_on_host).
         self.embedding_port, self.recv_socket = get_zmq_socket_on_host(
-            zmq.Context(), zmq.PULL, host=host_name
+            zmq.Context(), zmq.PULL, host=host_name, configure=False
         )
         logger.info(f"Waiting for input {self.embedding_port = }")
         self.recv_embedding_data = None
@@ -645,6 +650,26 @@ def _determine_tensor_transport_mode(server_args):
         return "cuda_ipc"
 
 
+_SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def extract_mm_item_key(item) -> str:
+    """Extract 40-char SHA1 from URL basename (matches encode_server cache key)."""
+    s = item.get("url", "") if isinstance(item, dict) else item
+    if not isinstance(s, str):
+        s = repr(item)
+    name = os.path.splitext(os.path.basename(s.split("?")[0]))[0].lower()
+    return name if _SHA1_RE.fullmatch(name) else s
+
+
+def compute_mm_item_sha1(item) -> str:
+    """Return 40-char SHA1 routing key for the gateway header."""
+    key = extract_mm_item_key(item)
+    if _SHA1_RE.fullmatch(key):
+        return key
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()
+
+
 class MMReceiverBase(ABC):
     def __init__(
         self,
@@ -659,6 +684,15 @@ class MMReceiverBase(ABC):
         self.context = zmq.asyncio.Context(20)
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         self.encode_urls = server_args.encoder_urls
+        # SHA1 routing (opt-in, mutually exclusive):
+        #  - enable_encoder_url_sha1_header: attach X-Model-Encoder-URL-Sha1 header
+        #    to /encode so an external gateway routes by SHA1.
+        #  - enable_encoder_endpoint_discovery: pick E pods locally by SHA1 consistent
+        #    hash (see _build_dispatcher / _dispatch_by_modality).
+        self.sha1_routing_header = server_args.enable_encoder_url_sha1_header
+        # Align with encoder side's max batch (encode_server ENCODER_MAX_BATCH_SIZE).
+        self._group_size = max(1, envs.SGLANG_ENCODER_MAX_BATCH_SIZE.get())
+        self._dispatcher = self._build_dispatcher(server_args)
         self.recv_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.host = get_local_ip_auto(server_args.host)
         self.model_type = (
@@ -751,8 +785,12 @@ class MMReceiverBase(ABC):
             if len(self.encode_urls) == 0 or not need_wait_for_mm_inputs:
                 return None
             req_id = uuid.uuid4().hex
+            if self._dispatcher is not None:
+                # Idempotent; first call has a 10s initial-sync timeout after
+                # which pick() falls back to the VIP, so this never blocks.
+                await self._dispatcher.start()
             embedding_port, recv_socket = get_zmq_socket_on_host(
-                self.context, zmq.PULL, host=self.host
+                self.context, zmq.PULL, host=self.host, configure=False
             )
             mm_data = self._extract_url_data(request_obj)
             modalities = [m.get("modality") for m in mm_data]
@@ -769,15 +807,11 @@ class MMReceiverBase(ABC):
                 timeout=self.recv_timeout,
             )
             elapsed = time.monotonic() - send_time
-            logger.info(
-                f"[{req_id}] Received embedding from E in {elapsed:.3f}s"
-            )
+            logger.info(f"[{req_id}] Received embedding from E in {elapsed:.3f}s")
             return result
         except asyncio.TimeoutError:
             elapsed = time.monotonic() - send_time
-            logger.warning(
-                f"[{req_id}] Embedding recv timeout after {elapsed:.3f}s"
-            )
+            logger.warning(f"[{req_id}] Embedding recv timeout after {elapsed:.3f}s")
             if req_id is not None:
                 self._cleanup_mooncake_buffer(req_id)
             return None
@@ -1127,6 +1161,75 @@ class MMReceiverBase(ABC):
                     )
         return mm_data
 
+    def _build_dispatcher(self, server_args):
+        if not server_args.enable_encoder_endpoint_discovery or not self.encode_urls:
+            return None
+        from sglang.srt.disaggregation.encoder_dispatcher import LocalHashRingDispatcher
+
+        return LocalHashRingDispatcher(self.encode_urls[0])
+
+    def _dispatch_by_modality(self, mm_data):
+        """Pick E endpoints per mm item by SHA1 consistent hash.
+
+        Adapts the source branch's per-modality dispatch to this branch's
+        single-pass (all-modalities) encode(). Returns:
+          call_urls: deduped URL list for THIS encode call; ``encoder_idx``
+                     indexes into it (not self.encode_urls).
+          num_items_assigned: OrderedDict{modality: [count per call_urls idx]},
+                     each list padded to len(call_urls) to match encode()'s loop.
+          reordered: mm_data reordered so items are grouped by (modality, bucket),
+                     aligned with the assignment counts.
+        """
+        modalities = list(dict.fromkeys(m.get("modality") for m in mm_data))
+        call_urls: List[str] = []
+
+        def _url_idx(u: str) -> int:
+            if u not in call_urls:
+                call_urls.append(u)
+            return call_urls.index(u)
+
+        # Per modality, bucket items by their target call_urls index. call_urls
+        # grows as buckets are discovered, so counts/items are keyed by idx and
+        # materialized only after the list has stabilized.
+        counts_by_modality = OrderedDict()  # modality -> {idx: count}
+        items_by_modality = OrderedDict()  # modality -> {idx: [items]}
+        for modality in modalities:
+            items = [m for m in mm_data if m.get("modality") == modality]
+            if not items:
+                continue
+            counts: Dict[int, int] = {}
+            grouped: Dict[int, List[Dict]] = {}
+            # video/audio must share one encoder (EmbeddingData merge overwrites
+            # cross-item state), so route the whole batch by the first item.
+            if modality in (Modality.VIDEO, Modality.AUDIO):
+                idx = _url_idx(self._dispatcher.pick(extract_mm_item_key(items[0])))
+                counts[idx] = len(items)
+                grouped[idx] = list(items)
+            else:
+                # Per-item routing: each item's SHA1 must land on the pod that
+                # caches it. Items sharing a target URL merge into one part
+                # downstream, so this costs no extra encode calls per node.
+                for item in items:
+                    idx = _url_idx(self._dispatcher.pick(extract_mm_item_key(item)))
+                    counts[idx] = counts.get(idx, 0) + 1
+                    grouped.setdefault(idx, []).append(item)
+            counts_by_modality[modality] = counts
+            items_by_modality[modality] = grouped
+
+        n = len(call_urls)
+        num_items_assigned = OrderedDict()
+        reordered: List[Dict] = []
+        for modality, counts in counts_by_modality.items():
+            num_items_assigned[modality] = [counts.get(i, 0) for i in range(n)]
+            grouped = items_by_modality[modality]
+            # Emit items in ascending call_urls-index order so they line up with
+            # the part-building loop's enumerate(num_items_assigned) consumption.
+            for i in range(n):
+                if i in grouped:
+                    reordered.extend(grouped[i])
+
+        return call_urls, num_items_assigned, reordered
+
 
 class MMReceiverHTTP(MMReceiverBase):
     def __init__(
@@ -1153,27 +1256,12 @@ class MMReceiverHTTP(MMReceiverBase):
     def process_waiting_requests(self, recv_reqs):
         return self._process_waiting_requests(recv_reqs, WaitingImageRequest)
 
-    async def encode(
-        self,
-        req_id,
-        mm_data,
-        embedding_port,
-        endpoint_encode,
-        endpoint_send,
-        num_items_assigned=None,
+    def _build_encode_requests(
+        self, req_id, mm_data, embedding_port, num_items_assigned, modalities
     ):
-        if len(mm_data) == 0:
-            return
-
-        # get unique modalities with order preserved
-        modalities = [mm_item.get("modality") for mm_item in mm_data]
-        modalities = list(dict.fromkeys(modalities))
+        """Build per-part encode requests where encoder_idx indexes the URL list
+        the caller resolved (self.encode_urls, or dispatch's call_urls)."""
         encode_requests = []
-
-        if num_items_assigned is None:
-            num_items_assigned = self._assign_items_by_modality(
-                mm_data, len(self.encode_urls)
-            )
 
         # Calculate total num_parts across all modalities
         total_num_parts, modality_num_parts = calculate_modality_num_parts(
@@ -1225,6 +1313,110 @@ class MMReceiverHTTP(MMReceiverBase):
                 cum_num_items += assigned_num
             part_idx_offset += num_parts
 
+        return encode_requests, total_num_parts
+
+    def _build_sha1_encode_requests(self, req_id, mm_data, embedding_port):
+        """Regroup mm items into fixed-size parts for gateway SHA1-header routing.
+
+        All parts target encode_urls[0] (encoder_idx=0); the gateway resolves the
+        real E node from the X-Model-Encoder-URL-Sha1 header. Returns
+        (encode_requests, total_num_parts, sha1_by_part).
+        """
+        modalities = list(dict.fromkeys(m.get("modality") for m in mm_data))
+        encode_requests = []
+        sha1_by_part = {}
+        part_idx = 0
+        for modality in modalities:
+            items = [m for m in mm_data if m.get("modality") == modality]
+            if not items:
+                continue
+            # video/audio share one encoder: single part, not regrouped.
+            if modality in (Modality.VIDEO, Modality.AUDIO):
+                groups = [items]
+            else:
+                groups = [
+                    items[s : s + self._group_size]
+                    for s in range(0, len(items), self._group_size)
+                ]
+            for grp in groups:
+                encode_requests.append(
+                    {
+                        "encoder_idx": 0,
+                        "mm_items": [it.get("url") for it in grp],
+                        "mm_items_preprocess_kwargs": [
+                            it.get("preprocess_kwargs") for it in grp
+                        ],
+                        "num_parts": None,  # filled once total is known
+                        "part_idx": part_idx,
+                        "req_id": create_part_req_id(req_id, part_idx),
+                        "modality": modality.name,
+                        "prefill_host": self.host,
+                        "embedding_port": embedding_port,
+                    }
+                )
+                sha1_by_part[part_idx] = compute_mm_item_sha1(grp[0])
+                part_idx += 1
+        total_num_parts = len(encode_requests)
+        for er in encode_requests:
+            er["num_parts"] = total_num_parts
+        return encode_requests, total_num_parts, sha1_by_part
+
+    async def encode(
+        self,
+        req_id,
+        mm_data,
+        embedding_port,
+        endpoint_encode,
+        endpoint_send,
+        num_items_assigned=None,
+    ):
+        if len(mm_data) == 0:
+            return
+
+        # caller_assigned == the zmq_to_scheduler path (_run_encode_in_thread
+        # passes num_items_assigned). SHA1 dispatch/regroup only apply to the
+        # recv_mm_data path, so both are gated on `not caller_assigned`.
+        caller_assigned = num_items_assigned is not None
+
+        if self._dispatcher is not None and not caller_assigned:
+            # Endpoint discovery: pick E pods by SHA1 consistent hash. call_urls
+            # is this call's URL list; encoder_idx indexes it (not encode_urls).
+            call_urls, num_items_assigned, mm_data = self._dispatch_by_modality(mm_data)
+        else:
+            call_urls = self.encode_urls
+
+        if self.sha1_routing_header and not caller_assigned:
+            # Gateway SHA1 routing: regroup by fixed batch size, all -> gateway.
+            encode_requests, total_num_parts, sha1_by_part = (
+                self._build_sha1_encode_requests(req_id, mm_data, embedding_port)
+            )
+        else:
+            # get unique modalities with order preserved (mm_data may have been
+            # reordered by dispatch to align with num_items_assigned).
+            modalities = list(dict.fromkeys(m.get("modality") for m in mm_data))
+            if num_items_assigned is None:
+                num_items_assigned = self._assign_items_by_modality(
+                    mm_data, len(call_urls)
+                )
+            encode_requests, total_num_parts = self._build_encode_requests(
+                req_id, mm_data, embedding_port, num_items_assigned, modalities
+            )
+            # Header attachment is additive: still tag parts when enabled even on
+            # a caller-assigned path (mirrors source; empty dict => no header).
+            sha1_by_part = (
+                {
+                    er["part_idx"]: compute_mm_item_sha1(er["mm_items"][0])
+                    for er in encode_requests
+                    if er["mm_items"]
+                }
+                if self.sha1_routing_header
+                else {}
+            )
+
+        def _headers_for_part(part_idx):
+            sha1 = sha1_by_part.get(part_idx)
+            return {"X-Model-Encoder-URL-Sha1": sha1} if sha1 else None
+
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
                 total=1800
@@ -1234,8 +1426,9 @@ class MMReceiverHTTP(MMReceiverBase):
 
             tasks = [
                 session.post(
-                    f"{self.encode_urls[encode_request['encoder_idx']]}/{endpoint_encode}",
+                    f"{call_urls[encode_request['encoder_idx']]}/{endpoint_encode}",
                     json=encode_request,
+                    headers=_headers_for_part(encode_request["part_idx"]),
                 )
                 for encode_request in encode_requests
             ]
@@ -1288,8 +1481,9 @@ class MMReceiverHTTP(MMReceiverBase):
                 )
                 metadata_tasks.append(
                     session.post(
-                        f"{self.encode_urls[response_json['encoder_idx']]}/{endpoint_send}",
+                        f"{call_urls[response_json['encoder_idx']]}/{endpoint_send}",
                         json=response_json,
+                        headers=_headers_for_part(response_json["part_idx"]),
                     )
                 )
                 offset += embedding_size_list_sort[idx]

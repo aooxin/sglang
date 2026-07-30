@@ -65,7 +65,6 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import maybe_reindex_device_id
 from sglang.srt.utils.network import (
     NetworkAddress,
-    config_socket,
     get_free_port,
     get_local_ip_auto,
     get_zmq_socket,
@@ -245,7 +244,9 @@ def _extract_url_sha1_key(
     url_str = _item_to_url(item)
     if not url_str:
         return None
-    name = os.path.splitext(os.path.basename(url_str.split("?")[0]))[0]
+    # .lower() keeps the cache-key contract aligned with prefill-side routing
+    # (encode_receiver.extract_mm_item_key), which also lowercases the basename.
+    name = os.path.splitext(os.path.basename(url_str.split("?")[0]))[0].lower()
     if not _SHA1_RE.fullmatch(name):
         return None
     url_hash = int(name, 16)
@@ -1616,8 +1617,10 @@ class MMEncoder:
 
         # Use thread pool executor for parallel ZMQ send operations
         def send_with_socket():
+            # No config_socket here: a fixed SO_SNDBUF disables kernel TCP
+            # autotuning and is truncated by net.core.wmem_max, capping the
+            # E->P embedding transfer at ~40MB/s.
             sock = self.sync_context.socket(zmq.PUSH)
-            config_socket(sock, zmq.PUSH)
             try:
                 sock.connect(endpoint)
                 if buffer is not None:

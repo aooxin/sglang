@@ -426,5 +426,40 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertEqual(args.decode_attention_backend, "triton")
 
 
+class TestEncoderSha1RoutingArgs(unittest.TestCase):
+    def _make_args(self, **overrides) -> ServerArgs:
+        args = ServerArgs(model_path="dummy")
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_endpoint_discovery_and_sha1_header_mutually_exclusive(self):
+        args = self._make_args(
+            enable_encoder_endpoint_discovery=True,
+            enable_encoder_url_sha1_header=True,
+        )
+        # The mutual-exclusion branch raises before any model-config lookup.
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            args._handle_encoder_disaggregation()
+
+    def test_each_flag_alone_is_allowed(self):
+        # get_model_config() is stubbed so the handler runs end-to-end without a
+        # real model; we only assert the mutual-exclusion check does not fire.
+        fake_cfg = MagicMock()
+        fake_cfg.hf_config.architectures = ["SomeCausalLM"]
+        for flags in (
+            {"enable_encoder_endpoint_discovery": True},
+            {"enable_encoder_url_sha1_header": True},
+        ):
+            args = self._make_args(**flags)
+            with patch.object(args, "get_model_config", return_value=fake_cfg):
+                args._handle_encoder_disaggregation()  # must not raise
+
+    def test_defaults_are_off(self):
+        args = ServerArgs(model_path="dummy")
+        self.assertFalse(args.enable_encoder_endpoint_discovery)
+        self.assertFalse(args.enable_encoder_url_sha1_header)
+
+
 if __name__ == "__main__":
     unittest.main()

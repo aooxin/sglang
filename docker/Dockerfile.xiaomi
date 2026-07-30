@@ -5,6 +5,8 @@ ARG UBUNTU_MIRROR=https://pkgs.d.xiaomi.net/artifactory/deb-remote/ubuntu/
 ARG PIP_DEFAULT_INDEX=https://pkgs.d.xiaomi.net/artifactory/api/pypi/pypi-virtual/simple
 ARG BUILD_MAX_JOBS=128
 ARG DEBIAN_FRONTEND=noninteractive
+# Set to 1 to bake FlashAttention-4 (CUTE) + sm120 patch for RTX 5090 / Blackwell.
+ARG ENABLE_FA4_SM120=0
 
 RUN if [ -n "${PIP_DEFAULT_INDEX}" ]; then \
     python3 -m pip config set global.index-url ${PIP_DEFAULT_INDEX}; \
@@ -36,6 +38,35 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages --no-build-iso
     decord==0.6.0 \
     "apache-tvm-ffi>=0.1.5,<0.2" \
     'fastokens>=0.2.0'
+
+# for encoder endpoint discovery (--enable-encoder-endpoint-discovery):
+# K8s Endpoints watch. Install with deps (pyyaml/urllib3/python-dateutil/...).
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+    "kubernetes_asyncio>=29,<30"
+
+# FlashAttention-4 (CUTE) for the MiMo ViT/audio "fa4" backend on Blackwell
+# (sm120/RTX 5090). cute is overwritten with sunjiale's sm120-fix fork (PyPI is broken).
+# Gated by ENABLE_FA4_SM120 — off by default for non-Blackwell builds.
+RUN if [ "$ENABLE_FA4_SM120" = "1" ]; then \
+    SP=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['purelib'])") && \
+    (python3 -m pip uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base || true) && \
+    rm -rf "$SP/cutlass" "$SP/nvidia_cutlass_dsl" "$SP"/nvidia_cutlass_dsl*.pth && \
+    python3 -m pip install --no-cache-dir --break-system-packages --no-build-isolation --no-deps \
+    "nvidia-cutlass-dsl==4.4.2" \
+    "nvidia-cutlass-dsl-libs-base==4.4.2" && \
+    echo "nvidia_cutlass_dsl/python_packages" > "$SP/nvidia_cutlass_dsl.pth" && \
+    python3 -m pip install --no-cache-dir --break-system-packages --no-build-isolation --no-deps \
+    "flash-attn-4==4.0.0b7" \
+    "quack-kernels==0.3.9" \
+    "apache-tvm-ffi==0.1.9" && \
+    wget -q https://wlcb-cloudml-starfs.api.xiaomi.net/aie-shared-models-n-datasets-wlcb/git/flash_attn_cute_sm120_7b18858.tar.gz -O /tmp/fa4cute.tar.gz && \
+    tar -xzf /tmp/fa4cute.tar.gz -C /tmp && \
+    cp -rf /tmp/flash_attn/cute/. "$SP/flash_attn/cute/" && \
+    rm -rf /tmp/fa4cute.tar.gz /tmp/flash_attn && \
+    grep -q "is_split_kv = False" "$SP/flash_attn/cute/flash_fwd_sm120.py" || (echo "ERROR: sm120 patch not applied" && exit 1) && \
+    python3 -c "import cutlass; print('cutlass ->', getattr(cutlass, '__file__', None) or list(cutlass.__path__))" && \
+    python3 -c "from cutlass import Int32, Float32; from flash_attn.cute import flash_attn_varlen_func; print('fa4 deps baked OK (sm120 patched)')"; \
+fi
 
 # cleanup sglang workspace
 RUN rm -fr /sgl-workspace/sglang

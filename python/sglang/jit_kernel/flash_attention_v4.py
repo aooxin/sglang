@@ -3,13 +3,14 @@ from __future__ import annotations
 from typing import Callable, Optional, Tuple, Union
 
 import torch
-from cutlass.base_dsl.typing import Int32
 
 from sglang.kernel_api_logging import debug_kernel_api
 
 try:
+    from cutlass.base_dsl.typing import Int32
     from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
 except Exception as _e:  # pragma: no cover
+    Int32 = None
     _flash_attn_varlen_func = None
     _flash_attn_import_error = _e
 else:

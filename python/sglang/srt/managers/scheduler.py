@@ -423,7 +423,8 @@ class Scheduler(
         self.init_profiler()
 
         # Init prefill-decodedisaggregation
-        self.init_disaggregation()
+        with startup_timer("initializing disaggregation"):
+            self.init_disaggregation()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1162,14 +1163,15 @@ class Scheduler(
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
             if self.server_args.enable_pd_direct2host:
-                self.pd_direct2host_manager = PDDirect2HostManager(
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    server_args=self.server_args,
-                    sliding_window_size=self.sliding_window_size,
-                    draft_token_to_kv_pool=draft_token_to_kv_pool,
-                    draft_token_to_kv_pool_list=draft_token_to_kv_pool_list,
-                )
+                with startup_timer("Initializing PDDirect2HostManager"):
+                    self.pd_direct2host_manager = PDDirect2HostManager(
+                        req_to_token_pool=self.req_to_token_pool,
+                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                        server_args=self.server_args,
+                        sliding_window_size=self.sliding_window_size,
+                        draft_token_to_kv_pool=draft_token_to_kv_pool,
+                        draft_token_to_kv_pool_list=draft_token_to_kv_pool_list,
+                    )
 
             buffer_size = (self.req_to_token_pool.size) * 2
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(

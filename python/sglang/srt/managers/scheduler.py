@@ -50,6 +50,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
+from sglang.srt.disaggregation.pd_direct2host_manager import PDDirect2HostManager
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -882,6 +883,7 @@ class Scheduler(
             )
         else:
             self.decode_offload_manager = None
+        self.pd_direct2host_manager = None
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
@@ -1159,6 +1161,16 @@ class Scheduler(
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
+            if self.server_args.enable_pd_direct2host:
+                self.pd_direct2host_manager = PDDirect2HostManager(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    server_args=self.server_args,
+                    sliding_window_size=self.sliding_window_size,
+                    draft_token_to_kv_pool=draft_token_to_kv_pool,
+                    draft_token_to_kv_pool_list=draft_token_to_kv_pool_list,
+                )
+
             buffer_size = (self.req_to_token_pool.size) * 2
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
@@ -2979,9 +2991,16 @@ class Scheduler(
         ):
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
-            )
+            pd_d2h_mgr = getattr(self, "pd_direct2host_manager", None)
+            if pd_d2h_mgr is not None:
+                pd_d2h_mgr.begin_retract()
+            try:
+                retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
+                    self.server_args
+                )
+            finally:
+                if pd_d2h_mgr is not None:
+                    pd_d2h_mgr.end_retract()
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
 
@@ -3642,17 +3661,8 @@ class Scheduler(
                         req.disagg_kv_sender.abort()
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            # Abort requests that have not yet finished preallocation
-            for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
-
-            # Abort requests waiting for kvcache to release tree cache
-            for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
+            self.disagg_decode_prealloc_queue.abort_matching(recv_req)
+            self.disagg_decode_transfer_queue.abort_matching(recv_req)
 
             # Abort requests already retracted to CPU cache
             if self.disagg_decode_prealloc_queue.retracted_queue:
@@ -4016,7 +4026,12 @@ def run_scheduler_process(
 
     # Set up tracing
     if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            server_args.disaggregation_mode,
+            server_args.otlp_traces_resource_attrs,
+        )
         thread_label = "Scheduler"
         if server_args.disaggregation_mode == "prefill":
             thread_label = "Prefill Scheduler"

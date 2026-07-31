@@ -437,6 +437,7 @@ class ServerArgs:
     kv_events_config: Optional[str] = None
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
+    otlp_traces_resource_attrs: Optional[str] = None
 
     # RequestMetricsExporter configuration
     export_metrics_to_file: bool = False
@@ -542,6 +543,7 @@ class ServerArgs:
     enforce_disable_flashinfer_allreduce_fusion: bool = False
     enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
+    deepep_ll_num_sms: int = 0
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
     init_expert_location: str = "trivial"
@@ -719,6 +721,12 @@ class ServerArgs:
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
     disaggregation_bootstrap_send_max_failures: int = 3
+
+    # PD direct-to-host: P writes KV directly into pinned host memory on D,
+    # then D pulls H2D asynchronously. Decode-only.
+    enable_pd_direct2host: bool = False
+    pd_direct2host_host_size: Optional[int] = None  # GB
+    pd_direct2host_host_ratio: float = 2.0
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -3483,6 +3491,29 @@ class ServerArgs:
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported when hicache-storage-backend is provided."
                 )
 
+        if self.enable_pd_direct2host:
+            if self.disaggregation_mode != "decode":
+                raise ValueError(
+                    "--enable-pd-direct2host is decode-only "
+                    f"(current disaggregation_mode={self.disaggregation_mode!r})."
+                )
+            if self.pp_size > 1:
+                raise ValueError(
+                    "--enable-pd-direct2host is not supported with "
+                    f"pipeline parallelism (pp_size={self.pp_size})."
+                )
+            if self.disaggregation_decode_enable_offload_kvcache:
+                raise ValueError(
+                    "--enable-pd-direct2host conflicts with "
+                    "--disaggregation-decode-enable-offload-kvcache; "
+                    "they share host memory budget."
+                )
+            if self.enable_hierarchical_cache:
+                raise ValueError(
+                    "--enable-pd-direct2host conflicts with --enable-hierarchical-cache "
+                    "in the current implementation; promote-to-L2 is a follow-up."
+                )
+
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
@@ -4587,6 +4618,13 @@ class ServerArgs:
             default="localhost:4317",
             help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
         )
+        parser.add_argument(
+            "--otlp-traces-resource-attrs",
+            type=str,
+            default=None,
+            help="Extra resource attributes for OTLP trace exporter as a JSON string. "
+            'e.g. \'{"cluster": "prod", "region": "cn-north"}\'.',
+        )
 
         # RequestMetricsExporter configuration
         parser.add_argument(
@@ -5118,6 +5156,12 @@ class ServerArgs:
             choices=["normal", "low_latency", "auto"],
             default="auto",
             help="Select the mode when enable DeepEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
+        )
+        parser.add_argument(
+            "--deepep-ll-num-sms",
+            type=int,
+            default=ServerArgs.deepep_ll_num_sms,
+            help="Number of SMs to use for DeepEP low-latency kernels. Set 0 to use DeepEP's default.",
         )
         parser.add_argument(
             "--ep-num-redundant-experts",
@@ -5977,6 +6021,27 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_bootstrap_send_max_failures,
             help="Max consecutive bootstrap PUSH send failures to a prefill endpoint before evicting its cached socket. Default is 3.",
+        )
+        parser.add_argument(
+            "--enable-pd-direct2host",
+            action="store_true",
+            help="Decode-only. Let prefill RDMA-write KV directly into pinned "
+            "host memory on decode, then async H2D when forward needs it. "
+            "Compresses device KV occupancy window.",
+        )
+        parser.add_argument(
+            "--pd-direct2host-host-size",
+            type=int,
+            default=ServerArgs.pd_direct2host_host_size,
+            help="Size in GB of the pinned host transit pool for PD direct2host. "
+            "Mutually exclusive with --pd-direct2host-host-ratio.",
+        )
+        parser.add_argument(
+            "--pd-direct2host-host-ratio",
+            type=float,
+            default=ServerArgs.pd_direct2host_host_ratio,
+            help="host:device size ratio for the PD direct2host transit pool "
+            "when --pd-direct2host-host-size is not set.",
         )
 
         # Encode prefill disaggregation

@@ -96,6 +96,7 @@ class CommonKVManager(BaseKVManager):
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
+        self.enable_pd_direct2host = server_args.enable_pd_direct2host
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port

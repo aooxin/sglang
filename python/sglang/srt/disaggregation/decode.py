@@ -24,6 +24,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum, auto
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
@@ -35,6 +36,9 @@ from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.pd_direct2host_manager import (
+    PDD2HAbortDisposition,
+)
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -51,6 +55,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -81,6 +86,19 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+
+REQUEST_ABORT_ERR_TYPE = "request_abort"
+
+
+class PDD2HState(Enum):
+    # Waiting for prefill to RDMA-write KV into decode host slots and send metadata.
+    WAIT_PREFILL = auto()
+    # Prefill transfer is committed; host KV is ready, but H2D has not started.
+    HOST_READY = auto()
+    # Device KV is allocated and host-to-device copy has been enqueued.
+    H2D_INFLIGHT = auto()
+    # The request is aborted, but device slots remain owned until H2D completes.
+    ABORT_PENDING_H2D = auto()
 
 
 def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
@@ -234,10 +252,167 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    pd_d2h_state: PDD2HState = PDD2HState.WAIT_PREFILL
 
     @property
     def seqlen(self) -> int:
         return self.req.seqlen
+
+    def abort_receiver_if_active(self) -> None:
+        if self.kv_receiver is not None:
+            self.kv_receiver.abort()
+
+
+def _is_request_abort(req: Req) -> bool:
+    return isinstance(req.finished_reason, FINISH_ABORT) and (
+        req.finished_reason.err_type == REQUEST_ABORT_ERR_TYPE
+    )
+
+
+def _notify_request_abort(scheduler: Scheduler, decode_req: DecodeRequest) -> None:
+    if _is_request_abort(decode_req.req):
+        return
+    decode_req.req.finished_reason = FINISH_ABORT(err_type=REQUEST_ABORT_ERR_TYPE)
+    scheduler.send_to_tokenizer.send_output(
+        AbortReq(rid=decode_req.req.rid), decode_req.req
+    )
+
+
+def _consensus_polls_by_room(
+    gathered_pairs: torch.Tensor,
+    counts: List[int],
+    world_size: int,
+    fallback_status: int,
+) -> Dict[int, int]:
+    """Compute per-room consensus poll status from gathered (room, poll) pairs.
+
+    A room reaches a non-fallback status only when every rank reported it;
+    Failed wins immediately; otherwise the min status across ranks is used.
+    """
+    present_counts: Dict[int, int] = {}
+    min_status_by_room: Dict[int, int] = {}
+    for pairs, count in zip(gathered_pairs, counts):
+        seen_rooms = set()
+        for i in range(count):
+            room = int(pairs[i, 0].item())
+            poll = int(pairs[i, 1].item())
+            if room in seen_rooms:
+                min_status_by_room[room] = min(min_status_by_room.get(room, poll), poll)
+                continue
+            seen_rooms.add(room)
+            present_counts[room] = present_counts.get(room, 0) + 1
+            min_status_by_room[room] = min(min_status_by_room.get(room, poll), poll)
+
+    polls_by_room: Dict[int, int] = {}
+    for room, min_status in min_status_by_room.items():
+        if min_status == KVPoll.Failed:
+            polls_by_room[room] = int(KVPoll.Failed)
+        elif present_counts.get(room, 0) == world_size:
+            polls_by_room[room] = min_status
+        else:
+            polls_by_room[room] = int(fallback_status)
+    return polls_by_room
+
+
+class PDD2HFusedPoller:
+    """Single fused gloo collective per scheduler iteration for pd-d2h.
+
+    Replaces the two independent — and conditionally executed — all_gather
+    pairs in DecodePreallocQueue and DecodeTransferQueue with one collective
+    that is issued unconditionally at a fixed point of the event loop. This
+    removes the queue-state-dependent branching that made the collective
+    schedule fragile across ranks.
+
+    Every collective carries a monotonically increasing sequence number and
+    an op code in a fixed-size header. After the header gather, all ranks
+    verify that (seq, op) match everywhere; on mismatch we raise immediately
+    with the per-rank values, converting a would-be silent deadlock into a
+    loud crash that pinpoints which rank ran ahead/behind.
+    """
+
+    def __init__(self, gloo_group: ProcessGroup, tp_rank: int):
+        self.gloo_group = gloo_group
+        self.tp_rank = tp_rank
+        self.seq = 0
+
+    def poll(
+        self,
+        prealloc_entries: List[Tuple[int, int]],
+        transfer_entries: List[Tuple[int, int]],
+        h2d_admit: bool,
+    ) -> Tuple[Dict[int, int], Dict[int, int], bool]:
+        """Gather (bootstrap_room, poll) snapshots of both queues in one shot.
+
+        Returns (prealloc_polls_by_room, transfer_polls_by_room, h2d_admit).
+        """
+        group = self.gloo_group
+        world_size = torch.distributed.get_world_size(group=group)
+        self.seq += 1
+
+        header = torch.tensor(
+            [
+                self.seq,
+                len(prealloc_entries),
+                len(transfer_entries),
+                int(h2d_admit),
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        gathered_headers = torch.empty(
+            (world_size, 4), dtype=torch.int64, device="cpu"
+        )
+        torch.distributed.all_gather_into_tensor(
+            gathered_headers.flatten(), header, group=group
+        )
+
+        seqs = gathered_headers[:, 0].tolist()
+        if len(set(seqs)) != 1:
+            raise RuntimeError(
+                "pd-d2h collective schedule desync detected: "
+                f"tp_rank={self.tp_rank} local(seq={self.seq}) "
+                f"gathered seqs={seqs}. "
+                "A scheduler rank diverged from the collective lockstep; "
+                "raising to trigger a clean restart instead of deadlocking."
+            )
+
+        counts_p = gathered_headers[:, 1].tolist()
+        counts_t = gathered_headers[:, 2].tolist()
+        h2d_admit = bool(gathered_headers[:, 3].min().item())
+        max_p = max(counts_p)
+        max_t = max(counts_t)
+        if max_p + max_t == 0:
+            return {}, {}, h2d_admit
+
+        stride = max_p + max_t
+        local_pairs = torch.full((stride, 2), -1, dtype=torch.int64, device="cpu")
+        for i, (room, poll_status) in enumerate(prealloc_entries):
+            local_pairs[i, 0] = room
+            local_pairs[i, 1] = poll_status
+        for i, (room, poll_status) in enumerate(transfer_entries):
+            local_pairs[max_p + i, 0] = room
+            local_pairs[max_p + i, 1] = poll_status
+
+        gathered_pairs = torch.empty(
+            (world_size, stride, 2), dtype=torch.int64, device="cpu"
+        )
+        torch.distributed.all_gather_into_tensor(
+            gathered_pairs.flatten(), local_pairs.flatten(), group=group
+        )
+
+        prealloc_polls = _consensus_polls_by_room(
+            gathered_pairs[:, :max_p],
+            counts_p,
+            world_size,
+            int(KVPoll.Bootstrapping),
+        )
+        transfer_polls = _consensus_polls_by_room(
+            gathered_pairs[:, max_p:],
+            counts_t,
+            world_size,
+            int(KVPoll.Transferring),
+        )
+        return prealloc_polls, transfer_polls, h2d_admit
 
 
 class DecodePreallocQueue:
@@ -318,6 +493,109 @@ class DecodePreallocQueue:
                 self.swa_extra_need_tokens = ceil_align(
                     self.swa_extra_need_tokens, self.scheduler.page_size
                 )
+
+    @staticmethod
+    def _to_metadata_indices(indices) -> np.ndarray:
+        arr = (
+            indices.detach().cpu().numpy()
+            if isinstance(indices, torch.Tensor)
+            else np.asarray(indices)
+        )
+        if arr.size and (arr.min() < 0 or arr.max() > np.iinfo(np.int32).max):
+            raise ValueError(
+                f"KV metadata index out of int32 range: min={arr.min()} max={arr.max()}"
+            )
+        return arr.astype(np.int32, copy=False)
+
+    def _pre_alloc_and_get_kv_indices(
+        self, decode_req: DecodeRequest, pd_d2h_mgr, origin_input_len: int
+    ) -> Optional[np.ndarray]:
+        req = decode_req.req
+
+        if pd_d2h_mgr is not None:
+            if not pd_d2h_mgr.pre_alloc(req):
+                return None
+            return self._to_metadata_indices(req.host_kv_indices[:origin_input_len])
+
+        dst_kv_indices = self._pre_alloc(req)
+        if self.scheduler.enable_hisparse:
+            return self._to_metadata_indices(dst_kv_indices[:origin_input_len])
+
+        kv_indices_full = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :origin_input_len
+        ]
+        return self._to_metadata_indices(kv_indices_full)
+
+    def _get_state_indices(
+        self, decode_req: DecodeRequest, pd_d2h_mgr, page_size: int
+    ):
+        req = decode_req.req
+
+        if pd_d2h_mgr is not None:
+            if req.host_state_indices is None:
+                return None
+            state_indices = self._to_metadata_indices(req.host_state_indices)
+            return kv_to_page_indices(state_indices, page_size)
+
+        if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+            return [
+                self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                    req.req_pool_idx
+                ]
+                .cpu()
+                .numpy()
+            ]
+
+        if isinstance(self.token_to_kv_pool, SWAKVPool):
+            seq_len = len(req.origin_input_ids)
+            window_size = self.scheduler.sliding_window_size
+            window_start = max(0, seq_len - window_size)
+            window_start = (window_start // page_size) * page_size
+            window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, window_start:seq_len
+            ]
+            window_kv_indices_swa = (
+                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    window_kv_indices_full
+                )
+            )
+            state_indices = self._to_metadata_indices(window_kv_indices_swa)
+            return kv_to_page_indices(state_indices, page_size)
+
+        if isinstance(self.token_to_kv_pool, NSATokenToKVPool):
+            seq_len = len(req.origin_input_ids)
+            kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :seq_len
+            ]
+            state_indices = self._to_metadata_indices(kv_indices_full)
+            return kv_to_page_indices(state_indices, self.token_to_kv_pool.page_size)
+
+        return None
+
+    def _bootstrap_room(self, decode_req: DecodeRequest) -> int:
+        bootstrap_room = decode_req.req.bootstrap_room
+        if bootstrap_room is None:
+            raise RuntimeError(
+                "Disagg decode prealloc request has no bootstrap_room: "
+                f"rid={decode_req.req.rid}"
+            )
+        return int(bootstrap_room)
+
+    def local_poll_entries(self) -> List[Tuple[int, int]]:
+        """Snapshot (bootstrap_room, poll) for every queued request.
+
+        Pure local computation — the collective exchange is done by
+        PDD2HFusedPoller so that all ranks issue exactly one collective per
+        scheduler iteration regardless of local queue state.
+        """
+        entries: List[Tuple[int, int]] = []
+        for decode_req in self.queue:
+            room = self._bootstrap_room(decode_req)
+            if decode_req.waiting_for_input:
+                entries.append((room, int(KVPoll.WaitingForInput)))
+            else:
+                entries.append((room, int(decode_req.kv_receiver.poll())))
+        return entries
 
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -412,6 +690,30 @@ class DecodePreallocQueue:
             kv_args.state_data_lens += state_data_lens
             kv_args.state_item_lens += state_item_lens
 
+        # PD direct-to-host: when enabled, the decode side advertises
+        # pinned host buffers as the RDMA destinations instead of device
+        # KV pools. The manager owns the lifetime of those buffers; we
+        # only forward the pool-level (ptr, len, item_len) tuples here.
+        pd_d2h_mgr = getattr(self.scheduler, "pd_direct2host_manager", None)
+        if pd_d2h_mgr is not None:
+            (
+                kv_args.host_kv_data_ptrs,
+                kv_args.host_kv_data_lens,
+                kv_args.host_kv_item_lens,
+            ) = pd_d2h_mgr.get_host_kv_buf_infos()
+            (
+                kv_args.host_state_data_ptrs,
+                kv_args.host_state_data_lens,
+                kv_args.host_state_item_lens,
+            ) = pd_d2h_mgr.get_host_state_buf_infos()
+        else:
+            kv_args.host_kv_data_ptrs = []
+            kv_args.host_kv_data_lens = []
+            kv_args.host_kv_item_lens = []
+            kv_args.host_state_data_ptrs = []
+            kv_args.host_state_data_lens = []
+            kv_args.host_state_item_lens = []
+
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -462,6 +764,21 @@ class DecodePreallocQueue:
                 return
 
             self.pending_reqs.append(decode_req)
+
+    def abort_matching(self, recv_req: AbortReq) -> None:
+        matched_ids = set()
+        for decode_req in self.queue:
+            if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
+                matched_ids.add(id(decode_req))
+                decode_req.abort_receiver_if_active()
+                _notify_request_abort(self.scheduler, decode_req)
+
+        if matched_ids:
+            self.pending_reqs = [
+                decode_req
+                for decode_req in self.pending_reqs
+                if id(decode_req) not in matched_ids
+            ]
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -647,17 +964,38 @@ class DecodePreallocQueue:
         return resumed_reqs
 
     def _update_handshake_waiters(
-        self, rids_to_check: Optional[List[str]] = None
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        polls_by_room: Optional[Dict[int, int]] = None,
     ) -> None:
-        if not self.queue:
+        pd_d2h_mgr = getattr(self.scheduler, "pd_direct2host_manager", None)
+        if not self.queue and pd_d2h_mgr is None:
             return
 
-        if all(decode_req.waiting_for_input for decode_req in self.queue):
+        if (
+            pd_d2h_mgr is None
+            and self.queue
+            and all(decode_req.waiting_for_input for decode_req in self.queue)
+        ):
             return
 
-        polls = poll_and_all_reduce(
-            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
-        )
+        if pd_d2h_mgr is not None:
+            if polls_by_room is None:
+                raise RuntimeError(
+                    "PD D2H handshake polling requires fused poll consensus; "
+                    "pipeline parallelism is not supported with PD D2H."
+                )
+            # Consensus was exchanged by PDD2HFusedPoller; local lookup only.
+            polls = [
+                polls_by_room.get(
+                    self._bootstrap_room(decode_req), int(KVPoll.Bootstrapping)
+                )
+                for decode_req in self.queue
+            ]
+        else:
+            polls = poll_and_all_reduce(
+                [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
+            )
 
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -674,6 +1012,8 @@ class DecodePreallocQueue:
                     decode_req.kv_receiver.failure_exception()
                 except Exception as e:
                     error_message += f" with exception {e}"
+                if _is_request_abort(decode_req.req):
+                    continue
                 logger.error(error_message)
                 prepare_abort(
                     decode_req.req,
@@ -719,7 +1059,7 @@ class DecodePreallocQueue:
                 error_msg = f"Could not fetch prefill parallel info from {bootstrap_addr} after {count} attempts"
                 logger.error(error_msg)
                 for decode_req in reqs:
-                    decode_req.kv_receiver.abort()
+                    decode_req.abort_receiver_if_active()
                 del self._ensure_retry_count[bootstrap_addr]
                 del self._ensure_last_attempt_time[bootstrap_addr]
             else:
@@ -772,11 +1112,13 @@ class DecodePreallocQueue:
             decode_req.kv_receiver.init(prefill_dp_rank)
 
     def pop_preallocated(
-        self, rids_to_check: Optional[List[str]] = None
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        polls_by_room: Optional[Dict[int, int]] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
         self._resolve_pending_reqs()
-        self._update_handshake_waiters(rids_to_check)
+        self._update_handshake_waiters(rids_to_check, polls_by_room=polls_by_room)
 
         failed_reqs = []
         preallocated_reqs = []
@@ -798,13 +1140,17 @@ class DecodePreallocQueue:
             assert swa_retractable_tokens is not None
 
         # First, remove all failed requests from the queue
+        pd_d2h_mgr = getattr(self.scheduler, "pd_direct2host_manager", None)
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                self.scheduler.stream_output(
-                    [decode_req.req], decode_req.req.return_logprob
-                )
+                if not _is_request_abort(decode_req.req):
+                    self.scheduler.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                if pd_d2h_mgr is not None:
+                    pd_d2h_mgr.abort(decode_req.req)
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
@@ -887,60 +1233,15 @@ class DecodePreallocQueue:
                 swa_allocatable_tokens -= swa_required_tokens_for_request
                 allocatable_tokens = (full_allocatable_tokens, swa_allocatable_tokens)
 
-            dst_kv_indices = self._pre_alloc(decode_req.req)
-
             origin_input_len = len(decode_req.req.origin_input_ids)
-            if self.scheduler.enable_hisparse:
-                # Must cast to int32 for ZMQ serialization — from_zmq reads np.int32.
-                kv_indices = (
-                    dst_kv_indices[:origin_input_len].cpu().numpy().astype(np.int32)
-                )
-            else:
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx
-                ][:origin_input_len]
-                kv_indices = kv_indices_full.cpu().numpy()
+            kv_indices = self._pre_alloc_and_get_kv_indices(
+                decode_req, pd_d2h_mgr, origin_input_len
+            )
+            if kv_indices is None:
+                # Host pool full — keep req in queue, retry next tick.
+                break
 
-            # Prepare extra pool indices for hybrid models
-            if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
-                # Mamba hybrid model: single mamba state index
-                state_indices = [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        decode_req.req.req_pool_idx
-                    ]
-                    .cpu()
-                    .numpy()
-                ]
-            elif isinstance(self.token_to_kv_pool, SWAKVPool):
-                # SWA hybrid model: send decode-side SWA window indices
-                seq_len = len(decode_req.req.origin_input_ids)
-                window_size = self.scheduler.sliding_window_size
-
-                window_start = max(0, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
-                window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, window_start:seq_len
-                ]
-
-                # Translate to SWA pool indices
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        window_kv_indices_full
-                    )
-                )
-                state_indices = window_kv_indices_swa.cpu().numpy()
-                state_indices = kv_to_page_indices(state_indices, page_size)
-            elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
-                seq_len = len(decode_req.req.origin_input_ids)
-                kv_indices_full = self.req_to_token_pool.req_to_token[
-                    decode_req.req.req_pool_idx, :seq_len
-                ]
-                state_indices = kv_indices_full.cpu().numpy()
-                # Indexer lives on device pool; always use device page_size
-                device_page_size = self.token_to_kv_pool.page_size
-                state_indices = kv_to_page_indices(state_indices, device_page_size)
-            else:
-                state_indices = None
+            state_indices = self._get_state_indices(decode_req, pd_d2h_mgr, page_size)
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
@@ -1199,7 +1500,122 @@ class DecodeTransferQueue:
                 if dr.kv_receiver.require_staging:
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
-    def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
+    def abort_matching(self, recv_req: AbortReq) -> None:
+        pd_d2h_mgr = getattr(self.scheduler, "pd_direct2host_manager", None)
+        remaining_queue = []
+        for decode_req in self.queue:
+            if not (recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid)):
+                remaining_queue.append(decode_req)
+                continue
+
+            logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
+            if _is_request_abort(decode_req.req):
+                remaining_queue.append(decode_req)
+                continue
+
+            decode_req.abort_receiver_if_active()
+            _notify_request_abort(self.scheduler, decode_req)
+
+            if pd_d2h_mgr is None:
+                remaining_queue.append(decode_req)
+                continue
+
+            if decode_req.pd_d2h_state is PDD2HState.WAIT_PREFILL:
+                remaining_queue.append(decode_req)
+                continue
+
+            disposition = pd_d2h_mgr.abort(decode_req.req)
+            if disposition is PDD2HAbortDisposition.DEFER_UNTIL_H2D_DONE:
+                decode_req.pd_d2h_state = PDD2HState.ABORT_PENDING_H2D
+                remaining_queue.append(decode_req)
+                continue
+
+            self._release_queue_entry(decode_req)
+
+        self.queue = remaining_queue
+
+    def _release_queue_entry(self, decode_req: DecodeRequest) -> None:
+        if self.enable_staging and self.staging_handler.is_staging_room(
+            decode_req.req.bootstrap_room
+        ):
+            self.staging_handler.unregister_decode_req(decode_req.req.bootstrap_room)
+
+        idx = decode_req.metadata_buffer_index
+        if idx != -1:
+            self.req_to_metadata_buffer_idx_allocator.free(idx)
+            decode_req.metadata_buffer_index = -1
+
+    def _bootstrap_room(self, decode_req: DecodeRequest) -> int:
+        bootstrap_room = decode_req.req.bootstrap_room
+        if bootstrap_room is None:
+            raise RuntimeError(
+                "Disagg decode transfer request has no bootstrap_room: "
+                f"rid={decode_req.req.rid}"
+            )
+        return int(bootstrap_room)
+
+    def _queue_indices_by_bootstrap_room(self) -> List[int]:
+        return sorted(
+            range(len(self.queue)),
+            key=lambda i: self._bootstrap_room(self.queue[i]),
+        )
+
+    def _h2d_reserved_decode_tokens(self) -> int:
+        total_reqs = len(self.scheduler.running_batch.reqs)
+        last_batch = self.scheduler.last_batch
+        if last_batch is not None and last_batch.forward_mode.is_prebuilt():
+            total_reqs += len(last_batch.reqs)
+        return self.scheduler.server_args.num_reserved_decode_tokens * total_reqs
+
+    def h2d_candidate(self) -> Optional[DecodeRequest]:
+        for i in self._queue_indices_by_bootstrap_room():
+            decode_req = self.queue[i]
+            if decode_req.pd_d2h_state is PDD2HState.HOST_READY:
+                return decode_req
+        return None
+
+    def start_h2d(self, pd_d2h_mgr, decode_req: DecodeRequest) -> None:
+        if not pd_d2h_mgr.start_h2d(decode_req.req):
+            raise RuntimeError(
+                f"H2D allocation failed after TP admission: rid={decode_req.req.rid}"
+            )
+        decode_req.pd_d2h_state = PDD2HState.H2D_INFLIGHT
+        decode_req.req.time_stats.set_decode_h2d_wait_start_time()
+
+    def local_poll_entries(self, pd_d2h_mgr) -> List[Tuple[int, int]]:
+        """Snapshot (bootstrap_room, poll) for every queued request.
+
+        Pure local computation — the collective exchange is done by
+        PDD2HFusedPoller (see DecodePreallocQueue.local_poll_entries).
+        """
+        entries: List[Tuple[int, int]] = []
+        for decode_req in self.queue:
+            room = self._bootstrap_room(decode_req)
+            if decode_req.pd_d2h_state is PDD2HState.WAIT_PREFILL:
+                entries.append((room, int(decode_req.kv_receiver.poll())))
+            elif decode_req.pd_d2h_state in (
+                PDD2HState.H2D_INFLIGHT,
+                PDD2HState.ABORT_PENDING_H2D,
+            ):
+                entries.append(
+                    (
+                        room,
+                        (
+                            int(KVPoll.Success)
+                            if pd_d2h_mgr.is_h2d_ready(decode_req.req)
+                            else int(KVPoll.Transferring)
+                        ),
+                    )
+                )
+            else:
+                entries.append((room, int(KVPoll.Transferring)))
+        return entries
+
+    def _commit_transfer_to_req(
+        self,
+        decode_req: DecodeRequest,
+        set_wait_queue_time: bool = True,
+    ) -> bool:
         """
         Returns:
             True if the request should be removed from the queue (success or corruption)
@@ -1286,7 +1702,8 @@ class DecodeTransferQueue:
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
-        decode_req.req.time_stats.set_wait_queue_entry_time()
+        if set_wait_queue_time:
+            decode_req.req.time_stats.set_wait_queue_entry_time()
         return True
 
     def _poll_with_staging(self) -> list:
@@ -1305,7 +1722,165 @@ class DecodeTransferQueue:
         )
         kv_manager._staging_handler = self.staging_handler
 
-    def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
+    def _pop_transferred_pd_d2h(
+        self,
+        pd_d2h_mgr,
+        rids_to_check: Optional[List[str]] = None,
+        polls_by_room: Optional[Dict[int, int]] = None,
+    ) -> List[Req]:
+        if polls_by_room is None:
+            raise RuntimeError(
+                "PD D2H transfer polling requires fused poll consensus; "
+                "pipeline parallelism is not supported with PD D2H."
+            )
+        polls = [
+            polls_by_room.get(
+                self._bootstrap_room(decode_req), int(KVPoll.Transferring)
+            )
+            for decode_req in self.queue
+        ]
+
+        transferred_reqs = []
+        indices_to_remove = set()
+        for i in self._queue_indices_by_bootstrap_room():
+            decode_req = self.queue[i]
+            poll = polls[i]
+            if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                continue
+
+            if poll == KVPoll.Failed:
+                error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
+                if decode_req.kv_receiver is not None:
+                    try:
+                        decode_req.kv_receiver.failure_exception()
+                    except Exception as e:
+                        error_message += f" with exception {e}"
+                is_request_abort = _is_request_abort(decode_req.req)
+                if not is_request_abort:
+                    logger.error(error_message)
+                    prepare_abort(
+                        decode_req.req,
+                        error_message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    self.scheduler.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                if self.scheduler.enable_hisparse:
+                    self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
+                if is_request_abort or decode_req.pd_d2h_state in (
+                    PDD2HState.H2D_INFLIGHT,
+                    PDD2HState.ABORT_PENDING_H2D,
+                ):
+                    disposition = pd_d2h_mgr.abort(decode_req.req)
+                    if disposition is PDD2HAbortDisposition.DEFER_UNTIL_H2D_DONE:
+                        decode_req.pd_d2h_state = PDD2HState.ABORT_PENDING_H2D
+                        continue
+                else:
+                    pd_d2h_mgr.release_failed(decode_req.req)
+                indices_to_remove.add(i)
+                if self.scheduler.enable_metrics and not is_request_abort:
+                    self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+                continue
+
+            if poll == KVPoll.Success:
+                if decode_req.pd_d2h_state in (
+                    PDD2HState.H2D_INFLIGHT,
+                    PDD2HState.ABORT_PENDING_H2D,
+                ):
+                    state_before_complete = decode_req.pd_d2h_state
+                    ready_req = pd_d2h_mgr.complete_h2d(decode_req.req)
+                    if ready_req is None:
+                        log_fn = (
+                            logger.warning
+                            if state_before_complete is PDD2HState.ABORT_PENDING_H2D
+                            else logger.error
+                        )
+                        log_fn(
+                            "pd-d2h complete_h2d returned None: "
+                            "tp_rank=%s rid=%s bootstrap_room=%s state=%s poll=%s",
+                            self.tp_rank,
+                            decode_req.req.rid,
+                            decode_req.req.bootstrap_room,
+                            state_before_complete.name,
+                            poll,
+                        )
+                    if (
+                        ready_req is not None
+                        and decode_req.pd_d2h_state is PDD2HState.H2D_INFLIGHT
+                    ):
+                        ready_req.time_stats.set_decode_h2d_wait_finish_time()
+                        ready_req.time_stats.set_wait_queue_entry_time()
+                        transferred_reqs.append(ready_req)
+                    indices_to_remove.add(i)
+                    continue
+
+                if decode_req.pd_d2h_state is not PDD2HState.WAIT_PREFILL:
+                    logger.error(
+                        "pd-d2h invalid state for transfer commit: "
+                        "tp_rank=%s rid=%s bootstrap_room=%s state=%s poll=%s",
+                        self.tp_rank,
+                        decode_req.req.rid,
+                        decode_req.req.bootstrap_room,
+                        decode_req.pd_d2h_state.name,
+                        poll,
+                    )
+                should_remove = self._commit_transfer_to_req(
+                    decode_req, set_wait_queue_time=False
+                )
+                if should_remove:
+                    if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                        indices_to_remove.add(i)
+                        is_request_abort = _is_request_abort(decode_req.req)
+                        if not is_request_abort:
+                            self.scheduler.stream_output(
+                                [decode_req.req], decode_req.req.return_logprob
+                            )
+                        if self.scheduler.enable_hisparse:
+                            self.scheduler.hisparse_coordinator.request_finished(
+                                decode_req.req
+                            )
+                        pd_d2h_mgr.abort(decode_req.req)
+                        if self.scheduler.enable_metrics and not is_request_abort:
+                            self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+                    else:
+                        decode_req.req.time_stats.set_decode_transferred_time()
+                        self.req_to_metadata_buffer_idx_allocator.free(
+                            decode_req.metadata_buffer_index
+                        )
+                        decode_req.metadata_buffer_index = -1
+                        decode_req.pd_d2h_state = PDD2HState.HOST_READY
+            elif poll in [
+                KVPoll.Bootstrapping,
+                KVPoll.WaitingForInput,
+                KVPoll.Transferring,
+            ]:
+                pass
+            else:
+                raise ValueError(f"Unexpected poll case: {poll}")
+
+        for i in indices_to_remove:
+            self._release_queue_entry(self.queue[i])
+
+        self.queue = [
+            entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
+        ]
+
+        return transferred_reqs
+
+    def pop_transferred(
+        self,
+        rids_to_check: Optional[List[str]] = None,
+        polls_by_room: Optional[Dict[int, int]] = None,
+    ) -> List[Req]:
+        pd_d2h_mgr = getattr(self.scheduler, "pd_direct2host_manager", None)
+        if pd_d2h_mgr is not None:
+            return self._pop_transferred_pd_d2h(
+                pd_d2h_mgr,
+                rids_to_check,
+                polls_by_room=polls_by_room,
+            )
+
         if not self.queue:
             return []
 
@@ -1319,41 +1894,48 @@ class DecodeTransferQueue:
         transferred_reqs = []
         indices_to_remove = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+            decode_req = self.queue[i]
+            poll = polls[i]
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
             if poll == KVPoll.Failed:
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
-                try:
-                    decode_req.kv_receiver.failure_exception()
-                except Exception as e:
-                    error_message += f" with exception {e}"
-                logger.error(error_message)
-                prepare_abort(
-                    decode_req.req,
-                    error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
-                self.scheduler.stream_output(
-                    [decode_req.req], decode_req.req.return_logprob
-                )
+                if decode_req.kv_receiver is not None:
+                    try:
+                        decode_req.kv_receiver.failure_exception()
+                    except Exception as e:
+                        error_message += f" with exception {e}"
+                is_request_abort = _is_request_abort(decode_req.req)
+                if not is_request_abort:
+                    logger.error(error_message)
+                    prepare_abort(
+                        decode_req.req,
+                        error_message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    self.scheduler.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
-                if self.scheduler.enable_metrics:
+                if self.scheduler.enable_metrics and not is_request_abort:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
                 should_remove = self._commit_transfer_to_req(decode_req)
                 if should_remove:
-                    indices_to_remove.add(i)
                     # Check if request was aborted due to corruption
+                    indices_to_remove.add(i)
                     if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
-                        self.scheduler.stream_output(
-                            [decode_req.req], decode_req.req.return_logprob
-                        )
+                        is_request_abort = _is_request_abort(decode_req.req)
+                        if not is_request_abort:
+                            self.scheduler.stream_output(
+                                [decode_req.req], decode_req.req.return_logprob
+                            )
                         if self.scheduler.enable_hisparse:
                             self.scheduler.hisparse_coordinator.request_finished(
                                 decode_req.req
@@ -1361,7 +1943,7 @@ class DecodeTransferQueue:
                         release_kv_cache(
                             decode_req.req, self.tree_cache, is_insert=False
                         )
-                        if self.scheduler.enable_metrics:
+                        if self.scheduler.enable_metrics and not is_request_abort:
                             self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                     else:
                         transferred_reqs.append(decode_req.req)
@@ -1375,15 +1957,7 @@ class DecodeTransferQueue:
                 raise ValueError(f"Unexpected poll case: {poll}")
 
         for i in indices_to_remove:
-            if self.enable_staging and self.staging_handler.is_staging_room(
-                self.queue[i].req.bootstrap_room
-            ):
-                self.staging_handler.unregister_decode_req(
-                    self.queue[i].req.bootstrap_room
-                )
-            idx = self.queue[i].metadata_buffer_index
-            assert idx != -1
-            self.req_to_metadata_buffer_idx_allocator.free(idx)
+            self._release_queue_entry(self.queue[i])
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -1558,6 +2132,39 @@ class SchedulerDisaggregationDecodeMixin:
 
     @nvtx_annotated_method("scheduler.disagg_decode.process_decode_queue")
     def process_decode_queue(self: Scheduler):
+        pd_d2h_mgr = getattr(self, "pd_direct2host_manager", None)
+
+        prealloc_polls_by_room: Optional[Dict[int, int]] = None
+        transfer_polls_by_room: Optional[Dict[int, int]] = None
+        h2d_candidate = None
+        h2d_admit = False
+        if pd_d2h_mgr is not None:
+            if not hasattr(self, "pd_d2h_fused_poller"):
+                self.pd_d2h_fused_poller = PDD2HFusedPoller(
+                    gloo_group=self.attn_tp_cpu_group,
+                    tp_rank=self.tp_rank,
+                )
+            h2d_candidate = self.disagg_decode_transfer_queue.h2d_candidate()
+            reserved_decode_tokens = (
+                self.disagg_decode_transfer_queue._h2d_reserved_decode_tokens()
+            )
+            local_h2d_admit = h2d_candidate is not None and pd_d2h_mgr.can_admit_h2d(
+                h2d_candidate.req, reserved_decode_tokens
+            )
+            prealloc_polls_by_room, transfer_polls_by_room, h2d_admit = (
+                self.pd_d2h_fused_poller.poll(
+                    self.disagg_decode_prealloc_queue.local_poll_entries(),
+                    self.disagg_decode_transfer_queue.local_poll_entries(pd_d2h_mgr),
+                    local_h2d_admit,
+                )
+            )
+            if h2d_admit:
+                if h2d_candidate is None:
+                    raise RuntimeError("TP admitted H2D without a local candidate")
+                self.disagg_decode_transfer_queue.start_h2d(
+                    pd_d2h_mgr, h2d_candidate
+                )
+
         if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
@@ -1577,10 +2184,12 @@ class SchedulerDisaggregationDecodeMixin:
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
         if self.polling_count % self.polling_interval == 0:
-            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+            req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated(
+                polls_by_room=prealloc_polls_by_room
+            )
             self.disagg_decode_transfer_queue.extend(req_conns)
-            transferred_reqs = (
-                self.disagg_decode_transfer_queue.pop_transferred()
+            transferred_reqs = self.disagg_decode_transfer_queue.pop_transferred(
+                polls_by_room=transfer_polls_by_room
             )  # the requests which kv has arrived
             if self.enable_hisparse:
                 for req in transferred_reqs:

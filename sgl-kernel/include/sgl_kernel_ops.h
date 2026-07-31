@@ -486,6 +486,35 @@ void transfer_kv_all_layer(
     int64_t block_quota,
     int64_t num_warps_per_block);
 
+void transfer_kv_all_layer_fuse(
+    const at::Tensor src_k_layers,
+    const at::Tensor dst_k_layers,
+    const at::Tensor src_v_layers,
+    const at::Tensor dst_v_layers,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t k_item_size,
+    int64_t v_item_size,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
+void transfer_kv_multi_pool_fuse(
+    const at::Tensor src_k_layers,
+    const at::Tensor dst_k_layers,
+    const at::Tensor src_v_layers,
+    const at::Tensor dst_v_layers,
+    const at::Tensor src_indices_ptrs,
+    const at::Tensor dst_indices_ptrs,
+    const at::Tensor layer_to_pool,
+    const at::Tensor layer_to_pool_layer,
+    const at::Tensor pool_num_items,
+    const at::Tensor pool_k_item_sizes,
+    const at::Tensor pool_v_item_sizes,
+    int64_t max_num_items,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
 void transfer_kv_all_layer_lf_pf(
     const at::Tensor src_k_layers,
     at::Tensor dst_k,

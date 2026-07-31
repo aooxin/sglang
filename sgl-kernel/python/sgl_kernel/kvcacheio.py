@@ -120,6 +120,70 @@ def transfer_kv_all_layer(
     )
 
 
+
+def transfer_kv_all_layer_fuse(
+    src_k_layers: torch.Tensor,
+    dst_k_layers: torch.Tensor,
+    src_v_layers: torch.Tensor,
+    dst_v_layers: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    k_item_size: int,
+    v_item_size: int,
+    num_layers: int,
+    block_quota: int = 8,
+    num_warps_per_block: int = 16 if _is_hip else 32,
+):
+    torch.ops.sgl_kernel.transfer_kv_all_layer_fuse.default(
+        src_k_layers,
+        dst_k_layers,
+        src_v_layers,
+        dst_v_layers,
+        src_indices,
+        dst_indices,
+        k_item_size,
+        v_item_size,
+        num_layers,
+        block_quota,
+        num_warps_per_block,
+    )
+
+
+def transfer_kv_multi_pool_fuse(
+    src_k_layers: torch.Tensor,
+    dst_k_layers: torch.Tensor,
+    src_v_layers: torch.Tensor,
+    dst_v_layers: torch.Tensor,
+    src_indices_ptrs: torch.Tensor,
+    dst_indices_ptrs: torch.Tensor,
+    layer_to_pool: torch.Tensor,
+    layer_to_pool_layer: torch.Tensor,
+    pool_num_items: torch.Tensor,
+    pool_k_item_sizes: torch.Tensor,
+    pool_v_item_sizes: torch.Tensor,
+    max_num_items: int,
+    block_quota: int = 8,
+    num_warps_per_block: int = 16 if _is_hip else 32,
+):
+    torch.ops.sgl_kernel.transfer_kv_multi_pool_fuse.default(
+        src_k_layers,
+        dst_k_layers,
+        src_v_layers,
+        dst_v_layers,
+        src_indices_ptrs,
+        dst_indices_ptrs,
+        layer_to_pool,
+        layer_to_pool_layer,
+        pool_num_items,
+        pool_k_item_sizes,
+        pool_v_item_sizes,
+        max_num_items,
+        block_quota,
+        num_warps_per_block,
+    )
+
+
+
 def transfer_kv_all_layer_lf_pf(
     src_k_layers: torch.Tensor,
     dst_k: torch.Tensor,

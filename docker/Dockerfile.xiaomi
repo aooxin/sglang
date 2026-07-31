@@ -71,8 +71,10 @@ fi
 # cleanup sglang workspace
 RUN rm -fr /sgl-workspace/sglang
 
-RUN python3 -m pip install https://cnbj1-fds.api.xiaomi.net/aie-shared-objects/20260514/transfer_kernel-0.4.1-cp310-abi3-linux_x86_64.whl \
-    --no-cache-dir --no-dependencies --force-reinstall
+RUN python3 -m pip install https://cnbj1-fds.api.xiaomi.net/git-assert/workspace/pro_test_whl/deepep/deep_ep-1.2.1+e16913a-cp312-cp312-linux_x86_64.whl \
+    --no-cache-dir --no-deps --force-reinstall && \
+    python3 -m pip install https://cnbj1-fds.api.xiaomi.net/git-assert/workspace/pro_test_whl/transfer_kernel/transfer_kernel-0.4.1-cp310-abi3-linux_x86_64.whl \
+    --no-cache-dir --no-deps --force-reinstall
 
 # gcache
 COPY docker/gcache.flags /sgl-workspace/

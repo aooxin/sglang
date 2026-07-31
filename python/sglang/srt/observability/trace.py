@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
@@ -157,7 +158,7 @@ def __get_host_id() -> str:
 
 
 # Should be called by each tracked process.
-def process_tracing_init(otlp_endpoint, server_name):
+def process_tracing_init(otlp_endpoint, server_name, mode="", resource_attrs=None):
     global opentelemetry_initialized
     global get_cur_time_ns
     global tracer
@@ -168,10 +169,21 @@ def process_tracing_init(otlp_endpoint, server_name):
         )
 
     try:
+        if mode == "prefill":
+            server_name += " Prefill"
+        elif mode == "decode":
+            server_name += " Decode"
+        elif mode == "encoder":
+            server_name += " Encoder"
+        attrs = {
+            SERVICE_NAME: server_name,
+        }
+        if resource_attrs:
+            if isinstance(resource_attrs, str):
+                resource_attrs = json.loads(resource_attrs)
+            attrs.update(resource_attrs)
         resource = Resource.create(
-            attributes={
-                SERVICE_NAME: server_name,
-            }
+            attributes=attrs
         )
         tracer_provider = TracerProvider(
             resource=resource, id_generator=TraceCustomIdGenerator()

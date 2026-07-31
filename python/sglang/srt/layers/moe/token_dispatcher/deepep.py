@@ -22,6 +22,7 @@ from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     get_deepep_config,
+    get_deepep_ll_num_sms,
     get_moe_runner_backend,
     is_tbo_enabled,
 )
@@ -320,6 +321,7 @@ class _DeepEPDispatcherImplBase:
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
+        self.deepep_ll_num_sms = get_deepep_ll_num_sms()
         # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
         assert self.num_max_dispatch_tokens_per_rank <= 1024
@@ -632,6 +634,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                num_sms=self.deepep_ll_num_sms,
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
@@ -693,6 +696,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 )
         else:
             overlap_args_dict = {}
+        if "num_sms" not in overlap_args_dict:
+            overlap_args_dict["num_sms"] = self.deepep_ll_num_sms
 
         with ctx:
             combined_hidden_states, event, hook = buffer.low_latency_combine(

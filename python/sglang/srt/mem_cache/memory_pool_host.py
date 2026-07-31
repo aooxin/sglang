@@ -303,9 +303,14 @@ class HostKVCache(abc.ABC):
             self.size = int(host_size * 1e9 // self.size_per_token)
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
-        # Align up the host memory pool size to the page size
-        self.page_num = self.size // self.page_size + 1
-        self.size = self.page_num * self.page_size
+        # Align the usable host memory pool size to the page size. Host pools
+        # reserve page 0 as padding and return usable slots from
+        # [page_size, size + page_size), so the backing tensors need one extra
+        # page even though self.size remains the usable capacity.
+        self.size = self.size - (self.size % self.page_size)
+        self.page_num = self.size // self.page_size
+        self.alloc_size = self.size + self.page_size
+        self.alloc_page_num = self.page_num + 1
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
@@ -315,7 +320,7 @@ class HostKVCache(abc.ABC):
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
-        requested_bytes = self.size * self.size_per_token
+        requested_bytes = self.alloc_size * self.size_per_token
         # preserve at least 10GB for other usage
         ten_gb = 10 * (1024**3)
         available_bytes = host_mem.available - ten_gb
@@ -389,14 +394,12 @@ class HostKVCache(abc.ABC):
     def clear(self):
         # Initialize memory states and tracking structures.
         self.mem_state = torch.zeros(
-            (self.size,), dtype=torch.uint8, device=self.device
+            (self.alloc_size,), dtype=torch.uint8, device=self.device
         )
-        # Pre-allocate a fixed-size buffer for free slot management.
-        # Instead of using torch.cat on every free() call (which allocates a
-        # new tensor each time and causes GPU memory fragmentation / OOM),
-        # we keep a fixed buffer and track head/tail pointers.  alloc() takes
-        # from the head, free() appends to the tail — both are in-place
-        # writes with zero allocation.
+        # Pre-allocate a fixed-size ring buffer for free slot management.
+        # Allocations read from head, frees append at tail.  The explicit
+        # count disambiguates full vs empty when head == tail and avoids
+        # periodic O(pool size) compaction.
         self._free_slots_buf = torch.arange(
             self.page_size,
             self.size + self.page_size,
@@ -404,10 +407,11 @@ class HostKVCache(abc.ABC):
             device=self.device,
         )
         self._free_slots_head = 0
-        self._free_slots_tail = len(self._free_slots_buf)
+        self._free_slots_tail = 0
+        self._free_slots_count = len(self._free_slots_buf)
 
     def available_size(self):
-        return self._free_slots_tail - self._free_slots_head
+        return self._free_slots_count
 
     # [SWA-DIAG] Human-readable label for this pool instance, set by the owning
     # SWATokenToKVPoolHost so alloc/free diagnostics can tell full vs swa apart.
@@ -419,14 +423,23 @@ class HostKVCache(abc.ABC):
         cap = len(self._free_slots_buf)
         head = self._free_slots_head
         tail = self._free_slots_tail
-        live = self._free_slots_buf[head:tail]
+        count = self._free_slots_count
+        if count == 0:
+            live = self._free_slots_buf[:0]
+        elif head + count <= cap:
+            live = self._free_slots_buf[head : head + count]
+        else:
+            first = cap - head
+            live = torch.cat(
+                (self._free_slots_buf[head:], self._free_slots_buf[: count - first])
+            )
         num_zero = int((live == 0).sum()) if live.numel() > 0 else 0
         num_dup = (
             int(live.numel() - torch.unique(live).numel()) if live.numel() > 0 else 0
         )
         return (
             f"pool={self._debug_pool_label} size={self.size} page_size={self.page_size} "
-            f"capacity={cap} head={head} tail={tail} available={tail - head} "
+            f"capacity={cap} head={head} tail={tail} available={count} "
             f"live_zeros={num_zero}(should be 0) live_duplicates={num_dup}(should be 0)"
         )
 
@@ -436,14 +449,25 @@ class HostKVCache(abc.ABC):
             need_size % self.page_size == 0
         ), "The requested size should be a multiple of the page size."
         if need_size == 0:
-            return self._free_slots_buf[:0].clone()
-        if need_size > self.available_size():
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+        if need_size > self._free_slots_count:
             return None
 
-        select_index = self._free_slots_buf[
-            self._free_slots_head : self._free_slots_head + need_size
-        ].clone()
-        self._free_slots_head += need_size
+        capacity = len(self._free_slots_buf)
+        end = self._free_slots_head + need_size
+        if end <= capacity:
+            select_index = self._free_slots_buf[self._free_slots_head : end].clone()
+        else:
+            first = capacity - self._free_slots_head
+            second = need_size - first
+            select_index = torch.empty(
+                (need_size,), dtype=torch.int64, device=self.device
+            )
+            select_index[:first] = self._free_slots_buf[self._free_slots_head :]
+            select_index[first:] = self._free_slots_buf[:second]
+
+        self._free_slots_head = end % capacity
+        self._free_slots_count -= need_size
 
         # [SWA-DIAG] Consumption-point ring integrity check: legal slot values
         # are >= page_size (ring is initialized with arange(page_size, ...)),
@@ -521,11 +545,9 @@ class HostKVCache(abc.ABC):
                     f"(n={n}, page_size={self.page_size}, min={min_val}, "
                     f"runs_ok={runs_ok}) would poison the free-slot ring"
                 )
-            # Capacity guard: the compaction below only fixes a run-away tail
-            # pointer, NOT the case where live + n exceeds the buffer capacity.
-            # That can only happen after a double-free (more slots in flight
-            # than exist); proceeding would desync the ring accounting.
-            live_before = self._free_slots_tail - self._free_slots_head
+            # Capacity guard: freeing more slots than the ring can hold
+            # indicates a double-free or an ownership/accounting bug.
+            live_before = self._free_slots_count
             if live_before + n > len(self._free_slots_buf):
                 logger.error(
                     "[SWA-DIAG] %s.free: capacity overflow (double-free suspected): "
@@ -542,22 +564,25 @@ class HostKVCache(abc.ABC):
                     f"(live={live_before} + n={n} > capacity={len(self._free_slots_buf)}), "
                     f"double-free suspected"
                 )
-        # If tail would exceed buffer capacity, compact by shifting the
-        # live region back to the front.  This happens rarely (only when
-        # cumulative alloc+free cycles exhaust the index space).
-        if self._free_slots_tail + n > len(self._free_slots_buf):
-            live = self._free_slots_tail - self._free_slots_head
-            if live > 0:
-                self._free_slots_buf[:live] = self._free_slots_buf[
-                    self._free_slots_head : self._free_slots_tail
-                ].clone()
-            self._free_slots_head = 0
-            self._free_slots_tail = live
+
+        capacity = len(self._free_slots_buf)
+        if n > capacity - self._free_slots_count:
+            raise RuntimeError(
+                "HostKVCache free-list overflow: "
+                f"freeing={n}, available={self._free_slots_count}, capacity={capacity}"
+            )
+
         # Append freed indices to the tail (in-place, no alloc).
-        self._free_slots_buf[self._free_slots_tail : self._free_slots_tail + n] = (
-            indices
-        )
-        self._free_slots_tail += n
+        end = self._free_slots_tail + n
+        if end <= capacity:
+            self._free_slots_buf[self._free_slots_tail : end] = indices
+        else:
+            first = capacity - self._free_slots_tail
+            second = n - first
+            self._free_slots_buf[self._free_slots_tail :] = indices[:first]
+            self._free_slots_buf[:second] = indices[first:]
+        self._free_slots_tail = end % capacity
+        self._free_slots_count += n
         return n
 
 
@@ -640,13 +665,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             k_dims = None
             v_dims = None
             if self.layout == "layer_first":
-                dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
+                dims = (2, self.layer_num, self.alloc_size, self.head_num, self.head_dim)
             elif self.layout == "page_first":
-                dims = (2, self.size, self.layer_num, self.head_num, self.head_dim)
+                dims = (2, self.alloc_size, self.layer_num, self.head_num, self.head_dim)
             elif self.layout == "page_first_direct":
                 dims = (
                     2,
-                    self.page_num,
+                    self.alloc_page_num,
                     self.layer_num,
                     self.page_size,
                     self.head_num,
@@ -655,7 +680,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             elif self.layout == "page_head":
                 dims = (
                     2,
-                    self.page_num,
+                    self.alloc_page_num,
                     self.head_num,
                     self.page_size,
                     self.layer_num,
@@ -665,29 +690,42 @@ class MHATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             dims = None
-            if self.layout == "page_first":
+            if self.layout == "layer_first":
                 k_dims = (
-                    self.size + self.page_size,
+                    self.layer_num,
+                    self.alloc_size,
+                    self.head_num,
+                    self.head_dim,
+                )
+                v_dims = (
+                    self.layer_num,
+                    self.alloc_size,
+                    self.head_num,
+                    self.v_head_dim,
+                )
+            elif self.layout == "page_first":
+                k_dims = (
+                    self.alloc_size,
                     self.layer_num,
                     self.head_num,
                     self.head_dim,
                 )
                 v_dims = (
-                    self.size + self.page_size,
+                    self.alloc_size,
                     self.layer_num,
                     self.head_num,
                     self.v_head_dim,
                 )
             elif self.layout == "page_first_direct":
                 k_dims = (
-                    self.page_num + 1,
+                    self.alloc_page_num,
                     self.layer_num,
                     self.page_size,
                     self.head_num,
                     self.head_dim,
                 )
                 v_dims = (
-                    self.page_num + 1,
+                    self.alloc_page_num,
                     self.layer_num,
                     self.page_size,
                     self.head_num,
@@ -842,6 +880,29 @@ class MHATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+    def get_multi_pool_h2d_descriptors(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+    ):
+        if io_backend != "kernel" or self.layout != "layer_first":
+            return None
+        return {
+            "src_k_layer_ptrs": self.k_data_ptrs,
+            "dst_k_layer_ptrs": device_pool.k_data_ptrs,
+            "src_v_layer_ptrs": self.v_data_ptrs,
+            "dst_v_layer_ptrs": device_pool.v_data_ptrs,
+            "src_indices": [host_indices],
+            "dst_indices": [device_indices],
+            "pool_num_items": [host_indices.numel()],
+            "pool_k_item_sizes": [self.token_stride_size],
+            "pool_v_item_sizes": [self.v_token_stride_size],
+            "max_num_items": host_indices.numel(),
+            "block_quota": self.h2d_block_quota,
+        }
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -1029,7 +1090,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         indices = indices.tolist()
         v_offset = (
             self.layer_num
-            * self.size
+            * self.alloc_size
             * self.head_num
             * self.head_dim
             * self.dtype.itemsize
@@ -1075,7 +1136,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             kv_buffer_data_ptr = self.kv_buffer.data_ptr()
             v_offset = (
                 self.layer_num
-                * self.size
+                * self.alloc_size
                 * self.head_num
                 * self.head_dim
                 * self.dtype.itemsize
@@ -1090,7 +1151,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                             * self.head_dim
                             * self.dtype.itemsize
                             + layer_id
-                            * self.size
+                            * self.alloc_size
                             * self.head_num
                             * self.head_dim
                             * self.dtype.itemsize
@@ -1236,20 +1297,20 @@ class MLATokenToKVPoolHost(HostKVCache):
         if self.layout == "layer_first":
             dims = (
                 self.layer_num,
-                self.size,
+                self.alloc_size,
                 1,
                 self.kv_cache_dim,
             )
         elif self.layout == "page_first":
             dims = (
-                self.size,
+                self.alloc_size,
                 self.layer_num,
                 1,
                 self.kv_cache_dim,
             )
         elif self.layout == "page_first_direct":
             dims = (
-                self.page_num,
+                self.alloc_page_num,
                 self.layer_num,
                 self.page_size,
                 1,
@@ -1259,7 +1320,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         # Separately allocate k_buffer and v_buffer for easier data transfer.
         elif self.layout == "page_first_kv_split":
             base_dims = (
-                self.page_num,
+                self.alloc_page_num,
                 self.layer_num,
                 self.page_size,
                 1,
@@ -1550,7 +1611,10 @@ class MLATokenToKVPoolHost(HostKVCache):
                     k_ptr = (
                         kv_buffer_data_ptr
                         + indices[index] * self.kv_cache_dim * self.dtype.itemsize
-                        + layer_id * self.size * self.kv_cache_dim * self.dtype.itemsize
+                        + layer_id
+                        * self.alloc_size
+                        * self.kv_cache_dim
+                        * self.dtype.itemsize
                     )
                     ptr_list.append(k_ptr)
             element_size = self.dtype.itemsize * self.page_size * self.kv_cache_dim
@@ -2808,6 +2872,70 @@ class SWATokenToKVPoolHost:
                 layer_id_pool,
                 io_backend,
             )
+
+    def get_multi_pool_h2d_descriptors(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+        swa_host_indices: torch.Tensor,
+        swa_device_indices: torch.Tensor,
+    ):
+        if io_backend != "kernel":
+            return None
+        full_desc = self.full_pool_host.get_multi_pool_h2d_descriptors(
+            self.device_pool.full_kv_pool,
+            host_indices,
+            device_indices,
+            io_backend,
+        )
+        if full_desc is None:
+            return None
+        if swa_host_indices is None or swa_device_indices is None:
+            return full_desc
+        swa_desc = self.swa_pool_host.get_multi_pool_h2d_descriptors(
+            self.device_pool.swa_kv_pool,
+            swa_host_indices,
+            swa_device_indices,
+            io_backend,
+        )
+        if swa_desc is None:
+            return None
+
+        src_k_layer_ptrs = []
+        dst_k_layer_ptrs = []
+        src_v_layer_ptrs = []
+        dst_v_layer_ptrs = []
+        layer_to_pool = []
+        layer_to_pool_layer = []
+        for layer_id in range(self.layer_num):
+            pool_layer_id, is_swa = self.device_pool.layers_mapping[layer_id]
+            desc = swa_desc if is_swa else full_desc
+            src_k_layer_ptrs.append(desc["src_k_layer_ptrs"][pool_layer_id])
+            dst_k_layer_ptrs.append(desc["dst_k_layer_ptrs"][pool_layer_id])
+            src_v_layer_ptrs.append(desc["src_v_layer_ptrs"][pool_layer_id])
+            dst_v_layer_ptrs.append(desc["dst_v_layer_ptrs"][pool_layer_id])
+            layer_to_pool.append(1 if is_swa else 0)
+            layer_to_pool_layer.append(pool_layer_id)
+
+        return {
+            "src_k_layer_ptrs": torch.stack(src_k_layer_ptrs),
+            "dst_k_layer_ptrs": torch.stack(dst_k_layer_ptrs),
+            "src_v_layer_ptrs": torch.stack(src_v_layer_ptrs),
+            "dst_v_layer_ptrs": torch.stack(dst_v_layer_ptrs),
+            "src_indices": full_desc["src_indices"] + swa_desc["src_indices"],
+            "dst_indices": full_desc["dst_indices"] + swa_desc["dst_indices"],
+            "layer_to_pool": layer_to_pool,
+            "layer_to_pool_layer": layer_to_pool_layer,
+            "pool_num_items": full_desc["pool_num_items"] + swa_desc["pool_num_items"],
+            "pool_k_item_sizes": full_desc["pool_k_item_sizes"]
+            + swa_desc["pool_k_item_sizes"],
+            "pool_v_item_sizes": full_desc["pool_v_item_sizes"]
+            + swa_desc["pool_v_item_sizes"],
+            "max_num_items": max(full_desc["max_num_items"], swa_desc["max_num_items"]),
+            "block_quota": self.h2d_block_quota,
+        }
 
     @nvtx_annotated_method("backup_from_device_all_layer")
     def backup_from_device_all_layer(

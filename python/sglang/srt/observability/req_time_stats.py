@@ -223,6 +223,11 @@ class RequestStage:
         level=1,
         metrics_is_observed=True,
     )
+    DECODE_H2D_WAIT = RequestStageConfig(
+        "decode_h2d_wait",
+        level=1,
+        metrics_is_observed=True,
+    )
     DECODE_FAKE_OUTPUT = RequestStageConfig(
         "fake_output",
         level=3,
@@ -584,6 +589,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # decode node, get by time.perf_counter()
     decode_prealloc_queue_entry_time: float = 0.0
     decode_transfer_queue_entry_time: float = 0.0
+    decode_transferred_time: float = 0.0
+    decode_h2d_wait_start_time: float = 0.0
     decode_prebuilt_finish_time: float = 0.0
 
     # bootstrap sub-phase tracking (PD disagg)
@@ -653,23 +660,57 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if ts is None:
             ts = time.perf_counter()
         if self.wait_queue_entry_time == 0.0:
-            if self.enable_metrics or self.trace_ctx.tracing_enable:
-                if self.disagg_mode == DisaggregationMode.PREFILL:
+            if self.disagg_mode == DisaggregationMode.PREFILL:
+                if self.enable_metrics or self.trace_ctx.tracing_enable:
                     stage = RequestStage.PREFILL_BOOTSTRAP
                     slice_start_time = self.prefill_bootstrap_queue_entry_time
-                elif self.disagg_mode == DisaggregationMode.DECODE:
-                    stage = RequestStage.DECODE_TRANSFERRED
-                    slice_start_time = self.decode_transfer_queue_entry_time
-                else:
-                    stage = RequestStage.REQUEST_PROCESS
-                    slice_start_time = self.scheduler_recv_time
-
+                    self.observe_per_stage_req_latency(stage, ts - slice_start_time)
+                    self.trace_slice(stage, slice_start_time, ts)
+            elif self.disagg_mode == DisaggregationMode.DECODE:
+                if self.decode_transferred_time == 0.0:
+                    self.set_decode_transferred_time(ts)
+            elif self.enable_metrics or self.trace_ctx.tracing_enable:
+                stage = RequestStage.REQUEST_PROCESS
+                slice_start_time = self.scheduler_recv_time
                 self.observe_per_stage_req_latency(stage, ts - slice_start_time)
                 self.trace_slice(stage, slice_start_time, ts)
         else:
             self.set_retract_time(ts)
 
         self.wait_queue_entry_time = ts
+
+    def set_decode_transferred_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        if self.decode_transferred_time != 0.0:
+            return
+        self.decode_transferred_time = ts
+        stage = RequestStage.DECODE_TRANSFERRED
+        self.observe_per_stage_req_latency(
+            stage, ts - self.decode_transfer_queue_entry_time
+        )
+        self.trace_slice(stage, self.decode_transfer_queue_entry_time, ts)
+
+    def set_decode_h2d_wait_start_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        if self.decode_h2d_wait_start_time == 0.0:
+            self.decode_h2d_wait_start_time = ts
+
+    def set_decode_h2d_wait_finish_time(self, ts=None):
+        if self.decode_h2d_wait_start_time == 0.0:
+            return None
+        if ts is None:
+            ts = time.perf_counter()
+        duration = ts - self.decode_h2d_wait_start_time
+        if duration < 0:
+            return None
+        self.observe_per_stage_req_latency(RequestStage.DECODE_H2D_WAIT, duration)
+        self.trace_slice(
+            RequestStage.DECODE_H2D_WAIT, self.decode_h2d_wait_start_time, ts
+        )
+        self.decode_h2d_wait_start_time = 0.0
+        return duration
 
     def set_forward_entry_time(self, ts=None):
         if ts is None:
@@ -1144,9 +1185,15 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 self.decode_transfer_queue_entry_time
                 - self.decode_prealloc_queue_entry_time
             )
-            transfer_duration = (
-                self.wait_queue_entry_time - self.decode_transfer_queue_entry_time
+            transferred_end_time = (
+                self.decode_transferred_time
+                if self.decode_transferred_time > 0.0
+                else self.wait_queue_entry_time
             )
+            transfer_duration = (
+                transferred_end_time - self.decode_transfer_queue_entry_time
+            )
+            h2d_wait_duration = self.wait_queue_entry_time - transferred_end_time
             queue_duration = self.forward_entry_time - self.wait_queue_entry_time
             forward_duration = self.completion_time - self.forward_entry_time
 
@@ -1155,9 +1202,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     assert (
                         prealloc_duration >= 0
                         and transfer_duration >= 0
+                        and h2d_wait_duration >= 0
                         and queue_duration >= 0
                         and forward_duration >= 0
-                    ), f"prealloc_duration={prealloc_duration} < 0 or transfer_duration={transfer_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0. {self=}"
+                    ), f"prealloc_duration={prealloc_duration} < 0 or transfer_duration={transfer_duration} < 0 or h2d_wait_duration={h2d_wait_duration} < 0 or queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0. {self=}"
 
             # Break down prealloc_duration into sub-phases
             if self.bootstrap_done_time > 0:
@@ -1182,6 +1230,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 f"prealloc_queue_duration({self.format_duration(prealloc_duration)}) "
                 f"{prealloc_breakdown}"
                 f"transfer_duration={self.format_duration(transfer_duration)}; "
+                f"decode_h2d_wait={self.format_duration(h2d_wait_duration)}; "
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
                 f"start={self.decode_prealloc_queue_entry_time:.3f}"

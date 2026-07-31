@@ -1480,8 +1480,8 @@ class TokenizerMetricsCollector:
                     default_bucket_prompt_tokens,
                 ),
             )
-            self.uncached_tokens_histogram = Histogram(
-                name="sglang:uncached_tokens_histogram",
+            self.uncached_tokens = Histogram(
+                name="sglang:uncached_tokens",
                 documentation="Histogram of uncached prompt token length per request.",
                 labelnames=labels.keys(),
                 buckets=generate_buckets(
@@ -1742,7 +1742,7 @@ class TokenizerMetricsCollector:
             self.generation_tokens_histogram.labels(**labels).observe(
                 float(generation_tokens)
             )
-            self.uncached_tokens_histogram.labels(**labels).observe(
+            self.uncached_tokens.labels(**labels).observe(
                 float(max(prompt_tokens - cached_tokens, 0))
             )
         self.num_retractions.labels(**labels).observe(retraction_count)

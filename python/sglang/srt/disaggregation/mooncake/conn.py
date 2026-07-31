@@ -132,6 +132,7 @@ class KVArgsRegisterInfo:
     dst_state_dim_per_tensor: list[int]
     # HiSparse: decode host pool stores KV at token granularity
     enable_hisparse: bool = False
+    enable_pd_direct2host: bool = False
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -161,8 +162,11 @@ class KVArgsRegisterInfo:
             enable_hisparse=(
                 msg[12].decode("ascii") == "1" if len(msg) > 12 else False
             ),
+            enable_pd_direct2host=(
+                msg[13].decode("ascii") == "1" if len(msg) > 13 else False
+            ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
         )
 
 
@@ -266,11 +270,30 @@ class MooncakeKVManager(CommonKVManager):
         self.engine = get_mooncake_transfer_engine()
 
     def register_buffer_to_engine(self):
+        decode_d2h = (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.enable_pd_direct2host
+        )
+
         # Batch register KV data buffers
-        if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
-            self.engine.batch_register(
-                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
-            )
+        if decode_d2h:
+            if len(self.kv_args.host_kv_data_ptrs) != len(self.kv_args.kv_data_ptrs):
+                raise RuntimeError(
+                    "PD direct-to-host requires host KV buffers to cover all "
+                    "decode KV buffers. "
+                    f"host={len(self.kv_args.host_kv_data_ptrs)} "
+                    f"device={len(self.kv_args.kv_data_ptrs)}"
+                )
+            if self.kv_args.host_kv_data_ptrs and self.kv_args.host_kv_data_lens:
+                self.engine.batch_register(
+                    self.kv_args.host_kv_data_ptrs,
+                    self.kv_args.host_kv_data_lens,
+                )
+        else:
+            if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
+                self.engine.batch_register(
+                    self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
+                )
 
         # Batch register auxiliary data buffers
         if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
@@ -279,10 +302,26 @@ class MooncakeKVManager(CommonKVManager):
             )
 
         # Batch register state/extra pool data buffers
-        if self.kv_args.state_data_ptrs and self.kv_args.state_data_lens:
-            self.engine.batch_register(
-                self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
-            )
+        if decode_d2h:
+            if len(self.kv_args.host_state_data_ptrs) != len(
+                self.kv_args.state_data_ptrs
+            ):
+                raise RuntimeError(
+                    "PD direct-to-host requires host state buffers to cover all "
+                    "decode state buffers. "
+                    f"host={len(self.kv_args.host_state_data_ptrs)} "
+                    f"device={len(self.kv_args.state_data_ptrs)}"
+                )
+            if self.kv_args.host_state_data_ptrs and self.kv_args.host_state_data_lens:
+                self.engine.batch_register(
+                    self.kv_args.host_state_data_ptrs,
+                    self.kv_args.host_state_data_lens,
+                )
+        else:
+            if self.kv_args.state_data_ptrs and self.kv_args.state_data_lens:
+                self.engine.batch_register(
+                    self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+                )
 
     # ------------------------------------------------------------------
     # Staging buffer methods (all delegate to staging_handler.py)
@@ -1908,14 +1947,45 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:
+            if self.kv_mgr.enable_pd_direct2host:
+                if len(self.kv_mgr.kv_args.host_kv_data_ptrs) != len(
+                    self.kv_mgr.kv_args.kv_data_ptrs
+                ):
+                    raise RuntimeError(
+                        "PD direct-to-host requires host KV buffers to cover all "
+                        "decode KV buffers. "
+                        f"host={len(self.kv_mgr.kv_args.host_kv_data_ptrs)} "
+                        f"device={len(self.kv_mgr.kv_args.kv_data_ptrs)}"
+                    )
+                if len(self.kv_mgr.kv_args.host_state_data_ptrs) != len(
+                    self.kv_mgr.kv_args.state_data_ptrs
+                ):
+                    raise RuntimeError(
+                        "PD direct-to-host requires host state buffers to cover all "
+                        "decode state buffers. "
+                        f"host={len(self.kv_mgr.kv_args.host_state_data_ptrs)} "
+                        f"device={len(self.kv_mgr.kv_args.state_data_ptrs)}"
+                    )
+                kv_ptrs = list(self.kv_mgr.kv_args.host_kv_data_ptrs)
+                state_ptrs = list(self.kv_mgr.kv_args.host_state_data_ptrs)
+                kv_item_len = (
+                    self.kv_mgr.kv_args.host_kv_item_lens[0]
+                    if self.kv_mgr.kv_args.host_kv_item_lens
+                    else self.kv_mgr.kv_args.kv_item_lens[0]
+                )
+            else:
+                kv_ptrs = list(self.kv_mgr.kv_args.kv_data_ptrs)
+                state_ptrs = list(self.kv_mgr.kv_args.state_data_ptrs)
+                kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
+
             packed_kv_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+                struct.pack("Q", ptr) for ptr in kv_ptrs
             )
             packed_aux_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
             )
             packed_state_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.state_data_ptrs
+                struct.pack("Q", ptr) for ptr in state_ptrs
             )
             # Pack state_item_lens and state_dim_per_tensor for mamba state slice transfer
             packed_state_item_lens = b"".join(
@@ -1930,11 +2000,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
-            kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
             enable_hisparse = b"1" if self.kv_mgr.server_args.enable_hisparse else b"0"
+            enable_pd_direct2host = b"1" if self.kv_mgr.enable_pd_direct2host else b"0"
 
             if (
                 self.kv_mgr.enable_staging
@@ -1952,7 +2022,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
             ip_address = bootstrap_info["rank_ip"]
             port = bootstrap_info["rank_port"]
             endpoint = NetworkAddress(ip_address, port).to_tcp()
-
             count = self._send_with_failure_tracking(
                 sock,
                 lock,
@@ -1971,6 +2040,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     packed_state_item_lens,
                     packed_state_dim_per_tensor,
                     enable_hisparse,
+                    enable_pd_direct2host,
                     packed_staging_base_ptr,
                     staging_total_size_str,
                 ],
@@ -2020,6 +2090,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
             ip_address = bootstrap_info["rank_ip"]
             port = bootstrap_info["rank_port"]
             endpoint = NetworkAddress(ip_address, port).to_tcp()
+            encoded_kv_indices = (
+                np.asarray(kv_indices, dtype=np.int32).tobytes()
+                if not is_dummy
+                else b""
+            )
 
             count = self._send_with_failure_tracking(
                 sock,
@@ -2030,7 +2105,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     self.kv_mgr.local_ip.encode("ascii"),
                     str(self.kv_mgr.rank_port).encode("ascii"),
                     self.session_id.encode("ascii"),
-                    kv_indices.tobytes() if not is_dummy else b"",
+                    encoded_kv_indices,
                     str(aux_index).encode("ascii") if not is_dummy else b"",
                     (
                         np.array(

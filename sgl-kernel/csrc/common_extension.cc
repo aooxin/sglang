@@ -298,6 +298,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "num_warps_per_block) -> ()");
   m.impl("transfer_kv_all_layer", torch::kCUDA, &transfer_kv_all_layer);
   m.def(
+
+      "transfer_kv_all_layer_fuse(Tensor src_k_layers, Tensor dst_k_layers, Tensor src_v_layers, Tensor dst_v_layers, "
+      "Tensor src_indices, Tensor dst_indices, int k_item_size, int v_item_size, int num_layers, int block_quota, int "
+      "num_warps_per_block) -> ()");
+  m.impl("transfer_kv_all_layer_fuse", torch::kCUDA, &transfer_kv_all_layer_fuse);
+  m.def(
+      "transfer_kv_multi_pool_fuse(Tensor src_k_layers, Tensor dst_k_layers, Tensor src_v_layers, Tensor dst_v_layers, "
+      "Tensor src_indices_ptrs, Tensor dst_indices_ptrs, Tensor layer_to_pool, Tensor layer_to_pool_layer, "
+      "Tensor pool_num_items, Tensor pool_k_item_sizes, Tensor pool_v_item_sizes, int max_num_items, int block_quota, "
+      "int num_warps_per_block) -> ()");
+  m.impl("transfer_kv_multi_pool_fuse", torch::kCUDA, &transfer_kv_multi_pool_fuse);
+  m.def(
+
       "transfer_kv_all_layer_lf_pf(Tensor src_k_layers, Tensor dst_k, Tensor src_v_layers, Tensor dst_v, "
       "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, int num_layers, int block_quota, int "
       "num_warps_per_block) -> ()");

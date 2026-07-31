@@ -37,6 +37,14 @@ class KVArgs:
     prefill_start_layer: int
     # for system dp
     system_dp_rank: int
+    # PD direct-to-host: pinned host buffers managed by PDDirect2HostManager
+    # on the decode side; empty lists when the feature is disabled.
+    host_kv_data_ptrs: List[int]
+    host_kv_data_lens: List[int]
+    host_kv_item_lens: List[int]
+    host_state_data_ptrs: List[int]
+    host_state_data_lens: List[int]
+    host_state_item_lens: List[int]
 
 
 class KVPoll:

@@ -728,7 +728,22 @@ class TestSchedulerReqTimeStats(unittest.TestCase):
         result = s.convert_to_duration()
         self.assertIn("prealloc_queue_duration", result)
         self.assertIn("transfer_duration=", result)
+        self.assertIn("decode_h2d_wait=0.00ms", result)
         self.assertNotIn("alloc_wait", result)
+
+    def test_convert_to_duration_decode_with_h2d_wait(self):
+        s = self._make_stats(
+            disagg_mode=DisaggregationMode.DECODE,
+            decode_prealloc_queue_entry_time=1.0,
+            decode_transfer_queue_entry_time=2.0,
+            decode_transferred_time=2.5,
+            wait_queue_entry_time=3.0,
+            forward_entry_time=4.0,
+            completion_time=6.0,
+        )
+        result = s.convert_to_duration()
+        self.assertIn("transfer_duration=500.00ms", result)
+        self.assertIn("decode_h2d_wait=500.00ms", result)
 
     def test_convert_to_duration_decode_with_bootstrap(self):
         s = self._make_stats(

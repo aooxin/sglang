@@ -271,6 +271,60 @@ __global__ void transfer_kernel_impl(
   }
 }
 
+__global__ void transfer_kv_multi_pool_fuse_kernel_impl(
+    const uintptr_t* __restrict__ src_k_layers,
+    const uintptr_t* __restrict__ dst_k_layers,
+    const uintptr_t* __restrict__ src_v_layers,
+    const uintptr_t* __restrict__ dst_v_layers,
+    const uintptr_t* __restrict__ src_indices_ptrs,
+    const uintptr_t* __restrict__ dst_indices_ptrs,
+    const int64_t* __restrict__ layer_to_pool,
+    const int64_t* __restrict__ layer_to_pool_layer,
+    const int64_t* __restrict__ pool_num_items,
+    const int64_t* __restrict__ pool_k_item_sizes,
+    const int64_t* __restrict__ pool_v_item_sizes,
+    int64_t num_layers,
+    int64_t max_num_items,
+    int64_t items_per_warp) {
+  int32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int32_t lane_id = tid % WARP_SIZE;
+  int32_t warp_id = tid / WARP_SIZE;
+  int64_t layer_id = blockIdx.y;
+
+  if (layer_id >= num_layers) {
+    return;
+  }
+
+  int64_t pool_id = layer_to_pool[layer_id];
+  int64_t pool_layer_id = layer_to_pool_layer[layer_id];
+  int64_t num_items = pool_num_items[pool_id];
+  int64_t k_item_size = pool_k_item_sizes[pool_id];
+  int64_t v_item_size = pool_v_item_sizes[pool_id];
+  const int64_t* __restrict__ src_indices = reinterpret_cast<const int64_t*>(src_indices_ptrs[pool_id]);
+  const int64_t* __restrict__ dst_indices = reinterpret_cast<const int64_t*>(dst_indices_ptrs[pool_id]);
+
+  const char* src_k_base = reinterpret_cast<const char*>(src_k_layers[layer_id]);
+  char* dst_k_base = reinterpret_cast<char*>(dst_k_layers[layer_id]);
+  const char* src_v_base = reinterpret_cast<const char*>(src_v_layers[layer_id]);
+  char* dst_v_base = reinterpret_cast<char*>(dst_v_layers[layer_id]);
+
+  (void)pool_layer_id;
+
+  for (int i = 0; i < items_per_warp; ++i) {
+    int64_t item_id = warp_id * items_per_warp + i;
+    if (item_id >= num_items || item_id >= max_num_items) {
+      break;
+    }
+
+    const int64_t src_page_id = src_indices[item_id];
+    const int64_t dst_page_id = dst_indices[item_id];
+    transfer_item_warp(
+        lane_id, src_k_base + src_page_id * k_item_size, dst_k_base + dst_page_id * k_item_size, k_item_size);
+    transfer_item_warp(
+        lane_id, src_v_base + src_page_id * v_item_size, dst_v_base + dst_page_id * v_item_size, v_item_size);
+  }
+}
+
 template <auto SrcOffsetFn, auto DstOffsetFn, bool IsMLA, bool PageHeadLayout = false>
 void transfer_kv_launcher(
     const at::Tensor& src_k,
@@ -592,6 +646,116 @@ void transfer_kv_all_layer(
       dst_v_layers,
       block_quota,
       num_warps_per_block);
+}
+
+void transfer_kv_all_layer_fuse(
+    const at::Tensor src_k_layers,
+    const at::Tensor dst_k_layers,
+    const at::Tensor src_v_layers,
+    const at::Tensor dst_v_layers,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t k_item_size,
+    int64_t v_item_size,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  TORCH_CHECK(num_layers == src_k_layers.size(0), "Number of layers in source k tensor does not match num_layers");
+  at::Tensor empty;
+  transfer_kv_fuse_launcher<get_global_offset_lf_tbl<const char>, get_global_offset_lf_tbl<char>, false>(
+      empty,
+      empty,
+      empty,
+      empty,
+      src_indices,
+      dst_indices,
+      0,
+      num_layers,
+      k_item_size,
+      0,
+      0,
+      v_item_size,
+      0,
+      0,
+      src_k_layers,
+      dst_k_layers,
+      src_v_layers,
+      dst_v_layers,
+      block_quota,
+      num_warps_per_block);
+}
+
+void transfer_kv_multi_pool_fuse(
+    const at::Tensor src_k_layers,
+    const at::Tensor dst_k_layers,
+    const at::Tensor src_v_layers,
+    const at::Tensor dst_v_layers,
+    const at::Tensor src_indices_ptrs,
+    const at::Tensor dst_indices_ptrs,
+    const at::Tensor layer_to_pool,
+    const at::Tensor layer_to_pool_layer,
+    const at::Tensor pool_num_items,
+    const at::Tensor pool_k_item_sizes,
+    const at::Tensor pool_v_item_sizes,
+    int64_t max_num_items,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  TORCH_CHECK(src_k_layers.is_cuda(), "Source k layer pointers must be a CUDA tensor");
+  TORCH_CHECK(dst_k_layers.is_cuda(), "Destination k layer pointers must be a CUDA tensor");
+  TORCH_CHECK(src_v_layers.is_cuda(), "Source v layer pointers must be a CUDA tensor");
+  TORCH_CHECK(dst_v_layers.is_cuda(), "Destination v layer pointers must be a CUDA tensor");
+  TORCH_CHECK(src_indices_ptrs.is_cuda(), "Source indices pointers must be a CUDA tensor");
+  TORCH_CHECK(dst_indices_ptrs.is_cuda(), "Destination indices pointers must be a CUDA tensor");
+  TORCH_CHECK(layer_to_pool.is_cuda(), "layer_to_pool must be a CUDA tensor");
+  TORCH_CHECK(layer_to_pool_layer.is_cuda(), "layer_to_pool_layer must be a CUDA tensor");
+  TORCH_CHECK(pool_num_items.is_cuda(), "pool_num_items must be a CUDA tensor");
+  TORCH_CHECK(pool_k_item_sizes.is_cuda(), "pool_k_item_sizes must be a CUDA tensor");
+  TORCH_CHECK(pool_v_item_sizes.is_cuda(), "pool_v_item_sizes must be a CUDA tensor");
+
+  TORCH_CHECK(layer_to_pool.scalar_type() == at::kLong, "layer_to_pool must be int64");
+  TORCH_CHECK(layer_to_pool_layer.scalar_type() == at::kLong, "layer_to_pool_layer must be int64");
+  TORCH_CHECK(pool_num_items.scalar_type() == at::kLong, "pool_num_items must be int64");
+  TORCH_CHECK(pool_k_item_sizes.scalar_type() == at::kLong, "pool_k_item_sizes must be int64");
+  TORCH_CHECK(pool_v_item_sizes.scalar_type() == at::kLong, "pool_v_item_sizes must be int64");
+
+  const int64_t num_layers = src_k_layers.numel();
+  if (num_layers == 0) {
+    return;
+  }
+  TORCH_CHECK(dst_k_layers.numel() == num_layers, "Destination k layer pointer count mismatch");
+  TORCH_CHECK(src_v_layers.numel() == num_layers, "Source v layer pointer count mismatch");
+  TORCH_CHECK(dst_v_layers.numel() == num_layers, "Destination v layer pointer count mismatch");
+  TORCH_CHECK(layer_to_pool.numel() == num_layers, "layer_to_pool count mismatch");
+  TORCH_CHECK(layer_to_pool_layer.numel() == num_layers, "layer_to_pool_layer count mismatch");
+  TORCH_CHECK(block_quota > 0, "block_quota must be positive");
+  TORCH_CHECK(num_warps_per_block > 0, "num_warps_per_block must be positive");
+
+  if (max_num_items == 0) {
+    return;
+  }
+  auto div_up = [](int64_t x, int64_t y) { return (x + y - 1) / y; };
+  const int64_t items_per_warp = div_up(max_num_items, block_quota * num_warps_per_block);
+  const int32_t num_blocks = div_up(max_num_items, items_per_warp * num_warps_per_block);
+  dim3 grid_dim(num_blocks, num_layers, 1);
+  const int32_t threads_per_block = num_warps_per_block * WARP_SIZE;
+  cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
+
+  transfer_kv_multi_pool_fuse_kernel_impl<<<grid_dim, threads_per_block, 0, torch_current_stream>>>(
+      reinterpret_cast<const uintptr_t*>(src_k_layers.data_ptr<uint64_t>()),
+      reinterpret_cast<const uintptr_t*>(dst_k_layers.data_ptr<uint64_t>()),
+      reinterpret_cast<const uintptr_t*>(src_v_layers.data_ptr<uint64_t>()),
+      reinterpret_cast<const uintptr_t*>(dst_v_layers.data_ptr<uint64_t>()),
+      reinterpret_cast<const uintptr_t*>(src_indices_ptrs.data_ptr<uint64_t>()),
+      reinterpret_cast<const uintptr_t*>(dst_indices_ptrs.data_ptr<uint64_t>()),
+      layer_to_pool.data_ptr<int64_t>(),
+      layer_to_pool_layer.data_ptr<int64_t>(),
+      pool_num_items.data_ptr<int64_t>(),
+      pool_k_item_sizes.data_ptr<int64_t>(),
+      pool_v_item_sizes.data_ptr<int64_t>(),
+      num_layers,
+      max_num_items,
+      items_per_warp);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void transfer_kv_all_layer_lf_pf(

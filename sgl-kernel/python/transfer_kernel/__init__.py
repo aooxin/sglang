@@ -14,6 +14,7 @@ from transfer_kernel.kvcacheio import (
     transfer_kv_all_layer,
     transfer_kv_all_layer_fuse_lf_pf,
     transfer_kv_all_layer_mla,
+    transfer_kv_multi_pool_fuse,
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
 )

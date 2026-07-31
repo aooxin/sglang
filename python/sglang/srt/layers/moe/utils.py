@@ -146,6 +146,7 @@ MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 SPECULATIVE_MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 SPECULATIVE_MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
 DEEPEP_MODE: Optional[DeepEPMode] = None
+DEEPEP_LL_NUM_SMS: Optional[int] = None
 IS_TBO_ENABLED: Optional[bool] = None
 IS_SBO_ENABLED: Optional[bool] = None
 TBO_TOKEN_DISTRIBUTION_THRESHOLD: Optional[float] = None
@@ -161,6 +162,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global SPECULATIVE_MOE_A2A_BACKEND
     global DEEPEP_MODE
     global DEEPEP_CONFIG
+    global DEEPEP_LL_NUM_SMS
     global IS_TBO_ENABLED
     global IS_SBO_ENABLED
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
@@ -181,6 +183,7 @@ def initialize_moe_config(server_args: ServerArgs):
     )
     DEEPEP_MODE = DeepEPMode(server_args.deepep_mode)
     DEEPEP_CONFIG = server_args.deepep_config or ""
+    DEEPEP_LL_NUM_SMS = server_args.deepep_ll_num_sms
     IS_TBO_ENABLED = server_args.enable_two_batch_overlap
     IS_SBO_ENABLED = server_args.enable_single_batch_overlap
     TBO_TOKEN_DISTRIBUTION_THRESHOLD = server_args.tbo_token_distribution_threshold
@@ -238,6 +241,13 @@ def get_deepep_config() -> str:
         logger.warning("DEEPEP_CONFIG is not initialized, using default config")
         DEEPEP_CONFIG = ""
     return DEEPEP_CONFIG
+
+
+def get_deepep_ll_num_sms() -> int:
+    global DEEPEP_LL_NUM_SMS
+    if DEEPEP_LL_NUM_SMS is None:
+        DEEPEP_LL_NUM_SMS = 0
+    return DEEPEP_LL_NUM_SMS
 
 
 def is_tbo_enabled() -> bool:

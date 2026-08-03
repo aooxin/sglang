@@ -93,6 +93,10 @@ logger = logging.getLogger(__name__)
 # Cached once at import: gating envs.SGLANG_SWA_DIAG_ENABLED.get() per alloc/free
 # would add an os.getenv lookup to the hot path, defeating the purpose.
 _SWA_DIAG_ENABLED = envs.SGLANG_SWA_DIAG_ENABLED.get()
+# Hot-path subset (in-lock ring checks, per-free mapping scans): these lengthen
+# allocator critical sections and perturb thread interleaving, so they need an
+# explicit second opt-in on top of the base flag.
+_SWA_DIAG_HOT_ENABLED = _SWA_DIAG_ENABLED and envs.SGLANG_SWA_DIAG_HOT_ENABLED.get()
 
 
 def synchronized(func):
@@ -298,6 +302,83 @@ def assert_page_uniform_swa_pattern(
             f"[SWA-DIAG] {where}: sub-page SWA pattern at source; "
             f"mapping write would produce mixed full_to_swa pages"
         )
+
+
+def assert_indices_in_bounds(
+    indices: torch.Tensor,
+    page_size: int,
+    upper_exclusive: int,
+    where: str,
+    allow_zero: bool = False,
+    hot: bool = False,
+) -> None:
+    """[SWA-DIAG] Fail-fast slot-value domain check before indices are turned
+    into raw pointers, kernel offsets, or handed across threads.
+
+    The free-slot rings are initialized as ``arange(page_size, size +
+    page_size)``, so every legal slot value lies in ``[page_size,
+    upper_exclusive)`` -- plus 0 for mapping-gathered inputs where unmapped
+    pages legitimately read as 0 (allow_zero=True). Anything else means the
+    index tensor was corrupted upstream (2026-08-03 production incident: a
+    full ``arange(0, page_size)`` page, i.e. the content of some *other*
+    tensor written over ours by a foreign/wild write). The page_size lower
+    bound matters: a plain ``[0, pool_size)`` bounds check would pass 63 of
+    those 64 corrupted values.
+
+    Letting a corrupt index through turns the downstream KV transfer into an
+    out-of-bounds host write (memory stomp) that corrupts unrelated tensors.
+
+    One aminmax + D2H sync per call. Cold call sites (per IO batch / per
+    prefetch operation) use the base SGLANG_SWA_DIAG_ENABLED gate. Hot call
+    sites (alloc exits inside the scheduler thread, latency-critical H2D load
+    path) pass hot=True so the sync -- which stalls until pending async
+    clones complete and perturbs thread interleaving -- is only incurred
+    under the second opt-in SGLANG_SWA_DIAG_HOT_ENABLED.
+    """
+    if not (_SWA_DIAG_HOT_ENABLED if hot else _SWA_DIAG_ENABLED):
+        return
+    if indices.numel() == 0:
+        return
+    amin, amax = torch.aminmax(indices)
+    min_val, max_val = torch.stack((amin, amax)).tolist()
+    below_ok = min_val >= page_size or (allow_zero and min_val == 0)
+    if below_ok and max_val < upper_exclusive:
+        if not (allow_zero and min_val == 0):
+            return
+        # min == 0 proved only that SOME value is 0; values in (0, page_size)
+        # may still hide between 0 and the max. Rescan precisely.
+        interior_bad = (indices > 0) & (indices < page_size)
+        if not bool(interior_bad.any()):
+            return
+    bad_mask = (indices < page_size) | (indices >= upper_exclusive)
+    if allow_zero:
+        bad_mask &= indices != 0
+    if not bool(bad_mask.any()):
+        return
+    bad_pos = bad_mask.nonzero(as_tuple=False).view(-1)
+    legal_domain = ("0 or " if allow_zero else "") + (
+        f"[{page_size}, {upper_exclusive})"
+    )
+    logger.error(
+        "[SWA-DIAG][%s] slot values outside legal domain %s: "
+        "min=%d max=%d numel=%d num_bad=%d "
+        "bad_positions(head)=%s bad_values(head)=%s indices_head=%s",
+        where,
+        legal_domain,
+        min_val,
+        max_val,
+        indices.numel(),
+        int(bad_mask.sum()),
+        bad_pos[:64].tolist(),
+        indices[bad_pos[:64]].tolist(),
+        indices[:128].tolist(),
+        stack_info=True,
+    )
+    raise AssertionError(
+        f"[SWA-DIAG][{where}] slot values outside legal domain "
+        f"{legal_domain} (min={min_val}, max={max_val}); foreign write into "
+        f"allocator bookkeeping or index tensor suspected"
+    )
 
 
 class HostTensorAllocator(abc.ABC):
@@ -603,8 +684,9 @@ class HostKVCache(abc.ABC):
         # means the ring was corrupted through a channel other than the Python
         # writers (e.g. a wild device-side write into this CUDA-resident
         # buffer). Fail hard: handing out corrupted slots would silently write
-        # KV data to wrong host offsets. Gated: this is a per-alloc hot path.
-        if _SWA_DIAG_ENABLED:
+        # KV data to wrong host offsets. Gated by the HOT flag: this runs
+        # inside the allocator lock on every alloc.
+        if _SWA_DIAG_HOT_ENABLED:
             pages = select_index.view(-1, self.page_size)
             runs_ok = bool((pages[:, 1:] - pages[:, :-1] == 1).all())
             min_val = int(pages[:, 0].min())
@@ -645,8 +727,9 @@ class HostKVCache(abc.ABC):
         # slot order). Letting violations through would permanently poison the
         # ring and defer the failure to a much later alloc() with the culprit's
         # stack long gone, so this one must fail hard (dump first, then raise).
-        # Gated: this is a per-free hot path.
-        if _SWA_DIAG_ENABLED:
+        # Gated by the HOT flag: this runs inside the allocator lock on every
+        # free.
+        if _SWA_DIAG_HOT_ENABLED:
             illegal_shape = n % self.page_size != 0
             min_val = int(indices.min())
             runs_ok = True
@@ -2621,6 +2704,10 @@ class SWATokenToKVPoolHost:
         self.layer_num = self.device_pool.layer_num
         self.reserve_swa_size = envs.SGLANG_RESERVE_SWA_SIZE_BEFORE_PREFETCHING.get()
         assert self.reserve_swa_size % self.page_size == 0
+        # Cached iota, mirroring PagedTokenToKVPoolAllocator._page_offsets:
+        # avoids re-materializing an int64 [0..page_size) temporary per
+        # mapping call.
+        self._page_offsets = torch.arange(self.page_size, device=device)
         self._token_stride_sizes, self._page_element_sizes = self._compute_page_meta()
 
     def _validate_host_pool_sizes(
@@ -2743,6 +2830,24 @@ class SWATokenToKVPoolHost:
             f"race: swa ring drained between availability check and alloc "
             f"(need={swa_need_size}, avail_now={self.swa_pool_host.available_size()})"
         )
+        # [SWA-DIAG] Value-domain check at the alloc exit (production
+        # incident 2026-08-03: an arange(0,64) page surfaced seconds later at
+        # the release assert). Checking here pins the corruption moment to
+        # "at/before alloc" vs "while parked during the storage query".
+        assert_indices_in_bounds(
+            full_host_indices,
+            self.page_size,
+            self.full_pool_host.size + self.page_size,
+            "SWATokenToKVPoolHost.alloc_unmapped_host_by_len(full)",
+            hot=True,
+        )
+        assert_indices_in_bounds(
+            swa_host_indices,
+            self.page_size,
+            self.swa_pool_host.size + self.page_size,
+            "SWATokenToKVPoolHost.alloc_unmapped_host_by_len(swa)",
+            hot=True,
+        )
 
         # Both full_host_indices and swa_host_indices are produced by an async
         # .clone() on this (the scheduler) thread's current CUDA stream, from
@@ -2770,7 +2875,11 @@ class SWATokenToKVPoolHost:
         swa_valid_mask = swa_device_indices != 0
         swa_need_size = int(swa_valid_mask.sum())
         assert swa_need_size % self.page_size == 0
-        assert_page_uniform_swa_pattern(
+        # Device-side input snapshot: a sub-page pattern here may be a concurrent
+        # torn read of swa_device_indices, not a deterministic bug, so log only
+        # (the test crash-1 reproduction relies on this mask penetrating to the
+        # later release site where it is caught).
+        log_subpage_swa_pattern(
             swa_valid_mask,
             self.page_size,
             "SWATokenToKVPoolHost.alloc_host(device swa_valid_mask)",
@@ -2797,7 +2906,21 @@ class SWATokenToKVPoolHost:
                 f"race: swa ring drained between availability check and alloc "
                 f"(need={swa_need_size}, avail_now={self.swa_pool_host.available_size()})"
             )
+            assert_indices_in_bounds(
+                swa_host_indices,
+                self.page_size,
+                self.swa_pool_host.size + self.page_size,
+                "SWATokenToKVPoolHost.alloc_host(swa)",
+                hot=True,
+            )
             swa_mapping[swa_valid_mask] = swa_host_indices
+        assert_indices_in_bounds(
+            full_host_indices,
+            self.page_size,
+            self.full_pool_host.size + self.page_size,
+            "SWATokenToKVPoolHost.alloc_host(full)",
+            hot=True,
+        )
         with self._mapping_section:
             self.full_to_swa_index_mapping[full_host_indices] = swa_mapping
 
@@ -2819,13 +2942,15 @@ class SWATokenToKVPoolHost:
         # Earliest possible detection of mixed mapping pages: without this,
         # the .bool() filter below silently frees the valid half of a mixed
         # page and the corruption only surfaces much later at the release
-        # asserts in cache_controller.
-        log_subpage_swa_pattern(
-            swa_valid,
-            self.page_size,
-            "SWATokenToKVPoolHost.free(mapping gather)",
-            extra=lambda: f"full_head={full_host_indices[:8].tolist()}",
-        )
+        # asserts in cache_controller. HOT-gated: runs on every free and its
+        # timing shift can mask the very race being investigated.
+        if _SWA_DIAG_HOT_ENABLED:
+            log_subpage_swa_pattern(
+                swa_valid,
+                self.page_size,
+                "SWATokenToKVPoolHost.free(mapping gather)",
+                extra=lambda: f"full_head={full_host_indices[:8].tolist()}",
+            )
         swa_freed = int(swa_valid.sum())
         if swa_freed > 0:
             self.swa_pool_host.free(swa_host_indices[swa_valid])
@@ -2875,8 +3000,13 @@ class SWATokenToKVPoolHost:
             pages_to_bind = nonzero_idx[trim_count:]
             swa_to_bind = swa_host_indices
 
-        # pages_to_bind: [P], arange(ps): [ps] → broadcast [P, ps] → flatten [P*ps]
-        token_indices = (pages_to_bind.unsqueeze(1) * ps + torch.arange(ps)).flatten()
+        # pages_to_bind: [P], page offsets: [ps] → broadcast [P, ps] → flatten
+        # [P*ps]. The .to() is a no-op on the expected pool-device path and
+        # only materializes a copy if a caller ever passes a CPU mask.
+        token_indices = (
+            pages_to_bind.unsqueeze(1) * ps
+            + self._page_offsets.to(pages_to_bind.device)
+        ).flatten()
 
         full_at_tokens = full_host_indices[token_indices]
         with self._mapping_section:
@@ -3111,6 +3241,21 @@ class SWATokenToKVPoolHost:
         swa_device_indices,
     ):
         assert io_backend == "kernel", "Only kernel IO backend is supported."
+        # D2H kernel writes to host at dst_indices * stride with NO bounds
+        # check inside the kernel; a corrupted index turns the KV backup into
+        # a host memory stomp. Validate before launch.
+        assert_indices_in_bounds(
+            host_indices,
+            self.page_size,
+            self.full_pool_host.size + self.page_size,
+            "SWATokenToKVPoolHost.backup_from_device_all_layer(host_indices)",
+        )
+        assert_indices_in_bounds(
+            swa_host_indices,
+            self.page_size,
+            self.swa_pool_host.size + self.page_size,
+            "SWATokenToKVPoolHost.backup_from_device_all_layer(swa_host_indices)",
+        )
         # Backup full-attention KV cache.
         transfer_kv_all_layer_fuse_lf_pf(
             src_k_layers=device_pool.full_kv_pool.k_data_ptrs,
@@ -3203,6 +3348,12 @@ class SWATokenToKVPoolHost:
         meta data for zero copy
         """
         assert len(full_host_indices) % self.page_size == 0
+        assert_indices_in_bounds(
+            full_host_indices,
+            self.page_size,
+            self.full_pool_host.size + self.page_size,
+            "SWATokenToKVPoolHost.get_page_buffer_meta(full_host_indices)",
+        )
         full_k_base_ptr = self.full_pool_host.k_buffer.data_ptr()
         full_v_base_ptr = self.full_pool_host.v_buffer.data_ptr()
         swa_k_base_ptr = self.swa_pool_host.k_buffer.data_ptr()
@@ -3221,6 +3372,13 @@ class SWATokenToKVPoolHost:
         # Vectorized: take the first token index of every page in one shot.
         page_full_idx = full_host_indices[:: self.page_size]
         page_swa_idx = self.gather_swa_mapping(page_full_idx)
+        assert_indices_in_bounds(
+            page_swa_idx,
+            self.page_size,
+            self.swa_pool_host.size + self.page_size,
+            "SWATokenToKVPoolHost.get_page_buffer_meta(page_swa_idx)",
+            allow_zero=True,
+        )
 
         # Vectorized per-page pointer computation (one tensor op instead of a
         # Python scalar loop over pages).

@@ -20,6 +20,7 @@ class StubSWATokenToKVPoolHost:
         # The real class guards mapping access with a lock+fence section; on
         # CPU tensors the fence is a no-op, so nullcontext is equivalent.
         self._mapping_section = nullcontext()
+        self._page_offsets = torch.arange(page_size)
 
     mapping = SWATokenToKVPoolHost.mapping_full_and_swa_indices
 

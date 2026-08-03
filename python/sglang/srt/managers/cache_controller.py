@@ -45,6 +45,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool_host import assert_indices_in_bounds
 from sglang.srt.observability.startup_func_log_and_timer import startup_timer
 from sglang.srt.utils import get_device_module
 
@@ -1417,6 +1418,17 @@ class HiCacheController:
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
+        # Host indices are the gather SOURCE here (H2D); out-of-range reads
+        # garbage KV instead of stomping memory, but it still means the index
+        # tensor is corrupt - catch it once per batch, not per layer.
+        assert_indices_in_bounds(
+            host_indices,
+            self.mem_pool_host.page_size,
+            self.mem_pool_host.size + self.mem_pool_host.page_size,
+            "start_loading(host_indices)",
+            hot=True,
+        )
+
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             # Full layers should skip SWA-only refill entries; SWA layers use
@@ -1664,13 +1676,16 @@ class HiCacheController:
         swa_only_to_release: Optional[torch.Tensor],
         allow_all_zero: bool = True,
     ):
-        """Release SWA-only host slots, validating per-page uniformity.
+        """Release SWA-only host slots after validating the slot-value domain.
 
         allow_all_zero encodes the caller's provenance and picks the invariant:
         - False: input is a pristine ``swa_pool_host.alloc()`` result; every
-          page must be all-valid (count == page_size). Any zero is corruption.
+          slot must be a real ring value in [page_size, swa_size + page_size).
+          Zeros (whole or partial pages) and foreign values are all corruption,
+          and the single domain check below catches every case.
         - True: input is a ``full_to_swa_index_mapping`` lookup; unmapped full
-          pages legitimately read as 0, so a page may be all-zero or all-valid.
+          pages legitimately read as 0, so the domain check exempts zeros and a
+          separate page-uniformity check rejects mixed pages.
         """
         if swa_only_to_release is None:
             assert (
@@ -1682,67 +1697,84 @@ class HiCacheController:
 
         page_size = self.mem_pool_host.page_size
         paged = swa_only_to_release.view(-1, page_size)
-        valid_count_per_page = paged.count_nonzero(dim=1)
-        bad_page_mask = (valid_count_per_page != 0) & (
-            valid_count_per_page != page_size
-        )
-        # [SWA-DIAG] 纯 alloc 结果中出现全零页：对 pristine 来源而言 0 是腐败
-        # 信号（alloc 结果每页必须全 valid），且这些 slot 会被 valid_page_mask
-        # 过滤掉 → 泄露。与混合页同等严重，dump 后 fail-fast。
-        if not allow_all_zero:
-            zero_page_mask = valid_count_per_page == 0
-            if bool(zero_page_mask.any()):
-                zero_idx = zero_page_mask.nonzero(as_tuple=False).view(-1)
-                logger.error(
-                    "[SWA-DIAG] append_swa_only_host_mem_release: all-zero pages "
-                    "in pristine-alloc input (allow_all_zero=False). num_pages=%d "
-                    "zero_pages(idx)=%s valid_count_per_page=%s "
-                    "swa_available=%s full_available=%s raw_head=%s",
-                    paged.shape[0],
-                    zero_idx.tolist()[:64],
-                    valid_count_per_page.tolist(),
-                    self.mem_pool_host.swa_pool_host.available_size(),
-                    self.mem_pool_host.full_pool_host.available_size(),
-                    swa_only_to_release[:128].tolist(),
-                    stack_info=True,
-                )
-                raise AssertionError(
-                    f"All-zero pages in pristine-alloc input "
-                    f"(allow_all_zero=False), got {valid_count_per_page.tolist()}"
-                )
-        if bool(bad_page_mask.any()):
-            # [SWA-DIAG] 炸前 dump 混合页的原始值，用于区分：
-            #   - 常量/递增值 → 页号被按 token 粒度误写入 mapping
-            #   - 部分真实 slot 值 + 部分 0 → 上游 mask 非页对齐
-            bad_idx = bad_page_mask.nonzero(as_tuple=False).view(-1)
+        # Slot-value domain: the swa host ring is initialized as
+        # arange(page_size, size + page_size), so a legal entry is in
+        # [page_size, swa_size + page_size) -- plus 0 (unmapped) for
+        # mapping-sourced inputs only. Anything else is a foreign write.
+        domain_upper = self.mem_pool_host.swa_pool_host.size + page_size
+        below_domain = swa_only_to_release < page_size
+        if allow_all_zero:
+            below_domain &= swa_only_to_release != 0
+        out_of_domain_mask = below_domain | (swa_only_to_release >= domain_upper)
+        if bool(out_of_domain_mask.any()):
+            bad_pos = out_of_domain_mask.nonzero(as_tuple=False).view(-1)
+            legal_domain = ("0 or " if allow_all_zero else "") + (
+                f"[{page_size}, {domain_upper})"
+            )
             logger.error(
-                "[SWA-DIAG] append_swa_only_host_mem_release: mixed pages "
-                "(allow_all_zero=%s). num_pages=%d bad_pages(idx)=%s "
-                "valid_count_per_page=%s numel=%d min=%s max=%s "
-                "swa_available=%s full_available=%s raw_head=%s bad_pages_raw=%s",
+                "[SWA-DIAG] append_swa_only_host_mem_release: slot values "
+                "outside legal domain %s (allow_all_zero=%s). "
+                "numel=%d num_bad=%d bad_positions(head)=%s bad_values(head)=%s "
+                "swa_available=%s full_available=%s raw_head=%s",
+                legal_domain,
                 allow_all_zero,
-                paged.shape[0],
-                bad_idx.tolist()[:64],
-                valid_count_per_page.tolist(),
                 swa_only_to_release.numel(),
-                int(swa_only_to_release.min()),
-                int(swa_only_to_release.max()),
+                int(out_of_domain_mask.sum()),
+                bad_pos[:64].tolist(),
+                swa_only_to_release[bad_pos[:64]].tolist(),
                 self.mem_pool_host.swa_pool_host.available_size(),
                 self.mem_pool_host.full_pool_host.available_size(),
                 swa_only_to_release[:128].tolist(),
-                paged[bad_idx[:8]].tolist(),
+                stack_info=True,
             )
             raise AssertionError(
-                f"Each page must be all-zero or all-valid, "
-                f"got {valid_count_per_page.tolist()}"
+                f"SWA slot values outside legal domain {legal_domain}; "
+                f"foreign write suspected"
             )
 
-        valid_page_mask = valid_count_per_page > 0
-        if valid_page_mask.any():
-            valid_pages = paged[valid_page_mask]
-            ready_event = self._record_release_ready_event(valid_pages)
+        if allow_all_zero:
+            # Mapping-sourced input: zeros passed the domain check, so page
+            # uniformity must be enforced separately.
+            valid_count_per_page = paged.count_nonzero(dim=1)
+            bad_page_mask = (valid_count_per_page != 0) & (
+                valid_count_per_page != page_size
+            )
+            if bool(bad_page_mask.any()):
+                # [SWA-DIAG] 炸前 dump 混合页的原始值，用于区分：
+                #   - 常量/递增值 → 页号被按 token 粒度误写入 mapping
+                #   - 部分真实 slot 值 + 部分 0 → 上游 mask 非页对齐
+                bad_idx = bad_page_mask.nonzero(as_tuple=False).view(-1)
+                logger.error(
+                    "[SWA-DIAG] append_swa_only_host_mem_release: mixed pages. "
+                    "num_pages=%d bad_pages(idx)=%s "
+                    "valid_count_per_page=%s numel=%d min=%s max=%s "
+                    "swa_available=%s full_available=%s raw_head=%s bad_pages_raw=%s",
+                    paged.shape[0],
+                    bad_idx.tolist()[:64],
+                    valid_count_per_page.tolist(),
+                    swa_only_to_release.numel(),
+                    int(swa_only_to_release.min()),
+                    int(swa_only_to_release.max()),
+                    self.mem_pool_host.swa_pool_host.available_size(),
+                    self.mem_pool_host.full_pool_host.available_size(),
+                    swa_only_to_release[:128].tolist(),
+                    paged[bad_idx[:8]].tolist(),
+                    stack_info=True,
+                )
+                raise AssertionError(
+                    f"Each page must be all-zero or all-valid, "
+                    f"got {valid_count_per_page.tolist()}"
+                )
+            pages_to_queue = paged[valid_count_per_page > 0]
+        else:
+            # Pristine input: the domain check proved every slot is a real
+            # ring value (no zeros possible), so all pages are releasable.
+            pages_to_queue = paged
+
+        if len(pages_to_queue) > 0:
+            ready_event = self._record_release_ready_event(pages_to_queue)
             # TODO(yingchun): 单独 put 入队，lock 获取频繁。可考虑批量入队。
-            for page in valid_pages:
+            for page in pages_to_queue:
                 self.swa_only_host_mem_release_queue.put((page, ready_event))
             self._log_queue_length(
                 "swa_only_host_mem_release_queue",
@@ -2055,6 +2087,27 @@ class HiCacheController:
                 if operation.host_indices_ready_event is not None:
                     operation.host_indices_ready_event.synchronize()
 
+                # Earliest cross-thread checkpoint: values are now guaranteed
+                # materialized (event just synced), so a domain violation here
+                # vs at the later release asserts bisects the corruption
+                # window. Cold-gated (hot=False): once per operation, no extra
+                # sync on top of the one above.
+                assert_indices_in_bounds(
+                    operation.host_indices,
+                    self.page_size,
+                    self.mem_pool_host.full_pool_host.size + self.page_size,
+                    "prefetch_thread_func(host_indices)",
+                    hot=False,
+                )
+                if operation.swa_host_indices is not None:
+                    assert_indices_in_bounds(
+                        operation.swa_host_indices,
+                        self.page_size,
+                        self.mem_pool_host.swa_pool_host.size + self.page_size,
+                        "prefetch_thread_func(swa_host_indices)",
+                        hot=False,
+                    )
+
                 # 通过 batch_exists 查看 storage 上存在的 KV cache（含 SWA 的有效区间 mask）
                 operation.mark_query_start()
                 (
@@ -2107,7 +2160,8 @@ class HiCacheController:
                     revoke_tokens = len(operation.host_indices)
                     self.append_host_mem_release(operation.host_indices)
                     self.append_swa_only_host_mem_release(
-                        operation.swa_host_indices, allow_all_zero=False
+                        operation.swa_host_indices,
+                        allow_all_zero=False,
                     )
                     if self.metrics_collector is not None:
                         self.metrics_collector.log_revoke_tokens(
@@ -2138,7 +2192,8 @@ class HiCacheController:
                         revoke_tokens = len(operation.host_indices)
                         self.append_host_mem_release(operation.host_indices)
                         self.append_swa_only_host_mem_release(
-                            operation.swa_host_indices, allow_all_zero=False
+                            operation.swa_host_indices,
+                            allow_all_zero=False,
                         )
                         if self.metrics_collector is not None:
                             self.metrics_collector.log_revoke_tokens(
@@ -2175,7 +2230,8 @@ class HiCacheController:
                     # free the SWA ONLY pre-allocated memory for pages that are not hit
                     if surplus_swa is not None:
                         self.append_swa_only_host_mem_release(
-                            surplus_swa, allow_all_zero=False
+                            surplus_swa,
+                            allow_all_zero=False,
                         )
                     # Reset swa_host_indices to None after being mapped
                     operation.swa_host_indices = None

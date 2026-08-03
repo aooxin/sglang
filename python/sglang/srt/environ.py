@@ -541,6 +541,12 @@ class Envs:
     # run per alloc/free on the hot path; keep disabled in production and enable
     # only when investigating SWA partial-page corruption.
     SGLANG_SWA_DIAG_ENABLED = EnvBool(False)
+    # Opt-in for the HOT-path subset of [SWA-DIAG] (per-alloc/free ring
+    # integrity checks and per-free mapping-gather scans). These run inside the
+    # allocator lock and lengthen critical sections, which perturbs thread
+    # interleaving and can mask timing-dependent races (heisenbug). Requires
+    # SGLANG_SWA_DIAG_ENABLED=1 as well; keep off when reproducing races.
+    SGLANG_SWA_DIAG_HOT_ENABLED = EnvBool(False)
 
     # Warmup
     SGLANG_WARMUP_TIMEOUT = EnvFloat(-1) # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm

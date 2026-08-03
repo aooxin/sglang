@@ -450,6 +450,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             size, page_size, dtype, device, kvcache, need_sort, pool_label=pool_label
         )
         self.num_pages = size // page_size
+        # Cached iota to avoid re-materializing an arange per alloc. Also a
+        # corruption-diagnosis aid: the per-call temporary put int64 [0..63]
+        # blocks in the caching allocator's 512-byte pool on every alloc;
+        # a single long-lived tensor removes that ammunition.
+        self._page_offsets = torch.arange(self.page_size, device=self.device)
         self.clear()
 
     def alloc(self, need_size: int):
@@ -473,8 +478,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self._alloc_bitmap[out_pages] = True
 
         out_indices = (
-            out_pages[:, None] * self.page_size
-            + torch.arange(self.page_size, device=self.device)
+            out_pages[:, None] * self.page_size + self._page_offsets
         ).reshape(-1)
 
         return out_indices

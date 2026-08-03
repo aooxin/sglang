@@ -684,6 +684,10 @@ class MMReceiverBase(ABC):
         self.context = zmq.asyncio.Context(20)
         self.encoder_transfer_backend = server_args.encoder_transfer_backend
         self.encode_urls = server_args.encoder_urls
+        # injected by tokenizer_manager after metrics init
+        self.metrics_collector = None
+        # (base req_id, part_idx) -> prefill post time
+        self._part_send_ts: Dict[tuple, float] = {}
         # SHA1 routing (opt-in, mutually exclusive):
         #  - enable_encoder_url_sha1_header: attach X-Model-Encoder-URL-Sha1 header
         #    to /encode so an external gateway routes by SHA1.
@@ -778,7 +782,12 @@ class MMReceiverBase(ABC):
         pass
 
     async def recv_mm_data(
-        self, request_obj, mm_processor, prompt, need_wait_for_mm_inputs=True
+        self,
+        request_obj,
+        mm_processor,
+        prompt,
+        need_wait_for_mm_inputs=True,
+        trace_context=None,
     ):
         req_id = None
         try:
@@ -800,7 +809,14 @@ class MMReceiverBase(ABC):
             )
             send_time = time.monotonic()
             asyncio.create_task(
-                self.encode(req_id, mm_data, embedding_port, "encode", "send")
+                self.encode(
+                    req_id,
+                    mm_data,
+                    embedding_port,
+                    "encode",
+                    "send",
+                    trace_context=trace_context,
+                )
             )
             result = await asyncio.wait_for(
                 self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
@@ -808,6 +824,17 @@ class MMReceiverBase(ABC):
             )
             elapsed = time.monotonic() - send_time
             logger.info(f"[{req_id}] Received embedding from E in {elapsed:.3f}s")
+            if self.metrics_collector is not None and result is not None:
+                names = sorted(
+                    {
+                        m.name.lower() if hasattr(m, "name") else str(m)
+                        for m in modalities
+                        if m is not None
+                    }
+                )
+                self.metrics_collector.observe_p2p_encoder_e2e_request_latency(
+                    elapsed, modality="+".join(names) or "unknown"
+                )
             return result
         except asyncio.TimeoutError:
             elapsed = time.monotonic() - send_time
@@ -815,6 +842,9 @@ class MMReceiverBase(ABC):
             if req_id is not None:
                 self._cleanup_mooncake_buffer(req_id)
             return None
+        finally:
+            if req_id is not None:
+                self._clear_part_send_ts(req_id)
 
     def _cleanup_mooncake_buffer(self, req_id):
         if self.encoder_transfer_backend != "mooncake":
@@ -830,6 +860,32 @@ class MMReceiverBase(ABC):
             logger.exception(
                 "mooncake: failed to deregister buffer for req_id=%s", req_id
             )
+
+    def _clear_part_send_ts(self, req_id):
+        for key in [k for k in self._part_send_ts if k[0] == req_id]:
+            self._part_send_ts.pop(key, None)
+
+    def _observe_part_metrics(self, recv_obj: EmbeddingData):
+        if self.metrics_collector is None:
+            return
+        modality = recv_obj.modality
+        modality_str = (
+            modality.name.lower() if hasattr(modality, "name") else str(modality)
+        )
+        now = time.time()
+        send_time = getattr(recv_obj, "send_time", None)
+        if send_time is not None:
+            self.metrics_collector.observe_encoder_transfer_seconds(
+                max(0.0, now - send_time), modality=modality_str
+            )
+        post_ts = self._part_send_ts.pop((recv_obj.req_id, recv_obj.part_idx), None)
+        if post_ts is not None:
+            self.metrics_collector.observe_encoder_p2p_part_e2e(
+                now - post_ts, modality=modality_str
+            )
+        encoder_e2e = getattr(recv_obj, "encoder_e2e_latency", None)
+        if encoder_e2e is not None:
+            self.metrics_collector.observe_encoder_e2e_request_latency(encoder_e2e)
 
     async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
         if req_id is None:
@@ -858,6 +914,7 @@ class MMReceiverBase(ABC):
                 original_req_id = extract_original_req_id(part_req_id)
                 # Update recv_obj.req_id to original for aggregation
                 recv_obj.req_id = original_req_id
+                self._observe_part_metrics(recv_obj)
                 if self.encoder_transfer_backend == "zmq_to_tokenizer":
                     if len(parts) < 2:
                         logger.error(
@@ -1369,6 +1426,7 @@ class MMReceiverHTTP(MMReceiverBase):
         endpoint_encode,
         endpoint_send,
         num_items_assigned=None,
+        trace_context=None,
     ):
         if len(mm_data) == 0:
             return
@@ -1413,6 +1471,10 @@ class MMReceiverHTTP(MMReceiverBase):
                 else {}
             )
 
+        if trace_context:
+            for er in encode_requests:
+                er["trace_context"] = trace_context
+
         def _headers_for_part(part_idx):
             sha1 = sha1_by_part.get(part_idx)
             return {"X-Model-Encoder-URL-Sha1": sha1} if sha1 else None
@@ -1424,6 +1486,14 @@ class MMReceiverHTTP(MMReceiverBase):
         ) as session:
             # Send encode requests
 
+            if self.metrics_collector is not None:
+                now = time.time()
+                # expire orphans from fire-and-forget encodes
+                cutoff = now - self.recv_timeout
+                for k in [k for k, ts in self._part_send_ts.items() if ts < cutoff]:
+                    self._part_send_ts.pop(k, None)
+                for er in encode_requests:
+                    self._part_send_ts[(req_id, er["part_idx"])] = now
             tasks = [
                 session.post(
                     f"{call_urls[encode_request['encoder_idx']]}/{endpoint_encode}",
@@ -1531,6 +1601,7 @@ class MMReceiverGrpc(MMReceiverBase):
         endpoint_encode,
         endpoint_send,
         num_items_assigned=None,
+        trace_context=None,  # not propagated over gRPC
     ):
         if not mm_data:
             return

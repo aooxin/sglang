@@ -112,6 +112,12 @@ class RequestStage:
         metrics_is_observed=True,
     )
 
+    # EPD: waiting for encoder embedding
+    MM_ENCODE_WAIT = RequestStageConfig(
+        "mm_encode_wait",
+        level=1,
+    )
+
     # common/non-disaggregation
     REQUEST_PROCESS = RequestStageConfig(
         "request_process",
@@ -1099,12 +1105,22 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         )
         if wait_dur is not None or io_dur is not None:
             wait_msg = self.format_duration(wait_dur) if wait_dur is not None else "NA"
-            queue_msg = self.format_duration(queue_dur) if queue_dur is not None else "NA"
-            query_msg = self.format_duration(query_dur) if query_dur is not None else "NA"
-            resolve_msg = self.format_duration(resolve_dur) if resolve_dur is not None else "NA"
-            io_queue_msg = self.format_duration(io_queue_dur) if io_queue_dur is not None else "NA"
+            queue_msg = (
+                self.format_duration(queue_dur) if queue_dur is not None else "NA"
+            )
+            query_msg = (
+                self.format_duration(query_dur) if query_dur is not None else "NA"
+            )
+            resolve_msg = (
+                self.format_duration(resolve_dur) if resolve_dur is not None else "NA"
+            )
+            io_queue_msg = (
+                self.format_duration(io_queue_dur) if io_queue_dur is not None else "NA"
+            )
             io_msg = self.format_duration(io_dur) if io_dur is not None else "NA"
-            commit_msg = self.format_duration(commit_dur) if commit_dur is not None else "NA"
+            commit_msg = (
+                self.format_duration(commit_dur) if commit_dur is not None else "NA"
+            )
             hicache_prefetch_msg = (
                 f", hicache_prefetch_wait_total={wait_msg}"
                 f", hicache_prefetch_queue={queue_msg}"

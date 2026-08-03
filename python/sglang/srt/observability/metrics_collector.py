@@ -522,7 +522,18 @@ class SchedulerMetricsCollector:
         )
 
         _default_bootstrap_buckets = [
-            0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 120, 300, 600,
+            0.01,
+            0.05,
+            0.1,
+            0.5,
+            1,
+            5,
+            10,
+            30,
+            60,
+            120,
+            300,
+            600,
         ]
         bucket_prefill_bootstrap_time = (
             getattr(server_args, "bucket_prefill_bootstrap_time", None)
@@ -1674,6 +1685,81 @@ class TokenizerMetricsCollector:
             ],
         )
 
+        # EPD encoder histograms (P side)
+        bucket_encoder_e2e_latency = [
+            0.1,
+            0.2,
+            0.3,
+            0.4,
+            0.6,
+            0.7,
+            0.8,
+            0.9,
+            1,
+            2,
+            4,
+            6,
+            8,
+            10,
+            20,
+            40,
+            60,
+            80,
+            100,
+            200,
+            400,
+            600,
+            1200,
+            1800,
+            2400,
+        ]
+
+        self.histogram_encoder_e2e_request_latency = Histogram(
+            name="sglang:encoder_e2e_request_latency_seconds",
+            documentation="Histogram of encoder End-to-end request latency in seconds",
+            labelnames=labels.keys(),
+            buckets=bucket_encoder_e2e_latency,
+        )
+
+        self.histogram_p2p_e2e_request_latency = Histogram(
+            name="sglang:p2p_encoder_e2e_request_latency_seconds",
+            documentation="Histogram of P-to-P encoder E2E request latency in seconds (including network)",
+            labelnames=list(labels.keys()) + ["modality"],
+            buckets=bucket_encoder_e2e_latency,
+        )
+
+        self.histogram_encoder_transfer_seconds = Histogram(
+            name="sglang:encoder_transfer_seconds",
+            documentation="Per-part embedding transfer latency to prefill node.",
+            labelnames=list(labels.keys()) + ["modality"],
+            buckets=bucket_encoder_e2e_latency,
+        )
+
+        self.histogram_encoder_p2p_part_e2e = Histogram(
+            name="sglang:encoder_p2p_part_e2e_seconds",
+            documentation="Per-part P->E->P e2e latency (prefill post -> prefill recv).",
+            labelnames=list(labels.keys()) + ["modality"],
+            buckets=bucket_encoder_e2e_latency,
+        )
+
+    def observe_encoder_e2e_request_latency(self, value: float):
+        self.histogram_encoder_e2e_request_latency.labels(**self.labels).observe(value)
+
+    def observe_p2p_encoder_e2e_request_latency(self, value: float, modality: str):
+        self.histogram_p2p_e2e_request_latency.labels(
+            **self.labels, modality=modality
+        ).observe(value)
+
+    def observe_encoder_transfer_seconds(self, value: float, modality: str):
+        self.histogram_encoder_transfer_seconds.labels(
+            **self.labels, modality=modality
+        ).observe(value)
+
+    def observe_encoder_p2p_part_e2e(self, value: float, modality: str):
+        self.histogram_encoder_p2p_part_e2e.labels(
+            **self.labels, modality=modality
+        ).observe(value)
+
     def observe_one_finished_request(
         self,
         labels: Dict[str, str],
@@ -1864,7 +1950,17 @@ class StorageMetricsCollector:
             bucket_bandwidth = [0.1, 0.5, 1, 5, 10, 50, 100]
 
         if bucket_storage_query_latency is None:
-            bucket_storage_query_latency = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10]
+            bucket_storage_query_latency = [
+                0.001,
+                0.005,
+                0.01,
+                0.05,
+                0.1,
+                0.5,
+                1,
+                5,
+                10,
+            ]
 
         if bucket_prefetch_io_latency is None:
             bucket_prefetch_io_latency = [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10]
@@ -2214,7 +2310,20 @@ class EncoderMetricsCollector:
         # SHM mm_cache lookup / insert latency (the mm_cache_lock-guarded
         # get_single / set, including the SHM tensor copy in shared mode).
         _cache_latency_buckets = [
-            0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30
+            0.0001,
+            0.0005,
+            0.001,
+            0.005,
+            0.01,
+            0.05,
+            0.1,
+            0.2,
+            0.5,
+            1,
+            2,
+            5,
+            10,
+            30,
         ]
         self.cache_read_seconds = Histogram(
             name="sglang:encoder_cache_read_seconds",
@@ -2249,7 +2358,27 @@ class EncoderMetricsCollector:
             name="sglang:encoder_mm_items_per_batch",
             documentation="Histogram of multimodal items processed per encoder batch.",
             labelnames=list(labels.keys()) + ["modality"],
-            buckets=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64, 128],
+            buckets=[
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16,
+                32,
+                64,
+                128,
+            ],
         )
 
         # Multimodal items per request histogram
@@ -2266,6 +2395,20 @@ class EncoderMetricsCollector:
             documentation="Per-request end-to-end encoder latency. per-request latency as experienced; do not sum across requests.",
             labelnames=list(labels.keys()) + ["modality"],
             buckets=[0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30],
+        )
+
+        self.batch_e2e_latency_seconds = Histogram(
+            name="sglang:encoder_batch_e2e_latency_seconds",
+            documentation="Histogram of encoder batch end-to-end latency in seconds.",
+            labelnames=list(labels.keys()) + ["modality"],
+            buckets=[0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60],
+        )
+
+        self.embedding_tokens_per_send = Histogram(
+            name="sglang:encoder_embedding_tokens_per_send",
+            documentation="Number of embedding tokens (first dim) sent to prefill per send.",
+            labelnames=list(labels.keys()) + ["modality"],
+            buckets=[16, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536],
         )
 
         # --- Latency breakdown histograms ---
@@ -2360,17 +2503,13 @@ class EncoderMetricsCollector:
             latency_seconds
         )
 
-    def observe_download(
-        self, latency_seconds: float, modality: str = "image"
-    ) -> None:
+    def observe_download(self, latency_seconds: float, modality: str = "image") -> None:
         """Record per-request media download latency."""
         self.download_seconds.labels(**self.labels, modality=modality).observe(
             latency_seconds
         )
 
-    def observe_decode(
-        self, latency_seconds: float, modality: str = "image"
-    ) -> None:
+    def observe_decode(self, latency_seconds: float, modality: str = "image") -> None:
         """Record per-request media decode latency."""
         self.decode_seconds.labels(**self.labels, modality=modality).observe(
             latency_seconds
@@ -2396,9 +2535,7 @@ class EncoderMetricsCollector:
         """Record the number of multimodal items processed in a batch."""
         self.mm_items_per_batch.labels(**self.labels, modality=modality).observe(count)
 
-    def observe_mm_items_per_request(
-        self, count: int, modality: str = "image"
-    ) -> None:
+    def observe_mm_items_per_request(self, count: int, modality: str = "image") -> None:
         """Record the number of multimodal items in a single request."""
         self.mm_items_per_request.labels(**self.labels, modality=modality).observe(
             count
@@ -2420,6 +2557,20 @@ class EncoderMetricsCollector:
         self, latency_seconds: float, modality: str = "image"
     ) -> None:
         """Record per-request end-to-end encoder latency in seconds."""
-        self.request_e2e_seconds.labels(
-            **self.labels, modality=modality
-        ).observe(latency_seconds)
+        self.request_e2e_seconds.labels(**self.labels, modality=modality).observe(
+            latency_seconds
+        )
+
+    def observe_batch_e2e_latency(
+        self, latency_seconds: float, modality: str = "image"
+    ) -> None:
+        self.batch_e2e_latency_seconds.labels(**self.labels, modality=modality).observe(
+            latency_seconds
+        )
+
+    def observe_embedding_tokens_per_send(
+        self, num_tokens: int, modality: str = "image"
+    ) -> None:
+        self.embedding_tokens_per_send.labels(**self.labels, modality=modality).observe(
+            num_tokens
+        )

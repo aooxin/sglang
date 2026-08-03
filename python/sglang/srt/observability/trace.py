@@ -291,6 +291,14 @@ class TraceReqContext:
     def is_tracing_enabled(self) -> bool:
         return self.tracing_enable
 
+    def to_propagation_header(self) -> Optional[Dict[str, str]]:
+        """Export root span context as W3C trace headers."""
+        if not self.tracing_enable or not self.root_span_context:
+            return None
+        carrier: Dict[str, str] = {}
+        propagate.inject(carrier, self.root_span_context)
+        return carrier or None
+
     def __create_thread_context(self, ts: int):
         if self.pid not in threads_info:
             trace_set_thread_info("unknown")

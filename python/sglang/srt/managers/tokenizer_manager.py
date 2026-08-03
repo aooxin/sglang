@@ -88,8 +88,10 @@ from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
+    RequestStage,
     calibrate_time_diff,
     convert_time_to_realtime,
+    monotonic_time,
     real_time,
     set_time_batch,
 )
@@ -445,6 +447,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 collect_tokens_histogram=self.server_args.collect_tokens_histogram,
             )
 
+            if getattr(self, "mm_receiver", None) is not None:
+                self.mm_receiver.metrics_collector = self.metrics_collector
+
             start_cpu_monitor_thread("tokenizer")
 
         if self.server_args.gc_warning_threshold_secs > 0.0:
@@ -749,12 +754,27 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 in ["zmq_to_tokenizer", "mooncake"]
             ):
                 if self.server_args.language_only:
+                    state = self.rid_to_state.get(obj.rid)
+                    time_stats = state.time_stats if state else None
+                    mm_encode_wait_start = monotonic_time()
                     mm_inputs = await self.mm_receiver.recv_mm_data(
                         request_obj=obj,
                         mm_processor=self.mm_processor,
                         prompt=(input_text or input_ids),
                         need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
+                        trace_context=(
+                            time_stats.trace_ctx.to_propagation_header()
+                            if time_stats and time_stats.trace_ctx.tracing_enable
+                            else None
+                        ),
                     )
+                    if time_stats is not None:
+                        time_stats.trace_slice(
+                            RequestStage.MM_ENCODE_WAIT,
+                            mm_encode_wait_start,
+                            monotonic_time(),
+                            attrs={"embedding_received": mm_inputs is not None},
+                        )
                 if mm_inputs is None:
                     if self.server_args.language_only:
                         logger.warning(
@@ -1625,9 +1645,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                         "reasoning_tokens": recv_obj.reasoning_tokens[i],
                         "completion_tokens": recv_obj.completion_tokens[i],
                         "cached_tokens": recv_obj.cached_tokens[i],
-                        "image_tokens": image_tokens_list[i] if image_tokens_list else 0,
-                        "audio_tokens": audio_tokens_list[i] if audio_tokens_list else 0,
-                        "video_tokens": video_tokens_list[i] if video_tokens_list else 0,
+                        "image_tokens": (
+                            image_tokens_list[i] if image_tokens_list else 0
+                        ),
+                        "audio_tokens": (
+                            audio_tokens_list[i] if audio_tokens_list else 0
+                        ),
+                        "video_tokens": (
+                            video_tokens_list[i] if video_tokens_list else 0
+                        ),
                     }
                 )
                 # Add detailed cache breakdown if available
@@ -2012,11 +2038,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         labels = dict(self.metrics_collector.labels)
         if custom_labels:
             labels.update(
-                {
-                    k: v
-                    for k, v in custom_labels.items()
-                    if k != "fake_cache_hit_ratio"
-                }
+                {k: v for k, v in custom_labels.items() if k != "fake_cache_hit_ratio"}
             )
         if self.enable_priority_scheduling:
             priority = getattr(state.obj, "priority", None)

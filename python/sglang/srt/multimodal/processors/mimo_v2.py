@@ -593,7 +593,7 @@ class MiMoProcessor:
         except Exception:
             return False
 
-    def _load_video_for_encoder(self, video_data, preprocess_kwargs=None):
+    def _load_video_for_encoder(self, video_data, preprocess_kwargs=None, timing=None):
         # Normalise once to bytes-or-path; reused by frame decode, audio
         # detection, and audio preprocessing without re-downloading.
         from sglang.srt.utils.common import VideoData, _normalize_video_input
@@ -601,6 +601,7 @@ class MiMoProcessor:
 
         if isinstance(video_data, VideoData):
             video_data = video_data.url
+        _dl_start = time.perf_counter() if timing is not None else None
         if isinstance(video_data, bytes):
             video_blob = video_data
         else:
@@ -609,9 +610,14 @@ class MiMoProcessor:
                 raise ValueError(
                     f"Unsupported video input type for EPD encoder: {type(video_data)}"
                 )
+        if timing is not None:
+            timing["download"] = timing.get("download", 0.0) + (
+                time.perf_counter() - _dl_start
+            )
 
         vdw = VideoDecoderWrapper(
-            video_blob, device="cpu",
+            video_blob,
+            device="cpu",
             num_decode_threads=self.video_decode_num_threads,
         )
         # Merge per-request preprocess_kwargs over the processor defaults so EPD
@@ -620,14 +626,21 @@ class MiMoProcessor:
             **self.default_video_processor_kwargs,
             **(preprocess_kwargs or {}),
         }
+        _dec_start = time.perf_counter() if timing is not None else None
         try:
             video_tuple = _decode_frames_and_timestamps(vdw, ele)
         finally:
             if hasattr(vdw, "close"):
                 vdw.close()
+        if timing is not None:
+            timing["decode"] = timing.get("decode", 0.0) + (
+                time.perf_counter() - _dec_start
+            )
         return video_blob, video_tuple
 
-    def preprocess_for_encoder(self, mm_data, modality, preprocess_kwargs_list=None):
+    def preprocess_for_encoder(
+        self, mm_data, modality, preprocess_kwargs_list=None, load_timings=None
+    ):
         # EPD encoder-side features. video_audio_* fields appear when any
         # video has audio; the D side uses them to rebuild input_ids.
         from sglang.srt.managers.schedule_batch import Modality
@@ -643,7 +656,10 @@ class MiMoProcessor:
             all_patches, all_grids = [], []
             for img in mm_data:
                 img_tensor, _, _ = self.get_visual_transform(
-                    img, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels,
+                    img,
+                    factor=factor,
+                    min_pixels=min_pixels,
+                    max_pixels=max_pixels,
                     device=self.device,
                 )
                 patches, grid = self._flatten_visual_inputs(img_tensor, "image")
@@ -665,7 +681,12 @@ class MiMoProcessor:
                     if i < len(preprocess_kwargs_list)
                     else None
                 ) or {}
-                video_blob, video_tuple = self._load_video_for_encoder(video_data, pk)
+                item_timing = {} if load_timings is not None else None
+                if load_timings is not None:
+                    load_timings.append(item_timing)
+                video_blob, video_tuple = self._load_video_for_encoder(
+                    video_data, pk, timing=item_timing
+                )
                 video_input_overrides = {
                     k: pk[k]
                     for k in self.default_video_processor_kwargs

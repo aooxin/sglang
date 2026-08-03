@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import contextlib
+import contextvars
 import copy
 import ctypes
 import hashlib
@@ -48,6 +49,14 @@ from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalSta
 from sglang.srt.model_loader import get_model
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
+from sglang.srt.observability.req_time_stats import convert_time_to_realtime_ns
+from sglang.srt.observability.trace import (
+    TraceReqContext,
+    TraceSliceContext,
+    get_global_tracing_enabled,
+    process_tracing_init,
+    trace_set_thread_info,
+)
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -93,6 +102,34 @@ ENCODER_MAX_BATCH_SIZE = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.get()
 # Watchdog: max time to wait for a batched /encode result. Bounds HTTP latency
 # if the batch worker stalls (NCCL hang, dead worker proc, etc.).
 ENCODER_REQ_TIMEOUT = envs.SGLANG_ENCODER_REQ_TIMEOUT.get()
+
+# per-task batch timing sink, for span emission
+_batch_timing_var: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "encoder_batch_timing", default=None
+)
+
+
+def _merge_batch_timing(stage_timing: Optional[dict], num_items: int) -> None:
+    # min/max merge so per-video loops accumulate into one timing
+    box = _batch_timing_var.get()
+    if box is None or stage_timing is None:
+        return
+    for key, pick in (
+        ("load_start_ts", min),
+        ("preprocess_start_ts", min),
+        ("forward_start_ts", min),
+        ("load_end_ts", max),
+        ("preprocess_end_ts", max),
+        ("forward_end_ts", max),
+    ):
+        vals = [v for v in (box.get(key), stage_timing.get(key)) if v is not None]
+        if vals:
+            box[key] = pick(vals)
+    box["load_timings"] = (box.get("load_timings") or []) + (
+        stage_timing.get("load_timings") or []
+    )
+    box["num_miss_items"] = box.get("num_miss_items", 0) + num_items
+    box["num_total_items"] = box.get("num_total_items", 0) + num_items
 
 
 class MMError(Exception):
@@ -254,7 +291,11 @@ def _extract_url_sha1_key(
         return url_hash
     # URL-string items carry no kwargs; caller passes them from the parallel
     # mm_items_preprocess_kwargs. Fall back to item-carried kwargs for dicts.
-    pp = preprocess_kwargs if preprocess_kwargs is not None else _item_preprocess_kwargs(item)
+    pp = (
+        preprocess_kwargs
+        if preprocess_kwargs is not None
+        else _item_preprocess_kwargs(item)
+    )
     pp_str = str(sorted(pp.items())) if pp else ""
     return int(hashlib.sha1(f"{url_hash}:{pp_str}".encode()).hexdigest(), 16)
 
@@ -675,7 +716,9 @@ class MMEncoder:
                 f"Video processing is not supported for {self.model_type} model."
             )
 
-    async def _flatten_and_load_data_by_modality(self, mm_items, modality, timings=None):
+    async def _flatten_and_load_data_by_modality(
+        self, mm_items, modality, timings=None
+    ):
         """
         Flatten mm_items structure, load multimodal data concurrently, and restore original structure.
 
@@ -837,11 +880,14 @@ class MMEncoder:
             new_embeddings = get_feature_fn([mm_item]).cpu()
             if new_embeddings.ndim != 2:
                 new_embeddings = new_embeddings.reshape(-1, new_embeddings.shape[-1])
-        forward_elapsed = time.perf_counter() - forward_start
+        forward_end = time.perf_counter()
+        forward_elapsed = forward_end - forward_start
         if forward_timing is not None:
             forward_timing["model_forward"] = (
                 forward_timing.get("model_forward", 0.0) + forward_elapsed
             )
+            forward_timing.setdefault("forward_start_ts", forward_start)
+            forward_timing["forward_end_ts"] = forward_end
         elif log_metrics and encoder_metrics_collector is not None:
             encoder_metrics_collector.observe_model_forward(
                 forward_elapsed, modality=modality.name.lower()
@@ -864,15 +910,22 @@ class MMEncoder:
         total = len(grid_dim)
         if not self.server_args.enable_prefix_mm_cache:
             return await self._encode_missing(
-                mm_feature, mm_inputs, list(range(total)), modality, get_feat,
+                mm_feature,
+                mm_inputs,
+                list(range(total)),
+                modality,
+                get_feat,
                 forward_timing=forward_timing,
                 log_metrics=log_metrics,
             )
 
+        mc = encoder_metrics_collector if log_metrics else None
+        modality_str = modality.name.lower()
         keys = self._calculate_hashes_from_features(mm_feature, grid_dim, modality)
         final_slices: List[Optional[torch.Tensor]] = [None] * total
         missing_indices: List[int] = []
 
+        _t0 = time.perf_counter()
         async with self.mm_cache_lock:
             for i, k in enumerate(keys):
                 hit = self.mm_cache.get_single(k)
@@ -880,17 +933,36 @@ class MMEncoder:
                     final_slices[i] = hit.embedding
                 else:
                     missing_indices.append(i)
+        if mc is not None:
+            mc.observe_cache_read(time.perf_counter() - _t0, modality=modality_str)
+            hits = total - len(missing_indices)
+            mc.record_cache_files(hits, total, modality=modality_str)
 
         if missing_indices:
             new_slices = await self._encode_missing(
-                mm_feature, mm_inputs, missing_indices, modality, get_feat,
+                mm_feature,
+                mm_inputs,
+                missing_indices,
+                modality,
+                get_feat,
                 forward_timing=forward_timing,
                 log_metrics=log_metrics,
             )
+            _t0 = time.perf_counter()
             async with self.mm_cache_lock:
                 for idx, emb in zip(missing_indices, new_slices):
                     final_slices[idx] = emb
                     self.mm_cache.set(keys[idx], EmbeddingResult(embedding=emb))
+            if mc is not None:
+                mc.observe_cache_write(time.perf_counter() - _t0, modality=modality_str)
+                mc.set_cache_state(self.mm_cache.current_size, len(self.mm_cache))
+
+        if mc is not None:
+            total_tokens = sum(int(s.shape[0]) for s in final_slices)
+            miss_tokens = sum(int(final_slices[i].shape[0]) for i in missing_indices)
+            mc.record_cache_tokens(
+                total_tokens - miss_tokens, total_tokens, modality=modality_str
+            )
 
         return final_slices
 
@@ -957,7 +1029,11 @@ class MMEncoder:
         new_slices = []
         if missing_indices:
             new_slices = await self._encode_missing(
-                mm_feature, mm_inputs, missing_indices, modality, get_feature_fn,
+                mm_feature,
+                mm_inputs,
+                missing_indices,
+                modality,
+                get_feature_fn,
                 log_metrics=log_metrics,
             )
 
@@ -1001,7 +1077,11 @@ class MMEncoder:
                 f"for {len(hit_indices)} mm items."
             )
             fallback_slices = await self._encode_missing(
-                mm_feature, mm_inputs, hit_indices, modality, get_feature_fn,
+                mm_feature,
+                mm_inputs,
+                hit_indices,
+                modality,
+                get_feature_fn,
                 log_metrics=log_metrics,
             )
         else:
@@ -1127,6 +1207,8 @@ class MMEncoder:
 
         load_timings = [] if stage_timing is not None else None
         _pp = {"preprocess": 0.0}
+        if stage_timing is not None:
+            stage_timing["load_start_ts"] = time.perf_counter()
 
         if modality == Modality.IMAGE:
             processor_input = await self._process_image_items(
@@ -1134,8 +1216,11 @@ class MMEncoder:
             )
         elif modality == Modality.VIDEO:
             processor_input = await self._process_video_items(
-                mm_items, model_preprocessor, mm_items_preprocess_kwargs,
-                load_timings, _pp,
+                mm_items,
+                model_preprocessor,
+                mm_items_preprocess_kwargs,
+                load_timings,
+                _pp,
             )
         elif modality == Modality.AUDIO:
             processor_input = await self._process_audio_items(
@@ -1149,6 +1234,11 @@ class MMEncoder:
             stage_timing["preprocess"] = _pp["preprocess"] + sum(
                 t.get("preprocess", 0.0) for t in load_timings
             )
+            # load ends where preprocess starts
+            now = time.perf_counter()
+            stage_timing["load_end_ts"] = _pp.get("preprocess_start_ts", now)
+            stage_timing["preprocess_start_ts"] = _pp.get("preprocess_start_ts", now)
+            stage_timing["preprocess_end_ts"] = now
 
         target = self.model.thinker if hasattr(self.model, "thinker") else self.model
         get_feature_method = getattr(target, f"get_{modality.name.lower()}_feature")
@@ -1161,6 +1251,8 @@ class MMEncoder:
             raise ValueError("No image processor available")
         images = await self._flatten_and_load_images(mm_items, timings=load_timings)
         _pp_start = time.perf_counter()
+        if pp_timing is not None:
+            pp_timing.setdefault("preprocess_start_ts", _pp_start)
         if model_preprocessor:
             result = model_preprocessor(images, Modality.IMAGE, self.vision_config)
         else:
@@ -1180,14 +1272,23 @@ class MMEncoder:
     ):
         if model_preprocessor:
             _pp_start = time.perf_counter()
+            if pp_timing is not None:
+                pp_timing.setdefault("preprocess_start_ts", _pp_start)
+            _n_before = len(load_timings) if load_timings is not None else 0
             result = model_preprocessor(
                 mm_items,
                 Modality.VIDEO,
                 self.vision_config,
                 mm_items_preprocess_kwargs,
+                load_timings=load_timings,
             )
             if pp_timing is not None:
-                pp_timing["preprocess"] += time.perf_counter() - _pp_start
+                elapsed = time.perf_counter() - _pp_start
+                # exclude in-preprocessor download/decode
+                if load_timings is not None:
+                    for t in load_timings[_n_before:]:
+                        elapsed -= t.get("download", 0.0) + t.get("decode", 0.0)
+                pp_timing["preprocess"] += max(0.0, elapsed)
             return result
         if not self.video_processor:
             raise ValueError("No video processor available")
@@ -1196,9 +1297,9 @@ class MMEncoder:
             mm_items, timings=load_timings
         )
         _pp_start = time.perf_counter()
-        processor_input = self.video_processor(
-            videos=videos, **video_processor_kwargs
-        )
+        if pp_timing is not None:
+            pp_timing.setdefault("preprocess_start_ts", _pp_start)
+        processor_input = self.video_processor(videos=videos, **video_processor_kwargs)
         if pp_timing is not None:
             pp_timing["preprocess"] += time.perf_counter() - _pp_start
 
@@ -1255,6 +1356,8 @@ class MMEncoder:
         audios = await self._flatten_and_load_audios(mm_items, timings=load_timings)
 
         _pp_start = time.perf_counter()
+        if pp_timing is not None:
+            pp_timing.setdefault("preprocess_start_ts", _pp_start)
         if model_preprocessor:
             result = model_preprocessor(audios, Modality.AUDIO, self.vision_config)
             if pp_timing is not None:
@@ -1292,10 +1395,12 @@ class MMEncoder:
         # mode it also does the content-hash lookup (cache_hit True on a hit).
         modality_str = modality.name.lower()
         mc = encoder_metrics_collector if log_metrics else None
-        stage_timing = {} if mc is not None else None
+        stage_timing = {} if (mc is not None or get_global_tracing_enabled()) else None
         try:
             mm_inputs, get_feature_fn = await self._process_mm_items(
-                mm_items, modality, mm_items_preprocess_kwargs,
+                mm_items,
+                modality,
+                mm_items_preprocess_kwargs,
                 stage_timing=stage_timing,
             )
         except NotImplementedError as e:
@@ -1341,9 +1446,13 @@ class MMEncoder:
                 mm_embedding = mm_embedding.cpu()
             if len(mm_embedding.shape) != 2:
                 mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+            forward_end = time.perf_counter()
+            if stage_timing is not None:
+                stage_timing["forward_start_ts"] = forward_start
+                stage_timing["forward_end_ts"] = forward_end
             if mc is not None:
                 mc.observe_model_forward(
-                    time.perf_counter() - forward_start, modality=modality_str
+                    forward_end - forward_start, modality=modality_str
                 )
 
         aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
@@ -1356,6 +1465,9 @@ class MMEncoder:
             if encode_video_audio_fn is not None:
                 audio_forward_start = time.perf_counter()
                 audio_embedding = encode_video_audio_fn(mm_inputs)
+                if stage_timing is not None:
+                    stage_timing.setdefault("forward_start_ts", audio_forward_start)
+                    stage_timing["forward_end_ts"] = time.perf_counter()
                 if mc is not None:
                     mc.observe_model_forward(
                         time.perf_counter() - audio_forward_start, modality="audio"
@@ -1369,6 +1481,7 @@ class MMEncoder:
                 )
 
         grid_dim = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+        _merge_batch_timing(stage_timing, num_items=len(grid_dim))
         return grid_dim, mm_embedding, aux_data, content_mm_hash, cache_hit
 
     @staticmethod
@@ -1459,7 +1572,10 @@ class MMEncoder:
         return self._recombine_video(per_video)
 
     async def _encode(
-        self, mm_items, modality: Modality, mm_items_preprocess_kwargs=None,
+        self,
+        mm_items,
+        modality: Modality,
+        mm_items_preprocess_kwargs=None,
         log_metrics: bool = True,
     ) -> torch.Tensor:
         modality_str = modality.name.lower()
@@ -1505,7 +1621,9 @@ class MMEncoder:
                         mm_hash := MultiModalStaticCache.combine_hashes(sha1_keys)
                     )
                 if mc is not None:
-                    mc.observe_cache_read(time.perf_counter() - _t0, modality=modality_str)
+                    mc.observe_cache_read(
+                        time.perf_counter() - _t0, modality=modality_str
+                    )
                 # Require grid; legacy entries without it fall through to recompute.
                 if hit is not None and hit.grid is not None:
                     if self.profiler is not None:
@@ -1526,12 +1644,8 @@ class MMEncoder:
             if cache_enabled and mc is not None:
                 total_tokens = int(mm_embedding.shape[0])
                 hit_tokens = total_tokens if cache_hit else 0
-                mc.record_cache_tokens(
-                    hit_tokens, total_tokens, modality=modality_str
-                )
-                mc.record_cache_files(
-                    1 if cache_hit else 0, 1, modality=modality_str
-                )
+                mc.record_cache_tokens(hit_tokens, total_tokens, modality=modality_str)
+                mc.record_cache_files(1 if cache_hit else 0, 1, modality=modality_str)
 
             # Store grid + aux so a later pre-download hit can rebuild EmbeddingData without preprocess.
             if cache_enabled and not sha1_skip:
@@ -1548,16 +1662,12 @@ class MMEncoder:
                     entries_after = len(self.mm_cache)
                     if mc is not None:
                         added = 0 if already_present else (1 if stored else 0)
-                        evictions = max(
-                            0, added - (entries_after - entries_before)
-                        )
+                        evictions = max(0, added - (entries_after - entries_before))
                         if evictions > 0:
                             mc.inc_cache_evictions(
                                 modality=modality_str, count=evictions
                             )
-                        mc.set_cache_state(
-                            self.mm_cache.current_size, entries_after
-                        )
+                        mc.set_cache_state(self.mm_cache.current_size, entries_after)
                 if mc is not None:
                     mc.observe_cache_write(
                         time.perf_counter() - _t0, modality=modality_str
@@ -1603,10 +1713,12 @@ class MMEncoder:
 
         # Serialize data
         if self.server_args.encoder_transfer_backend == "mooncake":
+            mm_data.send_time = time.time()
             serialized_data = pickle.dumps(mm_data)
             buffer = None
         else:
             new_mm_data = mm_data.copy_without_embedding()
+            new_mm_data.send_time = time.time()
             if new_mm_data.error_msg is not None:
                 buffer = None
                 serialized_data = pickle.dumps(new_mm_data)
@@ -1631,6 +1743,20 @@ class MMEncoder:
                 sock.close()
 
         await asyncio.get_event_loop().run_in_executor(self.executor, send_with_socket)
+
+        if (
+            encoder_metrics_collector is not None
+            and embedding is not None
+            and mm_data.error_msg is None
+        ):
+            modality_str = (
+                mm_data.modality.name.lower()
+                if hasattr(mm_data.modality, "name")
+                else str(mm_data.modality).lower()
+            )
+            encoder_metrics_collector.observe_embedding_tokens_per_send(
+                embedding.shape[0], modality=modality_str
+            )
 
     async def _cleanup_inflight_encode_state(self, req_id: str):
         # Encoder-DP cleanup adapter. This MMEncoder has no inflight-encode state
@@ -1672,7 +1798,9 @@ class MMEncoder:
     ):
         try:
             grid_dim, mm_embedding, aux_data = await self._encode(
-                mm_items, modality, mm_items_preprocess_kwargs,
+                mm_items,
+                modality,
+                mm_items_preprocess_kwargs,
                 log_metrics=log_metrics,
             )
 
@@ -1737,6 +1865,42 @@ class MMEncoder:
             log_metrics=log_metrics,
         )
 
+    def _finish_batch_timing(
+        self,
+        stage_timing: Optional[dict],
+        forward_timing: Optional[dict],
+        mc,
+        items_per_req: List[int],
+        num_requests: int,
+        num_miss_items: int,
+        num_total_items: int,
+        modality_str: str,
+    ) -> None:
+        if stage_timing is None:
+            return
+        if mc is not None:
+            _observe_download_decode_per_request(
+                mc, stage_timing.get("load_timings"), items_per_req, modality_str
+            )
+            _observe_per_request(
+                mc.observe_preprocess,
+                stage_timing.get("preprocess", 0.0),
+                num_requests=num_requests,
+                modality=modality_str,
+            )
+            _observe_per_request(
+                mc.observe_model_forward,
+                forward_timing.get("model_forward", 0.0),
+                num_requests=num_requests,
+                modality=modality_str,
+            )
+        stage_timing.update(forward_timing)
+        stage_timing["num_miss_items"] = num_miss_items
+        stage_timing["num_total_items"] = num_total_items
+        box = _batch_timing_var.get()
+        if box is not None:
+            box.update(stage_timing)
+
     async def batch_encode(
         self, requests: List[dict], modality: Modality, log_metrics: bool = True
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
@@ -1766,6 +1930,10 @@ class MMEncoder:
             flat_items.extend(leaves)
 
         total = len(flat_items)
+        if mc is not None:
+            for n in items_per_req:
+                mc.observe_mm_items_per_request(n, modality=modality_str)
+            mc.observe_mm_items_per_batch(total, modality=modality_str)
         keys = [_extract_url_sha1_key(it) for it in flat_items]
         cached_emb: List[Optional[torch.Tensor]] = [None] * total
         cached_grid: List[Optional[torch.Tensor]] = [None] * total
@@ -1792,10 +1960,14 @@ class MMEncoder:
             mc.record_cache_files(hits, total, modality=modality_str)
 
         # Download + preprocess + ViT only for the misses.
+        stage_timing = {} if (mc is not None or get_global_tracing_enabled()) else None
+        forward_timing = {} if stage_timing is not None else None
         if miss_indices:
             miss_items = [flat_items[i] for i in miss_indices]
             try:
-                mm_inputs, get_feat = await self._process_mm_items(miss_items, modality)
+                mm_inputs, get_feat = await self._process_mm_items(
+                    miss_items, modality, stage_timing=stage_timing
+                )
             except NotImplementedError as e:
                 return self._batch_set_error(
                     requests, modality, InternalError(f"Not implemented error: {e}")
@@ -1825,6 +1997,8 @@ class MMEncoder:
                     list(range(len(miss_items))),
                     modality,
                     get_feat,
+                    forward_timing=forward_timing,
+                    log_metrics=log_metrics,
                 )
 
                 skip_set = set(skip_indices)
@@ -1852,6 +2026,18 @@ class MMEncoder:
         if self.profiler is not None:
             for _ in requests:
                 self.profiler.step()
+
+        if miss_indices:
+            self._finish_batch_timing(
+                stage_timing,
+                forward_timing,
+                mc,
+                items_per_req,
+                len(requests),
+                len(miss_indices),
+                total,
+                modality_str,
+            )
 
         # No aux_data: batch_encode only handles IMAGE/AUDIO.
         results = []
@@ -1892,7 +2078,7 @@ class MMEncoder:
                 mc.observe_mm_items_per_request(n, modality=modality_str)
             mc.observe_mm_items_per_batch(total, modality=modality_str)
 
-        stage_timing = {} if mc is not None else None
+        stage_timing = {} if (mc is not None or get_global_tracing_enabled()) else None
         try:
             mm_inputs, get_feat = await self._process_mm_items(
                 flat_items, modality, stage_timing=stage_timing
@@ -1910,7 +2096,7 @@ class MMEncoder:
             mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
             grid_dim = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
 
-            forward_timing = {} if mc is not None else None
+            forward_timing = {} if stage_timing is not None else None
             final_slices = await self._encode_missing_with_cache(
                 mm_feature,
                 mm_inputs,
@@ -1921,26 +2107,21 @@ class MMEncoder:
                 log_metrics=log_metrics,
             )
 
-            if mc is not None:
-                _observe_download_decode_per_request(
-                    mc, stage_timing.get("load_timings"), items_per_req, modality_str
-                )
-                _observe_per_request(
-                    mc.observe_preprocess,
-                    stage_timing.get("preprocess", 0.0),
-                    num_requests=len(requests),
-                    modality=modality_str,
-                )
-                _observe_per_request(
-                    mc.observe_model_forward,
-                    forward_timing.get("model_forward", 0.0),
-                    num_requests=len(requests),
-                    modality=modality_str,
-                )
-
             if self.profiler is not None:
                 for _ in requests:
                     self.profiler.step()
+
+            self._finish_batch_timing(
+                stage_timing,
+                forward_timing,
+                mc,
+                items_per_req,
+                len(requests),
+                len(flat_items),
+                total,
+                modality_str,
+            )
+
             # No aux_data: batch_encode only handles IMAGE/AUDIO.
             results = []
             offset = 0
@@ -2323,16 +2504,35 @@ class EncoderScheduler:
         logger.info(f"Dispatching batch of {len(group)} {modality.name} requests")
 
         try:
-            results = await self.encoder.batch_encode(
-                requests, modality, log_metrics=batch_log_metrics
-            )
+            batch_timing: dict = {}
+            token = _batch_timing_var.set(batch_timing)
+            try:
+                results = await self.encoder.batch_encode(
+                    requests, modality, log_metrics=batch_log_metrics
+                )
+            finally:
+                _batch_timing_var.reset(token)
+            now = time.time()
             if encoder_metrics_collector is not None:
-                now = time.time()
+                if batch_log_metrics:
+                    encoder_metrics_collector.observe_batch_e2e_latency(
+                        max(0.0, now - start), modality=modality_str
+                    )
                 for p in group:
                     if p.request.get("log_metrics", True):
                         encoder_metrics_collector.observe_request_e2e(
                             max(0.0, now - p.submit_time), modality=modality_str
                         )
+            for p in group:
+                _emit_encode_trace(
+                    p.request,
+                    submit_time=p.submit_time,
+                    dispatch_start=start,
+                    finish_time=now,
+                    batch_timing=batch_timing,
+                    modality_str=modality_str,
+                    batch_size=len(group),
+                )
             if len(group) > 1:
                 logger.info(
                     f"Batch of {len(group)} {modality.name} requests completed in "
@@ -2368,38 +2568,17 @@ class EncoderScheduler:
         group: List[PendingRequest],
         modality: Modality,
     ) -> None:
-        modality_str = modality.name.lower()
         for p in group:
-            req = p.request
             try:
-                start = time.time()
-                req_log_metrics = req.get("log_metrics", True)
-                if encoder_metrics_collector is not None and req_log_metrics:
-                    encoder_metrics_collector.observe_queue_wait(
-                        max(0.0, start - p.submit_time), modality=modality_str
-                    )
-                    mm_items = req.get("mm_items", [])
-                    mm_count = (
-                        len(mm_items) if isinstance(mm_items, (list, tuple)) else 1
-                    )
-                    encoder_metrics_collector.observe_mm_items_per_request(
-                        mm_count, modality=modality_str
-                    )
-                    encoder_metrics_collector.observe_mm_items_per_batch(
-                        mm_count, modality=modality_str
-                    )
+                p.request["enter_time"] = p.submit_time
                 for sock in self.send_sockets:
-                    sock.send_pyobj(req)
-                result = await self.encoder.encode_request(req, modality)
-                if encoder_metrics_collector is not None and req_log_metrics:
-                    encoder_metrics_collector.observe_request_e2e(
-                        max(0.0, time.time() - p.submit_time), modality=modality_str
-                    )
+                    sock.send_pyobj(p.request)
+                result = await _encode_request_direct(self.encoder, p.request, modality)
                 if not p.future.done():
                     p.future.set_result(result)
             except Exception as e:
                 logger.error(
-                    f"Per-request encode failed for req_id={req.get('req_id')}: {e}"
+                    f"Per-request encode failed for req_id={p.request.get('req_id')}: {e}"
                 )
                 if not p.future.done():
                     p.future.set_exception(e)
@@ -2440,9 +2619,7 @@ def _observe_single_request_load(mc, stage_timing, modality_str: str) -> None:
         mc.observe_download(dl, modality=modality_str)
     if dec > 0.0:
         mc.observe_decode(dec, modality=modality_str)
-    mc.observe_preprocess(
-        stage_timing.get("preprocess", 0.0), modality=modality_str
-    )
+    mc.observe_preprocess(stage_timing.get("preprocess", 0.0), modality=modality_str)
 
 
 def _observe_download_decode_per_request(
@@ -2468,6 +2645,113 @@ def _observe_download_decode_per_request(
             mc.observe_download(dl, modality=modality_str)
         if dec > 0.0:
             mc.observe_decode(dec, modality=modality_str)
+
+
+_BATCH_SPAN_KEYS = (
+    ("mm_load", "load_start_ts", "load_end_ts"),
+    ("preprocess", "preprocess_start_ts", "preprocess_end_ts"),
+    ("model_forward", "forward_start_ts", "forward_end_ts"),
+)
+
+
+def _emit_encode_trace(
+    request: dict,
+    submit_time: float,
+    dispatch_start: float,
+    finish_time: float,
+    batch_timing: Optional[dict],
+    modality_str: str,
+    batch_size: int,
+) -> None:
+    if not get_global_tracing_enabled() or not request.get("trace_context"):
+        return
+    try:
+        req_id = str(request.get("req_id", ""))
+        ctx = TraceReqContext(
+            rid=req_id.split("_local_part_")[0],
+            role="encode",
+            module_name="encoder",
+            external_trace_header=request["trace_context"],
+        )
+        if not ctx.is_tracing_enabled():
+            return
+
+        def emit(name, start_ns, end_ns, attrs=None):
+            if end_ns > start_ns:
+                ctx.trace_slice(
+                    TraceSliceContext(name, start_ns, end_ns, level=1, attrs=attrs)
+                )
+
+        ctx.trace_req_start(int(submit_time * 1e9))
+        ctx.trace_set_root_attrs({"rid": req_id, "modality": modality_str})
+        emit("queue_wait", int(submit_time * 1e9), int(dispatch_start * 1e9))
+
+        if batch_timing:
+            attrs = {
+                "batch_size": batch_size,
+                "num_miss_items": batch_timing.get("num_miss_items", 0),
+                "num_total_items": batch_timing.get("num_total_items", 0),
+            }
+            loads = batch_timing.get("load_timings") or []
+            load_attrs = {
+                **attrs,
+                "download_seconds_sum": sum(t.get("download", 0.0) for t in loads),
+                "decode_seconds_sum": sum(t.get("decode", 0.0) for t in loads),
+            }
+            for name, start_key, end_key in _BATCH_SPAN_KEYS:
+                start_ts = batch_timing.get(start_key)
+                end_ts = batch_timing.get(end_key)
+                if start_ts is not None and end_ts is not None:
+                    emit(
+                        name,
+                        convert_time_to_realtime_ns(start_ts),
+                        convert_time_to_realtime_ns(end_ts),
+                        load_attrs if name == "mm_load" else attrs,
+                    )
+
+        ctx.trace_req_finish(int(finish_time * 1e9))
+    except Exception:
+        logger.warning("encoder trace emit failed", exc_info=True)
+
+
+def _stamp_encoder_e2e(enc: MMEncoder, request: dict) -> None:
+    mm_data = enc.embedding_to_send.get(request["req_id"])
+    if mm_data is not None:
+        mm_data.encoder_e2e_latency = time.time() - request["enter_time"]
+
+
+async def _encode_request_direct(enc: MMEncoder, request: dict, modality: Modality):
+    """Non-batchable (video) path: same per-request metrics as the dispatcher."""
+    modality_str = modality.name.lower()
+    mc = encoder_metrics_collector if request.get("log_metrics", True) else None
+    enter = request.get("enter_time") or time.time()
+    start = time.time()
+    if mc is not None:
+        mc.observe_queue_wait(max(0.0, start - enter), modality=modality_str)
+        mm_items = request.get("mm_items", [])
+        mm_count = len(mm_items) if isinstance(mm_items, (list, tuple)) else 1
+        mc.observe_mm_items_per_request(mm_count, modality=modality_str)
+        mc.observe_mm_items_per_batch(mm_count, modality=modality_str)
+    batch_timing: dict = {}
+    token = _batch_timing_var.set(batch_timing)
+    try:
+        result = await enc.encode_request(request, modality)
+    finally:
+        _batch_timing_var.reset(token)
+    now = time.time()
+    if mc is not None:
+        mc.observe_request_e2e(max(0.0, now - enter), modality=modality_str)
+        mc.observe_batch_e2e_latency(max(0.0, now - start), modality=modality_str)
+    _emit_encode_trace(
+        request,
+        submit_time=enter,
+        dispatch_start=start,
+        finish_time=now,
+        batch_timing=batch_timing,
+        modality_str=modality_str,
+        batch_size=1,
+    )
+    return result
 
 
 async def _push_embedding_to_prefill(enc: MMEncoder, request: dict) -> None:
@@ -2526,9 +2810,12 @@ async def _dp_worker_encode_and_send(
     encode_coro = (
         sched.submit(request)
         if sched is not None and modality in _BATCHABLE_MODALITIES
-        else enc.encode_request(request, modality)
+        else _encode_request_direct(enc, request, modality)
     )
     nbytes, embedding_len, embedding_dim, error_msg, error_code = await encode_coro
+
+    if not error_msg:
+        _stamp_encoder_e2e(enc, request)
 
     if error_msg:
         # zmq backends still forward an error EmbeddingData to P so it
@@ -3025,7 +3312,12 @@ async def _dp_worker_handle_request(
 ) -> None:
     t0 = time.time()
     modality_str = str(request.get("modality", "image")).lower()
-    is_encode = dp_type not in ("start_profile", "stop_profile", "health_encode", "send")
+    is_encode = dp_type not in (
+        "start_profile",
+        "stop_profile",
+        "health_encode",
+        "send",
+    )
     log_metrics = request.get("log_metrics", True)
     count_metrics = is_encode and log_metrics and encoder_metrics_collector is not None
     if count_metrics:
@@ -3133,6 +3425,10 @@ async def run_dp_worker(
             labels.update(server_args.extra_metric_labels)
         encoder_metrics_collector = EncoderMetricsCollector(labels)
         enc.dp_rank = dp_rank
+
+    if server_args.enable_trace:
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        trace_set_thread_info(f"Encoder-DP{dp_rank}", dp_rank=dp_rank)
 
     sched = EncoderScheduler(
         encoder=enc, send_sockets=[], max_batch_size=ENCODER_MAX_BATCH_SIZE
@@ -3295,6 +3591,10 @@ def launch_server(server_args: ServerArgs):
             labels.update(server_args.extra_metric_labels)
         encoder_metrics_collector = EncoderMetricsCollector(labels)
         add_prometheus_middleware(app)
+
+    if server_args.enable_trace:
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        trace_set_thread_info("Encoder")
 
     ctx = mp.get_context("spawn")
     zmq_ctx = zmq.Context(10)
@@ -3532,7 +3832,7 @@ async def handle_encode_request(request: dict):
             for socket in send_sockets:
                 socket.send_pyobj(request)
             nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                await encoder.encode_request(request, modality)
+                await _encode_request_direct(encoder, request, modality)
             )
 
         if error_msg:
@@ -3554,6 +3854,7 @@ async def handle_encode_request(request: dict):
                 status_code=error_code,
                 content={"status": "error", "message": error_msg, "req_id": req_id},
             )
+        _stamp_encoder_e2e(encoder, request)
         if encoder.server_args.encoder_transfer_backend == "mooncake":
             del request["mm_items"]
             request.update(

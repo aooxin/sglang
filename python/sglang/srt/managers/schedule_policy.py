@@ -1020,7 +1020,14 @@ class PrefillAdder:
         # batch already has at least one schedulable request. Skip this request
         # without marking the batch as full — subsequent requests in the waiting
         # queue may still fit if they are smaller (soft stop, not memory pressure).
-        if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+        if (
+            self.rem_chunk_tokens is None
+            and len(self.can_run_list) != 0
+            and real_input_tokens >= self.rem_input_tokens
+        ):
+            # If without chunked prefill:
+            # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
+            # - if the can_run_list is empty, always accept the first prefill request
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
@@ -1118,7 +1125,14 @@ class PrefillAdder:
             # have changed extend_input_len). Same logic as pre-lock check: the
             # request is too large for the remaining input budget but we already
             # have requests queued, so soft-stop without setting batch_is_full.
-            if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+            if (
+                self.rem_chunk_tokens is None
+                and len(self.can_run_list) != 0
+                and input_tokens >= self.rem_input_tokens
+            ):
+                # If without chunked prefill:
+                # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
+                # - if the can_run_list is empty, always accept the first prefill request
                 return AddReqResult.OTHER
 
             if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:

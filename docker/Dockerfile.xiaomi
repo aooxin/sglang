@@ -76,8 +76,8 @@ RUN python3 -m pip install https://cnbj1-fds.api.xiaomi.net/git-assert/workspace
     python3 -m pip install https://cnbj1-fds.api.xiaomi.net/git-assert/workspace/pro_test_whl/transfer_kernel/transfer_kernel-0.4.1-cp310-abi3-linux_x86_64.whl \
     --no-cache-dir --no-deps --force-reinstall
 
-# DeepGEMM with sm90 megamoe kernel (cloudml-aie/DeepGEMM branch sm90-megamoe-coop-nsplit-per128 @b23a8a0)
-RUN python3 -m pip install "https://cnbj1-fds.api.xiaomi.net/git-assets/test/deep_gemm-2.5.0+b23a8a0-cp312-cp312-linux_x86_64.whl" \
+# DeepGEMM with sm90 megamoe kernel (cloudml-aie/DeepGEMM branch sm90-megamoe-coop-nsplit-per128 @b23a8a0).
+RUN python3 -m pip install "https://cnbj1-fds.api.xiaomi.net/git-assets/test/0510/deep_gemm-2.5.0+local-cp312-cp312-linux_x86_64.whl" \
     --no-cache-dir --no-dependencies --force-reinstall
 
 # gcache

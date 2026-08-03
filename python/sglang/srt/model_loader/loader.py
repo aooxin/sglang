@@ -680,6 +680,15 @@ class DefaultModelLoader(BaseModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
 
+        if get_bool_env_var("SGL_CPU_QUANTIZATION"):
+            # Initialize and load weights on CPU, quantize module by module on
+            # the target device: avoids holding the whole bf16 model in GPU
+            # memory when weights are quantized online (e.g. injected fp8
+            # block-quant config for a bf16 checkpoint).
+            return load_model_with_cpu_quantization(
+                self, model_config=model_config, device_config=device_config
+            )
+
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
             # Load base model using shared method
             model = self._load_modelopt_base_model(model_config)

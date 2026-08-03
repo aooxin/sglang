@@ -173,6 +173,27 @@ class ModelConfig:
             model_override_args=self.model_override_args,
             **kwargs,
         )
+        # bf16/fp16 checkpoint served with --quantization fp8: inject the
+        # 0.5.5-style block-quant config so weights are block-quantized online
+        # after loading. `origin_dtype` marks the config as non-serialized for
+        # Fp8Config.from_config (required by mega MoE, which needs real
+        # [128, 128] block quantization, not per-tensor online quant).
+        if (
+            quantization == "fp8"
+            and getattr(self.hf_config, "quantization_config", None) is None
+        ):
+            logger.warning("Quantization config is not found. Using default config.")
+            setattr(
+                self.hf_config,
+                "quantization_config",
+                {
+                    "activation_scheme": "dynamic",
+                    "fmt": "e4m3",
+                    "quant_method": "fp8",
+                    "weight_block_size": [128, 128],
+                    "origin_dtype": torch.get_default_dtype(),
+                },
+            )
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.hf_generation_config = get_generation_config(
             self.model_path,

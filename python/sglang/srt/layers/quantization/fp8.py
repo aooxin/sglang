@@ -115,6 +115,28 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = logging.getLogger(__name__)
 
 
+def _per_block_cast_to_fp8_online(
+    x: torch.Tensor, block_n: int, block_k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Block-quantize a bf16/fp16 weight (2-D or batched 3-D) to fp8 e4m3.
+
+    Uses exact amax/448 scales (not pow-2/UE8M0) to match the numerics of the
+    TE Float8BlockQuantizer(force_pow_2_scales=False) that the validated 0.5.5
+    online-quant deployments used.
+    """
+    *lead, m, n = x.shape
+    m_pad = (m + block_n - 1) // block_n * block_n
+    n_pad = (n + block_k - 1) // block_k * block_k
+    x_padded = torch.zeros((*lead, m_pad, n_pad), dtype=x.dtype, device=x.device)
+    x_padded[..., :m, :n] = x
+    x_view = x_padded.view(*lead, m_pad // block_n, block_n, n_pad // block_k, block_k)
+    sf = x_view.abs().float().amax(dim=(-3, -1), keepdim=True).clamp(1e-4) / 448.0
+    x_quant = (x_view / sf).to(torch.float8_e4m3fn)
+    weight = x_quant.view(*lead, m_pad, n_pad)[..., :m, :n].contiguous()
+    scale = sf.squeeze(-1).squeeze(-2).contiguous()
+    return weight, scale
+
+
 class Fp8Config(QuantizationConfig):
     """Config class for FP8."""
 
@@ -146,7 +168,7 @@ class Fp8Config(QuantizationConfig):
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
         if weight_block_size is not None:
-            if not is_checkpoint_fp8_serialized:
+            if not is_checkpoint_fp8_serialized and weight_block_size != [128, 128]:
                 raise ValueError(
                     f"The block-wise quantization only supports fp8-serialized checkpoint for now."
                 )
@@ -183,7 +205,12 @@ class Fp8Config(QuantizationConfig):
     def from_config(cls, config: Dict[str, Any]) -> Fp8Config:
         quant_method = cls.get_from_keys(config, ["quant_method"])
         use_mxfp8 = "mxfp8" in quant_method
-        is_checkpoint_fp8_serialized = ("fp8" in quant_method) or use_mxfp8
+        # An `origin_dtype` key marks a config injected for a bf16/fp16
+        # checkpoint served with --quantization fp8: weights are quantized
+        # online after loading instead of being read as fp8 from disk.
+        is_checkpoint_fp8_serialized = (
+            ("fp8" in quant_method) or use_mxfp8
+        ) and cls.get_from_keys_or(config, ["origin_dtype"], None) is None
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
         packed_modules_mapping = (
             cls.get_from_keys_or(config, ["packed_modules_mapping"], {}) or {}
@@ -437,6 +464,21 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if not self.is_checkpoint_fp8_serialized and not self.use_mxfp8:
+            # bf16/fp16 checkpoint served with an injected block-quant fp8
+            # config (origin_dtype): quantize online, then run the
+            # transformations below on the quantized tensors.
+            weight, weight_scale = _per_block_cast_to_fp8_online(
+                layer.weight.data, *self.quant_config.weight_block_size
+            )
+            del layer.weight
+            weight = Parameter(weight, requires_grad=False)
+            weight_scale = Parameter(weight_scale, requires_grad=False)
+            weight_scale.format_ue8m0 = False
+            layer.register_parameter("weight", weight)
+            layer.register_parameter("weight_scale_inv", weight_scale)
+            layer.input_scale = None
+
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
@@ -1004,6 +1046,34 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if not self.quant_config.is_checkpoint_fp8_serialized and not self.use_mxfp8:
+            # bf16/fp16 checkpoint served with an injected block-quant fp8
+            # config (origin_dtype): quantize online before the serialized
+            # transformations below (and the MegaMoE weight build at the end).
+            block_n, block_k = self.quant_config.weight_block_size
+            w13_weight, w13_scale = _per_block_cast_to_fp8_online(
+                layer.w13_weight.data, block_n, block_k
+            )
+            w2_weight, w2_scale = _per_block_cast_to_fp8_online(
+                layer.w2_weight.data, block_n, block_k
+            )
+            del (
+                layer.w13_weight,
+                layer.w13_weight_scale_inv,
+                layer.w2_weight,
+                layer.w2_weight_scale_inv,
+            )
+            w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
+            w13_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
+            w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
+            w2_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
+            w13_scale.format_ue8m0 = False
+            w2_scale.format_ue8m0 = False
+            layer.register_parameter("w13_weight", w13_weight)
+            layer.register_parameter("w13_weight_scale_inv", w13_scale)
+            layer.register_parameter("w2_weight", w2_weight)
+            layer.register_parameter("w2_weight_scale_inv", w2_scale)
+
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic

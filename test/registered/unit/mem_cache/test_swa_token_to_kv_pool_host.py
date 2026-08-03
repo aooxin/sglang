@@ -1,4 +1,5 @@
 import unittest
+from contextlib import nullcontext
 
 import torch
 
@@ -16,6 +17,9 @@ class StubSWATokenToKVPoolHost:
     def __init__(self, page_size: int, mapping_size: int):
         self.page_size = page_size
         self.full_to_swa_index_mapping = torch.zeros(mapping_size, dtype=torch.int64)
+        # The real class guards mapping access with a lock+fence section; on
+        # CPU tensors the fence is a no-op, so nullcontext is equivalent.
+        self._mapping_section = nullcontext()
 
     mapping = SWATokenToKVPoolHost.mapping_full_and_swa_indices
 

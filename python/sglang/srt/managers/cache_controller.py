@@ -706,6 +706,26 @@ class HiCacheController:
                 # Preserve the historical error shape on init for unknown backends.
                 raise ValueError(f"Failed to create storage backend: {e}") from e
 
+    def _run_on_controller_device(self, thread_func):
+        # torch.cuda's current device is THREAD-LOCAL: plain threading.Thread
+        # workers default to cuda:0 even when this rank's tensors live on
+        # cuda:N, so stream lookups / event records in these threads would
+        # silently target the wrong device (or raise device-mismatch errors).
+        # Pin every storage background thread to this controller's device.
+        # The index must be resolved HERE, on the calling (scheduler) thread
+        # whose current device is correct: a bare "cuda" resolved inside the
+        # worker would map to that thread's default cuda:0 again.
+        device = torch.device(self.device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+
+        def wrapper():
+            if device.type == "cuda":
+                torch.cuda.set_device(device)
+            thread_func()
+
+        return wrapper
+
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
 
@@ -717,13 +737,16 @@ class HiCacheController:
         from sglang.srt.environ import Envs
 
         self.prefetch_thread = threading.Thread(
-            target=self.prefetch_thread_func, daemon=True
+            target=self._run_on_controller_device(self.prefetch_thread_func),
+            daemon=True,
         )
         self.backup_thread = threading.Thread(
-            target=self.backup_thread_func, daemon=True
+            target=self._run_on_controller_device(self.backup_thread_func),
+            daemon=True,
         )
         self.key_refresh_thread = threading.Thread(
-            target=self.key_refresh_thread_func, daemon=True
+            target=self._run_on_controller_device(self.key_refresh_thread_func),
+            daemon=True,
         )
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
@@ -1042,13 +1065,16 @@ class HiCacheController:
 
         if self.enable_storage:
             self.prefetch_thread = threading.Thread(
-                target=self.prefetch_thread_func, daemon=True
+                target=self._run_on_controller_device(self.prefetch_thread_func),
+                daemon=True,
             )
             self.backup_thread = threading.Thread(
-                target=self.backup_thread_func, daemon=True
+                target=self._run_on_controller_device(self.backup_thread_func),
+                daemon=True,
             )
             self.key_refresh_thread = threading.Thread(
-                target=self.key_refresh_thread_func, daemon=True
+                target=self._run_on_controller_device(self.key_refresh_thread_func),
+                daemon=True,
             )
             self.prefetch_thread.start()
             self.backup_thread.start()
@@ -1079,7 +1105,7 @@ class HiCacheController:
     ) -> Optional[torch.Tensor]:
         if not self.is_hybrid_swa:
             return None
-        return self.mem_pool_host.full_to_swa_index_mapping[full_host_indices]
+        return self.mem_pool_host.gather_swa_mapping(full_host_indices)
 
     def get_valid_swa_host_len(
         self,
@@ -1087,9 +1113,7 @@ class HiCacheController:
     ) -> int:
         if not self.is_hybrid_swa:
             return 0
-        swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[
-            full_host_indices
-        ]
+        swa_host_indices = self.mem_pool_host.gather_swa_mapping(full_host_indices)
         return torch.count_nonzero(swa_host_indices).item()
 
     def write(
@@ -1120,9 +1144,7 @@ class HiCacheController:
         # TODO(yingchun): 可与 start_loading 中的逻辑重构复用
         swa_args = {}
         if self.is_hybrid_swa:
-            swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[
-                host_indices
-            ]
+            swa_host_indices = self.mem_pool_host.gather_swa_mapping(host_indices)
             swa_device_indices = self.mem_pool_device.full_to_swa_index_mapping[
                 device_indices
             ]
@@ -1198,7 +1220,7 @@ class HiCacheController:
             return
         assert self.sliding_window_size is not None and self.sliding_window_size > 0
         # TODO(yingchun): swa_host_indices 与调用者重复计算，可传入参数直接用
-        swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[host_indices]
+        swa_host_indices = self.mem_pool_host.gather_swa_mapping(host_indices)
         ensure_swa_length = min(host_hit_length, self.sliding_window_size)
         # TODO(yingchun): this assert has D2H op
         if swa_host_indices[-ensure_swa_length:].min().item() <= 0:
@@ -1260,7 +1282,7 @@ class HiCacheController:
             return device_indices, 0, 0
 
         if swa_valid_mask is None:
-            swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[host_indices]
+            swa_host_indices = self.mem_pool_host.gather_swa_mapping(host_indices)
             swa_valid_mask = swa_host_indices.bool()
         return self.mem_pool_device_allocator.alloc_device(host_indices, swa_valid_mask)
 
@@ -1293,7 +1315,7 @@ class HiCacheController:
         the missing SWA capacity when allocation fails.
         """
         assert self.is_hybrid_swa
-        swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[host_indices]
+        swa_host_indices = self.mem_pool_host.gather_swa_mapping(host_indices)
         swa_host_valid_mask = swa_host_indices.bool()
         # [SWA-DIAG] host mapping gather is a concurrent-readable snapshot, so
         # log-only (a torn read here is not necessarily a persistent bug); the
@@ -1371,9 +1393,7 @@ class HiCacheController:
         # 在 default stream 上预计算 SWA indices
         swa_args = {}
         if self.is_hybrid_swa:
-            swa_host_indices = self.mem_pool_host.full_to_swa_index_mapping[
-                host_indices
-            ]
+            swa_host_indices = self.mem_pool_host.gather_swa_mapping(host_indices)
             swa_device_indices = self.mem_pool_device.full_to_swa_index_mapping[
                 device_indices
             ]
@@ -1609,12 +1629,32 @@ class HiCacheController:
         self.ack_backup_queue.put(operation)
         self._log_queue_length("ack_backup_queue", self.ack_backup_queue.qsize())
 
+    @staticmethod
+    def _record_release_ready_event(
+        tensor: torch.Tensor,
+    ) -> Optional[torch.cuda.Event]:
+        # The queued pages may still be produced by async CUDA ops on this
+        # (producer) thread's stream; the draining thread runs on a different
+        # stream and must wait on this event before torch.cat/free, otherwise
+        # torn reads poison the free-slot ring persistently.
+        # Device-pinned: torch.cuda's current device is thread-local, and
+        # background threads default to cuda:0 while the tensor may live on
+        # cuda:N — a bare Event().record() would raise "Event device does not
+        # match recording stream's device".
+        if not tensor.is_cuda:
+            return None
+        with torch.cuda.device(tensor.device):
+            event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(tensor.device))
+        return event
+
     def append_host_mem_release(self, host_indices: torch.Tensor):
         if host_indices.numel() == 0:
             return
         pages = host_indices.split(self.mem_pool_host.page_size)
+        ready_event = self._record_release_ready_event(host_indices)
         for page in pages:
-            self.host_mem_release_queue.put(page)
+            self.host_mem_release_queue.put((page, ready_event))
         self._log_queue_length(
             "host_mem_release_queue", self.host_mem_release_queue.qsize()
         )
@@ -1699,9 +1739,11 @@ class HiCacheController:
 
         valid_page_mask = valid_count_per_page > 0
         if valid_page_mask.any():
+            valid_pages = paged[valid_page_mask]
+            ready_event = self._record_release_ready_event(valid_pages)
             # TODO(yingchun): 单独 put 入队，lock 获取频繁。可考虑批量入队。
-            for page in paged[valid_page_mask]:
-                self.swa_only_host_mem_release_queue.put(page)
+            for page in valid_pages:
+                self.swa_only_host_mem_release_queue.put((page, ready_event))
             self._log_queue_length(
                 "swa_only_host_mem_release_queue",
                 self.swa_only_host_mem_release_queue.qsize(),
@@ -1994,7 +2036,8 @@ class HiCacheController:
         """
         self.prefetch_buffer = Queue()
         self.prefetch_io_aux_thread = threading.Thread(
-            target=self.prefetch_io_aux_func, daemon=True
+            target=self._run_on_controller_device(self.prefetch_io_aux_func),
+            daemon=True,
         )
         self.prefetch_io_aux_thread.start()
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():

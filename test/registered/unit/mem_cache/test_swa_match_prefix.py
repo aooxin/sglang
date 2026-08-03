@@ -843,7 +843,10 @@ def _make_hicache_swa_cache(
     cache = HiSimpleSWARadixCache.__new__(HiSimpleSWARadixCache)
     mapping = torch.zeros(int(host_indices.max().item()) + 1, dtype=torch.int64)
     mapping[host_indices] = swa_host_indices
-    cache.token_to_kv_pool_host = SimpleNamespace(full_to_swa_index_mapping=mapping)
+    cache.token_to_kv_pool_host = SimpleNamespace(
+        full_to_swa_index_mapping=mapping,
+        gather_swa_mapping=lambda idx: mapping[idx],
+    )
     cache.sliding_window_size = sliding_window_size
     cache.is_hybrid_swa = sliding_window_size > 0
     cache.page_size = page_size
@@ -1047,7 +1050,10 @@ class TestHiCacheLoadBackSwaMask(unittest.TestCase):
         controller.mem_pool_device_allocator = allocator
         mapping = torch.zeros(14, dtype=torch.int64)
         mapping[host_indices] = torch.tensor([0, 201, 0, 203])
-        controller.mem_pool_host = SimpleNamespace(full_to_swa_index_mapping=mapping)
+        controller.mem_pool_host = SimpleNamespace(
+            full_to_swa_index_mapping=mapping,
+            gather_swa_mapping=lambda idx: mapping[idx],
+        )
 
         controller.alloc_device(host_indices)
 

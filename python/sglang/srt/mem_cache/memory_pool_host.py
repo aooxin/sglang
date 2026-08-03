@@ -94,8 +94,6 @@ logger = logging.getLogger(__name__)
 # would add an os.getenv lookup to the hot path, defeating the purpose.
 _SWA_DIAG_ENABLED = envs.SGLANG_SWA_DIAG_ENABLED.get()
 
-_SWA_ALLOC_SYNC = envs.SGLANG_SWA_ALLOC_SYNC.get()
-
 
 def synchronized(func):
     @wraps(func)
@@ -104,6 +102,129 @@ def synchronized(func):
             return func(self, *args, **kwargs)
 
     return wrapper
+
+
+class _FenceSection:
+    """Reusable ``with`` target for a _CudaStreamFence.
+
+    Implemented as a plain __enter__/__exit__ class (not @contextmanager) to
+    avoid creating a generator object per entry on the alloc/free/gather hot
+    paths. One instance is created per fence and reused; safe because it holds
+    no per-entry state (the fence owns all state, and the caller must hold the
+    owner's lock).
+    """
+
+    __slots__ = ("_fence",)
+
+    def __init__(self, fence: "_CudaStreamFence"):
+        self._fence = fence
+
+    def __enter__(self):
+        self._fence._acquire()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._fence._release()
+        return False
+
+
+class _CudaStreamFence:
+    """Serialize async CUDA ops on a shared GPU tensor across threads/streams.
+
+    Why: the host-pool bookkeeping tensors (``_free_slots_buf``,
+    ``full_to_swa_index_mapping``) are CUDA-resident, but are touched by the
+    scheduler thread (running inside ``schedule_stream``) and the HiCache
+    prefetch / IO-aux threads (running on the default stream). A Python lock
+    only serializes kernel SUBMISSION, not EXECUTION: a slice ``.clone()``
+    enqueued on one stream may still be in flight when another thread reads
+    or overwrites the same region from a different stream, producing torn
+    reads/writes (observed in production as the
+    "Each page must be all-zero or all-valid" release asserts).
+
+    Protocol: every op touching the guarded tensor runs inside
+    ``with fence.order():`` while holding the owner's Python lock. Entering
+    makes the current thread's stream wait on the event recorded by the
+    previous op (possibly recorded on a different stream); exiting re-records
+    the event on the current stream. Combined with the lock, this yields a
+    total cross-stream execution order matching lock-acquisition order.
+
+    Deliberately total-order (reads included): a reader/writer split would
+    allow concurrent gathers, but these bookkeeping ops are low-QPS
+    page-granularity kernels where the win is negligible against the extra
+    protocol complexity (reader-event tracking, write-after-read hazards).
+
+    Re-recording the single pooled event is safe here: re-record happens only
+    inside the lock, after every consumer of the previous recording has
+    already submitted its wait (waits bind to the recording at submission
+    time).
+
+    Device pinning: torch.cuda's "current device" is THREAD-LOCAL. Background
+    threads (prefetch/IO) default to cuda:0 even when the pool tensor lives on
+    cuda:N, so ``torch.cuda.current_stream()`` without a device argument would
+    return cuda:0's stream there — waiting on the wrong stream and raising
+    "Event device does not match recording stream's device" on record. All
+    stream lookups therefore explicitly use the guarded tensor's device: ops
+    on a cuda:N tensor are enqueued on the calling thread's current stream
+    FOR cuda:N regardless of the thread's current device.
+    """
+
+    __slots__ = ("_enabled", "_device", "_event", "_recorded", "_section")
+
+    def __init__(self, device) -> None:
+        device = torch.device(device)
+        self._enabled = device.type == "cuda" and torch.cuda.is_available()
+        # A bare "cuda" (no index) would be re-resolved against each calling
+        # thread's thread-local current device — background threads would get
+        # cuda:0 again. Pin the index NOW, on the constructing (scheduler)
+        # thread, where the current device is the correct one.
+        if self._enabled and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        self._device = device
+        self._event: Optional[torch.cuda.Event] = None
+        self._recorded = False
+        self._section = _FenceSection(self)
+
+    def order(self) -> _FenceSection:
+        return self._section
+
+    def _acquire(self):
+        if not self._enabled:
+            return
+        if self._recorded:
+            torch.cuda.current_stream(self._device).wait_event(self._event)
+
+    def _release(self):
+        if not self._enabled:
+            return
+        if self._event is None:
+            with torch.cuda.device(self._device):
+                self._event = torch.cuda.Event()
+        self._event.record(torch.cuda.current_stream(self._device))
+        self._recorded = True
+
+
+class _LockedFenceSection:
+    """Single ``with`` target combining the owner lock and a fence section,
+    so call sites cannot forget one half of the pairing."""
+
+    __slots__ = ("_lock", "_section")
+
+    def __init__(self, lock: threading.RLock, section: _FenceSection):
+        self._lock = lock
+        self._section = section
+
+    def __enter__(self):
+        self._lock.acquire()
+        try:
+            self._section.__enter__()
+        except BaseException:
+            self._lock.release()
+            raise
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            return self._section.__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self._lock.release()
 
 
 def log_subpage_swa_pattern(
@@ -340,6 +461,7 @@ class HostKVCache(abc.ABC):
 
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
+        self._ring_fence = _CudaStreamFence(self.device)
         self.clear()
 
     @abc.abstractmethod
@@ -400,12 +522,13 @@ class HostKVCache(abc.ABC):
         # Allocations read from head, frees append at tail.  The explicit
         # count disambiguates full vs empty when head == tail and avoids
         # periodic O(pool size) compaction.
-        self._free_slots_buf = torch.arange(
-            self.page_size,
-            self.size + self.page_size,
-            dtype=torch.int64,
-            device=self.device,
-        )
+        with self._ring_fence.order():
+            self._free_slots_buf = torch.arange(
+                self.page_size,
+                self.size + self.page_size,
+                dtype=torch.int64,
+                device=self.device,
+            )
         self._free_slots_head = 0
         self._free_slots_tail = 0
         self._free_slots_count = len(self._free_slots_buf)
@@ -455,16 +578,19 @@ class HostKVCache(abc.ABC):
 
         capacity = len(self._free_slots_buf)
         end = self._free_slots_head + need_size
-        if end <= capacity:
-            select_index = self._free_slots_buf[self._free_slots_head : end].clone()
-        else:
-            first = capacity - self._free_slots_head
-            second = need_size - first
-            select_index = torch.empty(
-                (need_size,), dtype=torch.int64, device=self.device
-            )
-            select_index[:first] = self._free_slots_buf[self._free_slots_head :]
-            select_index[first:] = self._free_slots_buf[:second]
+        with self._ring_fence.order():
+            if end <= capacity:
+                select_index = self._free_slots_buf[
+                    self._free_slots_head : end
+                ].clone()
+            else:
+                first = capacity - self._free_slots_head
+                second = need_size - first
+                select_index = torch.empty(
+                    (need_size,), dtype=torch.int64, device=self.device
+                )
+                select_index[:first] = self._free_slots_buf[self._free_slots_head :]
+                select_index[first:] = self._free_slots_buf[:second]
 
         self._free_slots_head = end % capacity
         self._free_slots_count -= need_size
@@ -564,7 +690,6 @@ class HostKVCache(abc.ABC):
                     f"(live={live_before} + n={n} > capacity={len(self._free_slots_buf)}), "
                     f"double-free suspected"
                 )
-
         capacity = len(self._free_slots_buf)
         if n > capacity - self._free_slots_count:
             raise RuntimeError(
@@ -574,13 +699,14 @@ class HostKVCache(abc.ABC):
 
         # Append freed indices to the tail (in-place, no alloc).
         end = self._free_slots_tail + n
-        if end <= capacity:
-            self._free_slots_buf[self._free_slots_tail : end] = indices
-        else:
-            first = capacity - self._free_slots_tail
-            second = n - first
-            self._free_slots_buf[self._free_slots_tail :] = indices[:first]
-            self._free_slots_buf[:second] = indices[first:]
+        with self._ring_fence.order():
+            if end <= capacity:
+                self._free_slots_buf[self._free_slots_tail : end] = indices
+            else:
+                first = capacity - self._free_slots_tail
+                second = n - first
+                self._free_slots_buf[self._free_slots_tail :] = indices[:first]
+                self._free_slots_buf[:second] = indices[first:]
         self._free_slots_tail = end % capacity
         self._free_slots_count += n
         return n
@@ -2481,6 +2607,15 @@ class SWATokenToKVPoolHost:
                 torch.tensor([-1], dtype=torch.int64, device=device),
             ]
         )
+        # Guards full_to_swa_index_mapping: it is read/written by the scheduler
+        # thread (schedule_stream), the prefetch thread (default stream), and
+        # write/load threads (their own streams); a Python lock alone does not
+        # order the async CUDA ops across those streams.
+        self._mapping_fence = _CudaStreamFence(device)
+        self._mapping_lock = threading.RLock()
+        self._mapping_section = _LockedFenceSection(
+            self._mapping_lock, self._mapping_fence.order()
+        )
         # {global_layer_id: (pool_layer_id, is_swa_layer)}
         self.layers_mapping = self.device_pool.layers_mapping
         self.layer_num = self.device_pool.layer_num
@@ -2597,7 +2732,8 @@ class SWATokenToKVPoolHost:
             f"(need={full_need_size}, avail_now={self.full_pool_host.available_size()})"
         )
         # 注意: 此时并不做 mapping，而会在 cc._storage_hit_query 之后确定要真正要 batch_get 的 SWA 区间之后再做 mapping
-        self.full_to_swa_index_mapping[full_host_indices] = 0
+        with self._mapping_section:
+            self.full_to_swa_index_mapping[full_host_indices] = 0
         swa_host_indices = self.swa_pool_host.alloc(swa_need_size)
         # [SWA-DIAG] Same race on the swa ring: full already succeeded and the
         # mapping was written, so a None swa index is a torn allocation the
@@ -2616,7 +2752,7 @@ class SWATokenToKVPoolHost:
         # stream. The event is recorded after both clones, so it covers both;
         # both indices share a device, so gating on full is sufficient.
         host_indices_ready_event = None
-        if _SWA_ALLOC_SYNC and full_host_indices.is_cuda:
+        if full_host_indices.is_cuda:
             host_indices_ready_event = torch.cuda.Event()
             host_indices_ready_event.record()
 
@@ -2662,7 +2798,8 @@ class SWATokenToKVPoolHost:
                 f"(need={swa_need_size}, avail_now={self.swa_pool_host.available_size()})"
             )
             swa_mapping[swa_valid_mask] = swa_host_indices
-        self.full_to_swa_index_mapping[full_host_indices] = swa_mapping
+        with self._mapping_section:
+            self.full_to_swa_index_mapping[full_host_indices] = swa_mapping
 
         return full_host_indices, 0, 0
 
@@ -2670,8 +2807,14 @@ class SWATokenToKVPoolHost:
         if full_host_indices.numel() == 0:
             return 0, 0
 
+        # Detach the SWA mapping BEFORE returning the full indices to the free
+        # ring: once freed, another allocator call may re-alloc the same full
+        # indices and zero their mapping entries, so gathering afterwards
+        # would read 0 and leak the SWA slots.
+        with self._mapping_section:
+            swa_host_indices = self.full_to_swa_index_mapping[full_host_indices]
+            self.full_to_swa_index_mapping[full_host_indices] = 0
         self.full_pool_host.free(full_host_indices)
-        swa_host_indices = self.full_to_swa_index_mapping[full_host_indices]
         swa_valid = swa_host_indices.bool()
         # Earliest possible detection of mixed mapping pages: without this,
         # the .bool() filter below silently frees the valid half of a mixed
@@ -2686,7 +2829,6 @@ class SWATokenToKVPoolHost:
         swa_freed = int(swa_valid.sum())
         if swa_freed > 0:
             self.swa_pool_host.free(swa_host_indices[swa_valid])
-        self.full_to_swa_index_mapping[full_host_indices] = 0
 
         return int(full_host_indices.numel()), swa_freed
 
@@ -2737,9 +2879,10 @@ class SWATokenToKVPoolHost:
         token_indices = (pages_to_bind.unsqueeze(1) * ps + torch.arange(ps)).flatten()
 
         full_at_tokens = full_host_indices[token_indices]
-        self.full_to_swa_index_mapping[full_at_tokens] = swa_to_bind[
-            : len(full_at_tokens)
-        ]
+        with self._mapping_section:
+            self.full_to_swa_index_mapping[full_at_tokens] = swa_to_bind[
+                : len(full_at_tokens)
+            ]
 
         return updated_mask, surplus_swa
 
@@ -2749,12 +2892,10 @@ class SWATokenToKVPoolHost:
     ) -> torch.Tensor:
         # 由于 full 和 SWA 在一开始是 unmapped 的，且 SWA 也只分配了 self.reserve_swa_size 长度，
         # 所以 full 对应的 SWA 不一定有效，不能做 assert
-        swa_host_indices = self.full_to_swa_index_mapping[full_host_indices]
-        # swa_valid_num = torch.count_nonzero(swa_host_indices).item()
-        # assert swa_valid_num > 0, f"{swa_valid_num=}"
-
-        # 解除 mapping
-        self.full_to_swa_index_mapping[full_host_indices] = 0
+        with self._mapping_section:
+            swa_host_indices = self.full_to_swa_index_mapping[full_host_indices]
+            # 解除 mapping
+            self.full_to_swa_index_mapping[full_host_indices] = 0
 
         # 返回悬垂的 SWA，供 caller 释放
         return swa_host_indices
@@ -2790,37 +2931,48 @@ class SWATokenToKVPoolHost:
             src_full_indices = src_full_indices[valid_mask]
         if len(tgt_full_indices) == 0:
             return 0
-        tgt_swa = self.full_to_swa_index_mapping[tgt_full_indices]
-        src_swa = self.full_to_swa_index_mapping[src_full_indices]
-        transfer_mask: torch.Tensor = (tgt_swa == 0) & (src_swa != 0)
+        # Keep the critical section free of D2H syncs: count_nonzero().item()
+        # would block every other mapping user while holding the lock. The
+        # masked scatter is a no-op when the mask is all-false, so it can run
+        # unconditionally; the count and diagnostics read snapshots afterwards.
+        post_tgt_swa = post_src_swa = None
+        with self._mapping_section:
+            tgt_swa = self.full_to_swa_index_mapping[tgt_full_indices]
+            src_swa = self.full_to_swa_index_mapping[src_full_indices]
+            transfer_mask: torch.Tensor = (tgt_swa == 0) & (src_swa != 0)
+            self.full_to_swa_index_mapping[tgt_full_indices[transfer_mask]] = src_swa[
+                transfer_mask
+            ]
+            self.full_to_swa_index_mapping[src_full_indices[transfer_mask]] = 0
+            if _SWA_DIAG_ENABLED:
+                post_tgt_swa = self.full_to_swa_index_mapping[tgt_full_indices]
+                post_src_swa = self.full_to_swa_index_mapping[src_full_indices]
+
         num_transferred = int(transfer_mask.count_nonzero())
         if num_transferred > 0:
             assert num_transferred % self.page_size == 0
             # A sub-page transfer mask means tgt/src mapping pages are already
-            # mixed, or their page phases disagree; the scatter below would
+            # mixed, or their page phases disagree; the scatter above would
             # then propagate mixed pages further.
             log_subpage_swa_pattern(
                 transfer_mask,
                 self.page_size,
                 "SWATokenToKVPoolHost.splice_swa_mapping(transfer_mask)",
             )
-            self.full_to_swa_index_mapping[tgt_full_indices[transfer_mask]] = src_swa[
-                transfer_mask
-            ]
-            self.full_to_swa_index_mapping[src_full_indices[transfer_mask]] = 0
-            # [SWA-DIAG] 写后校验：即使 transfer_mask 本身页对齐，若 tgt/src 的
-            # 页相位不一致，scatter 后 tgt 或 src 的 mapping 也可能变成混合页。
-            # 在源头抓，而不是等到 free 时才炸。
-            assert_page_uniform_swa_pattern(
-                self.full_to_swa_index_mapping[tgt_full_indices].bool(),
-                self.page_size,
-                "SWATokenToKVPoolHost.splice_swa_mapping(post_tgt_mapping)",
-            )
-            assert_page_uniform_swa_pattern(
-                self.full_to_swa_index_mapping[src_full_indices].bool(),
-                self.page_size,
-                "SWATokenToKVPoolHost.splice_swa_mapping(post_src_mapping)",
-            )
+            if _SWA_DIAG_ENABLED:
+                # [SWA-DIAG] 写后校验：即使 transfer_mask 本身页对齐，若 tgt/src 的
+                # 页相位不一致，scatter 后 tgt 或 src 的 mapping 也可能变成混合页。
+                # 在源头抓，而不是等到 free 时才炸。
+                assert_page_uniform_swa_pattern(
+                    post_tgt_swa.bool(),
+                    self.page_size,
+                    "SWATokenToKVPoolHost.splice_swa_mapping(post_tgt_mapping)",
+                )
+                assert_page_uniform_swa_pattern(
+                    post_src_swa.bool(),
+                    self.page_size,
+                    "SWATokenToKVPoolHost.splice_swa_mapping(post_src_mapping)",
+                )
         return num_transferred
 
     def free_swa_only(self, swa_indices: torch.Tensor) -> int:
@@ -2831,11 +2983,22 @@ class SWATokenToKVPoolHost:
         self.swa_pool_host.free(swa_indices)
         return int(swa_indices.numel())
 
+    def gather_swa_mapping(self, full_host_indices: torch.Tensor) -> torch.Tensor:
+        with self._mapping_section:
+            return self.full_to_swa_index_mapping[full_host_indices]
+
+    def scatter_swa_mapping(
+        self, full_host_indices: torch.Tensor, swa_values: torch.Tensor
+    ) -> None:
+        with self._mapping_section:
+            self.full_to_swa_index_mapping[full_host_indices] = swa_values
+
     def clear(self):
         self.full_pool_host.clear()
         self.swa_pool_host.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
-        self.full_to_swa_index_mapping[:-1].fill_(0)
+        with self._mapping_section:
+            self.full_to_swa_index_mapping[:-1].fill_(0)
 
     def load_to_device_per_layer(
         self,
@@ -3057,7 +3220,7 @@ class SWATokenToKVPoolHost:
 
         # Vectorized: take the first token index of every page in one shot.
         page_full_idx = full_host_indices[:: self.page_size]
-        page_swa_idx = self.full_to_swa_index_mapping[page_full_idx]
+        page_swa_idx = self.gather_swa_mapping(page_full_idx)
 
         # Vectorized per-page pointer computation (one tensor op instead of a
         # Python scalar loop over pages).

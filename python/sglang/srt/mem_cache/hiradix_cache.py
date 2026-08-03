@@ -601,24 +601,32 @@ class BaseHiRadixCache(abc.ABC):
                         operation.completed_tokens
                     )
 
+        def _wait_release_ready_events(entries):
+            tensors = []
+            waited = set()
+            for tensor, ready_event in entries:
+                if ready_event is not None and id(ready_event) not in waited:
+                    torch.cuda.current_stream().wait_event(ready_event)
+                    waited.add(id(ready_event))
+                tensors.append(tensor)
+            return tensors
+
         def _drain_release():
-            host_indices_list = []
-            for host_indices in _drain_queue(cc.host_mem_release_queue, n_release):
-                host_indices_list.append(host_indices)
-            if host_indices_list:
-                host_indices = torch.cat(host_indices_list, dim=0)
+            entries = list(_drain_queue(cc.host_mem_release_queue, n_release))
+            if entries:
+                host_indices = torch.cat(_wait_release_ready_events(entries), dim=0)
                 cc.mem_pool_host.free(host_indices)
 
         def _drain_swa_only_release():
             if n_swa_only_release is None:
                 return
-            swa_indices_list = []
-            for swa_indices in _drain_queue(
-                cc.swa_only_host_mem_release_queue, n_swa_only_release
-            ):
-                swa_indices_list.append(swa_indices)
-            if swa_indices_list:
-                swa_host_indices = torch.cat(swa_indices_list, dim=0)
+            entries = list(
+                _drain_queue(cc.swa_only_host_mem_release_queue, n_swa_only_release)
+            )
+            if entries:
+                swa_host_indices = torch.cat(
+                    _wait_release_ready_events(entries), dim=0
+                )
                 cc.mem_pool_host.free_swa_only(swa_host_indices)
 
         _drain_revoke()
@@ -852,9 +860,9 @@ class BaseHiRadixCache(abc.ABC):
         # 彻底泄露（无人 free）
         assert not bool(
             torch.any(
-                self.token_to_kv_pool_host.full_to_swa_index_mapping[
+                self.token_to_kv_pool_host.gather_swa_mapping(
                     node.host_value[new_swa_mask]
-                ]
+                )
             )
         )
 
@@ -900,17 +908,15 @@ class BaseHiRadixCache(abc.ABC):
             return 0, 0
 
         # 建立 host 上 full 和 swa 的映射关系
-        self.token_to_kv_pool_host.full_to_swa_index_mapping[
-            full_host_indices[new_swa_mask]
-        ] = new_swa_host_indices
+        self.token_to_kv_pool_host.scatter_swa_mapping(
+            full_host_indices[new_swa_mask], new_swa_host_indices
+        )
 
         # [SWA-DIAG] 写后校验：这次 token 粒度 scatter 之后，整个 node 的 host
         # mapping 必须保持逐页均匀，否则后续 release 会触发
         # "all-zero or all-valid" 断言。在源头抓。
         assert_page_uniform_swa_pattern(
-            self.token_to_kv_pool_host.full_to_swa_index_mapping[
-                full_host_indices
-            ].bool(),
+            self.token_to_kv_pool_host.gather_swa_mapping(full_host_indices).bool(),
             self.page_size,
             "HiRadixCache.rewrite_swa_backup(post_mapping)",
             extra=f"reason={reason}",
@@ -962,7 +968,7 @@ class BaseHiRadixCache(abc.ABC):
         device_swa = self.token_to_kv_pool_allocator.full_to_swa_index_mapping[
             device_indices
         ]
-        host_swa = self.token_to_kv_pool_host.full_to_swa_index_mapping[host_indices]
+        host_swa = self.token_to_kv_pool_host.gather_swa_mapping(host_indices)
         swa_host_only = (device_swa == 0) & (host_swa != 0) if need_host_only else None
         swa_device_only = (
             (device_swa != 0) & (host_swa == 0) if need_device_only else None
@@ -1286,9 +1292,9 @@ class BaseHiRadixCache(abc.ABC):
     def _get_valid_load_back_swa_tail_start(self, host_indices: torch.Tensor) -> int:
         tail_start = max(0, len(host_indices) - self.sliding_window_size)
         tail_start = floor_align(tail_start, self.page_size)
-        tail_swa_host_indices = self.token_to_kv_pool_host.full_to_swa_index_mapping[
+        tail_swa_host_indices = self.token_to_kv_pool_host.gather_swa_mapping(
             host_indices[tail_start:]
-        ]
+        )
         assert tail_swa_host_indices.all(), (
             f"Last {len(host_indices) - tail_start} SWA slots must be valid, "
             f"got {tail_swa_host_indices.tolist()}"
@@ -2294,7 +2300,6 @@ class BaseHiRadixCache(abc.ABC):
             stack.extend(cur_node.children.values())
 
         dev_mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
-        host_mapping = self.token_to_kv_pool_host.full_to_swa_index_mapping
 
         if dev_values:
             cat_dev = torch.cat(dev_values)
@@ -2307,12 +2312,18 @@ class BaseHiRadixCache(abc.ABC):
         if host_values:
             cat_host = torch.cat(host_values)
             ret.host.full_tokens = len(cat_host)
-            ret.host.swa_tokens = int(host_mapping[cat_host].count_nonzero())
+            ret.host.swa_tokens = int(
+                self.token_to_kv_pool_host.gather_swa_mapping(
+                    cat_host
+                ).count_nonzero()
+            )
         if host_values_locked:
             cat_host_locked = torch.cat(host_values_locked)
             ret.host.full_tokens_locked = len(cat_host_locked)
             ret.host.swa_tokens_locked = int(
-                host_mapping[cat_host_locked].count_nonzero()
+                self.token_to_kv_pool_host.gather_swa_mapping(
+                    cat_host_locked
+                ).count_nonzero()
             )
         return ret
 

@@ -538,14 +538,6 @@ class Envs:
     # only when investigating SWA partial-page corruption.
     SGLANG_SWA_DIAG_ENABLED = EnvBool(False)
 
-    # Confirmation probe: synchronize the current CUDA stream right after the
-    # SWA host-index alloc, so the async .clone() completes before the tensor
-    # crosses (via a Python queue, which carries no CUDA dependency) to the
-    # prefetch thread that reads it on a different stream. If enabling this
-    # makes the mixed/all-zero-page crash disappear, the cross-thread stream
-    # race is confirmed. Off by default (a full sync per alloc is too costly).
-    SGLANG_SWA_ALLOC_SYNC = EnvBool(False)
-
     # Warmup
     SGLANG_WARMUP_TIMEOUT = EnvFloat(-1) # in seconds. If a warmup forward batch takes longer than this, the server will crash to prevent hanging. Recommend to increase warmup timeout to 1800 to accommodate some kernel JIT precache e.g. deep gemm
 

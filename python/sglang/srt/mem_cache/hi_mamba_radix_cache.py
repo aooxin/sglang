@@ -1553,8 +1553,15 @@ class HiMambaRadixCache(MambaRadixCache):
                     )
 
         def _drain_release():
+            # TODO(yingchun): host_mem_release_queue 的条目已改为
+            # (tensor, ready_event) 元组（见 HiCacheController.append_host_mem_release
+            # 的跨流 fence 协议）。Mamba 路径当前未在生产使用，暂不适配；
+            # 若启用 mamba + hicache，需参照 hiradix_cache._drain_release
+            # 先 wait_event 再 cat/free。
             host_indices_list = []
-            for host_indices in _drain_queue(cc.host_mem_release_queue, n_release):
+            for host_indices, _ready_event in _drain_queue(
+                cc.host_mem_release_queue, n_release
+            ):
                 host_indices_list.append(host_indices)
             if host_indices_list:
                 host_indices = torch.cat(host_indices_list, dim=0)

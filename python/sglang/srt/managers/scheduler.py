@@ -76,7 +76,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_group,
     get_attention_tp_group,
 )
-from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.moe import get_moe_a2a_backend, initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
@@ -584,6 +584,10 @@ class Scheduler(
 
         if hasattr(config_to_check, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
+            if get_moe_a2a_backend().is_megamoe():
+                from sglang.srt.layers.moe.mega_moe import validate_mega_moe_token_cap
+
+                validate_mega_moe_token_cap(self.server_args)
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
         initialize_fp8_gemm_config(self.server_args)

@@ -315,6 +315,11 @@ class _SinglePassGatherer(ABC):
             else:
                 raise NotImplementedError
 
+        if server_args.moe_a2a_backend == "megamoe":
+            # MegaMoE never fires the DeepEP dispatch hooks but still goes
+            # through select_experts, so gather per-expert load from topk_ids.
+            return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
+
         if server_args.moe_a2a_backend != "none":
             if server_args.deepep_mode == "normal":
                 return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)

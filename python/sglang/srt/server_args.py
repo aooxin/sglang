@@ -206,6 +206,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "mori",
     "ascend_fuseep",
     "flashinfer",
+    "megamoe",
 ]
 
 FP8_GEMM_RUNNER_BACKEND_CHOICES = [
@@ -535,7 +536,14 @@ class ServerArgs:
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
-        "none", "deepep", "mooncake", "nixl", "mori", "ascend_fuseep", "flashinfer"
+        "none",
+        "deepep",
+        "mooncake",
+        "nixl",
+        "mori",
+        "ascend_fuseep",
+        "flashinfer",
+        "megamoe",
     ] = "none"
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
@@ -2780,6 +2788,27 @@ class ServerArgs:
             )
 
     def _handle_a2a_moe(self):
+        if (
+            envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
+            and self.moe_a2a_backend != "megamoe"
+        ):
+            self.moe_a2a_backend = "megamoe"
+            logger.info(
+                "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE is set, "
+                "auto-configuring --moe-a2a-backend megamoe."
+            )
+
+        if self.moe_a2a_backend == "megamoe":
+            assert is_cuda() and is_sm90_supported(), (
+                "moe_a2a_backend=megamoe requires Hopper (SM90) GPUs "
+                "with CUDA >= 12.3."
+            )
+            self.ep_size = self.tp_size
+            logger.info(
+                f"Mega MoE is enabled. The expert parallel size is adjusted "
+                f"to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")

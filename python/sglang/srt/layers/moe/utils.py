@@ -27,6 +27,7 @@ class MoeA2ABackend(Enum):
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
     CUSTOMIZED = "customized"
+    MEGAMOE = "megamoe"
 
     @classmethod
     def _missing_(cls, value):
@@ -60,6 +61,9 @@ class MoeA2ABackend(Enum):
 
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
+
+    def is_megamoe(self):
+        return self == MoeA2ABackend.MEGAMOE
 
 
 class MoeRunnerBackend(Enum):

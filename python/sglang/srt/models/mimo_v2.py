@@ -212,7 +212,7 @@ class MoEGate(nn.Module):
         else:
             self.e_score_correction_bias = None
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, forward_batch=None):
         logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
 
         return logits
@@ -302,6 +302,16 @@ class MiMoV2MoE(nn.Module):
             get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake()
         )
 
+        # Fields consumed by the fused MegaMoE path (layers/moe/mega_moe.py);
+        # MiMo-V2 has no shared experts / dual-stream / hash routing.
+        self.routed_scaling_factor = 1.0
+        self.num_fused_shared_experts = 0
+        self.alt_stream = None
+        self.is_hash = False
+
+    def _forward_shared_experts(self, hidden_states):
+        return None
+
     def get_moe_weights(self):
         return [
             x.data
@@ -316,6 +326,14 @@ class MiMoV2MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        from sglang.srt.layers.moe.mega_moe import (
+            forward_mega_moe,
+            should_use_mega_moe,
+        )
+
+        if should_use_mega_moe(self, hidden_states):
+            return forward_mega_moe(self, hidden_states, forward_batch)
+
         if not self._enable_a2a_moe:
             return self.forward_normal(
                 hidden_states,

@@ -1078,6 +1078,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight_scale_inv.format_ue8m0 = True
                 layer.w2_weight_scale_inv.format_ue8m0 = True
 
+        # SM90 fused MegaMoE: build the transformed expert weights the kernel reads.
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        if get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import (
+                build_mega_moe_experts_weights,
+            )
+
+            build_mega_moe_experts_weights(layer)
+
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
         if not (_is_cuda and is_sm100_supported()):

@@ -78,7 +78,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
     a2a_backend = get_moe_a2a_backend()
-    if a2a_backend.is_none():
+    # MegaMoE does dispatch/combine inside the fused kernel.
+    if a2a_backend.is_none() or a2a_backend.is_megamoe():
         return StandardDispatcher(moe_runner_config)
     elif (
         a2a_backend.is_deepep()

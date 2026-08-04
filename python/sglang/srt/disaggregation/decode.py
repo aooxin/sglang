@@ -38,6 +38,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.pd_direct2host_manager import (
     PDD2HAbortDisposition,
+    PDDirect2HostManager,
 )
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
@@ -278,56 +279,17 @@ def _notify_request_abort(scheduler: Scheduler, decode_req: DecodeRequest) -> No
     )
 
 
-def _consensus_polls_by_room(
-    gathered_pairs: torch.Tensor,
-    counts: List[int],
-    world_size: int,
-    fallback_status: int,
-) -> Dict[int, int]:
-    """Compute per-room consensus poll status from gathered (room, poll) pairs.
-
-    A room reaches a non-fallback status only when every rank reported it;
-    Failed wins immediately; otherwise the min status across ranks is used.
-    """
-    present_counts: Dict[int, int] = {}
-    min_status_by_room: Dict[int, int] = {}
-    for pairs, count in zip(gathered_pairs, counts):
-        seen_rooms = set()
-        for i in range(count):
-            room = int(pairs[i, 0].item())
-            poll = int(pairs[i, 1].item())
-            if room in seen_rooms:
-                min_status_by_room[room] = min(min_status_by_room.get(room, poll), poll)
-                continue
-            seen_rooms.add(room)
-            present_counts[room] = present_counts.get(room, 0) + 1
-            min_status_by_room[room] = min(min_status_by_room.get(room, poll), poll)
-
-    polls_by_room: Dict[int, int] = {}
-    for room, min_status in min_status_by_room.items():
-        if min_status == KVPoll.Failed:
-            polls_by_room[room] = int(KVPoll.Failed)
-        elif present_counts.get(room, 0) == world_size:
-            polls_by_room[room] = min_status
-        else:
-            polls_by_room[room] = int(fallback_status)
-    return polls_by_room
-
-
 class PDD2HFusedPoller:
-    """Single fused gloo collective per scheduler iteration for pd-d2h.
+    """Fixed gloo collective sequence per scheduler iteration for pd-d2h.
 
     Replaces the two independent — and conditionally executed — all_gather
-    pairs in DecodePreallocQueue and DecodeTransferQueue with one collective
-    that is issued unconditionally at a fixed point of the event loop. This
-    removes the queue-state-dependent branching that made the collective
-    schedule fragile across ranks.
+    pairs in DecodePreallocQueue and DecodeTransferQueue with a fixed header,
+    and queue snapshot sequence. This removes queue-state-dependent collective
+    branching across ranks.
 
-    Every collective carries a monotonically increasing sequence number and
-    an op code in a fixed-size header. After the header gather, all ranks
-    verify that (seq, op) match everywhere; on mismatch we raise immediately
-    with the per-rank values, converting a would-be silent deadlock into a
-    loud crash that pinpoints which rank ran ahead/behind.
+    The fixed-size header carries a monotonically increasing sequence number.
+    After the header gather, all ranks verify that the sequence matches before
+    issuing the optional queue snapshot gather.
     """
 
     def __init__(self, gloo_group: ProcessGroup, tp_rank: int):
@@ -337,13 +299,14 @@ class PDD2HFusedPoller:
 
     def poll(
         self,
-        prealloc_entries: List[Tuple[int, int]],
-        transfer_entries: List[Tuple[int, int]],
-        h2d_admit: bool,
-    ) -> Tuple[Dict[int, int], Dict[int, int], bool]:
-        """Gather (bootstrap_room, poll) snapshots of both queues in one shot.
+        prealloc_entries: List[Tuple[int, int, int, int, int, int]],
+        transfer_entries: List[Tuple[int, int, int, int, int, int]],
+        admission_snapshot: Tuple[int, int, int, int, int],
+    ) -> Tuple[Dict[int, int], Dict[int, int], Optional[int], bool]:
+        """Gather queue snapshots and select a TP-wide H2D candidate room.
 
-        Returns (prealloc_polls_by_room, transfer_polls_by_room, h2d_admit).
+        Returns (prealloc_polls_by_room, transfer_polls_by_room,
+        h2d_candidate_room, h2d_admit).
         """
         group = self.gloo_group
         world_size = torch.distributed.get_world_size(group=group)
@@ -354,13 +317,13 @@ class PDD2HFusedPoller:
                 self.seq,
                 len(prealloc_entries),
                 len(transfer_entries),
-                int(h2d_admit),
+                *admission_snapshot,
             ],
             dtype=torch.int64,
             device="cpu",
         )
         gathered_headers = torch.empty(
-            (world_size, 4), dtype=torch.int64, device="cpu"
+            (world_size, 8), dtype=torch.int64, device="cpu"
         )
         torch.distributed.all_gather_into_tensor(
             gathered_headers.flatten(), header, group=group
@@ -378,42 +341,207 @@ class PDD2HFusedPoller:
 
         counts_p = gathered_headers[:, 1].tolist()
         counts_t = gathered_headers[:, 2].tolist()
-        h2d_admit = bool(gathered_headers[:, 3].min().item())
         max_p = max(counts_p)
         max_t = max(counts_t)
         if max_p + max_t == 0:
-            return {}, {}, h2d_admit
+            return {}, {}, None, False
 
         stride = max_p + max_t
-        local_pairs = torch.full((stride, 2), -1, dtype=torch.int64, device="cpu")
-        for i, (room, poll_status) in enumerate(prealloc_entries):
-            local_pairs[i, 0] = room
-            local_pairs[i, 1] = poll_status
-        for i, (room, poll_status) in enumerate(transfer_entries):
-            local_pairs[max_p + i, 0] = room
-            local_pairs[max_p + i, 1] = poll_status
+        local_entries = torch.full(
+            (stride, 6), -1, dtype=torch.int64, device="cpu"
+        )
+        for i, entry in enumerate(prealloc_entries):
+            local_entries[i] = torch.tensor(entry, dtype=torch.int64)
+        for i, entry in enumerate(transfer_entries):
+            local_entries[max_p + i] = torch.tensor(entry, dtype=torch.int64)
 
-        gathered_pairs = torch.empty(
-            (world_size, stride, 2), dtype=torch.int64, device="cpu"
+        gathered_entries = torch.empty(
+            (world_size, stride, 6), dtype=torch.int64, device="cpu"
         )
         torch.distributed.all_gather_into_tensor(
-            gathered_pairs.flatten(), local_pairs.flatten(), group=group
+            gathered_entries.flatten(), local_entries.flatten(), group=group
         )
 
-        prealloc_polls = _consensus_polls_by_room(
-            gathered_pairs[:, :max_p],
+        prealloc_polls = self._consensus_polls_by_room(
+            gathered_entries[:, :max_p],
             counts_p,
             world_size,
             int(KVPoll.Bootstrapping),
         )
-        transfer_polls = _consensus_polls_by_room(
-            gathered_pairs[:, max_p:],
+        transfer_polls = self._consensus_transfer_polls_by_room(
+            gathered_entries[:, max_p:],
             counts_t,
+            world_size,
+        )
+        h2d_candidate_room = self._common_room_with_state(
+            gathered_entries[:, max_p:],
+            counts_t,
+            world_size,
+            PDD2HState.HOST_READY.value,
+        )
+        h2d_admit = self._h2d_admit_from_snapshot(
+            h2d_candidate_room,
+            gathered_headers,
+            gathered_entries[:, max_p:],
+            counts_t,
+        )
+        return prealloc_polls, transfer_polls, h2d_candidate_room, h2d_admit
+
+    @staticmethod
+    def _consensus_polls_by_room(
+        gathered_entries: torch.Tensor,
+        counts: List[int],
+        world_size: int,
+        fallback_status: int,
+    ) -> Dict[int, int]:
+        """Compute per-room consensus poll status from gathered queue entries.
+
+        A room reaches a non-fallback status only when every rank reported it;
+        Failed wins immediately; otherwise the min status across ranks is used.
+        """
+        present_counts: Dict[int, int] = {}
+        min_status_by_room: Dict[int, int] = {}
+        for entries, count in zip(gathered_entries, counts):
+            seen_rooms = set()
+            for i in range(count):
+                room = int(entries[i, 0].item())
+                poll = int(entries[i, 1].item())
+                if room in seen_rooms:
+                    min_status_by_room[room] = min(
+                        min_status_by_room.get(room, poll), poll
+                    )
+                    continue
+                seen_rooms.add(room)
+                present_counts[room] = present_counts.get(room, 0) + 1
+                min_status_by_room[room] = min(
+                    min_status_by_room.get(room, poll), poll
+                )
+
+        polls_by_room: Dict[int, int] = {}
+        for room, min_status in min_status_by_room.items():
+            if min_status == KVPoll.Failed:
+                polls_by_room[room] = int(KVPoll.Failed)
+            elif present_counts.get(room, 0) == world_size:
+                polls_by_room[room] = min_status
+            else:
+                polls_by_room[room] = int(fallback_status)
+        return polls_by_room
+
+    @staticmethod
+    def _common_room_with_state(
+        gathered_entries: torch.Tensor,
+        counts: List[int],
+        world_size: int,
+        required_state: int,
+    ) -> Optional[int]:
+        """Return the smallest room reported in the required state by every rank."""
+        states_by_room: Dict[int, Dict[int, int]] = {}
+        for rank, (entries, count) in enumerate(zip(gathered_entries, counts)):
+            for i in range(count):
+                room = int(entries[i, 0].item())
+                state = int(entries[i, 2].item())
+                states_by_room.setdefault(room, {})[rank] = state
+
+        common_rooms = [
+            room
+            for room, rank_states in states_by_room.items()
+            if len(rank_states) == world_size
+            and all(state == required_state for state in rank_states.values())
+        ]
+        return min(common_rooms) if common_rooms else None
+
+    @classmethod
+    def _consensus_transfer_polls_by_room(
+        cls,
+        gathered_entries: torch.Tensor,
+        counts: List[int],
+        world_size: int,
+    ) -> Dict[int, int]:
+        polls_by_room = cls._consensus_polls_by_room(
+            gathered_entries,
+            counts,
             world_size,
             int(KVPoll.Transferring),
         )
-        return prealloc_polls, transfer_polls, h2d_admit
+        entries_by_room: Dict[int, Dict[int, Tuple[int, int, int]]] = {}
+        for rank, (entries, count) in enumerate(zip(gathered_entries, counts)):
+            for i in range(count):
+                room = int(entries[i, 0].item())
+                entries_by_room.setdefault(room, {})[rank] = (
+                    int(entries[i, 1].item()),
+                    int(entries[i, 2].item()),
+                    int(entries[i, 3].item()),
+                )
 
+        for room, poll in list(polls_by_room.items()):
+            if poll != KVPoll.Success:
+                continue
+            rank_entries = entries_by_room.get(room, {})
+            if len(rank_entries) != world_size:
+                polls_by_room[room] = int(KVPoll.Transferring)
+                continue
+            if all(
+                state == PDD2HState.WAIT_PREFILL.value
+                for _, state, _ in rank_entries.values()
+            ):
+                metadata_rooms = [
+                    metadata_room for _, _, metadata_room in rank_entries.values()
+                ]
+                if any(
+                    metadata_room not in (0, room)
+                    for metadata_room in metadata_rooms
+                ):
+                    polls_by_room[room] = int(KVPoll.Failed)
+                elif not all(
+                    metadata_room == room for metadata_room in metadata_rooms
+                ):
+                    polls_by_room[room] = int(KVPoll.Transferring)
+        return polls_by_room
+
+    @staticmethod
+    def _h2d_admit_from_snapshot(
+        candidate_room: Optional[int],
+        gathered_headers: torch.Tensor,
+        gathered_transfer_entries: torch.Tensor,
+        transfer_counts: List[int],
+    ) -> bool:
+        if candidate_room is None:
+            return False
+
+        for rank, (entries, count) in enumerate(
+            zip(gathered_transfer_entries, transfer_counts)
+        ):
+            full_available = int(gathered_headers[rank, 3].item())
+            swa_available = int(gathered_headers[rank, 4].item())
+            reserved_decode_tokens = int(gathered_headers[rank, 5].item())
+            retract_in_progress = int(gathered_headers[rank, 6].item())
+            h2d_gate_busy = int(gathered_headers[rank, 7].item())
+
+            candidate_entry = next(
+                (
+                    entries[i]
+                    for i in range(count)
+                    if int(entries[i, 0].item()) == candidate_room
+                ),
+                None,
+            )
+            if candidate_entry is None:
+                return False
+            need_full = int(candidate_entry[4].item())
+            need_swa = int(candidate_entry[5].item())
+            if not PDDirect2HostManager.can_admit_h2d_from_snapshot(
+                need_full,
+                need_swa,
+                (
+                    full_available,
+                    swa_available,
+                    reserved_decode_tokens,
+                    retract_in_progress,
+                    h2d_gate_busy,
+                ),
+            ):
+                return False
+        return True
 
 class DecodePreallocQueue:
     """
@@ -581,20 +709,22 @@ class DecodePreallocQueue:
             )
         return int(bootstrap_room)
 
-    def local_poll_entries(self) -> List[Tuple[int, int]]:
-        """Snapshot (bootstrap_room, poll) for every queued request.
+    def local_poll_entries(self) -> List[Tuple[int, int, int, int, int, int]]:
+        """Snapshot prealloc room, poll, local state, and metadata placeholder.
 
         Pure local computation — the collective exchange is done by
         PDD2HFusedPoller so that all ranks issue exactly one collective per
         scheduler iteration regardless of local queue state.
         """
-        entries: List[Tuple[int, int]] = []
+        entries: List[Tuple[int, int, int, int, int, int]] = []
         for decode_req in self.queue:
             room = self._bootstrap_room(decode_req)
             if decode_req.waiting_for_input:
-                entries.append((room, int(KVPoll.WaitingForInput)))
+                entries.append((room, int(KVPoll.WaitingForInput), 1, -1, -1, -1))
             else:
-                entries.append((room, int(decode_req.kv_receiver.poll())))
+                entries.append(
+                    (room, int(decode_req.kv_receiver.poll()), 0, -1, -1, -1)
+                )
         return entries
 
     def _init_kv_manager(self) -> CommonKVManager:
@@ -1567,12 +1697,18 @@ class DecodeTransferQueue:
             total_reqs += len(last_batch.reqs)
         return self.scheduler.server_args.num_reserved_decode_tokens * total_reqs
 
-    def h2d_candidate(self) -> Optional[DecodeRequest]:
-        for i in self._queue_indices_by_bootstrap_room():
-            decode_req = self.queue[i]
-            if decode_req.pd_d2h_state is PDD2HState.HOST_READY:
-                return decode_req
-        return None
+    def find_by_bootstrap_room(self, bootstrap_room: int) -> Optional[DecodeRequest]:
+        matches = [
+            decode_req
+            for decode_req in self.queue
+            if self._bootstrap_room(decode_req) == bootstrap_room
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(
+                "Duplicate bootstrap_room in disagg decode transfer queue: "
+                f"tp_rank={self.tp_rank} bootstrap_room={bootstrap_room}"
+            )
+        return matches[0] if matches else None
 
     def start_h2d(self, pd_d2h_mgr, decode_req: DecodeRequest) -> None:
         if not pd_d2h_mgr.start_h2d(decode_req.req):
@@ -1582,33 +1718,51 @@ class DecodeTransferQueue:
         decode_req.pd_d2h_state = PDD2HState.H2D_INFLIGHT
         decode_req.req.time_stats.set_decode_h2d_wait_start_time()
 
-    def local_poll_entries(self, pd_d2h_mgr) -> List[Tuple[int, int]]:
-        """Snapshot (bootstrap_room, poll) for every queued request.
+    def _local_metadata_room(self, decode_req: DecodeRequest) -> int:
+        if _is_fake_transfer(decode_req.req, self.scheduler.server_args):
+            return self._bootstrap_room(decode_req)
+        idx = decode_req.metadata_buffer_index
+        *_, output_bootstrap_room = self.metadata_buffers.get_buf(idx)
+        return int(output_bootstrap_room[0].item())
+
+    def local_poll_entries(
+        self, pd_d2h_mgr
+    ) -> List[Tuple[int, int, int, int, int, int]]:
+        """Snapshot transfer room, poll, state, and visible metadata room.
 
         Pure local computation — the collective exchange is done by
         PDD2HFusedPoller (see DecodePreallocQueue.local_poll_entries).
         """
-        entries: List[Tuple[int, int]] = []
+        entries: List[Tuple[int, int, int, int, int, int]] = []
         for decode_req in self.queue:
             room = self._bootstrap_room(decode_req)
+            need_full, need_swa = pd_d2h_mgr.h2d_required_tokens(decode_req.req)
+            metadata_room = -1
             if decode_req.pd_d2h_state is PDD2HState.WAIT_PREFILL:
-                entries.append((room, int(decode_req.kv_receiver.poll())))
+                poll = int(decode_req.kv_receiver.poll())
+                if poll == KVPoll.Success:
+                    metadata_room = self._local_metadata_room(decode_req)
             elif decode_req.pd_d2h_state in (
                 PDD2HState.H2D_INFLIGHT,
                 PDD2HState.ABORT_PENDING_H2D,
             ):
-                entries.append(
-                    (
-                        room,
-                        (
-                            int(KVPoll.Success)
-                            if pd_d2h_mgr.is_h2d_ready(decode_req.req)
-                            else int(KVPoll.Transferring)
-                        ),
-                    )
+                poll = (
+                    int(KVPoll.Success)
+                    if pd_d2h_mgr.is_h2d_ready(decode_req.req)
+                    else int(KVPoll.Transferring)
                 )
             else:
-                entries.append((room, int(KVPoll.Transferring)))
+                poll = int(KVPoll.Transferring)
+            entries.append(
+                (
+                    room,
+                    poll,
+                    decode_req.pd_d2h_state.value,
+                    metadata_room,
+                    need_full,
+                    need_swa,
+                )
+            )
         return entries
 
     def _commit_transfer_to_req(
@@ -2136,31 +2290,47 @@ class SchedulerDisaggregationDecodeMixin:
 
         prealloc_polls_by_room: Optional[Dict[int, int]] = None
         transfer_polls_by_room: Optional[Dict[int, int]] = None
-        h2d_candidate = None
-        h2d_admit = False
         if pd_d2h_mgr is not None:
             if not hasattr(self, "pd_d2h_fused_poller"):
                 self.pd_d2h_fused_poller = PDD2HFusedPoller(
                     gloo_group=self.attn_tp_cpu_group,
                     tp_rank=self.tp_rank,
                 )
-            h2d_candidate = self.disagg_decode_transfer_queue.h2d_candidate()
             reserved_decode_tokens = (
                 self.disagg_decode_transfer_queue._h2d_reserved_decode_tokens()
             )
-            local_h2d_admit = h2d_candidate is not None and pd_d2h_mgr.can_admit_h2d(
-                h2d_candidate.req, reserved_decode_tokens
+            prealloc_entries = self.disagg_decode_prealloc_queue.local_poll_entries()
+            transfer_entries = self.disagg_decode_transfer_queue.local_poll_entries(
+                pd_d2h_mgr
             )
-            prealloc_polls_by_room, transfer_polls_by_room, h2d_admit = (
-                self.pd_d2h_fused_poller.poll(
-                    self.disagg_decode_prealloc_queue.local_poll_entries(),
-                    self.disagg_decode_transfer_queue.local_poll_entries(pd_d2h_mgr),
-                    local_h2d_admit,
+            admission_snapshot = pd_d2h_mgr.h2d_admission_snapshot(
+                reserved_decode_tokens
+            )
+            (
+                prealloc_polls_by_room,
+                transfer_polls_by_room,
+                candidate_room,
+                h2d_admit,
+            ) = self.pd_d2h_fused_poller.poll(
+                prealloc_entries,
+                transfer_entries,
+                admission_snapshot,
+            )
+            h2d_candidate = (
+                self.disagg_decode_transfer_queue.find_by_bootstrap_room(
+                    candidate_room
                 )
+                if candidate_room is not None
+                else None
             )
+            if candidate_room is not None and h2d_candidate is None:
+                raise RuntimeError(
+                    "TP-wide H2D candidate is missing from the local queue: "
+                    f"tp_rank={self.tp_rank} bootstrap_room={candidate_room}"
+                )
             if h2d_admit:
                 if h2d_candidate is None:
-                    raise RuntimeError("TP admitted H2D without a local candidate")
+                    raise RuntimeError("TP admitted H2D without a shared candidate")
                 self.disagg_decode_transfer_queue.start_h2d(
                     pd_d2h_mgr, h2d_candidate
                 )

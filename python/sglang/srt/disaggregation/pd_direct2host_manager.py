@@ -146,30 +146,52 @@ class PDDirect2HostManager:
             len(self.transit_state_pools),
         )
 
-    def _allocatable_tokens(self, req: "Req") -> Tuple[int, int, int, int]:
+    def h2d_required_tokens(self, req: "Req") -> Tuple[int, int]:
         host_indices = getattr(req, "host_kv_indices", None)
         if host_indices is None:
-            return 0, 0, 0, 0
+            return 0, 0
 
         need_full = len(host_indices)
         host_state_indices = getattr(req, "host_state_indices", None)
         need_swa = len(host_state_indices) if host_state_indices is not None else 0
+        return need_full, need_swa
 
+    def _available_tokens(self) -> Tuple[int, int]:
         if hasattr(self.token_to_kv_pool_allocator, "full_available_size"):
             full_available = self.token_to_kv_pool_allocator.full_available_size()
             swa_available = self.token_to_kv_pool_allocator.swa_available_size()
         else:
             full_available = self.token_to_kv_pool_allocator.available_size()
             swa_available = 0
+        return full_available, swa_available
 
-        return need_full, full_available, need_swa, swa_available
-
-    def _has_device_room_for_h2d(
-        self, req: "Req", reserved_decode_tokens: int
-    ) -> bool:
-        need_full, full_available, need_swa, swa_available = self._allocatable_tokens(
-            req
+    def h2d_admission_snapshot(
+        self, reserved_decode_tokens: int
+    ) -> Tuple[int, int, int, int, int]:
+        full_available, swa_available = self._available_tokens()
+        return (
+            full_available,
+            swa_available,
+            reserved_decode_tokens,
+            int(self.retract_in_progress),
+            int(self._h2d_gate_busy()),
         )
+
+    @staticmethod
+    def can_admit_h2d_from_snapshot(
+        need_full: int,
+        need_swa: int,
+        snapshot: Tuple[int, int, int, int, int],
+    ) -> bool:
+        (
+            full_available,
+            swa_available,
+            reserved_decode_tokens,
+            retract_in_progress,
+            h2d_gate_busy,
+        ) = snapshot
+        if retract_in_progress or h2d_gate_busy:
+            return False
         if need_full + reserved_decode_tokens > full_available:
             return False
         if need_swa > swa_available:
@@ -177,11 +199,10 @@ class PDDirect2HostManager:
         return True
 
     def can_admit_h2d(self, req: "Req", reserved_decode_tokens: int) -> bool:
-        if self.retract_in_progress:
-            return False
-        if self._h2d_gate_busy():
-            return False
-        return self._has_device_room_for_h2d(req, reserved_decode_tokens)
+        return self.can_admit_h2d_from_snapshot(
+            *self.h2d_required_tokens(req),
+            self.h2d_admission_snapshot(reserved_decode_tokens),
+        )
 
     def begin_retract(self) -> None:
         self.retract_in_progress = True

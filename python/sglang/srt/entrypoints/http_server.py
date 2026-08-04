@@ -1891,6 +1891,9 @@ def _execute_server_warmup(server_args: ServerArgs):
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
             request_name = "/generate"
+            warmup_room_base = (
+                uuid.uuid4().int % (2**63 // server_args.dp_size)
+            ) * server_args.dp_size
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
@@ -1901,7 +1904,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                 # This is a hack to ensure fake transfer is enabled during prefill warmup
                 # ensure each dp rank has a unique bootstrap_room during prefill warmup
                 "bootstrap_room": [
-                    i * (2**63 // server_args.dp_size) + (i % server_args.tp_size)
+                    warmup_room_base + i
                     for i in range(server_args.dp_size)
                 ],
                 "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,

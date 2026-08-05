@@ -1,11 +1,14 @@
 import unittest
+from types import SimpleNamespace
 from typing import Dict, List
 
 import requests
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import GetLoadsReqInput
 from sglang.srt.observability.metrics_collector import (
     ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS,
     compute_routing_key_stats,
@@ -298,6 +301,77 @@ class TestComputeRoutingKeyStats(unittest.TestCase):
         num_unique, req_counts = compute_routing_key_stats(routing_keys)
         self.assertEqual(num_unique, 4)
         self.assertEqual(sorted(req_counts), [1, 5, 15, 250])
+
+
+class TestGetLoadsNumUsedTokens(unittest.TestCase):
+    """Unit tests for SchedulerMetricsMixin.get_loads token accounting.
+
+    num_used_tokens (reported to the router) must include queued tokens so a
+    long backlog is not underestimated, while token_usage must stay based only
+    on KV-cache occupancy so it remains normalized in [0, 1].
+    """
+
+    MAX_TOTAL = 1000
+    KV_USED = 100  # KV-cache occupancy from _get_token_info()
+
+    def _make_scheduler(self, waiting_queue):
+        """Build a minimal mock scheduler for the non-hybrid `core`-only path."""
+        stats = SimpleNamespace(
+            gen_throughput=0.0,
+            cache_hit_rate=0.0,
+            utilization=0.0,
+        )
+        return SimpleNamespace(
+            dp_rank=0,
+            is_hybrid_swa=False,
+            is_hybrid_ssm=False,
+            _get_token_info=lambda: (self.KV_USED, 0, 0, 0),
+            waiting_queue=waiting_queue,
+            disaggregation_mode=DisaggregationMode.NULL,
+            running_batch=SimpleNamespace(reqs=[]),
+            max_total_num_tokens=self.MAX_TOTAL,
+            max_running_requests=256,
+            stats=stats,
+        )
+
+    def _call(self, waiting_queue):
+        # Imported lazily via the managers.scheduler package first: importing
+        # scheduler_metrics_mixin directly triggers a circular import
+        # (mixin <-> managers.scheduler) at collection time. Loading the
+        # scheduler package fully resolves the cycle before we grab the mixin.
+        import sglang.srt.managers.scheduler  # noqa: F401
+        from sglang.srt.observability.scheduler_metrics_mixin import (
+            SchedulerMetricsMixin,
+        )
+
+        scheduler = self._make_scheduler(waiting_queue)
+        req = GetLoadsReqInput(include=["core"])
+        return SchedulerMetricsMixin.get_loads(scheduler, req)
+
+    def test_empty_waiting_queue(self):
+        out = self._call([])
+        self.assertEqual(out.num_used_tokens, self.KV_USED)
+        self.assertEqual(out.num_waiting_reqs, 0)
+        self.assertEqual(out.token_usage, round(self.KV_USED / self.MAX_TOTAL, 4))
+
+    def test_waiting_queue_counted_in_num_used_tokens(self):
+        waiting = [SimpleNamespace(seqlen=30), SimpleNamespace(seqlen=70)]
+        out = self._call(waiting)
+
+        # Reported token count includes queued tokens (100 + 30 + 70).
+        self.assertEqual(out.num_used_tokens, self.KV_USED + 100)
+        self.assertEqual(out.num_waiting_reqs, 2)
+
+    def test_token_usage_excludes_waiting_queue(self):
+        # A backlog far larger than the KV cache must not push token_usage > 1.
+        waiting = [SimpleNamespace(seqlen=self.MAX_TOTAL * 5)]
+        out = self._call(waiting)
+
+        # token_usage stays based only on KV occupancy → normalized in [0, 1].
+        self.assertEqual(out.token_usage, round(self.KV_USED / self.MAX_TOTAL, 4))
+        self.assertLessEqual(out.token_usage, 1.0)
+        # ...but the raw count still reflects the backlog.
+        self.assertEqual(out.num_used_tokens, self.KV_USED + self.MAX_TOTAL * 5)
 
 
 if __name__ == "__main__":

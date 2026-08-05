@@ -1044,6 +1044,14 @@ class SchedulerMetricsMixin:
             else 0.0
         )
 
+        # token_usage above reflects only KV cache occupancy (running reqs) so it
+        # stays normalized in [0, 1]. The reported num_used_tokens additionally
+        # includes tokens queued for processing (waiting/bootstrap/prealloc), so
+        # the router does not underestimate load on instances with a long backlog.
+        num_used_tokens += sum(
+            req.seqlen for queue in waiting_queues for req in queue
+        )
+
         memory = None
         if include_all or "memory" in include:
             try:

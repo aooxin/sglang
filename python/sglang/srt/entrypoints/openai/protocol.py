@@ -287,6 +287,16 @@ class CompletionRequest(BaseModel):
     return_hidden_states: bool = False
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
+    return_tokens_only: bool = Field(
+        default=False,
+        exclude=True,
+        description="Internal: stop after tokenization and return token IDs. Used by tokenize_proxy.",
+    )
+    return_hash_values: bool = Field(
+        default=False,
+        exclude=True,
+        description="Internal: return SHA256 hash values for HiCache block queries. Only used when return_tokens_only=true.",
+    )
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -607,6 +617,16 @@ class ChatCompletionRequest(BaseModel):
     return_hidden_states: bool = False
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
+    return_tokens_only: bool = Field(
+        default=False,
+        exclude=True,
+        description="Internal: stop after tokenization and return token IDs. Used by tokenize_proxy.",
+    )
+    return_hash_values: bool = Field(
+        default=False,
+        exclude=True,
+        description="Internal: return SHA256 hash values for HiCache block queries. Only used when return_tokens_only=true.",
+    )
     reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
@@ -1121,6 +1141,7 @@ class TokenizeResponse(BaseModel):
     tokens: Union[List[int], List[List[int]]]
     count: Union[int, List[int]]
     max_model_len: int
+    hash_values: Optional[Union[List[str], List[List[str]]]] = None
 
 
 class DetokenizeRequest(BaseModel):

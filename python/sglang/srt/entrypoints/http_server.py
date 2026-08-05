@@ -102,6 +102,7 @@ from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
 from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,
+    OpenAIServingTokenizeProxy,
 )
 from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
@@ -306,6 +307,12 @@ async def lifespan(fast_api_app: FastAPI):
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
         _global_state.tokenizer_manager
+    )
+    fast_api_app.state.openai_serving_tokenize_proxy = OpenAIServingTokenizeProxy(
+        _global_state.tokenizer_manager,
+        fast_api_app.state.openai_serving_chat,
+        fast_api_app.state.openai_serving_completion,
+        generate_request,
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
         _global_state.tokenizer_manager
@@ -664,6 +671,19 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
     obj.http_arrival_time = time.time()
+    if obj.return_tokens_only:
+        from sglang.srt.entrypoints.openai.utils import tokenize_or_passthrough
+
+        tokenizer = _global_state.tokenizer_manager.tokenizer
+        max_model_len = _global_state.tokenizer_manager.model_config.context_len
+        if obj.input_ids is not None:
+            inputs = obj.input_ids
+        elif obj.text is not None:
+            inputs = obj.text
+        else:
+            raise ValueError("return_tokens_only requires text or input_ids")
+        return tokenize_or_passthrough(tokenizer, inputs, max_model_len)
+
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -1480,6 +1500,17 @@ async def openai_v1_detokenize(request: DetokenizeRequest, raw_request: Request)
     """OpenAI-compatible detokenization endpoint."""
     return await raw_request.app.state.openai_serving_detokenize.handle_request(
         request, raw_request
+    )
+
+
+@app.post(
+    "/v1/tokenize_proxy",
+    dependencies=[Depends(validate_json_request)],
+)
+async def openai_v1_tokenize_proxy(raw_request: Request):
+    """Tokenize endpoint that proxies to inference endpoints for 100% consistency."""
+    return await raw_request.app.state.openai_serving_tokenize_proxy.handle_request(
+        raw_request
     )
 
 

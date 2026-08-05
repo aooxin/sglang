@@ -171,6 +171,10 @@ class GenerateReqInput(BaseReq):
     return_routed_experts: bool = False
     # The start location in the prompt for returning routed experts.
     routed_experts_start_len: int = 0
+    # If true, stop after tokenization and return token IDs instead of generated text.
+    return_tokens_only: bool = False
+    # If true, return SHA256 hash values for HiCache block queries.
+    return_hash_values: bool = False
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None

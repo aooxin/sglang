@@ -54,6 +54,37 @@ def hash_str_to_int64(hash_str: str) -> int:
     return uint64_val
 
 
+def compute_hash_values(
+    token_ids: List[int], page_size: int, prior_hash: Optional[str] = None
+) -> List[str]:
+    """Compute SHA256-based hash values for token IDs, one per complete page.
+
+    Uses the same logic as RadixCache.compute_node_hash_values() to ensure
+    hash values are consistent with those used for HiCache block queries.
+
+    Only computes hashes for full pages (page_size tokens each). The trailing
+    tokens that don't fill a complete page are skipped because HiCache only
+    stores page-aligned blocks — a partial-page hash would never match.
+
+    Args:
+        token_ids: List of token IDs to hash.
+        page_size: Page size for chunking tokens.
+        prior_hash: Optional prior hash value to chain from (e.g., parent node's last hash).
+
+    Returns:
+        List of SHA256 hex strings, one per complete page.
+    """
+    aligned_len = len(token_ids) // page_size * page_size
+    hash_values: List[str] = []
+    parent_hash = prior_hash
+    for start in range(0, aligned_len, page_size):
+        page_tokens = token_ids[start : start + page_size]
+        hash_val = get_hash_str(page_tokens, prior_hash=parent_hash)
+        hash_values.append(hash_val)
+        parent_hash = hash_val
+    return hash_values
+
+
 @dataclass
 class HiCacheStorageConfig:
     tp_rank: int

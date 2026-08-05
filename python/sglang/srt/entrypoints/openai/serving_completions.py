@@ -181,8 +181,18 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
-    ) -> Union[StreamingResponse, ErrorResponse]:
+    ) -> Union[StreamingResponse, ErrorResponse, dict]:
         """Handle streaming completion request"""
+        if request.return_tokens_only:
+            from sglang.srt.entrypoints.openai.utils import tokenize_or_passthrough
+
+            tokenizer = self.tokenizer_manager.tokenizer
+            max_model_len = self.tokenizer_manager.model_config.context_len
+            prompt = request.prompt
+            if self.template_manager.completion_template_name is not None:
+                prompt = generate_completion_prompt_from_request(request)
+            return tokenize_or_passthrough(tokenizer, prompt, max_model_len)
+
         generator = self._generate_completion_stream(
             adapted_request, request, raw_request
         )
@@ -411,8 +421,18 @@ class OpenAIServingCompletion(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: CompletionRequest,
         raw_request: Request,
-    ) -> Union[CompletionResponse, ErrorResponse, ORJSONResponse]:
+    ) -> Union[CompletionResponse, ErrorResponse, ORJSONResponse, dict]:
         """Handle non-streaming completion request"""
+        if request.return_tokens_only:
+            from sglang.srt.entrypoints.openai.utils import tokenize_or_passthrough
+
+            tokenizer = self.tokenizer_manager.tokenizer
+            max_model_len = self.tokenizer_manager.model_config.context_len
+            prompt = request.prompt
+            if self.template_manager.completion_template_name is not None:
+                prompt = generate_completion_prompt_from_request(request)
+            return tokenize_or_passthrough(tokenizer, prompt, max_model_len)
+
         try:
             generator = self.tokenizer_manager.generate_request(
                 adapted_request, raw_request

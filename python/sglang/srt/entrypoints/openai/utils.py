@@ -132,3 +132,51 @@ def process_cached_tokens_details_from_ret(
             device=details.get("device", 0),
             host=details.get("host", 0),
         )
+
+
+def tokenize_or_passthrough(
+    tokenizer,
+    prompts: Union[str, List[int], List[str], List[List[int]]],
+    max_model_len: int,
+) -> Dict[str, Any]:
+    """Tokenize prompts or pass through pre-tokenized input_ids.
+
+    Returns a dict with "tokens", "count", and "max_model_len" suitable for
+    return_tokens_only responses. Handles both single and batch inputs.
+    """
+    if isinstance(prompts, str):
+        tokens = tokenizer.encode(prompts)
+        return {"tokens": tokens, "count": len(tokens), "max_model_len": max_model_len}
+
+    if not isinstance(prompts, list):
+        raise ValueError(f"prompts must be str or list, got {type(prompts).__name__}")
+
+    # Empty batch
+    if len(prompts) == 0:
+        return {"tokens": [], "count": [], "max_model_len": max_model_len}
+
+    # Single pre-tokenized sequence: List[int]
+    is_single = isinstance(prompts[0], int)
+    if is_single:
+        return {
+            "tokens": prompts,
+            "count": len(prompts),
+            "max_model_len": max_model_len,
+        }
+
+    # Batch: List[str] or List[List[int]]
+    all_tokens = []
+    for p in prompts:
+        if isinstance(p, str):
+            all_tokens.append(tokenizer.encode(p))
+        elif isinstance(p, list):
+            all_tokens.append(p)
+        else:
+            raise ValueError(
+                f"Each prompt must be str or list of int, got {type(p).__name__}"
+            )
+    return {
+        "tokens": all_tokens,
+        "count": [len(t) for t in all_tokens],
+        "max_model_len": max_model_len,
+    }

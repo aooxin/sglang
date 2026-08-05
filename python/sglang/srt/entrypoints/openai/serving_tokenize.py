@@ -1,10 +1,17 @@
+import asyncio
 import logging
+import os
+import time
+import uuid
 from http import HTTPStatus
-from typing import List, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Union
 
-from fastapi import Request
+from fastapi import HTTPException, Request
+from pydantic import ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
     DetokenizeRequest,
     DetokenizeResponse,
     ErrorResponse,
@@ -12,6 +19,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     TokenizeResponse,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.utils.json_response import orjson_response
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
 
@@ -142,3 +154,118 @@ class OpenAIServingDetokenize(OpenAIServingBase):
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
+
+
+class OpenAIServingTokenizeProxy:
+    """Handler for /v1/tokenize_proxy.
+
+    Proxies tokenize requests to inference endpoints via return_tokens_only,
+    ensuring 100% consistency with the tokenization used during inference.
+    """
+
+    def __init__(
+        self,
+        tokenizer_manager: "TokenizerManager",
+        openai_serving_chat: Any,
+        openai_serving_completion: Any,
+        generate_handler: Callable,
+    ):
+        self.tokenizer_manager = tokenizer_manager
+        self.openai_serving_chat = openai_serving_chat
+        self.openai_serving_completion = openai_serving_completion
+        self.generate_handler = generate_handler
+
+    async def handle_request(self, raw_request: Request):
+        t_start = time.perf_counter()
+
+        body = await raw_request.json()
+        t_parse = time.perf_counter()
+
+        body["return_tokens_only"] = True
+        need_hash = body.pop("return_hash_values", False)
+        rid = body.get("rid") or f"tokproxy-{uuid.uuid4().hex[:8]}"
+
+        try:
+            if "messages" in body:
+                endpoint = "chat"
+                body.setdefault("max_tokens", 1)
+                request = ChatCompletionRequest(**body)
+                t_validate = time.perf_counter()
+                result = await self.openai_serving_chat.handle_request(
+                    request, raw_request
+                )
+            elif "prompt" in body:
+                endpoint = "completions"
+                body.setdefault("max_tokens", 1)
+                request = CompletionRequest(**body)
+                t_validate = time.perf_counter()
+                result = await self.openai_serving_completion.handle_request(
+                    request, raw_request
+                )
+            elif "text" in body:
+                endpoint = "generate"
+                request = GenerateReqInput(**body)
+                t_validate = time.perf_counter()
+                result = await self.generate_handler(request, raw_request)
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Missing 'messages', 'prompt' or 'text'",
+                )
+        except HTTPException:
+            raise
+        except (TypeError, ValueError, ValidationError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        t_tokenize = time.perf_counter()
+
+        if not isinstance(result, dict):
+            logger.debug(
+                "[tokenize_proxy] rid=%s endpoint=%s error_response "
+                "parse=%.1fms validate=%.1fms tokenize=%.1fms total=%.1fms",
+                rid,
+                endpoint,
+                (t_parse - t_start) * 1000,
+                (t_validate - t_parse) * 1000,
+                (t_tokenize - t_validate) * 1000,
+                (t_tokenize - t_start) * 1000,
+            )
+            return result
+
+        # Compute hash values if requested
+        if need_hash:
+            from sglang.srt.mem_cache.hicache_storage import compute_hash_values
+
+            page_size = self.tokenizer_manager.server_args.page_size
+            tokens = result["tokens"]
+            if not tokens:
+                result["hash_values"] = []
+            elif isinstance(tokens[0], list):
+                result["hash_values"] = await asyncio.to_thread(
+                    lambda: [compute_hash_values(t, page_size) for t in tokens]
+                )
+            else:
+                result["hash_values"] = await asyncio.to_thread(
+                    compute_hash_values, tokens, page_size
+                )
+
+        t_hash = time.perf_counter()
+
+        result["max_model_len"] = self.tokenizer_manager.model_config.context_len
+        t_end = time.perf_counter()
+
+        token_count = result["count"] if isinstance(result["count"], int) else sum(result["count"])
+        logger.debug(
+            "[tokenize_proxy] pid=%d rid=%s endpoint=%s tokens=%d "
+            "parse=%.1fms validate=%.1fms tokenize=%.1fms hash=%.1fms total=%.1fms",
+            os.getpid(),
+            rid,
+            endpoint,
+            token_count,
+            (t_parse - t_start) * 1000,
+            (t_validate - t_parse) * 1000,
+            (t_tokenize - t_validate) * 1000,
+            (t_hash - t_tokenize) * 1000,
+            (t_end - t_start) * 1000,
+        )
+        return orjson_response(result)

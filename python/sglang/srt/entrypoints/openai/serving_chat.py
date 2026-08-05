@@ -272,13 +272,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 return f"Tool '{tool_name}' not found in tools list."
 
         # Validate tool definitions
-        for i, tool in enumerate(request.tools or []):
-            if tool.function.parameters is None:
-                continue
-            try:
-                Draft202012Validator.check_schema(tool.function.parameters)
-            except SchemaError as e:
-                return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
+        if not request.return_tokens_only:
+            for i, tool in enumerate(request.tools or []):
+                if tool.function.parameters is None:
+                    continue
+                try:
+                    Draft202012Validator.check_schema(tool.function.parameters)
+                except SchemaError as e:
+                    return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = self.tokenizer_manager.server_args.context_length
@@ -322,6 +323,15 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
+
+        # Fast path: return_tokens_only directly returns prompt_ids from _process_messages.
+        # NOTE: only handles text requests for now; multimodal inputs (image_data,
+        # video_data, audio_data) are passed in the normal path below (GenerateReqInput at ~line 363).
+        if request.return_tokens_only:
+            adapted_request = GenerateReqInput(
+                input_ids=processed_messages.prompt_ids,
+            )
+            return adapted_request, request
 
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
@@ -792,8 +802,13 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
         raw_request: Request,
-    ) -> Union[StreamingResponse, ErrorResponse]:
+    ) -> Union[StreamingResponse, ErrorResponse, ORJSONResponse, dict]:
         """Handle streaming chat completion request"""
+        if request.return_tokens_only:
+            prompt_ids = adapted_request.input_ids
+            max_model_len = self.tokenizer_manager.model_config.context_len
+            return {"tokens": prompt_ids, "count": len(prompt_ids), "max_model_len": max_model_len}
+
         generator = self._generate_chat_stream(adapted_request, request, raw_request)
 
         # Kick-start the generator to trigger validation before HTTP 200 is sent.
@@ -1231,8 +1246,13 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
         raw_request: Request,
-    ) -> Union[ChatCompletionResponse, ErrorResponse, ORJSONResponse]:
+    ) -> Union[ChatCompletionResponse, ErrorResponse, ORJSONResponse, dict]:
         """Handle non-streaming chat completion request"""
+        if request.return_tokens_only:
+            prompt_ids = adapted_request.input_ids
+            max_model_len = self.tokenizer_manager.model_config.context_len
+            return {"tokens": prompt_ids, "count": len(prompt_ids), "max_model_len": max_model_len}
+
         try:
             ret = await self.tokenizer_manager.generate_request(
                 adapted_request, raw_request

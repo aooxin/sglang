@@ -61,6 +61,7 @@ class PrefillServerInfo:
     target_pp_ranks: Optional[List[int]] = None
     required_dst_info_num: Optional[int] = None
     required_prefill_response_num: Optional[int] = None
+    instance_epoch: Optional[int] = None
 
     def __post_init__(self):
         self.attn_tp_size = int(self.attn_tp_size)
@@ -368,7 +369,10 @@ class CommonKVManager(BaseKVManager):
         try:
             response = requests.put(url, json=payload, timeout=5)
             if response.status_code == 200:
-                logger.debug("Prefill successfully registered to bootstrap server.")
+                logger.info(
+                    "Prefill rank registered to bootstrap server: "
+                    f"bootstrap_url={url}, rank_ip={self.local_ip}, rank_port={self.rank_port}"
+                )
             else:
                 logger.error(
                     f"Prefill instance failed to connect to bootstrap server: {response.status_code}, {response.text}"
@@ -810,6 +814,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
+        self.instance_epoch = time.time_ns()
         self.app = web.Application()
         self.store = dict()
         self.lock = asyncio.Lock()
@@ -858,7 +863,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app.router.add_get("/health", self._handle_health_check)
 
     async def _handle_health_check(self, request):
-        return web.Response(text="OK", status=200)
+        return web.json_response({"instance_epoch": self.instance_epoch}, status=200)
 
     async def _handle_route(self, request: web.Request):
         method = request.method
@@ -975,6 +980,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
+                instance_epoch=self.instance_epoch,
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 

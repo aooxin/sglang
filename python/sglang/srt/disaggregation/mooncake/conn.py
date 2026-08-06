@@ -1695,6 +1695,36 @@ class MooncakeKVManager(CommonKVManager):
                         if response.status_code == 200:
                             self.heartbeat_failures[bootstrap_addr] = 0
 
+                            try:
+                                current_epoch = response.json().get("instance_epoch")
+                            except Exception:
+                                current_epoch = None
+
+                            with self.connection_lock:
+                                prefill_info = self.prefill_info_table.get(
+                                    bootstrap_addr
+                                )
+                                cached_epoch = (
+                                    prefill_info.instance_epoch
+                                    if prefill_info is not None
+                                    else None
+                                )
+                            if (
+                                current_epoch is not None
+                                and cached_epoch is not None
+                                and current_epoch != cached_epoch
+                            ):
+                                logger.warning(
+                                    "Prefill instance restarted, evicting stale connection cache: "
+                                    f"bootstrap_addr={bootstrap_addr}, "
+                                    f"old_epoch={cached_epoch}, new_epoch={current_epoch}"
+                                )
+                                self._handle_node_failure(bootstrap_addr)
+                                with self.session_pool_lock:
+                                    if bootstrap_addr in self.session_pool:
+                                        del self.session_pool[bootstrap_addr]
+                                continue
+
                             current_rooms = self.addr_to_rooms_tracker[
                                 bootstrap_addr
                             ].copy()

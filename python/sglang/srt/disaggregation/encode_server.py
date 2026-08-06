@@ -14,6 +14,7 @@ import time
 import traceback
 from collections import defaultdict
 from http import HTTPStatus
+from multiprocessing import Queue
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
@@ -34,6 +35,7 @@ from sglang.srt.disaggregation.encode_receiver import (
     EmbeddingData,
     video_meta_attrs_for,
 )
+from sglang.srt.disaggregation.image_loader import _MultiImageProcessingLoader
 from sglang.srt.distributed.parallel_state import (
     get_default_distributed_backend,
     get_mooncake_transfer_engine,
@@ -80,6 +82,10 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+IMAGE_LOADER_NUM_WORKERS = int(os.getenv("SGLANG_IMAGE_LOADER_NUM_WORKERS", "10"))
+image_processing_queue = Queue(maxsize=65535)
+image_processed_queue = Queue(maxsize=65535)
 
 HEALTH_CHECK_TIMEOUT = 30
 
@@ -217,6 +223,134 @@ def _get_mm_feature(mm_inputs, modality):
 def _build_mm_aux_data(mm_inputs, model_type=None):
     # Video aux metadata, scoped to model_type's video-meta attrs.
     return {attr: mm_inputs.get(attr) for attr in video_meta_attrs_for(model_type)}
+
+
+_image_grid_attrs = ["image_grid_thw", "image_grid_hws"]
+
+
+def _get_image_grid_dim(images_input):
+    for attr in _image_grid_attrs:
+        if attr in images_input:
+            return images_input[attr]
+    raise ValueError(
+        f"Image grid dim ({_image_grid_attrs}) not found in {images_input}"
+    )
+
+
+def _get_image_grid_attr_name(images_input):
+    """Get the name of the grid attribute used in images_input."""
+    for attr in _image_grid_attrs:
+        if attr in images_input:
+            return attr
+    raise ValueError(
+        f"Image grid dim ({_image_grid_attrs}) not found in {images_input}"
+    )
+
+
+def _compute_grid_products(grid_dim, grid_attr_name: str) -> List[int]:
+    """
+    Compute the raw grid products for each image (before any merge factor).
+
+    Args:
+        grid_dim: Grid dimensions tensor/list.
+                  For image_grid_thw: tensor of shape (num_images, 3) with (t, h, w)
+                  For image_grid_hws: list of (h, w) tuples
+        grid_attr_name: The attribute name ("image_grid_thw" or "image_grid_hws")
+
+    Returns:
+        List of grid products, one per image
+    """
+    grid_products = []
+
+    if grid_attr_name == "image_grid_thw":
+        # grid_dim is tensor of shape (num_images, 3) with (temporal, height, width)
+        if isinstance(grid_dim, torch.Tensor):
+            for i in range(grid_dim.shape[0]):
+                t, h, w = grid_dim[i].tolist()
+                product = int(t * h * w)
+                grid_products.append(product)
+        elif isinstance(grid_dim, (list, tuple)):
+            for grid in grid_dim:
+                if isinstance(grid, torch.Tensor):
+                    t, h, w = grid.tolist()
+                else:
+                    t, h, w = grid
+                product = int(t * h * w)
+                grid_products.append(product)
+    elif grid_attr_name == "image_grid_hws":
+        # grid_dim is list of (height, width) tuples
+        if isinstance(grid_dim, torch.Tensor):
+            for i in range(grid_dim.shape[0]):
+                h, w = grid_dim[i].tolist()
+                product = int(h * w)
+                grid_products.append(product)
+        elif isinstance(grid_dim, (list, tuple)):
+            for grid in grid_dim:
+                if isinstance(grid, torch.Tensor):
+                    h, w = grid.tolist()
+                else:
+                    h, w = grid
+                product = int(h * w)
+                grid_products.append(product)
+    else:
+        # Fallback: try to compute product of dimensions
+        if isinstance(grid_dim, torch.Tensor):
+            for i in range(grid_dim.shape[0]):
+                product = int(torch.prod(grid_dim[i]).item())
+                grid_products.append(product)
+        elif isinstance(grid_dim, (list, tuple)):
+            for grid in grid_dim:
+                if isinstance(grid, torch.Tensor):
+                    product = int(torch.prod(grid).item())
+                else:
+                    product = int(np.prod(grid))
+                grid_products.append(product)
+
+    return grid_products
+
+
+def _compute_tokens_per_image(
+    grid_products: List[int],
+    total_tokens: int,
+) -> List[int]:
+    """
+    Compute the actual number of tokens for each image, accounting for model merge factors.
+
+    The model may apply spatial merging (e.g., merge_size=2 means 2x2 patches merged into 1),
+    so actual tokens = grid_product / merge_factor^2.
+
+    We compute the merge factor from the total tokens and grid products.
+
+    Args:
+        grid_products: List of grid products (t*h*w or h*w) per image
+        total_tokens: Actual total tokens from model output
+
+    Returns:
+        List of actual token counts per image
+    """
+    total_grid_product = sum(grid_products)
+
+    if total_grid_product == 0:
+        return [0] * len(grid_products)
+
+    # Compute the ratio (merge factor squared)
+    # This handles cases where model applies spatial merging
+    ratio = total_grid_product / total_tokens
+
+    # Calculate tokens per image based on the ratio
+    tokens_per_image = []
+    for product in grid_products:
+        tokens = int(round(product / ratio))
+        tokens_per_image.append(tokens)
+
+    # Adjust for rounding errors to ensure sum matches exactly
+    current_sum = sum(tokens_per_image)
+    if current_sum != total_tokens and len(tokens_per_image) > 0:
+        # Distribute the difference to the last image
+        diff = total_tokens - current_sum
+        tokens_per_image[-1] += diff
+
+    return tokens_per_image
 
 
 def _describe_mm_source(mm_items, max_len: int = 96) -> str:
@@ -430,7 +564,131 @@ class MMEncoder:
 
             self.embedding_to_send = dict()
 
+        self.image_loader = _MultiImageProcessingLoader(
+            IMAGE_LOADER_NUM_WORKERS,
+            self.load_image_sync,
+            image_processing_queue,
+            image_processed_queue,
+        )
         logger.info(f"rank {rank} init finish ")
+
+    def load_image_sync(self, input_queue, output_queue):
+        while True:
+            batch_mm_items, modality, input_texts, batch_id = input_queue.get()
+            all_image, images_per_request, total_images = self.load_image_process(
+                batch_mm_items, modality, input_texts
+            )
+            output_queue.put((all_image, images_per_request, total_images, batch_id))
+
+    def load_image_process(
+        self,
+        batch_mm_items: List[List],
+        modality: Modality = Modality.IMAGE,
+        input_texts: List[str] = None,
+    ):
+        if input_texts is None:
+            input_texts = [""] * len(batch_mm_items)
+
+        # Currently only support IMAGE modality for batching
+        if modality != Modality.IMAGE:
+            # Fall back to sequential processing for non-image modalities
+            results = []
+            for i, mm_items in enumerate(batch_mm_items):
+                input_text = input_texts[i] if i < len(input_texts) else ""
+                loop = asyncio.get_running_loop()
+                result = loop.run_until_complete(
+                    self._encode(mm_items, modality, input_text)
+                )
+                results.append(result)
+            return results
+
+        # Step 1: Load and collect all images in parallel, tracking which belong to
+        # which request
+        all_images = []
+        images_per_request = []  # Number of images in each request
+
+        # Flatten all mm_items with their indices for parallel loading
+        load_tasks = []  # List of (req_idx, img_idx, mm_item)
+        for req_idx, mm_items in enumerate(batch_mm_items):
+            if not isinstance(mm_items, (list, tuple)):
+                mm_items = [mm_items]
+            for img_idx, mm_item in enumerate(mm_items):
+                load_tasks.append((req_idx, img_idx, mm_item))
+
+        # Parallel image loading function
+        async def load_single_image(
+            req_idx: int, img_idx: int, mm_item
+        ) -> Tuple[int, int, any]:
+            """Load a single image, returns (req_idx, img_idx, loaded_image)."""
+            loop = asyncio.get_event_loop()
+            try:
+                # Run blocking load_image in thread pool
+                loaded = await loop.run_in_executor(None, lambda: load_image(mm_item))
+                return (req_idx, img_idx, loaded[0] if loaded else None)
+            except Exception as e:
+                item_preview = (
+                    mm_item[:200] if isinstance(mm_item, str) else str(type(mm_item))
+                )
+                logger.error(
+                    f"Failed to load image {img_idx} in request {req_idx}: "
+                    f"item={item_preview}, error={type(e).__name__}: {e}"
+                )
+                raise RuntimeError(
+                    f"Failed to load image {img_idx} in request {req_idx} "
+                    f"(item={item_preview[:50]}...): {type(e).__name__}: {e}"
+                ) from e
+
+        # Load all images in parallel
+        logger.info(f"Loading {len(load_tasks)} images in parallel...")
+        load_start = time.perf_counter()
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        parallel_results = loop.run_until_complete(
+            asyncio.gather(
+                *[
+                    load_single_image(req_idx, img_idx, mm_item)
+                    for req_idx, img_idx, mm_item in load_tasks
+                ],
+                return_exceptions=True,
+            )
+        )
+
+        load_end = time.perf_counter()
+        logger.info(
+            f"Parallel image loading took {(load_end - load_start) * 1000:.2f}ms"
+        )
+
+        # Check for errors
+        for i, result in enumerate(parallel_results):
+            if isinstance(result, Exception):
+                raise result
+
+        # Organize results by request
+        # Build a dict: req_idx -> [(img_idx, image), ...]
+        images_by_request = {}
+        for req_idx, img_idx, image in parallel_results:
+            if req_idx not in images_by_request:
+                images_by_request[req_idx] = []
+            images_by_request[req_idx].append((img_idx, image))
+
+        # Sort images within each request by img_idx and collect
+        for req_idx in range(len(batch_mm_items)):
+            if req_idx in images_by_request:
+                # Sort by img_idx to maintain order
+                sorted_images = sorted(images_by_request[req_idx], key=lambda x: x[0])
+                req_images = [img for _, img in sorted_images]
+                images_per_request.append(len(req_images))
+                all_images.extend(req_images)
+            else:
+                images_per_request.append(0)
+
+        total_images = len(all_images)
+        logger.info(
+            f"Batch processing {total_images} images from "
+            f"{len(batch_mm_items)} requests"
+        )
+        return all_images, images_per_request, total_images
 
     def _infer_embedding_dims(self) -> dict:
         """Infer per-modality embedding dimensions from hf_config at init time."""

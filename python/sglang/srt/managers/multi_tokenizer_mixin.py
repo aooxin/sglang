@@ -321,18 +321,27 @@ class MultiHttpWorkerDetokenizerMixin:
         self.socket_mapping = SocketMapping()
         while True:
             recv_obj = self.recv_from_scheduler.recv_pyobj()
-            output = self._request_dispatcher(recv_obj)
-            if output is None:
+            try:
+                output = self._request_dispatcher(recv_obj)
+                if output is None:
+                    continue
+
+                assert isinstance(
+                    recv_obj, BaseBatchReq
+                ), "for multi-http-worker, recv_obj must be BaseBatchReq"
+
+                # Send data using the corresponding socket
+                for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
+                    new_output = _handle_output_by_index(output, i)
+                    self.socket_mapping.send_output(ipc_name, new_output)
+            except Exception:
+                # One bad request (e.g. KeyError from a duplicated rid) must not crash the process.
+                rids = getattr(recv_obj, "rids", None) or getattr(recv_obj, "rid", None)
+                logger.error(
+                    f"Detokenizer failed to handle {type(recv_obj).__name__} "
+                    f"(rid={rids}), skipping this batch:\n{get_exception_traceback()}"
+                )
                 continue
-
-            assert isinstance(
-                recv_obj, BaseBatchReq
-            ), "for multi-http-worker, recv_obj must be BaseBatchReq"
-
-            # Send data using the corresponding socket
-            for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
-                new_output = _handle_output_by_index(output, i)
-                self.socket_mapping.send_output(ipc_name, new_output)
 
 
 class MultiTokenizerRouter:

@@ -3625,6 +3625,10 @@ class Scheduler(
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+            # A retracted-then-aborted request still has decode_status in detoken;
+            # mirror the abort there too. Skip if skip_tokenizer_init (sockets alias).
+            if not self.skip_tokenizer_init:
+                self.send_to_detokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if self.enable_hisparse:

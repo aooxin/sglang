@@ -259,7 +259,7 @@ class GenerateReqInput(BaseReq):
             or has_valid_data(self.audio_data)
         )
 
-    def normalize_batch_and_arguments(self):
+    def normalize_batch_and_arguments(self, force_unique_rid: bool = False):
         """
         Normalize the batch size and arguments for the request.
 
@@ -267,6 +267,10 @@ class GenerateReqInput(BaseReq):
         are properly formatted as either single values or batches depending on the input.
         It also handles parallel sampling expansion and sets default values for
         unspecified parameters.
+
+        Args:
+            force_unique_rid: When True, append a unique suffix to a client-supplied
+                rid (kept as prefix) so reused rids do not collide in decode_status.
 
         Raises:
             ValueError: If inputs are not properly specified (e.g., none or all of
@@ -289,9 +293,9 @@ class GenerateReqInput(BaseReq):
         self._handle_parallel_sampling()
 
         if self.is_single:
-            self._normalize_single_inputs()
+            self._normalize_single_inputs(force_unique_rid)
         else:
-            self._normalize_batch_inputs()
+            self._normalize_batch_inputs(force_unique_rid)
 
         self._validate_rid_uniqueness()
 
@@ -362,12 +366,15 @@ class GenerateReqInput(BaseReq):
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
 
-    def _normalize_single_inputs(self):
+    def _normalize_single_inputs(self, force_unique_rid: bool = False):
         """Normalize inputs for a single example."""
         if self.sampling_params is None:
             self.sampling_params = {}
         if self.rid is None:
             self.rid = uuid.uuid4().hex
+        elif force_unique_rid:
+            # Keep client rid as prefix (abort-by-prefix), add suffix to avoid collision.
+            self.rid = f"{self.rid}_{uuid.uuid4().hex}"
         if self.return_logprob is None:
             self.return_logprob = False
         if self.logprob_start_len is None:
@@ -377,7 +384,7 @@ class GenerateReqInput(BaseReq):
         if not self.token_ids_logprob:  # covers both None and []
             self.token_ids_logprob = None
 
-    def _normalize_batch_inputs(self):
+    def _normalize_batch_inputs(self, force_unique_rid: bool = False):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
         # Calculate expanded batch size
         if self.parallel_sample_num == 1:
@@ -388,7 +395,7 @@ class GenerateReqInput(BaseReq):
 
         # Expand input based on type
         self._expand_inputs(num)
-        self._normalize_rid(num)
+        self._normalize_rid(num, force_unique_rid)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
         self._normalize_video_data(num)
@@ -496,12 +503,18 @@ class GenerateReqInput(BaseReq):
         else:  # Already a list
             self.sampling_params = self.sampling_params * self.parallel_sample_num
 
-    def _normalize_rid(self, num):
+    def _normalize_rid(self, num, force_unique_rid: bool = False):
         """Normalize request IDs for batch processing."""
         if self.rid is None:
             self.rid = [uuid.uuid4().hex for _ in range(num)]
         elif isinstance(self.rid, str):
-            new_rids = [f"{self.rid}_{i}" for i in range(num)]
+            # The batch index alone only differs within a batch; add a uuid so rids
+            # stay unique across requests reusing the same base rid.
+            if force_unique_rid:
+                batch_uuid = uuid.uuid4().hex
+                new_rids = [f"{self.rid}_{batch_uuid}_{i}" for i in range(num)]
+            else:
+                new_rids = [f"{self.rid}_{i}" for i in range(num)]
             self.rid = new_rids
         elif isinstance(self.rid, list):
             # Note: the length of rid shall be the same as the batch_size,
@@ -510,6 +523,8 @@ class GenerateReqInput(BaseReq):
                 raise ValueError(
                     "The specified rids length mismatch with the batch_size for batch processing."
                 )
+            if force_unique_rid:
+                self.rid = [f"{rid}_{uuid.uuid4().hex}" for rid in self.rid]
         else:
             raise ValueError("The rid should be a string or a list of strings.")
 
@@ -827,7 +842,8 @@ class EmbeddingReqInput(BaseReq):
     # The uid of LoRA adaptors, should be initialized by tokenizer manager
     lora_id: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
-    def normalize_batch_and_arguments(self):
+    def normalize_batch_and_arguments(self, force_unique_rid: bool = False):
+        # force_unique_rid is a no-op here: embeddings have no detokenizer decode_status.
         # at least one of text, input_ids, or image should be provided
         if self.text is None and self.input_ids is None and self.image_data is None:
             raise ValueError(

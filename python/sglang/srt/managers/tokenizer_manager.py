@@ -517,7 +517,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         self.auto_create_handle_loop()
 
         # Normalize the request
-        obj.normalize_batch_and_arguments()
+        obj.normalize_batch_and_arguments(force_unique_rid=True)
         self._set_default_priority(obj)
         self._validate_rid_not_in_flight(obj)
 

@@ -27,6 +27,7 @@ import zmq
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
@@ -131,6 +132,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             [
                 (BatchEmbeddingOutput, self.handle_batch_embedding_out),
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
+                (AbortReq, self.handle_abort_req),
                 (FreezeGCReq, self.handle_freeze_gc_req),
             ]
         )
@@ -140,7 +142,16 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = self.recv_from_scheduler.recv_pyobj()
-            output = self._request_dispatcher(recv_obj)
+            try:
+                output = self._request_dispatcher(recv_obj)
+            except Exception:
+                # One bad request (e.g. KeyError from a duplicated rid) must not crash the process.
+                rids = getattr(recv_obj, "rids", None) or getattr(recv_obj, "rid", None)
+                logger.error(
+                    f"Detokenizer failed to handle {type(recv_obj).__name__} "
+                    f"(rid={rids}), skipping this batch:\n{get_exception_traceback()}"
+                )
+                continue
             if output is not None:
                 self.send_to_tokenizer.send_pyobj(output)
             self.soft_watchdog.feed()
@@ -284,6 +295,19 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             try:
                 s = self.decode_status[rid]
             except KeyError:
+                cur_size = len(self.decode_status)
+                # size >= capacity means real FIFO eviction; size < capacity means a
+                # duplicated rid (deleted earlier in this batch), NOT memory pressure.
+                logger.error(
+                    f"Decode status not found for rid={recv_obj.rids[i]}. "
+                    f"decode_status size={cur_size}, capacity={DETOKENIZER_MAX_STATES}. "
+                    + (
+                        "Cause: FIFO eviction under memory pressure (size >= capacity)."
+                        if cur_size >= DETOKENIZER_MAX_STATES
+                        else "Cause: rid was deleted within this batch or never created "
+                        "(likely a duplicated/non-unique rid), NOT memory pressure."
+                    )
+                )
                 raise RuntimeError(
                     f"Decode status not found for request {rid}. "
                     "It may be due to the request being evicted from the decode status due to memory pressure. "
@@ -303,6 +327,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 else:
                     new_text = find_printable_text(new_text)
             else:
+                # Guard against a duplicated rid finishing twice in one batch (align with upstream #17734).
                 if rid in self.decode_status:
                     del self.decode_status[rid]
 
@@ -373,6 +398,15 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
         freeze_gc("Detokenizer Manager")
+        return None
+
+    def handle_abort_req(self, recv_req: AbortReq):
+        """Release decode status for aborted requests, else a request aborted after
+        it started decoding leaks its decode_status entry (never gets a finish)."""
+        if recv_req.abort_all:
+            self.decode_status.clear()
+        else:
+            self.decode_status.pop(recv_req.rid, None)
         return None
 
 

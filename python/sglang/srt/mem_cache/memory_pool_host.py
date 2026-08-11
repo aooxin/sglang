@@ -2913,7 +2913,9 @@ class SWATokenToKVPoolHost:
                 "SWATokenToKVPoolHost.alloc_host(swa)",
                 hot=True,
             )
-            swa_mapping[swa_valid_mask] = swa_host_indices
+            # swa_mapping is on the host pool device (CPU); swa_valid_mask comes
+            # from swa_device_indices (CUDA). Align the mask before indexing.
+            swa_mapping[swa_valid_mask.to(swa_mapping.device)] = swa_host_indices
         assert_indices_in_bounds(
             full_host_indices,
             self.page_size,
@@ -3053,6 +3055,12 @@ class SWATokenToKVPoolHost:
         Returns the number of tokens whose SWA mapping was transferred.
         """
         assert len(tgt_full_indices) == len(src_full_indices)
+        # full_to_swa_index_mapping is on the host pool device (CPU); tree-side
+        # indices may arrive on CUDA. Align both once so all gather/scatter
+        # below stays on the mapping's device (.to() is a no-op if already CPU).
+        mapping_device = self.full_to_swa_index_mapping.device
+        tgt_full_indices = tgt_full_indices.to(mapping_device)
+        src_full_indices = src_full_indices.to(mapping_device)
         # tgt_full_indices may contain -1 placeholders for non-backuped tree
         # nodes (write_back mode). Skip those positions entirely.
         valid_mask = tgt_full_indices >= 0
@@ -3114,8 +3122,14 @@ class SWATokenToKVPoolHost:
         return int(swa_indices.numel())
 
     def gather_swa_mapping(self, full_host_indices: torch.Tensor) -> torch.Tensor:
+        # full_to_swa_index_mapping lives on the host pool device (CPU). Index
+        # it on that device (the .to() is a no-op when already there), then
+        # hand the result back on the caller's device so downstream ops with
+        # device-side indices/masks stay consistent.
+        mapping_device = self.full_to_swa_index_mapping.device
         with self._mapping_section:
-            return self.full_to_swa_index_mapping[full_host_indices]
+            swa = self.full_to_swa_index_mapping[full_host_indices.to(mapping_device)]
+        return swa.to(full_host_indices.device)
 
     def scatter_swa_mapping(
         self, full_host_indices: torch.Tensor, swa_values: torch.Tensor

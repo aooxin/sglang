@@ -144,7 +144,6 @@ class BaseHiRadixCache(abc.ABC):
                     server_args.hicache_size,
                     self.page_size,
                     server_args.hicache_mem_layout,
-                    device=params.token_to_kv_pool_allocator.device,
                     allocator_type=server_args.hicache_storage_backend,
                 )
         else:
@@ -855,13 +854,18 @@ class BaseHiRadixCache(abc.ABC):
         """
         assert self.is_hybrid_swa
         assert len(node.value) == len(node.host_value) == len(new_swa_mask)
+        # new_swa_mask is produced on the device side (CUDA) by
+        # _compute_swa_mismatch_masks; node.host_value lives on the host pool
+        # device, so use a mask copy on host_value's device for host indexing
+        # (node.value[new_swa_mask] below keeps the original device mask).
+        new_swa_mask_host = new_swa_mask.to(node.host_value.device)
         # 前置条件：被 mask 选中的位置，host 侧 mapping 必须全为 0。
         # 否则后续赋值会覆盖掉既有的 SWA slot 指针，导致原 SWA slot
         # 彻底泄露（无人 free）
         assert not bool(
             torch.any(
                 self.token_to_kv_pool_host.gather_swa_mapping(
-                    node.host_value[new_swa_mask]
+                    node.host_value[new_swa_mask_host]
                 )
             )
         )
@@ -909,7 +913,7 @@ class BaseHiRadixCache(abc.ABC):
 
         # 建立 host 上 full 和 swa 的映射关系
         self.token_to_kv_pool_host.scatter_swa_mapping(
-            full_host_indices[new_swa_mask], new_swa_host_indices
+            full_host_indices[new_swa_mask_host], new_swa_host_indices
         )
 
         # [SWA-DIAG] 写后校验：这次 token 粒度 scatter 之后，整个 node 的 host
@@ -926,7 +930,7 @@ class BaseHiRadixCache(abc.ABC):
         # TODO: optimize to avoid rewrite full attn
         self.cache_controller.write(
             device_indices=node.value[new_swa_mask],
-            host_indices=full_host_indices[new_swa_mask],
+            host_indices=full_host_indices[new_swa_mask_host],
             node_id=node.id,
         )
         self.ongoing_write_through[node.id] = {
@@ -968,7 +972,13 @@ class BaseHiRadixCache(abc.ABC):
         device_swa = self.token_to_kv_pool_allocator.full_to_swa_index_mapping[
             device_indices
         ]
-        host_swa = self.token_to_kv_pool_host.gather_swa_mapping(host_indices)
+        # host_swa comes back on host_indices' device; align it to device_swa so
+        # the elementwise comparisons below run on one device. Masks are thus
+        # returned on device_swa's device (CUDA); CPU consumers (indexing
+        # node.host_value) must move the mask to CPU themselves.
+        host_swa = self.token_to_kv_pool_host.gather_swa_mapping(host_indices).to(
+            device_swa.device
+        )
         swa_host_only = (device_swa == 0) & (host_swa != 0) if need_host_only else None
         swa_device_only = (
             (device_swa != 0) & (host_swa == 0) if need_device_only else None
@@ -2514,7 +2524,14 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
             host_swa = self.cache_controller.get_swa_host_indices(host_indices)
             swa_parts.append(host_swa)
 
-        swa_indices = torch.cat(swa_parts) if len(swa_parts) > 1 else swa_parts[0]
+        if len(swa_parts) > 1:
+            # Device portion (allocator mapping) is on CUDA; host portion (host
+            # pool mapping) is on CPU. Align to the first part's device before
+            # concatenating for compute_swa_safe_len.
+            target_device = swa_parts[0].device
+            swa_indices = torch.cat([p.to(target_device) for p in swa_parts])
+        else:
+            swa_indices = swa_parts[0]
         assert len(swa_indices) == total_len, f"{len(swa_indices)=}, {total_len=}"
 
         # 3. Delegate to the shared SWA safety check algorithm.

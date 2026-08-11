@@ -1284,7 +1284,10 @@ class HiCacheController:
 
         if swa_valid_mask is None:
             swa_host_indices = self.mem_pool_host.gather_swa_mapping(host_indices)
-            swa_valid_mask = swa_host_indices.bool()
+            # The device allocator consumes this mask, so align it to its device.
+            swa_valid_mask = swa_host_indices.bool().to(
+                self.mem_pool_device_allocator.device
+            )
         return self.mem_pool_device_allocator.alloc_device(host_indices, swa_valid_mask)
 
     def load(
@@ -1317,7 +1320,9 @@ class HiCacheController:
         """
         assert self.is_hybrid_swa
         swa_host_indices = self.mem_pool_host.gather_swa_mapping(host_indices)
-        swa_host_valid_mask = swa_host_indices.bool()
+        # This mask is combined with swa_device_indices (CUDA) and consumed by
+        # the device allocator below, so align it to the device side.
+        swa_host_valid_mask = swa_host_indices.bool().to(device_indices.device)
         # [SWA-DIAG] host mapping gather is a concurrent-readable snapshot, so
         # log-only (a torn read here is not necessarily a persistent bug); the
         # deterministic post-write is asserted inside alloc_missing_swa_for_full_indices.
@@ -1343,9 +1348,11 @@ class HiCacheController:
             return False, 0, lack_swa_size
 
         if refill_size > 0:
+            # refill_mask comes from the device allocator (CUDA); align it to
+            # each operand's device before indexing.
             self.load(
-                host_indices=host_indices[refill_mask],
-                device_indices=device_indices[refill_mask],
+                host_indices=host_indices[refill_mask.to(host_indices.device)],
+                device_indices=device_indices[refill_mask.to(device_indices.device)],
                 priority=priority,
                 node_id=node_id,
                 swa_only=True,

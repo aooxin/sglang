@@ -1078,7 +1078,6 @@ class Scheduler(
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
-                device=kv_pool.device,
             )
         else:
             logger.warning(

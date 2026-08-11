@@ -257,6 +257,12 @@ class DFlashDraftModel(nn.Module):
       - `norm.weight` for final normalization
     """
 
+    # Param names NOT backed by the checkpoint (aliased to the target's embed
+    # at runtime).  The remote weight loader must skip them: on the seed they
+    # are freed by the aliasing right after MR registration, so registering or
+    # transferring them would publish a stale MR whose address may be reused.
+    remote_weight_skip_names = {"embed_tokens.weight"}
+
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
         self.config = config

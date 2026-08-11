@@ -132,6 +132,19 @@ def get_remote_instance_transfer_engine_info_per_rank(
         return None, None
 
 
+def get_remote_weight_skip_names(model) -> set:
+    """Param names the remote weight loader must not register or transfer.
+
+    Models that alias weights onto another model (e.g. the DFlash draft aliases
+    its ``embed_tokens.weight`` to the target's embed at runtime) declare these
+    in ``model.remote_weight_skip_names``.  The aliased param is not backed by
+    the checkpoint: on the seed it is freed by the aliasing shortly after
+    registration, leaving a stale MR entry that a client RDMA read could hit
+    after the address is reused.
+    """
+    return getattr(model, "remote_weight_skip_names", set())
+
+
 def register_memory_region(model, transfer_engine):
     weight_mr_dict, _ = register_memory_region_with_handles(model, transfer_engine)
     return weight_mr_dict
@@ -165,9 +178,12 @@ def unregister_memory_region(transfer_engine, registered_memory_addrs):
 def register_memory_region_v1(model, transfer_engine):
     start_tic = time.time()
 
+    skip_names = get_remote_weight_skip_names(model)
     weight_mr_dict = {}
     registered_memory_addrs = []
     for name, weight in model.named_parameters():
+        if name in skip_names:
+            continue
         ret = transfer_engine.register_memory(
             weight.data_ptr(), weight.numel() * weight.element_size()
         )
@@ -191,9 +207,12 @@ def register_memory_region_v1(model, transfer_engine):
 def register_memory_region_v2(model, transfer_engine):
     start_tic = time.time()
 
+    skip_names = get_remote_weight_skip_names(model)
     weight_mr_dict = {}
     weight_addr_set = set()
     for name, weight in model.named_parameters():
+        if name in skip_names:
+            continue
         weight_mr_dict[name] = (
             weight.data_ptr(),
             weight.numel(),

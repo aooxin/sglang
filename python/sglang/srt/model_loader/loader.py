@@ -40,6 +40,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_model_idx,
     get_remote_instance_transfer_engine_info_per_rank,
+    get_remote_weight_skip_names,
     register_memory_region_with_handles,
     trigger_transferring_weights_request,
     unregister_memory_region,
@@ -2343,7 +2344,10 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         seed_ptr_list = []
         client_ptr_list = []
         client_len_list = []
+        skip_names = get_remote_weight_skip_names(model)
         for name, tensor in model.named_parameters():
+            if name in skip_names:
+                continue
             weight_info = seed_transfer_engine_weight_info.get(name, None)
             if weight_info is None:
                 logger.error(f"Cannot find weight info for {name}.")
@@ -2477,10 +2481,13 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             mx_client.close()
 
         # Transfer weights via TransferEngine RDMA
+        skip_names = get_remote_weight_skip_names(model)
         seed_ptr_list = []
         client_ptr_list = []
         client_len_list = []
         for name, tensor in model.named_parameters():
+            if name in skip_names:
+                continue
             weight_info = seed_weight_info.get(name, None)
             if weight_info is None:
                 raise RuntimeError(

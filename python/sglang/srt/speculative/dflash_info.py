@@ -14,7 +14,11 @@ from sglang.srt.mem_cache.common import (
     alloc_token_slots,
     get_last_loc,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.speculative.dflash_utils import (
     compute_dflash_accept_len_and_bonus,
     compute_dflash_sampling_accept_len_and_bonus,
@@ -249,6 +253,50 @@ class DFlashVerifyInput(SpecInput):
             if mask_chunks
             else torch.empty((0,), dtype=torch.bool, device=batch.device)
         )
+
+    def prepare_for_verify_v2(
+        self,
+        batch,
+        target_worker,
+    ):
+        """Spec-v2 (overlap scheduling) verify-batch preparation for DFlash.
+
+        Unlike the v1 ``prepare_for_verify`` above — which allocates ``out_cache_loc``
+        and builds a custom mask off a :class:`ScheduleBatch` — the v2 worker already
+        materialized ``out_cache_loc`` (and the draft-block KV slots) into the
+        ``ModelWorkerBatch`` before calling this. This helper just stamps the verify
+        spec_info / forward_mode / capture_hidden_mode onto the batch, packages a
+        :class:`ForwardBatch`, and pre-initializes either CUDA-graph replay state or
+        eager attention metadata so the actual forward can run with
+        ``skip_attn_backend_init=True``.
+
+        Mirrors EagleVerifyInput.prepare_for_v2_verify in shape: when the target's
+        graph_runner can run this batch we call ``graph_runner.replay_prepare`` so
+        the subsequent ``replay`` fast-path can read ``self.raw_num_token`` and the
+        pre-populated input buffers; otherwise we plan eager attention metadata.
+        """
+        batch.input_ids = self.draft_token
+        batch.spec_info = self
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.TARGET_VERIFY
+        )
+        batch.capture_hidden_mode = self.capture_hidden_mode
+        verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+        can_run_cuda_graph = bool(
+            target_worker.model_runner.graph_runner
+            and target_worker.model_runner.graph_runner.can_run(verify_forward_batch)
+        )
+        if can_run_cuda_graph:
+            target_worker.model_runner.graph_runner.replay_prepare(
+                verify_forward_batch
+            )
+        elif not batch.forward_mode.is_idle():
+            target_worker.model_runner.attn_backend.init_forward_metadata(
+                verify_forward_batch
+            )
+        return verify_forward_batch, can_run_cuda_graph
 
     def generate_attn_arg_prefill(
         self,

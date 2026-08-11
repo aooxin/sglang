@@ -746,11 +746,22 @@ class MiMoV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
+        captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
+        if captured_last_layer_outputs is not None:
+            hidden_states, residual = (
+                self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
+                    hidden_states,
+                    residual,
+                    forward_batch,
+                    captured_last_layer_outputs=captured_last_layer_outputs,
+                )
+            )
+        else:
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
+            )
 
         if hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
@@ -957,13 +968,34 @@ class MiMoV2Model(nn.Module):
             )
         else:
             for i in range(self.start_layer, self.end_layer):
+                # Capture the residual stream entering this layer (= output of the
+                # previous target layer) via the layer communicator, which records
+                # it at the attention scatter mode (TP_ATTN_FULL). This keeps every
+                # captured tensor in one consistent layout under DP attention, where
+                # the per-layer residual stream alternates scattered/gathered.
+                # TODO: fixme
+                # capture_buf = aux_hidden_states if i in self.layers_to_capture else None
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
                     hidden_states,
                     forward_batch,
                     residual,
+                    # TODO: fixme
+                    #captured_last_layer_outputs=capture_buf,
                 )
+            # DFLASH may also request capture *after* the final layer (e.g.
+            # target_layer_ids ends at num_hidden_layers-1, so layers_to_capture
+            # contains end_layer). The final residual stream is already at the
+            # model-output scatter mode (TP_ATTN_FULL), matching the in-loop
+            # captures; clone to avoid the post-loop norm mutating it in place.
+            # TODO: fixme
+            #if self.end_layer in self.layers_to_capture:
+            #    aux_hidden_states.append(
+            #        (hidden_states + residual).clone()
+            #        if residual is not None
+            #        else hidden_states.clone()
+            #    )
 
         hidden_states_before_norm = None
         if not self.pp_group.is_last_rank:

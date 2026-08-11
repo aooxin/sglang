@@ -666,7 +666,10 @@ class CudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
-        if self.require_mlp_tp_gather:
+        if (
+            self.require_mlp_tp_gather
+            and forward_batch.global_num_tokens_cpu is not None
+        ):
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()

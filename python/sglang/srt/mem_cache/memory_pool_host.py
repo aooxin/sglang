@@ -2665,6 +2665,8 @@ class SWATokenToKVPoolHost:
         self.full_pool_host._debug_pool_label = "full_pool_host"
         self.swa_pool_host._debug_pool_label = "swa_pool_host"
 
+        self.has_full_layers = self.full_pool_host.k_buffer.numel() > 0
+
         # Validate host pool capacities: in disaggregated prefill mode the
         # host pools buffer KV data evicted from the device before transfer to
         # the decode node.  If the host pool is smaller than 1.5x the device
@@ -3411,30 +3413,12 @@ class SWATokenToKVPoolHost:
 
         ptr_list = []
         element_size_list = []
+        has_full = self.has_full_layers
         for page_idx, swa_needed in enumerate(swa_valid_list):
-            if swa_needed:
-                ptr_list.extend(
-                    [
-                        full_k_ptrs[page_idx],
-                        full_v_ptrs[page_idx],
-                        swa_k_ptrs[page_idx],
-                        swa_v_ptrs[page_idx],
-                    ]
-                )
-                element_size_list.extend(
-                    [
-                        full_k_element_size,
-                        full_v_element_size,
-                        swa_k_element_size,
-                        swa_v_element_size,
-                    ]
-                )
-            else:
+            if has_full:
                 ptr_list.extend([full_k_ptrs[page_idx], full_v_ptrs[page_idx]])
-                element_size_list.extend(
-                    [
-                        full_k_element_size,
-                        full_v_element_size,
-                    ]
-                )
+                element_size_list.extend([full_k_element_size, full_v_element_size])
+            if swa_needed:
+                ptr_list.extend([swa_k_ptrs[page_idx], swa_v_ptrs[page_idx]])
+                element_size_list.extend([swa_k_element_size, swa_v_element_size])
         return ptr_list, element_size_list, swa_valid_list

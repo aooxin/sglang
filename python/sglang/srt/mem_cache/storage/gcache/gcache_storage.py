@@ -392,7 +392,7 @@ class GcacheStorage(HiCacheStorage):
             return [True] * len(keys)
 
         start_time = time.perf_counter()
-        gcache_keys, value_ptr_list, value_size_list, swa_valid_list = (
+        gcache_keys, value_ptr_list, value_size_list, swa_valid_list, has_full = (
             self._batch_preprocess(keys, host_indices, is_draft=is_draft)
         )
         logger.debug(f"gcache: begin set {len(gcache_keys)} keys")
@@ -439,7 +439,7 @@ class GcacheStorage(HiCacheStorage):
         execution_time = (end_time - start_time) * 1e6
         success_count = sum(1 for each in set_results if each)
 
-        ret = self._batch_postprocess(set_results, swa_valid_list)
+        ret = self._batch_postprocess(set_results, swa_valid_list, has_full)
         if len(gcache_keys) == success_count:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
@@ -486,7 +486,7 @@ class GcacheStorage(HiCacheStorage):
         )
 
         t0 = time.perf_counter()
-        gcache_keys, value_ptr_list, value_size_list, swa_valid_list = (
+        gcache_keys, value_ptr_list, value_size_list, swa_valid_list, has_full = (
             self._batch_preprocess(
                 keys, host_indices, swa_needed_per_page, is_draft=is_draft
             )
@@ -502,7 +502,7 @@ class GcacheStorage(HiCacheStorage):
         assert len(results) == len(gcache_keys)
         success_count = sum(1 for each in results if each)
 
-        ret = self._batch_postprocess(results, swa_valid_list)
+        ret = self._batch_postprocess(results, swa_valid_list, has_full)
         t3 = time.perf_counter()
         execution_time = (t3 - t0) * 1e6
 
@@ -593,6 +593,7 @@ class GcacheStorage(HiCacheStorage):
         with_size: bool = False,
         is_swa: bool = True,
         draft: bool = False,
+        has_full: bool = True,
     ):
         if swa_valid_list is not None:
             assert len(keys) == len(swa_valid_list)
@@ -604,8 +605,9 @@ class GcacheStorage(HiCacheStorage):
         ret = []
         for i in range(len(keys)):
             mid = prefix + keys[i]
-            ret.append(mid + suffix_full_k)
-            ret.append(mid + suffix_full_v)
+            if has_full:
+                ret.append(mid + suffix_full_k)
+                ret.append(mid + suffix_full_v)
             if is_swa and (swa_valid_list is None or swa_valid_list[i]):
                 ret.append(mid + suffix_swa_k)
                 ret.append(mid + suffix_swa_v)
@@ -614,11 +616,16 @@ class GcacheStorage(HiCacheStorage):
         if with_size:
             full_and_swa = self.mem_pool_host.get_page_element_sizes()
             full_only = full_and_swa[:2]
+            swa_only = full_and_swa[2:]
             if swa_valid_list is None:
-                size_list = list(full_and_swa) * len(keys)
+                per_page = list(full_and_swa) if has_full else list(swa_only)
+                size_list = per_page * len(keys)
             else:
                 for valid in swa_valid_list:
-                    size_list.extend(full_and_swa if valid else full_only)
+                    if has_full:
+                        size_list.extend(full_and_swa if valid else full_only)
+                    elif valid:
+                        size_list.extend(swa_only)
         return ret, size_list
 
     def _batch_preprocess(
@@ -650,22 +657,27 @@ class GcacheStorage(HiCacheStorage):
             swa_valid_list = [False] * len(keys)
         assert len(swa_valid_list) == len(keys)
 
+        has_full = pool.has_full_layers
         key_list, _ = self._convert_hybrid_keys(
-            keys, swa_valid_list, is_swa=is_swa, draft=is_draft
+            keys, swa_valid_list, is_swa=is_swa, draft=is_draft, has_full=has_full
         )
 
         assert len(key_list) == len(ptr_list) == len(element_size_list)
-        return key_list, ptr_list, element_size_list, swa_valid_list
+        return key_list, ptr_list, element_size_list, swa_valid_list, has_full
 
     def _batch_postprocess(
         self,
         results: List[bool],
         swa_valid_list: List[bool],
+        has_full: bool = True,
     ) -> List[bool]:
         ret = []
         idx = 0
         for swa_valid in swa_valid_list:
-            step = 4 if swa_valid else 2
+            if has_full:
+                step = 4 if swa_valid else 2
+            else:
+                step = 2 if swa_valid else 0
             ret.append(all(results[idx : idx + step]))
             idx += step
         assert idx == len(results)

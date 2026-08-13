@@ -24,6 +24,7 @@ import logging
 import multiprocessing as multiprocessing
 import os
 import pickle
+import signal
 import sys
 import threading
 from functools import partialmethod
@@ -519,6 +520,8 @@ def monkey_patch_uvicorn_multiprocessing(timeout: float = 10, use_fork: bool = T
 
     1. is_alive timeout: from default 5s -> 10s.
     2. Optionally switch uvicorn worker processes from spawn to fork.
+    3. Remove SIGQUIT from uvicorn's supervisor handled signals so SGLang's
+       own SIGQUIT handler (registered in the main process) stays effective.
     """
     try:
         from uvicorn.supervisors.multiprocess import Process
@@ -529,6 +532,19 @@ def monkey_patch_uvicorn_multiprocessing(timeout: float = 10, use_fork: bool = T
         logger.warning(
             "uvicorn.supervisors.multiprocess not found, skipping monkey patch"
         )
+
+    # uvicorn's Multiprocess supervisor registers a handler for every signal in
+    # its SIGNALS dict (which includes SIGQUIT) in __init__, silently clobbering
+    # the SIGQUIT handler SGLang registered for the main process. That breaks
+    # both the orchestrator's force-exit path and the subprocess watchdog's
+    # crash cleanup (it sends SIGQUIT and expects SGLang to kill the tree).
+    # uvicorn has no handle_quit() anyway, so dropping SIGQUIT loses nothing.
+    try:
+        import uvicorn.supervisors.multiprocess as _uv_mp
+
+        _uv_mp.SIGNALS.pop(signal.SIGQUIT, None)
+    except ImportError:
+        pass
 
     if not use_fork:
         logger.info(

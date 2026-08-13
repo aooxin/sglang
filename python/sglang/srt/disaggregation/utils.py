@@ -200,6 +200,12 @@ class MetadataBuffers:
             self.mm_video_tokens = torch.zeros(
                 (size, 16), dtype=torch.int32, device=device
             )
+            # PD + DFlash: draft KV cursor after prefill-side
+            # _append_target_hidden_to_draft_kv. Padded to 16 ints (>=64B) to
+            # satisfy mooncake RDMA min item size.
+            self.dflash_draft_seq_len = torch.zeros(
+                (size, 16), dtype=torch.int32, device=device
+            )
             # Request validation: store bootstrap_room to detect metadata corruption
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
@@ -219,6 +225,7 @@ class MetadataBuffers:
             self.mm_image_tokens.data_ptr(),
             self.mm_audio_tokens.data_ptr(),
             self.mm_video_tokens.data_ptr(),
+            self.dflash_draft_seq_len.data_ptr(),
             self.bootstrap_room.data_ptr(),
         ]
         data_lens = [
@@ -234,6 +241,7 @@ class MetadataBuffers:
             self.mm_image_tokens.nbytes,
             self.mm_audio_tokens.nbytes,
             self.mm_video_tokens.nbytes,
+            self.dflash_draft_seq_len.nbytes,
             self.bootstrap_room.nbytes,
         ]
         item_lens = [
@@ -249,6 +257,7 @@ class MetadataBuffers:
             self.mm_image_tokens[0].nbytes,
             self.mm_audio_tokens[0].nbytes,
             self.mm_video_tokens[0].nbytes,
+            self.dflash_draft_seq_len[0].nbytes,
             self.bootstrap_room[0].nbytes,
         ]
         return ptrs, data_lens, item_lens
@@ -267,6 +276,7 @@ class MetadataBuffers:
             self.mm_image_tokens[idx],
             self.mm_audio_tokens[idx],
             self.mm_video_tokens[idx],
+            self.dflash_draft_seq_len[idx],
             self.bootstrap_room[idx],
         )
 
@@ -312,6 +322,11 @@ class MetadataBuffers:
             )
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
+            )
+        # PD + DFlash spec decode: copy draft KV cursor
+        if req.dflash_draft_seq_len is not None:
+            self.dflash_draft_seq_len[req.metadata_buffer_index][0] = (
+                req.dflash_draft_seq_len
             )
         # Store bootstrap_room for validation on decode side
         self.bootstrap_room[req.metadata_buffer_index, 0] = (

@@ -138,6 +138,8 @@ class DFlashDraftInputV2(SpecInput):
         lags by one iteration; keep it separate from the reserved upper bound that backs
         the overallocated mapping.
         """
+        batch.maybe_evict_swa()
+
         plan_stream, plan_stream_ctx = _get_overlap_plan_stream(batch.device)
         if plan_stream is None and self.verify_done is not None:
             # Ensure previous forward is completed before mutating shared buffers.
@@ -176,6 +178,7 @@ class DFlashDraftInputV2(SpecInput):
         uniform_top_k_value = None
         uniform_top_k = True
         for i, req in enumerate(batch.reqs):
+            req.decode_batch_idx += 1
             committed_len = int(req.kv_committed_len)
             if cur_allocated_seq_lens_cpu is not None and i < len(
                 cur_allocated_seq_lens_cpu

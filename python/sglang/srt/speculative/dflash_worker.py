@@ -1,5 +1,7 @@
 import logging
 import math
+import os
+from contextlib import nullcontext
 from copy import deepcopy
 from typing import Optional, Union
 
@@ -73,6 +75,7 @@ class DFlashWorker:
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.page_size = server_args.page_size
+        self._enable_dp_attention = bool(server_args.enable_dp_attention)
         self.draft_window_size: Optional[int] = (
             int(server_args.speculative_dflash_draft_window_size)
             if server_args.speculative_dflash_draft_window_size is not None
@@ -80,6 +83,21 @@ class DFlashWorker:
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
+
+        # DP attention support: wrap any draft model collective in the
+        # attention TP group so DP groups don't deadlock on each other's
+        # collectives. When DP attention is off this is a no-op contextmanager.
+        if self._enable_dp_attention:
+            from sglang.srt.speculative.spec_utils import (
+                draft_tp_context as _draft_tp_context_cls,
+            )
+
+            self._draft_tp_context = _draft_tp_context_cls
+        else:
+            from sglang.srt.utils import empty_context as _empty_context_cls
+
+            # Match the draft_tp_context call signature (takes one positional arg).
+            self._draft_tp_context = lambda _tp_group: _empty_context_cls()
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
@@ -129,21 +147,29 @@ class DFlashWorker:
             target_worker.model_runner.model_config.context_len
         )
         saved_server_args = get_global_server_args()
-        self.draft_worker = TpModelWorker(
-            server_args=draft_server_args,
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            moe_ep_rank=moe_ep_rank,
-            pp_rank=0,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
-            dp_rank=dp_rank,
-            nccl_port=nccl_port,
-            is_draft_worker=True,
-            req_to_token_pool=shared_req_to_token_pool,
-            token_to_kv_pool_allocator=target_token_to_kv_pool_allocator,
-            memory_pool_config=target_worker.model_runner.memory_pool_config,
-        )
+        if self._enable_dp_attention:
+            from sglang.srt.layers.dp_attention import get_attention_tp_group
+            from sglang.srt.speculative.spec_utils import draft_tp_context
+
+            _init_ctx = draft_tp_context(get_attention_tp_group())
+        else:
+            _init_ctx = nullcontext()
+        with _init_ctx:
+            self.draft_worker = TpModelWorker(
+                server_args=draft_server_args,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                pp_rank=0,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
+                dp_rank=dp_rank,
+                nccl_port=nccl_port,
+                is_draft_worker=True,
+                req_to_token_pool=shared_req_to_token_pool,
+                token_to_kv_pool_allocator=target_token_to_kv_pool_allocator,
+                memory_pool_config=target_worker.model_runner.memory_pool_config,
+            )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
         self.draft_model = self.draft_model_runner.model
@@ -173,6 +199,10 @@ class DFlashWorker:
             mask_token=self._mask_token,
             mask_token_id=self._mask_token_id_override,
         )
+        # Merge the trained mask embedding from mask_embedding.pt (if present)
+        # into the target embedding table. Must run after _mask_token_id is set
+        # and before any draft forward consumes target.embed_tokens(mask_token_id).
+        self._maybe_merge_trained_mask_embedding()
         if self.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -235,6 +265,21 @@ class DFlashWorker:
                 eligible, reason = can_dflash_use_fused_qkv_proj(attn.qkv_proj)
                 if not eligible:
                     fused_disable_reason = f"{reason}: layer={layer_idx}"
+                    break
+
+                # Fused path multiplies hidden_states * QKV_weight directly to
+                # produce K/V; it does NOT execute the per-head v*=v_scale that
+                # DFlashAttention.kv_proj_only does. Fallback to sequential if
+                # the draft model declares a non-unit v_scale.
+                dflash_v_scale = getattr(attn, "v_scale", None)
+                if dflash_v_scale is not None and not math.isclose(
+                    float(dflash_v_scale), 1.0
+                ):
+                    fused_disable_reason = (
+                        "DFlash attention_value_scale != 1.0 is not supported "
+                        f"for fused KV path: layer={layer_idx}, "
+                        f"v_scale={dflash_v_scale}"
+                    )
                     break
 
                 # Keep semantics aligned with set_kv_buffer scaling behavior.
@@ -509,6 +554,84 @@ class DFlashWorker:
 
         return int(resolved_id)
 
+    def _maybe_merge_trained_mask_embedding(self) -> None:
+        """Merge a trained mask embedding into the target model's embedding table.
+
+        During DFlash training, the mask token embedding is trained separately
+        and saved as ``mask_embedding.pt`` in the draft checkpoint directory.
+        Without merging, the draft consumes whatever (untrained / noise) row
+        sits at ``mask_token_id`` in the target vocab and accept_rate collapses.
+
+        Handles VocabParallelEmbedding TP sharding: each rank only updates the
+        row if the mask token falls within its local shard range.
+
+        Per-position mask embeddings (``per_position=True`` in the saved file)
+        are stored on the worker and applied per block-offset during drafting
+        instead of being merged into the embedding table.
+        """
+        self._per_position_mask_embeddings = None
+
+        draft_model_path = self.server_args.speculative_draft_model_path
+        if draft_model_path is None:
+            return
+
+        mask_emb_path = os.path.join(draft_model_path, "mask_embedding.pt")
+        if not os.path.exists(mask_emb_path):
+            return
+
+        saved = torch.load(mask_emb_path, map_location=self.device, weights_only=True)
+        embedding_tensor = saved["embedding"]
+        saved_token_id = int(saved["mask_token_id"])
+
+        if saved_token_id != self._mask_token_id:
+            raise ValueError(
+                f"DFLASH mask_embedding.pt was trained with mask_token_id={saved_token_id}, "
+                f"but the current resolved mask_token_id={self._mask_token_id}. "
+                "These must match."
+            )
+
+        target_model = self.target_worker.model_runner.model
+        embed_module = target_model.get_input_embeddings()
+
+        if saved.get("per_position"):
+            self._per_position_mask_embeddings = embedding_tensor.to(
+                embed_module.weight.dtype
+            )
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFLASH loaded per-position mask embeddings (shape=%s, source=%s)",
+                    list(self._per_position_mask_embeddings.shape),
+                    mask_emb_path,
+                )
+            return
+
+        token_id = self._mask_token_id
+        shard_indices = getattr(embed_module, "shard_indices", None)
+
+        with torch.no_grad():
+            if shard_indices is not None:
+                # VocabParallelEmbedding: only the owning shard writes.
+                start = shard_indices.org_vocab_start_index
+                end = shard_indices.org_vocab_end_index
+                if start <= token_id < end:
+                    local_idx = token_id - start
+                    embed_module.weight[local_idx].copy_(
+                        embedding_tensor.to(embed_module.weight.dtype)
+                    )
+            else:
+                # Standard nn.Embedding (no TP sharding).
+                embed_module.weight[token_id].copy_(
+                    embedding_tensor.to(embed_module.weight.dtype)
+                )
+
+        if self.tp_rank == 0:
+            logger.info(
+                "DFLASH merged trained mask embedding into target model "
+                "(mask_token_id=%s, source=%s)",
+                self._mask_token_id,
+                mask_emb_path,
+            )
+
     def _prepare_for_speculative_decoding(
         self, batch: ScheduleBatch, draft_input: DFlashDraftInput
     ):
@@ -626,6 +749,43 @@ class DFlashWorker:
             draft_spec_info = self._draft_block_spec_info
             seq_lens = draft_prefix_lens
             seq_lens_sum = int(draft_prefix_lens.sum().item())
+            # Under --enable-dp-attention, cuda_graph_runner.can_run reads
+            # global_num_tokens_cpu to derive cuda_graph_bs and (per DP rank)
+            # to choose the same captured graph on every rank. batch.global_num_tokens
+            # is already all-gathered in prepare_mlp_sync_batch, so it is identical
+            # across ranks and reflects each DP's true request count (1 token / req
+            # at target-decode time). Draft forward processes block_size tokens per
+            # request, so scale each entry by block_size to get the per-DP draft
+            # token count.
+            # prepare_mlp_sync_batch additionally asserts that the for_logprob
+            # variants are not None — draft is always greedy with no logprobs,
+            # so we mirror the same values.
+            draft_global_num_tokens_cpu = None
+            draft_global_num_tokens_gpu = None
+            draft_global_num_tokens_for_logprob_cpu = None
+            draft_global_num_tokens_for_logprob_gpu = None
+            if batch.global_num_tokens is not None:
+                draft_global_num_tokens_cpu = [
+                    int(n) * int(self.block_size)
+                    for n in batch.global_num_tokens
+                ]
+                draft_global_num_tokens_gpu = torch.tensor(
+                    draft_global_num_tokens_cpu,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                draft_global_num_tokens_for_logprob_cpu = list(
+                    draft_global_num_tokens_cpu
+                )
+                draft_global_num_tokens_for_logprob_gpu = (
+                    draft_global_num_tokens_gpu.clone()
+                )
+            # _pad_inputs_to_size mutates self.lora_ids (extend with None).
+            # `batch` here is a ScheduleBatch (no `lora_ids` attribute);
+            # mirror ScheduleBatch.get_model_worker_batch and derive the list
+            # from req.lora_id. Empty list works for draft because the draft
+            # model doesn't apply user-side LoRA adapters anyway.
+            draft_lora_ids = [req.lora_id for req in batch.reqs]
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.TARGET_VERIFY,
                 batch_size=bs,
@@ -643,9 +803,16 @@ class DFlashWorker:
                 spec_algorithm=SpeculativeAlgorithm.DFLASH,
                 spec_info=draft_spec_info,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
+                global_num_tokens_cpu=draft_global_num_tokens_cpu,
+                global_num_tokens_gpu=draft_global_num_tokens_gpu,
+                global_num_tokens_for_logprob_cpu=draft_global_num_tokens_for_logprob_cpu,
+                global_num_tokens_for_logprob_gpu=draft_global_num_tokens_for_logprob_gpu,
+                lora_ids=draft_lora_ids,
             )
 
-            with torch.inference_mode():
+            with torch.inference_mode(), self._draft_tp_context(
+                self.draft_model_runner.tp_group
+            ):
                 draft_logits_output = self.draft_model_runner.forward(
                     forward_batch
                 ).logits_output
@@ -657,10 +824,11 @@ class DFlashWorker:
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
+        with self._draft_tp_context(self.draft_model_runner.tp_group):
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+                lm_head=lm_head,
+            ).view(bs, self.block_size - 1)
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
@@ -895,6 +1063,40 @@ class DFlashWorker:
             draft_input.target_hidden = draft_input.target_hidden[:0]
             return
 
+        # Invariant check: target_hidden token count must match sum(ctx_lens).
+        # With --enable-dp-attention, prepare_mlp_sync_batch rounds each DP's
+        # global_num_tokens up to a multiple of attn_tp_size for reduce-scatter
+        # alignment. The trailing padding rows are NOT real tokens — they must
+        # be dropped before we use them as ctx_hidden, otherwise we materialize
+        # KV into slots that don't belong to this request and silently corrupt
+        # other requests' cache.
+        expected_ctx = int(draft_input.ctx_lens.sum())
+        if total_ctx > expected_ctx:
+            if not getattr(self, "_logged_dp_padding_trim", False):
+                logger.warning(
+                    "DFLASH target_hidden has %d trailing DP-padding row(s); trimming "
+                    "to sum(ctx_lens)=%d. (target_hidden=%d, ctx_lens=%s, forward_mode=%s, "
+                    "is_extend_in_batch=%s, bs=%d) Logged once per worker.",
+                    total_ctx - expected_ctx,
+                    expected_ctx,
+                    total_ctx,
+                    draft_input.ctx_lens.tolist(),
+                    batch.forward_mode,
+                    getattr(batch, "is_extend_in_batch", None),
+                    bs,
+                )
+                self._logged_dp_padding_trim = True
+            draft_input.target_hidden = draft_input.target_hidden[:expected_ctx]
+            total_ctx = expected_ctx
+        elif total_ctx < expected_ctx:
+            raise RuntimeError(
+                "DFLASH target_hidden has fewer rows than sum(ctx_lens) — "
+                f"target_hidden={total_ctx}, sum(ctx_lens)={expected_ctx}, "
+                f"ctx_lens={draft_input.ctx_lens.tolist()}, forward_mode={batch.forward_mode}, "
+                f"is_extend_in_batch={getattr(batch, 'is_extend_in_batch', None)}, bs={bs}. "
+                "This indicates upstream hidden capture lost rows."
+            )
+
         target_req_to_token = batch.req_to_token_pool.req_to_token
         draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
 
@@ -947,7 +1149,9 @@ class DFlashWorker:
             )  # [sum(ctx_lens)]
             ctx_positions = pos2d[mask]  # [sum(ctx_lens)]
 
-        with torch.inference_mode():
+        with torch.inference_mode(), self._draft_tp_context(
+            self.draft_model_runner.tp_group
+        ):
             ctx_hidden = self.draft_model.project_target_hidden(
                 draft_input.target_hidden
             )  # [sum(ctx), hidden]
@@ -1013,7 +1217,7 @@ class DFlashWorker:
             k = attn.apply_k_norm(k)
             k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
-            v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+            v = v.view(-1, attn.num_kv_heads, attn.v_head_dim)
             self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
                 attn.attn,
                 ctx_cache_loc,
@@ -1123,6 +1327,21 @@ class DFlashWorker:
                 batch_result.logits_output,
                 batch_result.next_token_ids,
             )
+
+            # Under --enable-dp-attention, is_extend_in_batch is True on every
+            # rank as long as ANY DP rank has an extend batch. A rank that is
+            # locally decode/idle still has to follow this branch to keep
+            # collectives in lockstep, but it must NOT run prefill-side draft
+            # KV materialization (its extend_seq_lens / extend_prefix_lens are
+            # None, and there is no real prompt to inject).
+            if not batch.forward_mode.is_extend():
+                return GenerationBatchResult(
+                    logits_output=logits_output,
+                    next_token_ids=next_token_ids,
+                    num_accepted_tokens=0,
+                    can_run_cuda_graph=batch_result.can_run_cuda_graph,
+                )
+
             if logits_output.hidden_states is None:
                 raise RuntimeError(
                     "DFLASH requires target aux hidden capture for prefill, but got None. "
@@ -1172,11 +1391,49 @@ class DFlashWorker:
             )
 
         # Decode / target-verify stage.
+        # Under --enable-dp-attention, a rank with no requests this step is
+        # handed a freshly-built idle ScheduleBatch whose spec_info is None.
+        # Fall back to an empty placeholder so the isinstance check below does
+        # not raise. Mirrors eagle v2 / dflash v2 (see EagleDraftInput /
+        # DFlashDraftInputV2.create_idle_input).
+        if batch.spec_info is None:
+            batch.spec_info = DFlashDraftInput.create_idle_input(device=self.device)
+
         draft_input = batch.spec_info
         if not isinstance(draft_input, DFlashDraftInput):
             raise RuntimeError(
                 "DFLASH decode requires DFlashDraftInput state on the running batch. "
                 "This usually means the request did not complete the prefill stage."
+            )
+
+        # Idle DP rank short-circuit: peer DP ranks run target verify on the
+        # global tp_group, so this rank must fire an equivalent (empty) target
+        # verify to keep cross-DP NCCL collectives in lockstep. A matching
+        # dummy draft forward is NOT needed: draft uses its own attn-tp group
+        # (scoped inside one DP), and when this DP rank is idle every peer in
+        # its attn-tp group is also idle — no draft-side collective needs to
+        # be synchronized.
+        if batch.forward_mode.is_idle():
+            # Match peer DP rank's forward_mode (TARGET_VERIFY) and
+            # capture_hidden_mode (FULL) so the cuda-graph runner picks the same
+            # captured graph here; otherwise IDLE / capture_hidden_mode=NULL on
+            # this rank selects a different graph and the recorded collective
+            # sequence diverges -> NCCL hang.
+            model_worker_batch = batch.get_model_worker_batch()
+            model_worker_batch.forward_mode = ForwardMode.TARGET_VERIFY
+            model_worker_batch.spec_info = DFlashVerifyInput.create_idle_input(
+                device=self.device,
+                draft_token_num=int(self.block_size),
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch, **kwargs
+            )
+            return GenerationBatchResult(
+                logits_output=batch_result.logits_output,
+                next_token_ids=batch_result.next_token_ids,
+                num_accepted_tokens=0,
+                can_run_cuda_graph=batch_result.can_run_cuda_graph,
             )
 
         self._prepare_for_speculative_decoding(batch, draft_input)

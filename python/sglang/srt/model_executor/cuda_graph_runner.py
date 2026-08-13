@@ -334,7 +334,9 @@ class DecodeInputBuffers(ForwardInputBuffers):
             self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
 
         if enable_num_token_non_padded_flag:
-            if require_gathered_buffer and not nsa_enable_prefill_cp:
+            if forward_batch.num_token_non_padded is None:
+                self.num_token_non_padded.fill_(raw_num_token)
+            elif require_gathered_buffer and not nsa_enable_prefill_cp:
                 num_tokens_per_dp = bs * num_tokens_per_bs
                 local = compute_local_num_token_non_padded(
                     global_num_token_non_padded=forward_batch.num_token_non_padded,
@@ -690,7 +692,11 @@ class CudaGraphRunner:
             else cuda_graph_bs <= self.max_bs
         )
 
-        if self.require_mlp_sync:
+        skip_dp_sync_gate = (
+            self.model_runner.is_draft_worker
+            and self.model_runner.spec_algorithm.is_dflash()
+        )
+        if self.require_mlp_sync and not skip_dp_sync_gate:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
 
         # NOTE: cuda graph cannot handle mixed batch (encoder_len = 0)

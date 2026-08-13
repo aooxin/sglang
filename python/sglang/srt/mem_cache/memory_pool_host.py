@@ -433,9 +433,10 @@ def alloc_with_host_register(
         assert v_dims is None
         buffer = allocator.allocate(dims, dtype=dtype, device="cpu")
         if pin_memory:
-            torch.cuda.cudart().cudaHostRegister(
-                buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
-            )
+            if buffer.numel() > 0:
+                torch.cuda.cudart().cudaHostRegister(
+                    buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
+                )
     else:
         assert k_dims is not None
         assert v_dims is not None

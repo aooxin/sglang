@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 import os
@@ -5,13 +6,16 @@ from copy import deepcopy
 from typing import List, Optional
 
 import torch
-import torch.nn.functional as F
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.swa_memory_pool import (
+    SWAKVPool,
+    SWATokenToKVPoolAllocator,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -39,6 +43,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_req_to_token_pool_func,
     draft_tp_context,
+    generate_token_bitmask,
 )
 from sglang.srt.speculative.triton_ops.dflash_accept_bonus import (
     _compute_dflash_accept_bonus_triton_unchecked,
@@ -157,6 +162,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
+        # Force the draft's vocab_size to the target's. The draft checkpoint
+        # carries no embed weight — its embed_tokens is aliased to the target's
+        # sharded embedding in _setup_draft_embed_tokens(), so the draft's
+        # VocabParallelEmbedding shard metadata (org_vocab_start/end_index used
+        # for input masking and mask-embedding row lookup) must be computed
+        # from the TARGET vocab size. A draft config.json with a different
+        # vocab_size would silently corrupt embed lookups and tank accept length.
+        target_vocab_size = int(
+            target_worker.model_runner.model_config.hf_config.vocab_size
+        )
+        _override = json.loads(draft_server_args.json_model_override_args or "{}")
+        _override["vocab_size"] = target_vocab_size
+        draft_server_args.json_model_override_args = json.dumps(_override)
         saved_server_args = get_global_server_args()
         target_req_to_token_pool, target_token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
@@ -219,6 +237,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
+        self.draft_swa_window_size = (
+            int(draft_config.swa_window_size)
+            if (getattr(draft_config, "use_swa", False) and draft_config.swa_window_size)
+            else None
+        )
         self._mask_token_id = self._resolve_mask_token_id(
             mask_token=self._mask_token,
             mask_token_id=self._mask_token_id_override,
@@ -287,17 +310,43 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
 
-        # Merge the trained mask embedding (mask_embedding.pt) into the target
-        # embedding table before snapshotting it, so the draft's MASK block positions
-        # use the learned vector instead of the target's untrained mask-token row.
+        # Populate the draft's own attention-tp-sharded embed_tokens weight from the
+        # target's global-tp-sharded embedding. Runtime draft embed lookup then only
+        # requires an all_reduce inside the attention-tp group, avoiding the
+        # active/idle DP rank split issue with the target's embed all_reduce.
+        self._setup_draft_embed_tokens()
+
+        # Merge the trained mask embedding (mask_embedding.pt) into the draft's own
+        # embed_tokens, so the draft's MASK block positions use the learned vector
+        # instead of the target's untrained mask-token row.
         self._maybe_merge_trained_mask_embedding()
 
-        # Under dp attention the active and idle DP groups run different code paths, so
-        # the attn-TP all_reduce inside VocabParallelEmbedding gets mismatched calls
-        # across ranks. Gather the full embedding to GPU once (all ranks sync here), then
-        # do a collective-free, sync-free on-device lookup at runtime.
-        self._full_embed_gpu: Optional[torch.Tensor] = None
-        self._cache_full_embed_weight()
+        # SWA draft pool (all-SWA layers when the target is a hybrid-SWA model):
+        # req_to_token / out_cache_loc are in the FULL index space, while the
+        # draft KV physically lives in the swa sub-pool whose rows are swa
+        # slots. The attention backend translates on the READ path; the WRITE
+        # paths (target-hidden materialization and the draft block's own KV
+        # save) are handled by this worker and must translate explicitly (see
+        # _append_target_hidden_to_draft_kv_by_loc and spec_draft_block).
+        draft_pool = self.draft_model_runner.token_to_kv_pool
+        self._draft_pool_is_swa = isinstance(draft_pool, SWAKVPool)
+        if self._draft_pool_is_swa:
+            draft_alloc = self.draft_model_runner.token_to_kv_pool_allocator
+            assert isinstance(draft_alloc, SWATokenToKVPoolAllocator), (
+                "DFLASH draft uses an SWAKVPool but the shared allocator is "
+                f"{type(draft_alloc).__name__}; full->swa loc translation is "
+                "unavailable."
+            )
+            # The allocator only registers the mapping on the pool it was
+            # constructed with (the target's). Register the same mapping on the
+            # draft pool so its own translate/debug helpers work too.
+            if draft_pool.full_to_swa_index_mapping is None:
+                draft_pool.register_mapping(draft_alloc.full_to_swa_index_mapping)
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFLASH draft pool is SWAKVPool; full->swa loc translation "
+                    "enabled for draft KV writes."
+                )
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -433,12 +482,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._fused_kv_helper = None
 
     def _maybe_merge_trained_mask_embedding(self) -> None:
-        """Merge a trained mask embedding into the target model's embedding table.
+        """Merge a trained mask embedding into the draft's embed_tokens table.
 
         During DFlash training the mask-token embedding can be trained separately and
         saved as ``mask_embedding.pt`` in the draft checkpoint directory. If present,
-        overwrite the corresponding row in the target embedding table so inference uses
-        the learned representation (the target's own mask-token row is typically an
+        overwrite the corresponding row in the draft's own embedding table so inference
+        uses the learned representation (the target's own mask-token row is typically an
         untrained added-vocab slot ~= 0). For per-position mask embeddings
         (``per_position=True``), keep them on the worker and apply per block offset at
         draft time instead of merging into the table.
@@ -467,8 +516,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "These must match."
             )
 
-        target_model = self.target_worker.model_runner.model
-        embed_module = target_model.get_input_embeddings()
+        embed_module = self.draft_model.embed_tokens
 
         if saved.get("per_position"):
             self._per_position_mask_embeddings = embedding_tensor.to(
@@ -501,60 +549,49 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if self.tp_rank == 0:
             logger.info(
-                "Merged trained mask embedding into target model "
+                "Merged trained mask embedding into draft embed_tokens "
                 "(mask_token_id=%s, source=%s)",
                 self._mask_token_id,
                 mask_emb_path,
             )
 
-    def _cache_full_embed_weight(self) -> None:
-        """Cache the full target embedding replicated on GPU during init.
+    def _setup_draft_embed_tokens(self) -> None:
+        """Alias the draft's embed_tokens weight to the target's embed weight.
 
-        With dp attention the active and idle DP groups run different code paths, so the
-        attn-TP all_reduce inside VocabParallelEmbedding gets mismatched calls (idle DP
-        ranks skip the draft step) and corrupts results. Gather the full embedding once
-        during init (all ranks sync) and keep it replicated on GPU, so the draft block-id
-        lookup is a collective-free, sync-free on-device ``F.embedding``.
+        The draft's `embed_tokens` is declared with the TARGET's vocab_size
+        (forced via json_model_override_args at worker init, since the draft
+        checkpoint carries no embed weight and its config.json vocab_size is
+        not authoritative), and `use_attn_tp_group=is_dp_attention_enabled()`
+        shards it the same way the target's embed is (attention-tp for MoE
+        targets under dp attention, global-tp otherwise). So the target's
+        weight tensor can be shared directly — zero extra memory, and
+        mask-embedding overrides land on the shared tensor.
+
+        A dense target (llama-style, embed always global-tp-sharded) with
+        dp attention enabled would produce a shape mismatch; that combo is
+        not currently supported and raises here.
         """
-        self._full_embed_gpu = None
+        target_embed = self.target_worker.model_runner.model.get_input_embeddings()
+        draft_embed = self.draft_model.embed_tokens
 
-        if not self.server_args.enable_dp_attention:
-            return
+        if tuple(draft_embed.weight.shape) != tuple(target_embed.weight.shape):
+            raise RuntimeError(
+                "DFLASH draft embed_tokens shape does not match the target's. "
+                f"draft={tuple(draft_embed.weight.shape)}, "
+                f"target={tuple(target_embed.weight.shape)}. "
+                "The draft's vocab_size is overridden to the target's at init, "
+                "so a mismatch here means the sharding scheme differs (e.g. a "
+                "global-tp-sharded dense-target embed with dp attention "
+                "enabled), which DFLASH does not currently support. Aliasing "
+                "anyway would silently corrupt embed lookups."
+            )
 
-        target_model = self.target_worker.model_runner.model
-        tp_group = get_tp_group()
-        tp_size = int(tp_group.world_size)
-        if tp_size <= 1:
-            return
-
-        def _broadcast_gather(local_shard, tp_group, tp_size, tp_rank):
-            """Gather shards on GPU via sequential broadcast (one shard at a time)."""
-            import torch.distributed as dist
-
-            parts = []
-            for r in range(tp_size):
-                if r == tp_rank:
-                    buf = local_shard.contiguous()
-                else:
-                    buf = torch.empty_like(local_shard)
-                dist.broadcast(buf, src=tp_group.ranks[r], group=tp_group.device_group)
-                parts.append(buf.clone())
-            return torch.cat(parts, dim=0)
-
-        # Full embed_tokens, kept replicated on GPU (sync-free runtime lookup).
-        embed_module = target_model.get_input_embeddings()
-        local_w = embed_module.weight.data
-        shard = getattr(embed_module, "shard_indices", None)
-        num_org = int(shard.num_org_elements) if shard else local_w.shape[0]
-        vocab_size = int(self.target_worker.model_runner.model_config.vocab_size)
-        self._full_embed_gpu = _broadcast_gather(
-            local_w[:num_org], tp_group, tp_size, self.tp_rank
-        )[:vocab_size]
+        del draft_embed.weight
+        draft_embed.weight = target_embed.weight
         if self.tp_rank == 0:
             logger.info(
-                "DFLASH cached embed on GPU: shape=%s, mask_norm=%.4f",
-                list(self._full_embed_gpu.shape),
-                self._full_embed_gpu[self._mask_token_id].float().norm().item(),
+                "DFLASH draft embed_tokens aliased to target (shape=%s)",
+                list(target_embed.weight.shape),
             )
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
@@ -1086,6 +1123,26 @@ class DFlashWorkerV2(BaseSpecWorker):
             if commit_lens.dtype != torch.int32:
                 commit_lens = commit_lens.to(torch.int32)
 
+        if self._draft_pool_is_swa:
+            # The incoming cache locs are in the FULL index space, but the
+            # (all-SWA) draft KV lives in the swa sub-pool. Translate before
+            # writing so the READ path (attention backend translates
+            # kv_indices the same way) sees the data we wrote.
+            _alloc = self.draft_model_runner.token_to_kv_pool_allocator
+            cache_loc = _alloc.translate_loc_from_full_to_swa(cache_loc).to(
+                torch.int64
+            )
+            if cache_loc_2d is not None:
+                cache_loc_2d = (
+                    _alloc.translate_loc_from_full_to_swa(cache_loc_2d.reshape(-1))
+                    .to(torch.int64)
+                    .view_as(cache_loc_2d)
+                )
+            # SWAKVPool.set_kv_buffer prefers self.swa_loc over the passed loc;
+            # a stale swa_loc from the previous draft forward would silently
+            # override our translated locs. Clear it.
+            self.draft_model_runner.token_to_kv_pool.set_swa_loc(None)
+
         with torch.inference_mode(), self.draft_tp_context(
             self.draft_model_runner.tp_group
         ):
@@ -1525,7 +1582,6 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
-        embed_module = target_model.get_input_embeddings()
         lm_head = getattr(target_model, "lm_head", None)
         if lm_head is None or not hasattr(lm_head, "weight"):
             raise RuntimeError(
@@ -1601,12 +1657,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        # Use the GPU-replicated full embedding under dp attention (collective-free,
-        # no host-device sync); otherwise the on-device VocabParallelEmbedding path.
-        if self._full_embed_gpu is not None:
-            noise_embedding = F.embedding(block_ids, self._full_embed_gpu)
-        else:
-            noise_embedding = embed_module(block_ids)
+        # Draft embed_tokens declares `use_attn_tp_group=is_dp_attention_enabled()`,
+        # so its all_reduce is already routed to the attention-tp group and does
+        # not collide with idle peer DP ranks.
+        noise_embedding = self.draft_model.embed_tokens(block_ids)
         if self._per_position_mask_embeddings is not None:
             is_mask = block_ids == self._mask_token_id
             pos_in_block = torch.arange(self.block_size, device=block_ids.device)
@@ -1677,6 +1731,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
                 draft_seq_lens_sum = int(prefix_lens.sum().item())
 
+        # SWA draft pool: the draft block writes its own KV during forward via
+        # RadixAttention -> SWAKVPool.set_kv_buffer, which prefers pool.swa_loc
+        # (set by ModelRunner.forward from out_cache_loc_swa). Provide the
+        # translated locs so the block KV lands in the correct swa slots.
+        out_cache_loc_swa = None
+        if self._draft_pool_is_swa:
+            out_cache_loc_swa = self.draft_model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                verify_out_cache_loc
+            )
+
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,
@@ -1684,6 +1748,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             req_pool_indices=model_worker_batch.req_pool_indices,
             seq_lens=draft_seq_lens,
             out_cache_loc=verify_out_cache_loc,
+            out_cache_loc_swa=out_cache_loc_swa,
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
@@ -1766,11 +1831,47 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
+        # Grammar-constrained decoding
+        vocab_mask = None
+        if model_worker_batch.has_grammar:
+            chain_len = int(self.block_size)
+            retrieve_next_token_cpu = torch.full(
+                (bs, chain_len), -1, dtype=torch.int64
+            )
+            retrieve_next_token_cpu[:, :-1] = torch.arange(
+                1, chain_len, dtype=torch.int64
+            )
+            retrieve_next_sibling_cpu = torch.full(
+                (bs, chain_len), -1, dtype=torch.int64
+            )
+            draft_tokens_cpu = draft_tokens.cpu()
+
+            vocab_mask = generate_token_bitmask(
+                model_worker_batch.reqs,
+                verify_input,
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+                model_worker_batch.sampling_info.vocab_size,
+            )
+            if vocab_mask is not None:
+                assert verify_input.grammar is not None
+                vocab_mask = vocab_mask.to(logits_output.next_token_logits.device)
+                # NOTE: otherwise, this vocab mask will be the one from the
+                # previous extend stage and will be applied to produce wrong
+                # results (same as the eagle_worker_v2 verify path).
+                model_worker_batch.sampling_info.vocab_mask = None
+
         if sampling_info is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
+            )
+
+        if vocab_mask is not None:
+            verify_input.grammar.apply_vocab_mask(
+                logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
 
         candidates = draft_tokens

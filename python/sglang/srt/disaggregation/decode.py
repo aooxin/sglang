@@ -676,7 +676,7 @@ class DecodePreallocQueue:
 
         if isinstance(self.token_to_kv_pool, SWAKVPool):
             seq_len = len(req.origin_input_ids)
-            window_size = self.scheduler.sliding_window_size
+            window_size = self.scheduler.swa_retention_window
             window_start = max(0, seq_len - window_size)
             window_start = (window_start // page_size) * page_size
             window_kv_indices_full = self.req_to_token_pool.req_to_token[
@@ -970,7 +970,7 @@ class DecodePreallocQueue:
         return ceil_align(
             min(
                 req_len,
-                self.scheduler.sliding_window_size,
+                self.scheduler.swa_retention_window,
             )
             + min(self.num_reserved_decode_tokens, self.evict_len_per_step)
             + self.swa_extra_need_tokens,
@@ -981,7 +981,7 @@ class DecodePreallocQueue:
         return ceil_align(
             min(
                 req.seqlen,
-                self.scheduler.sliding_window_size,
+                self.scheduler.swa_retention_window,
             )
             + self.evict_len_per_step,
             page_size,
@@ -991,7 +991,7 @@ class DecodePreallocQueue:
         retractable_tokens = 0
         swa_retractable_tokens = 0
         is_hybrid_swa = self.scheduler.model_config.is_hybrid_swa
-        sliding_window_size = self.scheduler.sliding_window_size
+        sliding_window_size = self.scheduler.swa_retention_window
         for req in self.scheduler.running_batch.reqs:
             req_len = req.seqlen
             retractable_tokens += req_len
@@ -1019,7 +1019,7 @@ class DecodePreallocQueue:
             max(
                 min(
                     len(req.origin_input_ids),
-                    self.scheduler.sliding_window_size,
+                    self.scheduler.swa_retention_window,
                 )
                 + self.swa_extra_need_tokens
                 + min(
@@ -1554,7 +1554,7 @@ class DecodePreallocQueue:
         elif self._has_pre_alloc:
             kv_loc = self.token_to_kv_pool_allocator.pre_alloc(
                 fill_len,
-                self.scheduler.sliding_window_size,
+                self.scheduler.swa_retention_window,
             )
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
@@ -1583,7 +1583,7 @@ class DecodePreallocQueue:
             max(
                 len(req.origin_input_ids)
                 + max(len(req.output_ids) - 1, 0)
-                - self.scheduler.sliding_window_size,
+                - self.scheduler.swa_retention_window,
                 0,
             ),
             self.token_to_kv_pool_allocator.page_size,
@@ -1789,6 +1789,7 @@ class DecodeTransferQueue:
             mm_image_tokens,
             mm_audio_tokens,
             mm_video_tokens,
+            dflash_draft_seq_len,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
 
@@ -1839,6 +1840,12 @@ class DecodeTransferQueue:
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
             decode_req.req.hidden_states_tensor = output_hidden_states
+        if self.spec_algorithm.is_dflash():
+            # PD + DFlash: prefill side already populated draft KV pool; decode
+            # only needs the cursor to rebuild DFlashDraftInput in process_prebuilt.
+            decode_req.req.dflash_draft_seq_len = int(
+                dflash_draft_seq_len[0].item()
+            )
 
         if decode_req.req.return_logprob:
             decode_req.req.output_token_logprobs_val.append(
@@ -2161,6 +2168,8 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
             self.process_decode_queue()
+
+            self._apply_war_barrier()
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()

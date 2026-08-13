@@ -113,6 +113,7 @@ class PoolName(str, Enum):
 
     KV = "kv"
     MAMBA = "mamba"
+    DRAFT = "draft"
 
 
 class PoolHitPolicy(str, Enum):
@@ -177,6 +178,10 @@ class HiCacheStorage(ABC):
         if not hasattr(self, "registered_pools"):
             self.registered_pools = {}
         self.registered_pools[host_pool_name] = host_pool
+
+    def register_draft_mem_pool_host(self, draft_host_pool: HostKVCache) -> None:
+        self.register_mem_host_pool_v2(draft_host_pool, PoolName.DRAFT)
+        self.draft_mem_pool_host = draft_host_pool
 
     def batch_exists_v2(
         self,

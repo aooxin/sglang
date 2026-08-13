@@ -336,6 +336,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
         self.memory_pool_config = memory_pool_config
+        self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
@@ -349,6 +350,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
+
+        if self.is_draft_worker:
+            from sglang.srt.mem_cache.swa_memory_pool import (
+                SWATokenToKVPoolAllocator,
+            )
+
+            if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+                self.is_hybrid_swa = True
+                if not hasattr(self.model_config, "swa_attention_layer_ids"):
+                    draft_num_layers = int(
+                        self.model_config.hf_text_config.num_hidden_layers
+                    )
+                    # DFlash-SWA: every draft layer is a SWA layer.
+                    self.model_config.swa_attention_layer_ids = list(
+                        range(draft_num_layers)
+                    )
+                    self.model_config.full_attention_layer_ids = []
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0

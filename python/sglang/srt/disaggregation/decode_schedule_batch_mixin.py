@@ -185,3 +185,80 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     spec_info.future_indices, spec_info
                 )
             self.spec_info = spec_info
+        elif self.spec_algorithm.is_dflash():
+            # PD + DFlash: prefill side has already projected target_hidden and
+            # written it into the draft KV pool (the draft KV bytes travelled
+            # with the target KV via mooncake). The decode side only needs to
+            # reconstruct a spec_info matching the worker's expected DraftInput
+            # type. No target_hidden context features are needed because the
+            # KV cache is already populated.
+            if self.enable_overlap:
+                # Spec-v2 path: V2 worker expects DFlashDraftInputV2.
+                # V2 worker derives draft prefix_lens from model_worker_batch.seq_lens
+                # at decode time (or _compute_compact_draft_seq_lens when draft
+                # windowing is enabled), so we do NOT need to thread the prefill-side
+                # cursor through here. Mirrors EAGLE V2's PD reconstruction:
+                # alloc future_indices + register the spec_info into future_map so
+                # the overlap scheduler can resolve it when the next batch runs.
+                from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+
+                bs = len(self.reqs)
+                verified_id = (
+                    self.output_ids
+                    if self.output_ids.dtype == torch.int32
+                    else self.output_ids.to(torch.int32)
+                )
+                spec_info = DFlashDraftInputV2(
+                    topk_p=torch.empty(
+                        (bs, 0), device=self.device, dtype=torch.float32
+                    ),
+                    topk_index=torch.empty(
+                        (bs, 0), device=self.device, dtype=torch.int64
+                    ),
+                    verified_id=verified_id,
+                    new_seq_lens=self.seq_lens.to(torch.int64),
+                    hidden_states=torch.empty(
+                        (bs, 0), device=self.device, dtype=torch.float16
+                    ),
+                    verify_done=None,
+                    cur_allocated_seq_lens_cpu=self.seq_lens_cpu.to(torch.int32),
+                )
+                spec_info.future_indices = future_map.alloc_future_indices(bs)
+                future_map.store_to_map_for_new_batch(
+                    spec_info.future_indices, spec_info
+                )
+                self.spec_info = spec_info
+            else:
+                # Spec-v1 path: V1 worker expects DFlashDraftInput with an
+                # explicit draft_seq_lens field. Use the cursor that prefill
+                # serialised through the metadata buffer (`req.dflash_draft_seq_len`).
+                # The decode-side first step _prepare_for_speculative_decoding
+                # uses draft_seq_lens as prefix_lens and verified_id as the
+                # draft seed token.
+                from sglang.srt.speculative.dflash_info import DFlashDraftInput
+
+                bs = len(self.reqs)
+                verified_id = (
+                    self.output_ids
+                    if self.output_ids.dtype == torch.int64
+                    else self.output_ids.to(torch.int64)
+                )
+                draft_seq_lens = torch.tensor(
+                    [req.dflash_draft_seq_len for req in self.reqs],
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                ctx_lens = torch.zeros(bs, dtype=torch.int32, device=self.device)
+                # Empty target_hidden: KV is already in pool. Second dim is irrelevant
+                # while shape[0] == 0 — _append_target_hidden_to_draft_kv bails on
+                # total_ctx <= 0, and merge_batch / filter_batch have explicit
+                # numel() == 0 shortcuts.
+                target_hidden = torch.empty(
+                    (0, 0), dtype=torch.bfloat16, device=self.device
+                )
+                self.spec_info = DFlashDraftInput(
+                    verified_id=verified_id,
+                    target_hidden=target_hidden,
+                    ctx_lens=ctx_lens,
+                    draft_seq_lens=draft_seq_lens,
+                )

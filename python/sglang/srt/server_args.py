@@ -3059,11 +3059,6 @@ class ServerArgs:
             self.speculative_algorithm = "EAGLE"
 
         if self.speculative_algorithm == "DFLASH":
-            if self.enable_dp_attention:
-                raise ValueError(
-                    "Currently DFLASH speculative decoding does not support dp attention."
-                )
-
             if self.pp_size != 1:
                 raise ValueError(
                     "Currently DFLASH speculative decoding only supports pp_size == 1."
@@ -3192,6 +3187,15 @@ class ServerArgs:
                 logger.warning(
                     "Mixed chunked prefill is disabled because of using dflash speculative decoding."
                 )
+
+            if self.disaggregation_mode != "null":
+                if self.disaggregation_transfer_backend != "mooncake":
+                    raise ValueError(
+                        f"DFLASH PD mode currently only supports the mooncake "
+                        f"transfer backend; got "
+                        f"{self.disaggregation_transfer_backend!r}."
+                    )
+
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:

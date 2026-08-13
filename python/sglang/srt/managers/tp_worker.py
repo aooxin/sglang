@@ -71,6 +71,10 @@ class BaseTpWorker(ABC):
         pass
 
     @property
+    def war_fastpath_runner(self):
+        return self.model_runner
+
+    @property
     def sliding_window_size(self) -> Optional[int]:
         return self.model_runner.sliding_window_size
 

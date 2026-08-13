@@ -438,6 +438,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
+        if batch.seq_lens_sum is None and batch.seq_lens_cpu is not None:
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -980,7 +982,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.extend_seq_lens is not None:
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
 
-        if self.spec_info is not None and self.spec_info.is_draft_input():
+        # NOTE: this padding hardcodes EagleDraftInput fields (hidden_states,
+        # topk_p, topk_index, accept_length). is_draft_input() also returns
+        # True for DFLASH_DRAFT (a state snapshot that has none of these
+        # fields), so narrow the gate to EAGLE_DRAFT specifically. The
+        # FIXME(lsyin) below tracks the broader refactor of moving padding
+        # into each spec_info subclass.
+        from sglang.srt.speculative.spec_info import SpecInputType
+
+        if (
+            self.spec_info is not None
+            and self.spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT
+        ):
             # FIXME(lsyin): remove this isinstance logic
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
@@ -1032,10 +1045,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
                 num_tokens = bs * self.spec_info.draft_token_num
-                logits_output.next_token_logits = logits_output.next_token_logits[
-                    :num_tokens
-                ]
-                logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+                # DFlash draft model returns logits=None on purpose (it borrows
+                # the target's lm_head later inside the worker). Guard each
+                # field so the post-sync slicing only runs when the tensor
+                # actually exists.
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = (
+                        logits_output.next_token_logits[:num_tokens]
+                    )
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states[
+                        :num_tokens
+                    ]
             elif self.forward_mode.is_draft_extend():  # draft extend
                 self.spec_info.accept_length = self.spec_info.accept_length[:bs]
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
@@ -1045,8 +1066,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
-                logits_output.next_token_logits = logits_output.next_token_logits[:bs]
-                logits_output.hidden_states = logits_output.hidden_states[:bs]
+                # Idle short-circuit in DFlash worker calls target.forward without
+                # capture_hidden_mode=FULL, so hidden_states may be None. Guard
+                # both fields, mirroring the is_target_verify branch above.
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = (
+                        logits_output.next_token_logits[:bs]
+                    )
+                if logits_output.hidden_states is not None:
+                    logits_output.hidden_states = logits_output.hidden_states[:bs]
 
             if hasattr(self, "hidden_states_backup"):
                 self.spec_info.hidden_states = self.hidden_states_backup

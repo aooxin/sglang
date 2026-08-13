@@ -27,6 +27,7 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolName,
 )
 
 if TYPE_CHECKING:
@@ -614,10 +615,13 @@ class HiCacheController:
 
         self.has_draft_kv_pool = False
         self.has_draft_kv_pool_list = False
+        self.draft_l3_enabled = False
         self.mem_pool_device_draft = None
         self.mem_pool_host_draft = None
         self.mem_pool_device_draft_list = []
         self.mem_pool_host_draft_list = []
+        self.draft_page_get_func = None
+        self.draft_page_set_func = None
         self.storage_backend = None
         self.storage_backend_type = None
         self.pp_rank = pp_rank
@@ -905,6 +909,8 @@ class HiCacheController:
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
+            self._maybe_register_draft_with_storage()
+
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
             self._start_storage_threads()
@@ -945,6 +951,8 @@ class HiCacheController:
             self.enable_storage = False
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
+            self.draft_page_get_func = None
+            self.draft_page_set_func = None
             raise
 
     def detach_storage_backend(self):
@@ -997,6 +1005,8 @@ class HiCacheController:
         self.enable_storage = False
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
+        self.draft_page_get_func = None
+        self.draft_page_set_func = None
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
@@ -1133,6 +1143,14 @@ class HiCacheController:
         )
         self.start_writing()
 
+    @staticmethod
+    def _draft_swa_args(draft_host_pool, swa_args: dict) -> dict:
+        """SWA copy args only apply to a draft host pool that is itself SWA;
+        full-attention draft pools ignore the SWA index tensors."""
+        from sglang.srt.mem_cache.memory_pool_host import SWATokenToKVPoolHost
+
+        return swa_args if isinstance(draft_host_pool, SWATokenToKVPoolHost) else {}
+
     def start_writing(self) -> None:
         if len(self.write_queue) == 0:
             return
@@ -1181,6 +1199,7 @@ class HiCacheController:
                 self.io_backend,
                 **swa_args,
             )
+
             if self.has_draft_kv_pool_list:
                 for i, draft_device_pool in enumerate(self.mem_pool_device_draft_list):
                     self.mem_pool_host_draft_list[i].backup_from_device_all_layer(
@@ -1188,7 +1207,9 @@ class HiCacheController:
                         host_indices,
                         device_indices,
                         self.io_backend,
-                        **swa_args,
+                        **self._draft_swa_args(
+                            self.mem_pool_host_draft_list[i], swa_args
+                        ),
                     )
             elif self.has_draft_kv_pool:
                 self.mem_pool_host_draft.backup_from_device_all_layer(
@@ -1196,7 +1217,7 @@ class HiCacheController:
                     host_indices,
                     device_indices,
                     self.io_backend,
-                    **swa_args,
+                    **self._draft_swa_args(self.mem_pool_host_draft, swa_args),
                 )
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
@@ -1454,12 +1475,14 @@ class HiCacheController:
                     self.io_backend,
                     **swa_args,
                 )
+
                 if self.has_draft_kv_pool_list:
                     for j, draft_host_pool in enumerate(self.mem_pool_host_draft_list):
                         if i < self.mem_pool_host_draft_list[j].layer_num:
                             _, is_draft_swa_layer = (
                                 draft_host_pool.device_pool.layers_mapping[i]
                             )
+                            _kw = self._draft_swa_args(draft_host_pool, swa_args)
                             draft_host_pool.load_to_device_per_layer(
                                 self.mem_pool_device_draft_list[j],
                                 (
@@ -1474,13 +1497,14 @@ class HiCacheController:
                                 ),
                                 i,
                                 self.io_backend,
-                                **swa_args,
+                                **_kw,
                             )
                 elif self.has_draft_kv_pool:
                     if i < self.mem_pool_host_draft.layer_num:
                         _, is_draft_swa_layer = (
                             self.mem_pool_host_draft.device_pool.layers_mapping[i]
                         )
+                        _kw = self._draft_swa_args(self.mem_pool_host_draft, swa_args)
                         self.mem_pool_host_draft.load_to_device_per_layer(
                             self.mem_pool_device_draft,
                             host_indices if is_draft_swa_layer else full_host_indices,
@@ -1491,7 +1515,7 @@ class HiCacheController:
                             ),
                             i,
                             self.io_backend,
-                            **swa_args,
+                            **_kw,
                         )
                 producer_event.complete(i)
             # NOTE: We must save the host indices and device indices here,
@@ -1542,10 +1566,50 @@ class HiCacheController:
             self.has_draft_kv_pool_list = True
             self.mem_pool_device_draft_list = draft_kv_pool_list
             self.mem_pool_host_draft_list = draft_host_kv_pool_list
+            self.draft_l3_enabled = False
+            logger.info(
+                "HiCache draft KV registered: multi-pool list (L2 only, L3 disabled)"
+            )
         elif draft_kv_pool:
             self.has_draft_kv_pool = True
             self.mem_pool_device_draft = draft_kv_pool
             self.mem_pool_host_draft = draft_host_kv_pool
+            self.draft_l3_enabled = True  # L3 enabled for single-pool draft
+            logger.info(
+                "HiCache draft KV registered: %s (host %d slots)",
+                type(draft_kv_pool).__name__,
+                draft_host_kv_pool.size,
+            )
+
+        # If storage is already attached, wire up the draft I/O path now.
+        # Otherwise this will be deferred until attach_storage_backend().
+        self._maybe_register_draft_with_storage()
+
+    def _maybe_register_draft_with_storage(self) -> None:
+        self.draft_page_get_func = None
+        self.draft_page_set_func = None
+        if not self.draft_l3_enabled or not self.enable_storage:
+            return
+
+        self.storage_backend.register_draft_mem_pool_host(
+            self.mem_pool_host_draft
+        )
+
+        draft_zero_copy_backends = {"gcache"}
+        if self.storage_backend_type in draft_zero_copy_backends:
+            self.draft_page_get_func = self._draft_page_get_zero_copy
+            self.draft_page_set_func = self._draft_page_set_zero_copy
+            logger.info(
+                "HiCache draft L3 enabled with zero-copy path (backend=%s)",
+                self.storage_backend_type,
+            )
+        else:
+            self.draft_page_get_func = self._draft_page_get_generic
+            self.draft_page_set_func = self._draft_page_set_generic
+            logger.info(
+                "HiCache draft L3 enabled with generic path (backend=%s)",
+                self.storage_backend_type,
+            )
 
     def evict_host(
         self, host_indices: torch.Tensor, backup_only: bool = True
@@ -1861,6 +1925,11 @@ class HiCacheController:
 
                 if self._fault_injector.enabled:
                     self._fault_injector.maybe_inject_timeout_fault(operation.id)
+
+                if self.draft_l3_enabled:
+                    self.draft_page_get_func(
+                        batch_hashes, batch_host_indices, extra_info
+                    )
 
                 # Get one batch token, and update the completed_tokens if succeed
                 t0_io = time.perf_counter()
@@ -2282,6 +2351,48 @@ class HiCacheController:
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
         )
 
+    def _draft_page_set_zero_copy(
+        self, hash_values, host_indices, extra_info=None
+    ) -> None:
+        self.storage_backend.batch_set_v1_draft(
+            hash_values, host_indices, extra_info
+        )
+
+    def _draft_page_get_zero_copy(
+        self, hash_values, host_indices, extra_info=None
+    ) -> None:
+        self.storage_backend.batch_get_v1_draft(
+            hash_values, host_indices, extra_info
+        )
+
+    def _draft_page_set_generic(
+        self, hash_values, host_indices, extra_info=None
+    ) -> None:
+        # `{hash}.draft` mirrors HiCacheStorage._get_component_key's
+        # `{key}.{pool_name}` convention so target/draft pages never collide.
+        draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
+        draft_data = [
+            self.mem_pool_host_draft.get_data_page(host_indices[i * self.page_size])
+            for i in range(len(draft_keys))
+        ]
+        self.storage_backend.batch_set(draft_keys, draft_data)
+
+    def _draft_page_get_generic(
+        self, hash_values, host_indices, extra_info=None
+    ) -> None:
+        draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
+        draft_dummy = [
+            self.mem_pool_host_draft.get_dummy_flat_data_page() for _ in draft_keys
+        ]
+        draft_pages = self.storage_backend.batch_get(draft_keys, draft_dummy)
+        if draft_pages is None:
+            return
+        for i, p in enumerate(draft_pages):
+            if p is not None:
+                self.mem_pool_host_draft.set_from_flat_data_page(
+                    host_indices[i * self.page_size], p
+                )
+
     # Backup batch by batch
     def _page_backup(self, operation):
         # Backup batch by batch
@@ -2306,6 +2417,12 @@ class HiCacheController:
                 )
                 break
             logger.debug(f"Write page to storage: {len(batch_hashes)} pages succeeded.")
+
+            # Best-effort draft L3 write alongside target.
+            if self.draft_l3_enabled:
+                self.draft_page_set_func(
+                    batch_hashes, batch_host_indices, extra_info
+                )
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes

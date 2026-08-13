@@ -556,7 +556,11 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    if is_swa_layer:
+                    # SWA-specific cache slots only exist on a hybrid SWA pool
+                    # (SWAKVPool). Models that just set layer.sliding_window_size
+                    # for the attention mask but use a plain MHATokenToKVPool
+                    # (e.g. DFlash draft) must write to the regular cache_loc.
+                    if is_swa_layer and self.use_sliding_window_kv_pool:
                         forward_batch.token_to_kv_pool.set_kv_buffer(
                             layer,
                             forward_batch.out_cache_loc_swa,
@@ -587,7 +591,14 @@ class FlashAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
-        window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
+        if is_swa_layer and layer.attn_type == AttentionType.ENCODER_ONLY:
+            # Non-causal attention (e.g. DFlash draft block) needs a symmetric
+            # window so each token can attend to both sides within the window.
+            window_size = (layer.sliding_window_size, layer.sliding_window_size)
+        elif is_swa_layer:
+            window_size = (layer.sliding_window_size, 0)
+        else:
+            window_size = (-1, -1)
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -936,7 +947,11 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    if is_swa_layer:
+                    # SWA-specific cache slots only exist on a hybrid SWA pool
+                    # (SWAKVPool). Models that just set layer.sliding_window_size
+                    # for the attention mask but use a plain MHATokenToKVPool
+                    # (e.g. DFlash draft) must write to the regular cache_loc.
+                    if is_swa_layer and self.use_sliding_window_kv_pool:
                         forward_batch.token_to_kv_pool.set_kv_buffer(
                             layer,
                             forward_batch.out_cache_loc_swa,
@@ -975,7 +990,12 @@ class FlashAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
-        window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
+        if is_swa_layer and layer.attn_type == AttentionType.ENCODER_ONLY:
+            window_size = (layer.sliding_window_size, layer.sliding_window_size)
+        elif is_swa_layer:
+            window_size = (layer.sliding_window_size, 0)
+        else:
+            window_size = (-1, -1)
 
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:

@@ -14,6 +14,11 @@ from torch import nn
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_rank,
+    get_attention_tp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -23,6 +28,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
@@ -30,12 +36,19 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     parse_dflash_draft_config,
 )
+from sglang.srt.utils.common import add_prefix
 
 logger = logging.getLogger(__name__)
 
 
 class DFlashAttention(nn.Module):
-    def __init__(self, config, layer_id: int) -> None:
+    def __init__(
+        self,
+        config,
+        layer_id: int,
+        quant_config=None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         tp_size = int(get_tensor_model_parallel_world_size())
@@ -65,8 +78,13 @@ class DFlashAttention(nn.Module):
             )
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         self.head_dim = head_dim
+        self.v_head_dim = int(getattr(config, "v_head_dim", head_dim))
         self.q_size = self.num_heads * head_dim
-        self.kv_size = self.num_kv_heads * head_dim
+        self.k_size = self.num_kv_heads * head_dim
+        self.v_size = self.num_kv_heads * self.v_head_dim
+        # Keep the old name aliased so existing callers that read .kv_size keep
+        # working when k_size == v_size (the common case).
+        self.kv_size = self.k_size
 
         attention_bias = bool(getattr(config, "attention_bias", False))
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
@@ -76,28 +94,54 @@ class DFlashAttention(nn.Module):
             head_size=head_dim,
             total_num_heads=self.total_num_heads,
             total_num_kv_heads=self.total_num_kv_heads,
+            v_head_size=self.v_head_dim,
             bias=attention_bias,
-            prefix="qkv_proj",
+            quant_config=quant_config,
+            prefix=(f"{prefix}.qkv_proj" if prefix else "qkv_proj"),
         )
         self.o_proj = RowParallelLinear(
-            self.total_num_heads * head_dim,
+            self.total_num_heads * self.v_head_dim,
             hidden_size,
             bias=attention_bias,
-            prefix="o_proj",
+            quant_config=quant_config,
+            prefix=(f"{prefix}.o_proj" if prefix else "o_proj"),
         )
 
         # Per-head Q/K RMSNorm, matching HF Qwen3.
         self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
 
-        rope_theta = float(getattr(config, "rope_theta", 1000000))
-        rope_scaling = getattr(config, "rope_scaling", None)
+        # Parse dflash_config early so RoPE / SWA / sink / v_scale all use it
+        # consistently.
+        draft_cfg = parse_dflash_draft_config(draft_hf_config=config)
+
+        # RoPE base: read directly from config.rope_theta. The HF ckpt's top-level
+        # rope_theta is what the draft was TRAINED with — for SWA-trained drafts
+        # this is the SWA base (e.g. 10000), NOT the backbone base. The DFlash
+        # commit f765d9de7 (in the old repo) explicitly REMOVED an override that
+        # had been incorrectly substituting the backbone base.
+        # transformers v5+ moves top-level rope_theta / rope_scaling into a
+        # config.rope_parameters dict and hides the legacy attributes. Read the
+        # dict first; if absent, fall back to the legacy top-level attributes.
+        # Mirrors the pattern used in models/qwen3.py.
+        if (
+            hasattr(config, "rope_parameters")
+            and config.rope_parameters
+            and "rope_theta" in config.rope_parameters
+        ):
+            rope_theta = float(config.rope_parameters["rope_theta"])
+            rope_scaling = config.rope_parameters
+        else:
+            rope_theta = float(getattr(config, "rope_theta", 1000000))
+            rope_scaling = getattr(config, "rope_scaling", None)
         rope_is_neox_style = bool(
             getattr(
                 config, "rope_is_neox_style", getattr(config, "is_neox_style", True)
             )
         )
         max_position_embeddings = int(getattr(config, "max_position_embeddings", 32768))
+        partial_rotary_factor = float(getattr(config, "partial_rotary_factor", 1.0))
+
         self.rotary_emb = get_rope(
             head_dim,
             rotary_dim=head_dim,
@@ -105,7 +149,16 @@ class DFlashAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=rope_is_neox_style,
+            partial_rotary_factor=partial_rotary_factor,
         )
+
+        # SWA window for the draft block. Prefer dflash_config.swa_window_size
+        # (training-time setting), fall back to top-level sliding_window.
+        swa_window = None
+        if draft_cfg.use_swa:
+            swa_window = draft_cfg.swa_window_size
+            if swa_window is None:
+                swa_window = getattr(config, "sliding_window", None)
 
         self.scaling = head_dim**-0.5
         # DFlash uses non-causal attention over the draft block.
@@ -114,8 +167,19 @@ class DFlashAttention(nn.Module):
             head_dim=head_dim,
             scaling=self.scaling,
             num_kv_heads=self.num_kv_heads,
+            v_head_dim=self.v_head_dim,
             layer_id=layer_id,
             attn_type=AttentionType.ENCODER_ONLY,
+            sliding_window_size=int(swa_window) if swa_window else -1,
+        )
+
+        # Optional: per-layer attention_sink_bias parameter + value scale read
+        # from dflash_config. Defaults preserve old checkpoints behavior.
+        self.v_scale: Optional[float] = draft_cfg.attention_value_scale
+        self.attention_sink_bias = (
+            nn.Parameter(torch.empty(self.num_heads), requires_grad=False)
+            if draft_cfg.attention_sink_bias
+            else None
         )
 
     def forward(
@@ -125,10 +189,12 @@ class DFlashAttention(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
         q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        if self.v_scale is not None:
+            v = v * self.v_scale
+        attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -143,18 +209,22 @@ class DFlashAttention(nn.Module):
         # Fast path for unquantized weights: slice the fused QKV weight and run one GEMM.
         can_slice_qkv_weight, _ = can_dflash_slice_qkv_weight(self.qkv_proj)
         if can_slice_qkv_weight:
-            kv_slice = slice(self.q_size, self.q_size + 2 * self.kv_size)
+            kv_slice = slice(self.q_size, self.q_size + self.k_size + self.v_size)
             weight = self.qkv_proj.weight[kv_slice]
             bias = (
                 self.qkv_proj.bias[kv_slice] if self.qkv_proj.bias is not None else None
             )
             kv = F.linear(hidden_states, weight, bias)
-            k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
+            k, v = kv.split([self.k_size, self.v_size], dim=-1)
+            if self.v_scale is not None:
+                v = v * self.v_scale
             return k, v
 
         # Fallback: compute full QKV and discard Q (keeps compatibility with quantized weights).
         qkv, _ = self.qkv_proj(hidden_states)
-        _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        _, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        if self.v_scale is not None:
+            v = v * self.v_scale
         return k, v
 
     def apply_k_norm(self, k: torch.Tensor) -> torch.Tensor:
@@ -208,15 +278,30 @@ class DFlashMLP(nn.Module):
 
 
 class DFlashDecoderLayer(nn.Module):
-    def __init__(self, config, layer_id: int) -> None:
+    def __init__(
+        self,
+        config,
+        layer_id: int,
+        quant_config=None,
+        prefix: str = "",
+    ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.self_attn = DFlashAttention(config=config, layer_id=layer_id)
+        self.self_attn = DFlashAttention(
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=(f"{prefix}.self_attn" if prefix else "self_attn"),
+        )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.mlp = DFlashMLP(config=config)
+        self.mlp = DFlashMLP(
+            config=config,
+            quant_config=quant_config,
+            prefix=(f"{prefix}.mlp" if prefix else "mlp"),
+        )
 
     def forward(
         self,
@@ -249,19 +334,19 @@ class DFlashDecoderLayer(nn.Module):
 
 
 class DFlashDraftModel(nn.Module):
-    """SGLang DFlash draft model (no embedding / lm_head weights).
+    """SGLang DFlash draft model (no lm_head weights).
 
     The checkpoint provides:
       - transformer weights for `layers.*`
       - `fc.weight`, `hidden_norm.weight` for projecting target context features
       - `norm.weight` for final normalization
-    """
 
-    # Param names NOT backed by the checkpoint (aliased to the target's embed
-    # at runtime).  The remote weight loader must skip them: on the seed they
-    # are freed by the aliasing right after MR registration, so registering or
-    # transferring them would publish a stale MR whose address may be reused.
-    remote_weight_skip_names = {"embed_tokens.weight"}
+    The token embedding weight is not in the checkpoint; under dp attention
+    the worker populates `self.embed_tokens.weight` from the target's embed
+    weight (resharded to the attention-tp group), so draft embed lookup is
+    isolated to the active dp attention group and doesn't collide with idle
+    peer ranks.
+    """
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -271,8 +356,34 @@ class DFlashDraftModel(nn.Module):
         num_layers = int(config.num_hidden_layers)
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
 
+        # Embed aliased to the target's embed weight by the worker; not
+        # loaded from the draft checkpoint (checkpoint carries no embed).
+        # `config.vocab_size` here is ALREADY the target's vocab size — the
+        # worker overrides it via json_model_override_args before this model
+        # is constructed. It must match the target exactly: the shard indices
+        # computed from it drive input masking and the mask-embedding row
+        # lookup against the aliased target weight.
+        # `use_attn_tp_group=is_dp_attention_enabled()` makes the runtime
+        # all_reduce inside `VocabParallelEmbedding.forward` route to the
+        # attention-tp group directly, so we don't rely on the caller
+        # patching `_TP` first.
+        self.embed_tokens = VocabParallelEmbedding(
+            int(config.vocab_size),
+            hidden_size,
+            use_attn_tp_group=is_dp_attention_enabled(),
+            prefix=add_prefix("embed_tokens", prefix),
+        )
+
         self.layers = nn.ModuleList(
-            [DFlashDecoderLayer(config=config, layer_id=i) for i in range(num_layers)]
+            [
+                DFlashDecoderLayer(
+                    config=config,
+                    layer_id=i,
+                    quant_config=quant_config,
+                    prefix=(f"{prefix}.layers.{i}" if prefix else f"layers.{i}"),
+                )
+                for i in range(num_layers)
+            ]
         )
         self.norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
@@ -371,6 +482,24 @@ class DFlashDraftModel(nn.Module):
             return None
 
         for name, loaded_weight in weights:
+            # Merged QKV (per-rank chunked FP8 layout): both .weight (fp8) and
+            # .weight_scale_inv (fp32) are sharded by chunk(attn_tp_size, dim=0).
+            # Falls through to stacked_params_mapping for legacy ckpts that store
+            # q_proj/k_proj/v_proj separately.
+            if (
+                ".self_attn.qkv_proj.weight" in name
+                or ".self_attn.qkv_proj.weight_scale_inv" in name
+            ):
+                resolved_name = resolve_param_name(name)
+                if resolved_name is None:
+                    continue
+                param = params_dict[resolved_name]
+                attn_tp_size = get_attention_tp_size()
+                attn_tp_rank = get_attention_tp_rank()
+                sharded = loaded_weight.chunk(attn_tp_size, dim=0)[attn_tp_rank]
+                default_weight_loader(param, sharded)
+                continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:
                     continue
@@ -388,6 +517,13 @@ class DFlashDraftModel(nn.Module):
                     # Ignore unexpected weights (e.g., HF rotary caches).
                     continue
                 param = params_dict[resolved_name]
+                if resolved_name.endswith("attention_sink_bias"):
+                    # Slice the full-head sink_bias tensor per attn_tp_rank to
+                    # match the per-rank parameter shape (= num_heads).
+                    start = get_attention_tp_rank() * param.numel()
+                    sliced = loaded_weight[start : start + param.numel()]
+                    param.data.copy_(sliced)
+                    continue
                 if resolved_name.endswith("fc.weight") and tuple(
                     loaded_weight.shape
                 ) != tuple(param.shape):

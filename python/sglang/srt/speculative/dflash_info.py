@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
@@ -85,12 +86,36 @@ class DFlashDraftInput(SpecInput):
     # How many committed tokens are visible to the draft worker per request.
     draft_seq_lens: torch.Tensor
 
+    # Used by prepare_mlp_sync_batch (DP attention) to derive batch_size from
+    # num_tokens. Decode/idle batches consume 1 verified token per request,
+    # matching EagleDraftInput's draft-extend convention.
+    num_tokens_per_req: int = 1
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         # Draft state does not change token accounting.
         return (1, 1)
+
+    @classmethod
+    def create_idle_input(cls, device: torch.device) -> "DFlashDraftInput":
+        """Empty-tensor placeholder for DP-attention idle batches.
+
+        The DP-attention scheduler creates an idle ScheduleBatch on ranks that
+        have no requests this step, so they can still participate in collectives.
+        Such batches arrive at the DFlash worker with spec_info=None, which would
+        otherwise fail the isinstance check in the decode branch. Mirroring
+        EagleDraftInput.create_idle_input / DFlashDraftInputV2.create_idle_input,
+        this returns a zero-row instance whose downstream consumers all bail on
+        empty inputs.
+        """
+        return cls(
+            verified_id=torch.empty((0,), dtype=torch.int64, device=device),
+            target_hidden=torch.empty((0, 0), dtype=torch.bfloat16, device=device),
+            ctx_lens=torch.empty((0,), dtype=torch.int32, device=device),
+            draft_seq_lens=torch.empty((0,), dtype=torch.int32, device=device),
+        )
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         old_ctx_lens = self.ctx_lens
@@ -169,15 +194,51 @@ class DFlashVerifyInput(SpecInput):
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
-    num_tokens_per_batch: int = -1
+    # Named `num_tokens_per_req` to match EAGLE / forward_batch_info convention;
+    # community #22077 originally called this `num_tokens_per_batch`, which broke
+    # prepare_mlp_sync_batch under DP attention.
+    num_tokens_per_req: int = -1
+
+    # Stamped by generate_token_bitmask during verify, read back to apply the mask.
+    grammar: Optional[BaseGrammarObject] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
-        if self.num_tokens_per_batch == -1:
-            self.num_tokens_per_batch = int(self.draft_token_num)
+        if self.num_tokens_per_req == -1:
+            self.num_tokens_per_req = int(self.draft_token_num)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
+
+    @classmethod
+    def create_idle_input(
+        cls,
+        device: torch.device,
+        draft_token_num: int,
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL,
+    ) -> "DFlashVerifyInput":
+        """Empty-tensor placeholder for DP-attention idle batches.
+
+        Used by the dflash worker's idle short-circuit so the spec_info handed
+        to target.forward carries the same coefficient (block_size) as a real
+        verify batch on other DP ranks. Without this, an idle rank would use
+        DFlashDraftInput's coefficient=1 and disagree with sibling ranks on
+        global_num_tokens_cpu, causing the cuda-graph runner to pick a graph
+        whose collective sequence diverges from the real verify graph.
+
+        capture_hidden_mode defaults to FULL to match what the target worker's
+        cuda graph captures for DFlash verify (see CudaGraphRunner.get_spec_info).
+        Mismatching this against the captured graph causes the replay to take a
+        different attention/logits path on the idle rank, which can desync
+        collectives. Pass NULL only when the caller is the draft worker.
+        """
+        return cls(
+            draft_token=torch.empty((0,), dtype=torch.long, device=device),
+            positions=torch.empty((0,), dtype=torch.int64, device=device),
+            draft_token_num=int(draft_token_num),
+            custom_mask=None,
+            capture_hidden_mode=capture_hidden_mode,
+        )
 
     def prepare_for_verify(
         self,

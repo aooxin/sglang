@@ -221,6 +221,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_int_env_var,
+    is_cuda,
     is_mps,
     kill_itself_when_parent_died,
     point_to_point_pyobj,
@@ -284,11 +285,11 @@ class EmbeddingBatchResult:
         self.copy_done.record()
 
 
-def validate_dflash_request(req: Req) -> Optional[str]:
+def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
     if req.return_logprob:
         return "DFLASH speculative decoding does not support return_logprob yet."
 
-    if (
+    if not enable_overlap and (
         req.sampling_params.json_schema is not None
         or req.sampling_params.regex is not None
         or req.sampling_params.ebnf is not None
@@ -296,7 +297,7 @@ def validate_dflash_request(req: Req) -> Optional[str]:
     ):
         return (
             "DFLASH speculative decoding does not support "
-            "grammar-constrained decoding yet."
+            "grammar-constrained decoding without overlap scheduling."
         )
 
     return None
@@ -754,11 +755,31 @@ class Scheduler(
         )
 
         self.sliding_window_size = None
+        self.swa_retention_window = None
         if self.is_hybrid_swa:
             self.sliding_window_size = self.tp_worker.sliding_window_size
             self.full_tokens_per_layer, self.swa_tokens_per_layer = (
                 self.tp_worker.get_tokens_per_layer_info()
             )
+            self.swa_retention_window = self.sliding_window_size
+            draft_window = getattr(self.draft_worker, "draft_swa_window_size", None)
+            if self.sliding_window_size is not None and draft_window:
+                self.swa_retention_window = max(
+                    int(self.sliding_window_size), int(draft_window)
+                )
+                if (
+                    self.swa_retention_window != self.sliding_window_size
+                    and self.tp_rank == 0
+                ):
+                    logger.info(
+                        "SWA retention window set to %d = max(target=%d, "
+                        "dflash_draft=%d); attention masks stay per-model. Ensure "
+                        "--swa-full-tokens-ratio leaves headroom for the larger "
+                        "swa pool retention.",
+                        self.swa_retention_window,
+                        self.sliding_window_size,
+                        int(draft_window),
+                    )
             if self.enable_hierarchical_cache:
                 if server_args.disaggregation_mode != DisaggregationMode.PREFILL.value:
                     if self.tp_rank == 0:
@@ -806,7 +827,7 @@ class Scheduler(
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             chunked_prefill_size=effective_chunked_prefill_size,
-            sliding_window_size=self.sliding_window_size,
+            sliding_window_size=self.swa_retention_window,
         )
 
         if effective_chunked_prefill_size is not None and self.disable_radix_cache:
@@ -848,7 +869,7 @@ class Scheduler(
                     self.tp_worker.register_hicache_layer_transfer_counter(
                         self.tree_cache.cache_controller.layer_done_counter
                     )
-                    if self.spec_algorithm.is_eagle():
+                    if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash():
                         self._register_draft_kv_pool_for_hicache(server_args)
                 else:
                     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
@@ -910,6 +931,30 @@ class Scheduler(
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
+
+    def _get_draft_kv_pool(self):
+        """Return (draft_token_to_kv_pool, draft_model_config) for the current
+        draft worker, or (None, None) when no draft KV pool is available."""
+        if self.draft_worker is None or self.spec_algorithm.is_ngram():
+            return None, None
+
+        if self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
+            if self.server_args.enable_multi_layer_eagle:
+                draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
+            else:
+                draft_runner = self.draft_worker.draft_worker.draft_runner
+            return draft_runner.token_to_kv_pool, draft_runner.model_config
+
+        if self.spec_algorithm.is_dflash():
+            return (
+                self.draft_worker.draft_model_runner.token_to_kv_pool,
+                self.draft_worker.draft_model_runner.model_config,
+            )
+
+        return (
+            self.draft_worker.model_runner.token_to_kv_pool,
+            self.draft_worker.model_config,
+        )
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
@@ -1077,6 +1122,7 @@ class Scheduler(
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                device=kv_pool.device,
             )
         elif isinstance(kv_pool, MLATokenToKVPool):
             host_kv_pool = MLATokenToKVPoolHost(
@@ -1097,6 +1143,9 @@ class Scheduler(
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
+            host_kv_pool.full_to_swa_index_mapping = (
+                self.tree_cache.token_to_kv_pool_host.full_to_swa_index_mapping
+            )
         else:
             logger.warning(
                 f"Draft KV pool type {type(kv_pool).__name__} not supported for HiCache, "
@@ -1106,11 +1155,16 @@ class Scheduler(
         return host_kv_pool
 
     def _register_draft_kv_pool_for_hicache(self, server_args):
-        """Register draft model KV pool with HiCache for EAGLE speculative decoding"""
-        draft_kv_pool, draft_host_kv_pool, draft_runner = None, None, None
-        draft_kv_pool_list, draft_host_kv_pool_list, draft_runner_list = [], [], []
+        """Register draft model KV pool with HiCache for speculative decoding (EAGLE / DFlash)."""
+        draft_kv_pool, draft_host_kv_pool = None, None
+        draft_kv_pool_list, draft_host_kv_pool_list = [], []
+        draft_runner = None
+        draft_runner_list = []
 
-        if self.enable_overlap:
+        if self.spec_algorithm.is_dflash():
+            draft_kv_pool = self.draft_worker.draft_model_runner.token_to_kv_pool
+            draft_host_kv_pool = self._register_host_kv_pool(draft_kv_pool, server_args)
+        elif self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:
                 draft_runner_list = self.draft_worker.draft_worker.draft_runner_list
             else:
@@ -1155,6 +1209,7 @@ class Scheduler(
         draft_token_to_kv_pool_list, draft_runner_list = [], []
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
+            model_config = None
         elif self.spec_algorithm.supports_spec_v2():
             if self.enable_overlap:
                 if self.server_args.enable_multi_layer_eagle:
@@ -1180,6 +1235,20 @@ class Scheduler(
             draft_token_to_kv_pool = self.draft_worker.model_runner.token_to_kv_pool
             model_config = self.draft_worker.model_config
 
+        # PD + DFlash relies on the draft KV pool being registered as an RDMA
+        # buffer so the draft KV bytes ride along with the target KV.
+        if (
+            self.spec_algorithm.is_dflash()
+            and self.disaggregation_mode != DisaggregationMode.NULL
+            and draft_token_to_kv_pool is None
+        ):
+            raise RuntimeError(
+                "DFLASH PD: draft_token_to_kv_pool is None; "
+                "draft KV cannot be transferred to the decode node."
+            )
+        if model_config is None:
+            model_config = self.model_config
+
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
@@ -1189,7 +1258,7 @@ class Scheduler(
                         req_to_token_pool=self.req_to_token_pool,
                         token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                         server_args=self.server_args,
-                        sliding_window_size=self.sliding_window_size,
+                        sliding_window_size=self.swa_retention_window,
                         draft_token_to_kv_pool=draft_token_to_kv_pool,
                         draft_token_to_kv_pool_list=draft_token_to_kv_pool_list,
                     )
@@ -1492,8 +1561,22 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+        self._war_barrier_enabled = self.spec_algorithm.is_dflash() and (
+            is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        )
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
+
+    def _apply_war_barrier(self):
+        if not self._war_barrier_enabled:
+            return
+        runner = self.model_worker.war_fastpath_runner
+        ev = runner.war_fastpath_read_done_event
+        if ev is not None:
+            self.schedule_stream.wait_event(ev)
+            runner.war_fastpath_read_done_event = None
+        else:
+            self.schedule_stream.wait_stream(self.forward_stream)
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1541,6 +1624,8 @@ class Scheduler(
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
+
+            self._apply_war_barrier()
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
@@ -2119,7 +2204,7 @@ class Scheduler(
             return
 
         if self.spec_algorithm.is_dflash():
-            error_msg = validate_dflash_request(req)
+            error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
@@ -2733,7 +2818,7 @@ class Scheduler(
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
-            sliding_window_size=self.sliding_window_size if self.is_hybrid_swa else 0,
+            sliding_window_size=self.swa_retention_window if self.is_hybrid_swa else 0,
         )
 
         if self.chunked_req is not None:

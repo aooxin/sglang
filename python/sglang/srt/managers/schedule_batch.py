@@ -813,6 +813,11 @@ class Req(ReqDllmMixin):
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None
         self.output_topk_index = None
+        # PD + DFlash: draft KV cache cursor after prefill-side
+        # _append_target_hidden_to_draft_kv. Decode rebuilds
+        # DFlashDraftInput.draft_seq_lens from this; the draft KV bytes ride
+        # along with the target KV via mooncake.
+        self.dflash_draft_seq_len: Optional[int] = None
 
         # capture routed experts
         self.return_routed_experts = return_routed_experts
@@ -2277,7 +2282,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens.add_(1)
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
-        self.seq_lens_sum += bs
+        if self.seq_lens_sum is not None:
+            self.seq_lens_sum += bs
 
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.map_last_loc_to_buffer(
@@ -2332,9 +2338,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
     ):
-        # FIXME(lsyin): used here to get the correct seq_lens
-        # The batch has been launched but we need it verified to get correct next batch info
-        self.maybe_wait_verify_done()
+        # DFLASH relies on the WAR barrier for cross-stream ordering; Eagle/MTP
+        # must still synchronize the launched verify before touching seq_lens
+        if not self.spec_algorithm.is_dflash():
+            self.maybe_wait_verify_done()
 
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
@@ -2375,7 +2382,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        self.seq_lens_sum = self.seq_lens.sum().item()
+        # Lazy: recomputed from seq_lens_cpu (CPU-side) in ForwardBatch.init_new.
+        # Avoids the .item() host sync that used to require verify_done to have finished.
+        self.seq_lens_sum = None
 
         if self.output_ids is not None:
             self.output_ids = self.output_ids[keep_indices_device]
@@ -2407,14 +2416,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
-        # In the regular scheduler path:
-        # 1) self is always prefill, whose seq_lens is not a future
-        # 2) other is always decode, which is finished in previous step
-        # so verify_done is already synced and this is a no-op.
-        # In disagg decode + overlap, merge_batch can be called before
-        # filter_batch, so running_batch.seq_lens may still be a forward_stream
-        # future. Synchronize here to avoid a cross-stream data race.
-        self.maybe_wait_verify_done()
+        # DFLASH relies on the WAR barrier for cross-stream ordering; Eagle/MTP
+        # must still synchronize the launched verify before touching seq_lens
+        # (merge can run before filter in disagg decode + overlap).
+        if not self.spec_algorithm.is_dflash():
+            self.maybe_wait_verify_done()
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
@@ -2432,7 +2438,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
-        self.seq_lens_sum += other.seq_lens_sum
+        # Lazy: recomputed in ForwardBatch.init_new from concatenated seq_lens_cpu.
+        self.seq_lens_sum = None
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
         self.mamba_track_indices = None
@@ -2576,10 +2583,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
-                    # We set evict_swa condition here with two reasons:
-                    # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-                    # 2. Evict swa every window_size tokens to reduce the overhead.
-                    if req.decode_batch_idx % sliding_window_size == 1:
+                    live_len = (req.seqlen - 1) - req.swa_evicted_seqlen
+                    if req.decode_batch_idx > 0 and live_len >= 2 * sliding_window_size:
                         self._evict_swa(req, req.seqlen - 1)
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
                     # SWAChunkCache reclaims request-local SWA KV immediately before the next
@@ -2652,7 +2657,8 @@ class ModelWorkerBatch:
     out_cache_loc: torch.Tensor
     # The sequence length tensor on CPU
     seq_lens_cpu: Optional[torch.Tensor]
-    seq_lens_sum: int
+    # None when left lazy by filter/merge; ForwardBatch.init_new recomputes it.
+    seq_lens_sum: Optional[int]
 
     # For logprob
     return_logprob: bool

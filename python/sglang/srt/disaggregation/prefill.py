@@ -484,7 +484,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.waiting_queue.extend(
                     self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
                 )
-
+                self._apply_war_barrier()
                 batch = self.get_next_disagg_prefill_batch_to_run()
                 self.cur_batch = batch
 
@@ -591,6 +591,15 @@ class SchedulerDisaggregationPrefillMixin:
                     req.hidden_states_tensor = (
                         batch.spec_info.hidden_states[i].cpu().clone()
                     )
+                elif (
+                    self.spec_algorithm.is_dflash()
+                    and not batch.is_spec_v2
+                    and batch.spec_info is not None
+                ):
+                    req.dflash_draft_seq_len = int(
+                        batch.spec_info.draft_seq_lens[i].item()
+                    )
+                    req.hidden_states_tensor = None
                 else:
                     req.hidden_states_tensor = None
                 if req.return_logprob:
@@ -899,7 +908,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # SWA hybrid model: send last window KV indices
                 # match decode & main-KV token range so the state-index count agrees on both sides
                 seq_len = min(len(req.fill_ids), len(req.origin_input_ids))
-                window_size = self.sliding_window_size
+                window_size = self.swa_retention_window
                 window_start = max(0, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
 

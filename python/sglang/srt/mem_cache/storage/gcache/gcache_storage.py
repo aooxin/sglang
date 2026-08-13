@@ -12,7 +12,11 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache, SWATokenToKVPoolHost
+from sglang.srt.mem_cache.memory_pool_host import (
+    HostKVCache,
+    MHATokenToKVPoolHost,
+    SWATokenToKVPoolHost,
+)
 from sglang.srt.observability.metrics_collector import StorageMetrics
 from sglang.srt.observability.startup_func_log_and_timer import startup_timer
 
@@ -39,6 +43,12 @@ class GcacheStorage(HiCacheStorage):
         self._key_suffix_full_v = f"_{self.tp_rank}_full_v"
         self._key_suffix_swa_k = f"_{self.tp_rank}_swa_k"
         self._key_suffix_swa_v = f"_{self.tp_rank}_swa_v"
+
+        # Draft host pool state (set by register_draft_mem_pool_host). The
+        # buffers are registered with the gcache SDK so the controller's
+        # generic draft L3 path can still DMA directly into them.
+        self.draft_mem_pool_host: Optional[HostKVCache] = None
+        self._draft_is_swa: bool = False
 
         # TODO(yingchun): move to python/sglang/srt/environ.py
         master_addr = os.environ.get("GCACHE_MASTER_ADDR")
@@ -250,6 +260,11 @@ class GcacheStorage(HiCacheStorage):
             raise RuntimeError("Gcache store is not initialized.")
         ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
+        if size == 0:
+            # E.g. the full-layer sub-pool of an all-SWA draft (DFlash) is a
+            # 0-layer empty buffer. gcache's register_memory aborts on size=0.
+            logger.info(f"Skip registering empty buffer: {hint_buffer}")
+            return
         logger.info(
             f"gcache register_memory: {hint_buffer} "
             f"ptr=0x{ptr:x}, end=0x{ptr + size:x}, size={size} ({size / (1 << 30):.3f} GB)"
@@ -353,12 +368,32 @@ class GcacheStorage(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        return self._batch_set_v1_impl(keys, host_indices, extra_info, is_draft=False)
+
+    def batch_set_v1_draft(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        """Zero-copy write of draft KV pages. Requires prior
+        `register_draft_mem_pool_host` so the draft host buffers are
+        registered with the gcache SDK."""
+        return self._batch_set_v1_impl(keys, host_indices, extra_info, is_draft=True)
+
+    def _batch_set_v1_impl(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo],
+        is_draft: bool,
+    ) -> List[bool]:
         if len(keys) == 0:
             return [True] * len(keys)
 
         start_time = time.perf_counter()
         gcache_keys, value_ptr_list, value_size_list, swa_valid_list = (
-            self._batch_preprocess(keys, host_indices)
+            self._batch_preprocess(keys, host_indices, is_draft=is_draft)
         )
         logger.debug(f"gcache: begin set {len(gcache_keys)} keys")
 
@@ -424,6 +459,25 @@ class GcacheStorage(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        return self._batch_get_v1_impl(keys, host_indices, extra_info, is_draft=False)
+
+    def batch_get_v1_draft(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        """Zero-copy read of draft KV pages. Requires prior
+        `register_draft_mem_pool_host`."""
+        return self._batch_get_v1_impl(keys, host_indices, extra_info, is_draft=True)
+
+    def _batch_get_v1_impl(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo],
+        is_draft: bool,
+    ) -> List[bool]:
         if len(keys) == 0:
             return [True] * len(keys)
 
@@ -433,7 +487,9 @@ class GcacheStorage(HiCacheStorage):
 
         t0 = time.perf_counter()
         gcache_keys, value_ptr_list, value_size_list, swa_valid_list = (
-            self._batch_preprocess(keys, host_indices, swa_needed_per_page)
+            self._batch_preprocess(
+                keys, host_indices, swa_needed_per_page, is_draft=is_draft
+            )
         )
         assert len(gcache_keys) == len(value_ptr_list) == len(value_size_list)
         logger.debug(f"gcache: begin get {len(gcache_keys)} keys")
@@ -535,10 +591,12 @@ class GcacheStorage(HiCacheStorage):
         keys: List[str],
         swa_valid_list: Optional[List[bool]] = None,
         with_size: bool = False,
+        is_swa: bool = True,
+        draft: bool = False,
     ):
         if swa_valid_list is not None:
             assert len(keys) == len(swa_valid_list)
-        prefix = self._key_prefix
+        prefix = ("d:" if draft else "") + self._key_prefix
         suffix_full_k = self._key_suffix_full_k
         suffix_full_v = self._key_suffix_full_v
         suffix_swa_k = self._key_suffix_swa_k
@@ -548,7 +606,7 @@ class GcacheStorage(HiCacheStorage):
             mid = prefix + keys[i]
             ret.append(mid + suffix_full_k)
             ret.append(mid + suffix_full_v)
-            if swa_valid_list is None or swa_valid_list[i]:
+            if is_swa and (swa_valid_list is None or swa_valid_list[i]):
                 ret.append(mid + suffix_swa_k)
                 ret.append(mid + suffix_swa_v)
 
@@ -568,17 +626,33 @@ class GcacheStorage(HiCacheStorage):
         keys: List[str],
         host_indices: torch.Tensor,
         swa_needed_per_page: Optional[list[bool]] = None,
+        is_draft: bool = False,
     ):
         assert len(keys) > 0
-        assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
-        assert isinstance(self.mem_pool_host, SWATokenToKVPoolHost)
 
-        ptr_list, element_size_list, swa_valid_list = (
-            self.mem_pool_host.get_page_buffer_meta(host_indices, swa_needed_per_page)
-        )
+        if is_draft:
+            pool = self.draft_mem_pool_host
+            assert isinstance(pool, SWATokenToKVPoolHost)
+            is_swa = self._draft_is_swa
+        else:
+            pool = self.mem_pool_host
+            assert isinstance(pool, SWATokenToKVPoolHost)
+            is_swa = True
+
+        assert len(keys) == len(host_indices) // pool.page_size
+
+        if is_swa:
+            ptr_list, element_size_list, swa_valid_list = pool.get_page_buffer_meta(
+                host_indices, swa_needed_per_page
+            )
+        else:
+            ptr_list, element_size_list = pool.get_page_buffer_meta(host_indices)
+            swa_valid_list = [False] * len(keys)
         assert len(swa_valid_list) == len(keys)
 
-        key_list, _ = self._convert_hybrid_keys(keys, swa_valid_list)
+        key_list, _ = self._convert_hybrid_keys(
+            keys, swa_valid_list, is_swa=is_swa, draft=is_draft
+        )
 
         assert len(key_list) == len(ptr_list) == len(element_size_list)
         return key_list, ptr_list, element_size_list, swa_valid_list
@@ -596,6 +670,52 @@ class GcacheStorage(HiCacheStorage):
             idx += step
         assert idx == len(results)
         return ret
+
+    def register_draft_mem_pool_host(self, draft_host_pool: HostKVCache) -> None:
+        super().register_draft_mem_pool_host(draft_host_pool)
+        self.draft_mem_pool_host = draft_host_pool
+
+        if isinstance(draft_host_pool, SWATokenToKVPoolHost):
+            self._draft_is_swa = True
+            assert draft_host_pool.layout in ["page_first", "page_first_direct"], (
+                "gcache draft SWA pool only supports page_first / page_first_direct layout"
+            )
+            try:
+                self.register_buffer(
+                    draft_host_pool.full_pool_host.k_buffer, "draft full K buffer"
+                )
+                self.register_buffer(
+                    draft_host_pool.full_pool_host.v_buffer, "draft full V buffer"
+                )
+                self.register_buffer(
+                    draft_host_pool.swa_pool_host.k_buffer, "draft SWA K buffer"
+                )
+                self.register_buffer(
+                    draft_host_pool.swa_pool_host.v_buffer, "draft SWA V buffer"
+                )
+            except TypeError as err:
+                logger.error("Failed to register draft SWA buffer to Gcache: %s", err)
+                raise
+        elif isinstance(draft_host_pool, MHATokenToKVPoolHost):
+            self._draft_is_swa = False
+            assert draft_host_pool.layout in ["page_first", "page_first_direct"], (
+                "gcache draft MHA pool only supports page_first / page_first_direct layout"
+            )
+            try:
+                self.register_buffer(draft_host_pool.k_buffer, "draft K buffer")
+                self.register_buffer(draft_host_pool.v_buffer, "draft V buffer")
+            except TypeError as err:
+                logger.error("Failed to register draft MHA buffer to Gcache: %s", err)
+                raise
+        else:
+            raise TypeError(
+                f"gcache does not yet support draft host pool type "
+                f"{type(draft_host_pool).__name__}"
+            )
+        logger.info(
+            "gcache: registered draft host pool (%s)",
+            "SWA" if self._draft_is_swa else "MHA",
+        )
 
     def get_stats(self):
         # Atomic swap under GIL to avoid race with IO threads appending

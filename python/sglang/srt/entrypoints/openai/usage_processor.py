@@ -4,15 +4,31 @@ from typing import Any, Dict, List, Mapping, Optional, final
 
 from sglang.srt.entrypoints.openai.protocol import PromptTokensDetails, UsageInfo
 
+# Shared immutable-by-convention instance for the common decode-path case
+# (cache report enabled, no prefix-cache hit). MUST NOT be mutated; see
+# UsageProcessor.calculate_token_usage, which builds a fresh instance instead
+# of modifying the one passed in.
+_ZERO_CACHED_DETAILS = PromptTokensDetails(cached_tokens=0)
+
 
 @final
 class UsageProcessor:
     """Stateless helpers that turn raw token counts into a UsageInfo."""
 
     @staticmethod
-    def _details_if_cached(count: int) -> Optional[PromptTokensDetails]:
-        """Return PromptTokensDetails only when count > 0 (keeps JSON slim)."""
-        return PromptTokensDetails(cached_tokens=count) if count > 0 else None
+    def cached_details_if_enabled(
+        cached_tokens: int, enable_cache_report: bool
+    ) -> Optional[PromptTokensDetails]:
+        """Cached-token details gated on the server's cache-report flag.
+
+        Once cache reporting is enabled this always returns details (even
+        ``cached_tokens=0``), so prompt_tokens_details is never null.
+        """
+        if not enable_cache_report:
+            return None
+        if cached_tokens == 0:
+            return _ZERO_CACHED_DETAILS
+        return PromptTokensDetails(cached_tokens=cached_tokens)
 
     @staticmethod
     def calculate_response_usage(
@@ -36,13 +52,13 @@ class UsageProcessor:
             r["meta_info"].get("reasoning_tokens", 0) for r in responses
         )
 
-        cached_details = None
-        if enable_cache_report:
-            cached_total = sum(
+        cached_details = UsageProcessor.cached_details_if_enabled(
+            sum(
                 responses[i]["meta_info"].get("cached_tokens", 0)
                 for i in range(0, len(responses), n_choices)
-            )
-            cached_details = UsageProcessor._details_if_cached(cached_total)
+            ),
+            enable_cache_report,
+        )
 
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
@@ -73,12 +89,9 @@ class UsageProcessor:
         total_reasoning_tokens = sum(reasoning_tokens.values())
         total_completion_tokens = sum(completion_tokens.values())
 
-        cached_details = (
-            UsageProcessor._details_if_cached(
-                sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0)
-            )
-            if enable_cache_report
-            else None
+        cached_details = UsageProcessor.cached_details_if_enabled(
+            sum(tok for idx, tok in cached_tokens.items() if idx % n_choices == 0),
+            enable_cache_report,
         )
 
         return UsageProcessor.calculate_token_usage(
@@ -104,14 +117,14 @@ class UsageProcessor:
         """Calculate token usage information"""
         details = cached_tokens
         if image_tokens or audio_tokens or video_tokens:
-            if details is None:
-                details = PromptTokensDetails()
-            if image_tokens:
-                details.image_tokens = image_tokens
-            if audio_tokens:
-                details.audio_tokens = audio_tokens
-            if video_tokens:
-                details.video_tokens = video_tokens
+            # Build a fresh instance instead of mutating the input in place:
+            # `cached_tokens` may be the shared _ZERO_CACHED_DETAILS singleton.
+            details = PromptTokensDetails(
+                cached_tokens=details.cached_tokens if details is not None else 0,
+                image_tokens=image_tokens or None,
+                audio_tokens=audio_tokens or None,
+                video_tokens=video_tokens or None,
+            )
 
         return UsageInfo(
             prompt_tokens=prompt_tokens,

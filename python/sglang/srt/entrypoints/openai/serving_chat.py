@@ -279,7 +279,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 try:
                     Draft202012Validator.check_schema(tool.function.parameters)
                 except SchemaError as e:
-                    return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
+                    return (
+                        f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
+                    )
 
         max_output_tokens = request.max_completion_tokens or request.max_tokens
         server_context_length = self.tokenizer_manager.server_args.context_length
@@ -807,7 +809,11 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_tokens_only:
             prompt_ids = adapted_request.input_ids
             max_model_len = self.tokenizer_manager.model_config.context_len
-            return {"tokens": prompt_ids, "count": len(prompt_ids), "max_model_len": max_model_len}
+            return {
+                "tokens": prompt_ids,
+                "count": len(prompt_ids),
+                "max_model_len": max_model_len,
+            }
 
         generator = self._generate_chat_stream(adapted_request, request, raw_request)
 
@@ -869,6 +875,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         stream_started = False
         try:
+            enable_cache_report = self.tokenizer_manager.server_args.enable_cache_report
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
                 self.tokenizer_manager.server_args.stream_response_default_include_usage,
@@ -959,17 +966,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
 
                     if continuous_usage_stats:
-                        cached_details = (
-                            UsageProcessor._details_if_cached(
-                                cached_tokens.get(index, 0)
-                            )
-                            if self.tokenizer_manager.server_args.enable_cache_report
-                            else None
-                        )
                         chunk.usage = UsageProcessor.calculate_token_usage(
                             prompt_tokens=prompt_tokens.get(index, 0),
                             completion_tokens=0,
-                            cached_tokens=cached_details,
+                            cached_tokens=UsageProcessor.cached_details_if_enabled(
+                                cached_tokens.get(index, 0), enable_cache_report
+                            ),
                         )
 
                     yield f"data: {chunk.model_dump_json()}\n\n"
@@ -979,9 +981,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 delta = content["text"][len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
 
-                if toolcall_gate_active and not seen_special_toolcall.get(
-                    index, False
-                ):
+                if toolcall_gate_active and not seen_special_toolcall.get(index, False):
                     output_ids = content.get("output_ids") or []
                     if toolcall_incremental_output:
                         tail = output_ids
@@ -1040,6 +1040,10 @@ class OpenAIServingChat(OpenAIServingBase):
                                     prompt_tokens=prompt_tokens.get(index, 0),
                                     reasoning_tokens=reasoning_tokens.get(index, 0),
                                     completion_tokens=completion_tokens.get(index, 0),
+                                    cached_tokens=UsageProcessor.cached_details_if_enabled(
+                                        cached_tokens.get(index, 0),
+                                        enable_cache_report,
+                                    ),
                                 )
 
                             yield f"data: {chunk.model_dump_json()}\n\n"
@@ -1097,6 +1101,9 @@ class OpenAIServingChat(OpenAIServingBase):
                                 prompt_tokens=prompt_tokens.get(index, 0),
                                 reasoning_tokens=reasoning_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
+                                cached_tokens=UsageProcessor.cached_details_if_enabled(
+                                    cached_tokens.get(index, 0), enable_cache_report
+                                ),
                             )
 
                         yield f"data: {chunk.model_dump_json()}\n\n"
@@ -1127,6 +1134,9 @@ class OpenAIServingChat(OpenAIServingBase):
                             prompt_tokens=prompt_tokens.get(index, 0),
                             reasoning_tokens=reasoning_tokens.get(index, 0),
                             completion_tokens=completion_tokens.get(index, 0),
+                            cached_tokens=UsageProcessor.cached_details_if_enabled(
+                                cached_tokens.get(index, 0), enable_cache_report
+                            ),
                         )
                     yield f"data: {flush_chunk.model_dump_json()}\n\n"
                     remaining_logprobs = None
@@ -1219,7 +1229,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     completion_tokens,
                     cached_tokens=cached_tokens,
                     n_choices=request.n,
-                    enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    enable_cache_report=enable_cache_report,
                     image_tokens=total_image_tokens,
                     audio_tokens=total_audio_tokens,
                     video_tokens=total_video_tokens,
@@ -1251,7 +1261,11 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_tokens_only:
             prompt_ids = adapted_request.input_ids
             max_model_len = self.tokenizer_manager.model_config.context_len
-            return {"tokens": prompt_ids, "count": len(prompt_ids), "max_model_len": max_model_len}
+            return {
+                "tokens": prompt_ids,
+                "count": len(prompt_ids),
+                "max_model_len": max_model_len,
+            }
 
         try:
             ret = await self.tokenizer_manager.generate_request(
@@ -1420,9 +1434,7 @@ class OpenAIServingChat(OpenAIServingBase):
             token_bytes = list(token.encode("utf-8"))
             top_logprobs = []
             if logprobs.top_logprobs:
-                for top_token, top_logprob in logprobs.top_logprobs[
-                    token_idx
-                ].items():
+                for top_token, top_logprob in logprobs.top_logprobs[token_idx].items():
                     top_token_bytes = list(top_token.encode("utf-8"))
                     top_logprobs.append(
                         TopLogprob(
@@ -1729,6 +1741,7 @@ class OpenAIServingChat(OpenAIServingBase):
         gate_blocked: bool = False,
     ):
         """Process tool calls in streaming response"""
+        enable_cache_report = self.tokenizer_manager.server_args.enable_cache_report
         # Gate blocked (see _toolcall_gate_blocks): emit delta as text, not a call.
         if gate_blocked:
             if delta:
@@ -1758,6 +1771,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         reasoning_tokens=reasoning_tokens,
+                        cached_tokens=UsageProcessor.cached_details_if_enabled(
+                            content["meta_info"].get("cached_tokens", 0),
+                            enable_cache_report,
+                        ),
                     )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
@@ -1812,6 +1829,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
+                    cached_tokens=UsageProcessor.cached_details_if_enabled(
+                        content["meta_info"].get("cached_tokens", 0),
+                        enable_cache_report,
+                    ),
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"
@@ -1865,6 +1886,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     reasoning_tokens=reasoning_tokens,
+                    cached_tokens=UsageProcessor.cached_details_if_enabled(
+                        content["meta_info"].get("cached_tokens", 0),
+                        enable_cache_report,
+                    ),
                 )
 
             yield f"data: {chunk.model_dump_json()}\n\n"

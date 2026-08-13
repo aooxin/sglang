@@ -237,6 +237,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         stream_started = False
         try:
+            enable_cache_report = self.tokenizer_manager.server_args.enable_cache_report
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
                 self.tokenizer_manager.server_args.stream_response_default_include_usage,
@@ -343,6 +344,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         prompt_tokens=prompt_tokens.get(index, 0),
                         completion_tokens=completion_tokens.get(index, 0),
                         reasoning_tokens=reasoning_tokens.get(index, 0),
+                        cached_tokens=UsageProcessor.cached_details_if_enabled(
+                            cached_tokens.get(index, 0),
+                            enable_cache_report,
+                        ),
                     )
 
                 yield f"data: {chunk.model_dump_json()}\n\n"
@@ -396,7 +401,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     completion_tokens,
                     cached_tokens=cached_tokens,
                     n_choices=request.n,
-                    enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    enable_cache_report=enable_cache_report,
                 )
                 final_usage_chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],

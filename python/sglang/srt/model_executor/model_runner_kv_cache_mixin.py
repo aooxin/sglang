@@ -173,15 +173,30 @@ class ModelRunnerKVCacheMixin:
             )
 
             draft_num_layers = getattr(self, "dflash_draft_num_layers", None)
+            draft_cfg = getattr(self, "dflash_draft_model_config", None)
             if (
                 draft_num_layers is not None
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
+                and draft_cfg is not None
             ):
+                draft_kv_dtype = (
+                    draft_cfg.dtype
+                    if self.server_args.kv_cache_dtype == "auto"
+                    else self.kv_cache_dtype
+                )
+                draft_kv_size = torch._utils._element_size(draft_kv_dtype)
+                draft_cell_size_per_token = (
+                    draft_cfg.get_num_kv_heads(get_attention_tp_size())
+                    * (draft_cfg.head_dim + draft_cfg.v_head_dim)
+                    * int(draft_num_layers)
+                    * draft_kv_size
+                )
                 cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers),
+                    draft_cell_size_per_token=draft_cell_size_per_token,
                 )
 
         rest_memory = post_model_load_memory - pre_model_load_memory * (

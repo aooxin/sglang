@@ -383,6 +383,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_use_aux_hidden_state = False
         self.dflash_target_layer_ids = None
         self.dflash_draft_num_layers = None
+        self.dflash_draft_model_config = None
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             # load draft config
             draft_model_config = ModelConfig.from_server_args(
@@ -449,6 +450,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             self.dflash_use_aux_hidden_state = True
             self.dflash_draft_num_layers = int(draft_num_layers)
+            self.dflash_draft_model_config = draft_model_config
             self.dflash_target_layer_ids = dflash_draft_config.resolve_target_layer_ids(
                 target_num_layers=int(target_num_layers),
                 draft_num_layers=int(draft_num_layers),

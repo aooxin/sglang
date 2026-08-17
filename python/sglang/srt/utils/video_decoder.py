@@ -51,7 +51,7 @@ class VideoDecoderWrapper:
         self._num_decode_threads = num_decode_threads
         self._tmp_path = None
         if _BACKEND == "torchcodec":
-            kwargs = {"dimension_order": "NHWC", "seek_mode": "approximate"}
+            kwargs = {"dimension_order": "NHWC"}
             if device == "cuda" and _try_cuda_backend():
                 kwargs["device"] = "cuda"
             self._tc_kwargs = kwargs

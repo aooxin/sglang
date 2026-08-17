@@ -80,8 +80,6 @@ elif _is_hip:
         # Fallback: vllm not available, will use forward_native
         _has_vllm_rms_norm = False
 
-_FLASHINFER_NORM_NUMEL_MAX = 2**31 - 1
-
 logger = logging.getLogger(__name__)
 
 if _is_npu:
@@ -204,28 +202,8 @@ class RMSNorm(MultiPlatformOp):
             # we probably need to add another parameter to fused_add_rmsnorm
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            if x.numel() > _FLASHINFER_NORM_NUMEL_MAX:
-                from sgl_kernel.elementwise import _fused_add_rmsnorm_internal
-
-                logger.warning(
-                    "fused_add_rmsnorm: numel=%d exceeds int32; using AOT kernel",
-                    x.numel(),
-                )
-                _fused_add_rmsnorm_internal(
-                    x, residual, self.weight.data, self.variance_epsilon, None
-                )
-                return x, residual
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
-        if x.numel() > _FLASHINFER_NORM_NUMEL_MAX:
-            from sgl_kernel.elementwise import _rmsnorm_internal
-
-            logger.warning(
-                "rmsnorm: numel=%d exceeds int32; using AOT kernel", x.numel()
-            )
-            return _rmsnorm_internal(
-                x, self.weight.data, self.variance_epsilon, None, None
-            )
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         return out
 

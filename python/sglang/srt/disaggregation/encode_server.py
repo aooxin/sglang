@@ -2083,7 +2083,10 @@ class MMEncoder:
         except Exception as e:
             error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
             error_msg = str(e)
-            logger.error(f"Rank {self.rank} encode failed: {error_msg} {error_code = }")
+            logger.error(
+                f"Rank {self.rank} encode failed: {error_msg} {error_code = }",
+                exc_info=True,
+            )
             if self.rank == 0:
                 mm_data = EmbeddingData(
                     req_id,
@@ -2133,25 +2136,35 @@ class MMEncoder:
         num_miss_items: int,
         num_total_items: int,
         modality_str: str,
+        miss_indices: Optional[List[int]] = None,
     ) -> None:
         if stage_timing is None:
             return
         if mc is not None:
-            _observe_download_decode_per_request(
-                mc, stage_timing.get("load_timings"), items_per_req, modality_str
-            )
-            _observe_per_request(
-                mc.observe_preprocess,
-                stage_timing.get("preprocess", 0.0),
-                num_requests=num_requests,
-                modality=modality_str,
-            )
-            _observe_per_request(
-                mc.observe_model_forward,
-                forward_timing.get("model_forward", 0.0),
-                num_requests=num_requests,
-                modality=modality_str,
-            )
+            try:
+                _observe_download_decode_per_request(
+                    mc,
+                    stage_timing.get("load_timings"),
+                    items_per_req,
+                    modality_str,
+                    miss_indices=miss_indices,
+                )
+                _observe_per_request(
+                    mc.observe_preprocess,
+                    stage_timing.get("preprocess", 0.0),
+                    num_requests=num_requests,
+                    modality=modality_str,
+                )
+                _observe_per_request(
+                    mc.observe_model_forward,
+                    forward_timing.get("model_forward", 0.0),
+                    num_requests=num_requests,
+                    modality=modality_str,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to record batch encode metrics", exc_info=True
+                )
         stage_timing.update(forward_timing)
         stage_timing["num_miss_items"] = num_miss_items
         stage_timing["num_total_items"] = num_total_items
@@ -2295,6 +2308,7 @@ class MMEncoder:
                 len(miss_indices),
                 total,
                 modality_str,
+                miss_indices=miss_indices,
             )
 
         # No aux_data: batch_encode only handles IMAGE/AUDIO.
@@ -2408,7 +2422,9 @@ class MMEncoder:
     ) -> List[Tuple[int, int, int, str, int]]:
         code = getattr(exc, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
         msg = str(exc)
-        logger.error(f"Rank {self.rank} batch_encode failed: {msg} {code = }")
+        logger.error(
+            f"Rank {self.rank} batch_encode failed: {msg} {code = }", exc_info=True
+        )
         if self.rank == 0:
             for req in requests:
                 self.embedding_to_send[req["req_id"]] = EmbeddingData(
@@ -2881,21 +2897,22 @@ def _observe_single_request_load(mc, stage_timing, modality_str: str) -> None:
 
 
 def _observe_download_decode_per_request(
-    mc, load_timings, items_per_req, modality_str: str
+    mc, load_timings, items_per_req, modality_str: str, miss_indices=None
 ) -> None:
     """Sum each request's leaf-item download/decode."""
     if mc is None or not load_timings:
         return
+    if miss_indices is not None:
+        miss_pos = {gidx: j for j, gidx in enumerate(miss_indices)}
+    else:
+        miss_pos = {i: i for i in range(len(load_timings))}
     offset = 0
     for n in items_per_req:
-        dl = sum(
-            (load_timings[i].get("download", 0.0) for i in range(offset, offset + n)),
-            0.0,
-        )
-        dec = sum(
-            (load_timings[i].get("decode", 0.0) for i in range(offset, offset + n)),
-            0.0,
-        )
+        idxs = [
+            miss_pos[i] for i in range(offset, offset + n) if i in miss_pos
+        ]
+        dl = sum((load_timings[j].get("download", 0.0) for j in idxs), 0.0)
+        dec = sum((load_timings[j].get("decode", 0.0) for j in idxs), 0.0)
         offset += n
         if dl <= 0.0 and dec <= 0.0:
             continue

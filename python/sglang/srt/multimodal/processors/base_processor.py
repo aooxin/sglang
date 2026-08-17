@@ -513,6 +513,8 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
+        except ValueError as e:
+            raise ValueError(f"Error while loading data {data}: {e}") from e
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")
 
@@ -819,6 +821,16 @@ class BaseMultimodalProcessor(ABC):
         for modality, idx, future in futures:
             try:
                 result = future.result()
+            except ValueError as e:
+                logger.warning(
+                    "[load_mm_data(simple)] invalid %s data at index=%d: %s",
+                    modality.name,
+                    idx,
+                    e,
+                )
+                raise ValueError(
+                    f"Invalid {modality.name} data at index {idx}: {e}"
+                ) from e
             except Exception as e:
                 logger.exception(
                     "[load_mm_data(simple)] error loading %s data at index=%d",

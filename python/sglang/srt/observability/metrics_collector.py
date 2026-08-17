@@ -1508,7 +1508,7 @@ class TokenizerMetricsCollector:
                 ),
             )
             self.uncached_tokens = Histogram(
-                name="sglang:uncached_tokens",
+                name="sglang:uncached_tokens_per_request",
                 documentation="Histogram of uncached prompt token length per request.",
                 labelnames=labels.keys(),
                 buckets=generate_buckets(

@@ -1435,6 +1435,12 @@ class TokenizerMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        self.uncached_tokens_total = Counter(
+            name="sglang:uncached_tokens_total",
+            documentation="Number of uncached prompt tokens.",
+            labelnames=labels.keys(),
+        )
+
         self.generation_tokens_total = Counter(
             name="sglang:generation_tokens_total",
             documentation="Number of generation tokens processed.",
@@ -1776,6 +1782,8 @@ class TokenizerMetricsCollector:
         is_abort: bool = False,
     ):
         self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
+        uncached_tokens = max(prompt_tokens - cached_tokens, 0)
+        self.uncached_tokens_total.labels(**labels).inc(uncached_tokens)
         if not is_abort:
             self.prompt_tokens_excluding_abort_total.labels(**labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**labels).inc(generation_tokens)
@@ -1829,7 +1837,7 @@ class TokenizerMetricsCollector:
                 float(generation_tokens)
             )
             self.uncached_tokens.labels(**labels).observe(
-                float(max(prompt_tokens - cached_tokens, 0))
+                float(uncached_tokens)
             )
         self.num_retractions.labels(**labels).observe(retraction_count)
 

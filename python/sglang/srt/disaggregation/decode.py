@@ -2170,6 +2170,10 @@ class SchedulerDisaggregationDecodeMixin:
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
+        def pop_and_process():
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
+
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
@@ -2183,6 +2187,18 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
 
+            # overlap + spec + grammar is unsupported (would desync DP ranks).
+            # Under spec_v2 the current batch's verify step builds the grammar
+            # vocab mask (traverse_tree) from the shared grammar matcher, so the
+            # previous batch's tokens must be accepted into the matcher BEFORE
+            # this batch runs; otherwise the mask reflects a stale grammar state
+            # and the sampled token can later be rejected -> abort, which under
+            # DP attention desyncs the ranks and deadlocks the engine.
+            # TODO(spec-v2): support overlap + spec + grammar
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+            if disable_overlap_for_batch and self.last_batch:
+                pop_and_process()
+
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
@@ -2192,8 +2208,8 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Process the last batch
             if self.last_batch:
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
+                if not disable_overlap_for_batch:
+                    pop_and_process()
             elif batch is None:
                 self.self_check_during_idle()
 

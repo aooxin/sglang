@@ -1114,9 +1114,8 @@ class MiMoV2ForCausalLM(nn.Module):
         vision_config = getattr(config, "vision_config", None)
         audio_config = getattr(config, "audio_config", None)
         self._is_multimodal = vision_config is not None and audio_config is not None
-        # Always build vision/audio encoders so P can fall back to local
-        # encoding when the EPD encoder is unreachable.
-        if self._is_multimodal:
+        self.language_only = getattr(config, "language_only", False)
+        if self._is_multimodal and not self.language_only:
             if hasattr(vision_config, "to_dict"):
                 vision_config = vision_config.to_dict()
             if hasattr(audio_config, "to_dict"):
@@ -1347,7 +1346,9 @@ class MiMoV2ForCausalLM(nn.Module):
             )
 
         for name, loaded_weight in weights:
-            if not self._is_multimodal and _is_vision_audio_weight(name):
+            if (
+                not self._is_multimodal or self.language_only
+            ) and _is_vision_audio_weight(name):
                 continue
 
             if self.config.encoder_only and name.startswith(

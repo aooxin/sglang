@@ -39,8 +39,9 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
+from sglang.srt.multimodal.processors.qwen_vl import FRAME_FACTOR
 from sglang.srt.utils import ImageData, VideoData
+from sglang.srt.utils.common import get_int_env_var
 from sglang.utils import logger
 
 try:
@@ -271,11 +272,36 @@ _QWEN2VL_PIXEL_STD = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
 _mean_std_cache = {}
 
 
+def _smart_nframes_mimo(ele, total_frames, video_fps):
+    num_frames = ele.get("num_frames")
+    fps = ele.get("fps")
+    if num_frames is not None:
+        nframes = num_frames
+    elif fps is not None:
+        nframes = math.ceil(total_frames / video_fps * fps)
+        max_frames = ele.get("max_frames")
+        if max_frames is not None:
+            nframes = min(nframes, max_frames)
+        min_frames = ele.get("min_frames")
+        if min_frames is not None:
+            nframes = max(nframes, min_frames)
+    else:
+        raise ValueError("Either fps or num_frames must be set for video sampling")
+    if nframes > total_frames:
+        nframes = total_frames
+    nframes = math.ceil(nframes / FRAME_FACTOR) * FRAME_FACTOR
+    if nframes == 0:
+        nframes = FRAME_FACTOR
+    return nframes
+
+
 def _decode_frames_and_timestamps(vdw, ele):
-    # Shared E/D frame-sampling recipe: smart_nframes + linspace + permute.
     total_frames, video_fps = len(vdw), vdw.avg_fps
-    nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
-    idx = list(np.unique(np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)))
+    if not video_fps or video_fps <= 0:
+        video_fps = 1.0
+    nframes = _smart_nframes_mimo(ele, total_frames=total_frames, video_fps=video_fps)
+    idx = np.linspace(0, total_frames, num=nframes + 1)[:-1].round().astype(np.int64)
+    idx = np.clip(idx, 0, total_frames - 1).tolist()
     video_tensor = vdw.get_frames_as_tensor(idx).permute(0, 3, 1, 2).float()
     timestamps = torch.as_tensor(idx, dtype=torch.float32) / video_fps
     return video_tensor, timestamps
@@ -559,8 +585,6 @@ class MiMoProcessor:
         if "video_decode_num_threads" in video_cfg:
             kwargs["video_decode_num_threads"] = video_cfg["video_decode_num_threads"]
         else:
-            from sglang.srt.utils.common import get_int_env_var
-
             kwargs["video_decode_num_threads"] = get_int_env_var(
                 "SGLANG_ENCODER_VIDEO_DECODE_NUM_THREADS", 0
             )
@@ -967,11 +991,16 @@ class MiMoProcessor:
             )
 
         video_tensor, timestamps_sampled = video
-        if len(timestamps_sampled) < 2:
+        ts_spacing = (
+            float(timestamps_sampled[1] - timestamps_sampled[0])
+            if len(timestamps_sampled) >= 2
+            else 0.0
+        )
+        if ts_spacing <= 0:
             logger.info(
-                "[Warning] Less than two frames are sampled, using default fps (1 fps)"
+                "[Warning] Less than two distinct frame timestamps, using default fps (1 fps)"
             )
-            fps_sampled = 1
+            fps_sampled = torch.tensor(1.0)
         else:
             fps_sampled = 1 / (timestamps_sampled[1] - timestamps_sampled[0])
         num_frames_sampled = video_tensor.shape[0]
@@ -1910,6 +1939,9 @@ class MiMoV2Processor(BaseMultimodalProcessor):
             pad_token_id=self._processor.tokenizer.pad_token_id,
             rope_type=rope_type,
             use_video_timestamps=processor_config.get("use_video_timestamps", False),
+            video_decode_num_threads=get_int_env_var(
+                "SGLANG_VIDEO_DECODE_NUM_THREADS", 0
+            ),
             device=device,
         )
         self._processor = self.mimo_processor
@@ -2192,6 +2224,7 @@ class MiMoV2Processor(BaseMultimodalProcessor):
             len(raw_audio_data),
         )
         contents = []
+        loop = asyncio.get_running_loop()
 
         for text_part in text_parts:
             if multimodal_tokens_pattern.match(text_part):
@@ -2224,26 +2257,33 @@ class MiMoV2Processor(BaseMultimodalProcessor):
 
                     preprocess_kwargs = {}
                     raw_video_item_audio = None
-                    use_audio = False
+                    audio_probe_source = None
                     if isinstance(raw_video_item, VideoData):
                         preprocess_kwargs = (
                             getattr(raw_video_item, "preprocess_kwargs", {}) or {}
                         )
-                        use_audio = self.mimo_processor.has_audio_track(
-                            raw_video_item.url
-                        )
+                        audio_probe_source = raw_video_item.url
                         raw_video_item_audio = raw_video_item.url
                     elif isinstance(raw_video_item, dict):
-                        use_audio = self.mimo_processor.has_audio_track(
-                            raw_video_item.get("url", raw_video_item)
-                        )
+                        audio_probe_source = raw_video_item.get("url", raw_video_item)
                         raw_video_item_audio = raw_video_item
                     elif isinstance(raw_video_item, str):
-                        use_audio = self.mimo_processor.has_audio_track(raw_video_item)
+                        audio_probe_source = raw_video_item
                         raw_video_item_audio = raw_video_item
 
-                    video_tuple = self._preprocess_video_sync(
-                        loaded_video, preprocess_kwargs
+                    use_audio = False
+                    if audio_probe_source is not None:
+                        use_audio = await loop.run_in_executor(
+                            self.io_executor,
+                            self.mimo_processor.has_audio_track,
+                            audio_probe_source,
+                        )
+
+                    video_tuple = await loop.run_in_executor(
+                        self.io_executor,
+                        self._preprocess_video_sync,
+                        loaded_video,
+                        preprocess_kwargs,
                     )
                     contents.append(
                         self._make_video_content(
@@ -2276,7 +2316,6 @@ class MiMoV2Processor(BaseMultimodalProcessor):
                 if text_part:
                     contents.append(Content(type="text", content=text_part))
 
-        loop = asyncio.get_running_loop()
         try:
             input_sample = await loop.run_in_executor(
                 self.io_executor,
@@ -2405,13 +2444,34 @@ class MiMoV2Processor(BaseMultimodalProcessor):
 
         # Merge video-borne audio into AUDIO bucket for uniform slicing.
         if video_audio_embedding is not None:
-            if Modality.AUDIO in embeddings:
-                raise NotImplementedError(
-                    "Request mixes standalone audio and video-with-audio; "
-                    "EPD merge path for this combination is not yet implemented."
-                )
             embeddings = dict(embeddings)
-            embeddings[Modality.AUDIO] = video_audio_embedding
+            standalone_audio = embeddings.get(Modality.AUDIO)
+            if standalone_audio is None:
+                embeddings[Modality.AUDIO] = video_audio_embedding
+            else:
+                # Both sources emit audio_token_id runs; downstream slicing
+                # consumes rows sequentially, so interleave the two embedding
+                # tensors in placeholder (prompt) order. Video-borne rows are
+                # already trimmed to sum(segment_lens) per video by the E side.
+                chunks = []
+                sa_off = va_off = 0
+                a_idx = v_idx = 0
+                for part in text_parts:
+                    mod = self.mm_tokens.get_modality_of_token(part)
+                    if mod == Modality.AUDIO:
+                        n = int(audio_feature_lens[a_idx].item())
+                        chunks.append(standalone_audio[sa_off : sa_off + n])
+                        sa_off += n
+                        a_idx += 1
+                    elif mod == Modality.VIDEO:
+                        audio_info = per_video_audio_info[v_idx]
+                        v_idx += 1
+                        if audio_info is None:
+                            continue
+                        n = int(sum(audio_info["segment_lens"]))
+                        chunks.append(video_audio_embedding[va_off : va_off + n])
+                        va_off += n
+                embeddings[Modality.AUDIO] = torch.cat(chunks, dim=0)
 
         merge_size = self.spatial_merge_size
         input_ids = []

@@ -753,21 +753,29 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 or self.server_args.encoder_transfer_backend
                 in ["zmq_to_tokenizer", "mooncake"]
             ):
-                if self.server_args.language_only:
+                if self.server_args.language_only and obj.need_wait_for_mm_inputs:
                     state = self.rid_to_state.get(obj.rid)
                     time_stats = state.time_stats if state else None
+                    max_retries = envs.SGLANG_ENCODER_RECV_MAX_RETRIES.get()
                     mm_encode_wait_start = monotonic_time()
-                    mm_inputs = await self.mm_receiver.recv_mm_data(
-                        request_obj=obj,
-                        mm_processor=self.mm_processor,
-                        prompt=(input_text or input_ids),
-                        need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
-                        trace_context=(
-                            time_stats.trace_ctx.to_propagation_header()
-                            if time_stats and time_stats.trace_ctx.tracing_enable
-                            else None
-                        ),
-                    )
+                    for attempt in range(max_retries):
+                        mm_inputs = await self.mm_receiver.recv_mm_data(
+                            request_obj=obj,
+                            mm_processor=self.mm_processor,
+                            prompt=(input_text or input_ids),
+                            need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
+                            trace_context=(
+                                time_stats.trace_ctx.to_propagation_header()
+                                if time_stats and time_stats.trace_ctx.tracing_enable
+                                else None
+                            ),
+                        )
+                        if mm_inputs is not None:
+                            break
+                        logger.warning(
+                            "Encoder embedding not available "
+                            f"(attempt {attempt + 1}/{max_retries}), retrying"
+                        )
                     if time_stats is not None:
                         time_stats.trace_slice(
                             RequestStage.MM_ENCODE_WAIT,
@@ -775,12 +783,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                             monotonic_time(),
                             attrs={"embedding_received": mm_inputs is not None},
                         )
-                if mm_inputs is None:
-                    if self.server_args.language_only:
-                        logger.warning(
-                            "Encoder embedding not available, "
-                            "falling back to local mm processing"
+                    if mm_inputs is None:
+                        raise ValueError(
+                            "Failed to receive encoder embedding "
+                            f"after {max_retries} attempts"
                         )
+                if mm_inputs is None:
                     mm_inputs = await self.mm_processor.process_mm_data_async(
                         image_data=obj.image_data,
                         audio_data=obj.audio_data,

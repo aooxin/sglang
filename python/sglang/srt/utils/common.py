@@ -745,12 +745,19 @@ def load_audio(
     if _BACKEND == "torchcodec":
         from torchcodec.decoders import AudioDecoder
 
-        decoder = AudioDecoder(
-            source,
-            sample_rate=sr,
-            num_channels=1 if mono else None,
-        )
-        samples = decoder.get_all_samples()
+        try:
+            decoder = AudioDecoder(
+                source,
+                sample_rate=sr,
+                num_channels=1 if mono else None,
+            )
+            samples = decoder.get_all_samples()
+        except RuntimeError as e:
+            logger.warning(f"Invalid audio file: {e}")
+            raise ValueError(f"Invalid audio: {e}") from e
+        if samples.data.numel() == 0:
+            logger.warning("Invalid audio file: no samples decoded")
+            raise ValueError("Invalid audio: length=0")
         if timing is not None:
             timing["decode"] = timing.get("decode", 0.0) + (
                 time.perf_counter() - _dec_start
@@ -768,6 +775,15 @@ def load_audio(
         audio, original_sr = sf.read(BytesIO(source))
     else:
         audio, original_sr = sf.read(source)
+
+    # Guard against empty audio or invalid sample rate
+    if len(audio) == 0 or original_sr == 0:
+        logger.warning(
+            f"Invalid audio file: length={len(audio)}, sample_rate={original_sr}"
+        )
+        raise ValueError(
+            f"Invalid audio: length={len(audio)}, sample_rate={original_sr}"
+        )
 
     if mono and len(audio.shape) > 1:
         audio = np.mean(audio, axis=1)

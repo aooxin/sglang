@@ -43,6 +43,7 @@ from sglang.srt.speculative.multi_layer_eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
+    generate_token_bitmask,
     maybe_detect_nan,
     maybe_detect_oob,
     select_top_k_tokens,
@@ -717,6 +718,16 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     else None
                 ),
             )
+        # Prepare grammar data on CPU if needed (mirrors eagle_worker_v2.verify).
+        # Must snapshot the tree tensors before the target forward pass rebinds
+        # the buffers, so the bitmask is built from this step's draft tree.
+        if batch.has_grammar:
+            retrieve_next_token_cpu = verify_input.retrive_next_token.cpu()
+            retrieve_next_sibling_cpu = verify_input.retrive_next_sibling.cpu()
+            draft_tokens_cpu = verify_input.draft_token.view(
+                verify_input.retrive_next_token.shape
+            ).cpu()
+
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(
             model_worker_batch=None,
@@ -726,13 +737,35 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         )
         logits_output = forward_batch_output.logits_output
 
+        # Generate vocab mask for constrained decoding. Without this the target
+        # sampler ignores the grammar FSM and can accept a grammar-illegal token,
+        # which then fails req.grammar.accept_token downstream ("Tokens not
+        # accepted") and aborts the request (multi-layer EAGLE + forced
+        # tool_choice). Single-layer eagle_worker_v2 already does this.
+        vocab_mask = None
+        if batch.has_grammar:
+            vocab_mask = generate_token_bitmask(
+                batch.reqs,
+                verify_input,
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+                batch.sampling_info.vocab_size,
+            )
+            if vocab_mask is not None:
+                assert verify_input.grammar is not None
+                vocab_mask = vocab_mask.to(verify_input.retrive_next_token.device)
+                # Otherwise the stale mask from the previous extend stage would be
+                # reused and produce wrong results.
+                batch.sampling_info.vocab_mask = None
+
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
             accept_length,
             accept_index,
-        ) = verify_input.sample(batch, logits_output)
+        ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_length
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()

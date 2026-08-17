@@ -225,7 +225,10 @@ class PiecewiseCudaGraphRunner:
         # with capture_hidden_mode=FULL because the draft model consumes the
         # target's full hidden states. Capture with FULL so `can_run` matches
         # and PCG is actually used for the target prefill.
-        if model_runner.spec_algorithm.is_eagle():
+        if (
+            model_runner.spec_algorithm.is_eagle()
+            or model_runner.spec_algorithm.is_dflash()
+        ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
         # Multi-layer EAGLE (e.g. mimo_v2) additionally requires the pre-norm
         # hidden states. This flag is read inside the compiled region

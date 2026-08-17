@@ -1620,6 +1620,14 @@ class DecodeTransferQueue:
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
 
+    @property
+    def num_h2d_queue_reqs(self):
+        return sum(
+            1
+            for decode_req in self.queue
+            if decode_req.pd_d2h_state is PDD2HState.HOST_READY
+        )
+
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
 

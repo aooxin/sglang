@@ -596,6 +596,9 @@ class SchedulerMetricsMixin:
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.disagg_decode_transfer_queue.queue, priority_enabled
                 )
+                self.stats.num_decode_h2d_queue_reqs = (
+                    self.disagg_decode_transfer_queue.num_h2d_queue_reqs
+                )
 
             # Others
             self.calculate_utilization()
@@ -835,6 +838,9 @@ class SchedulerMetricsMixin:
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.disagg_decode_transfer_queue.queue, priority_enabled
+                )
+                self.stats.num_decode_h2d_queue_reqs = (
+                    self.disagg_decode_transfer_queue.num_h2d_queue_reqs
                 )
             running_routing_keys = [r.routing_key for r in batch.reqs]
             waiting_routing_keys = [r.routing_key for r in self.waiting_queue]

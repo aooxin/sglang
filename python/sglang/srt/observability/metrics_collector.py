@@ -109,6 +109,7 @@ class SchedulerStats:
     num_prefill_total_reqs: int = 0
     num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_decode_h2d_queue_reqs: int = 0
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     kv_transfer_rdma_speed_gb_s: float = 0.0
@@ -382,6 +383,12 @@ class SchedulerMetricsCollector:
         self.num_decode_transfer_queue_reqs = Gauge(
             name="sglang:num_decode_transfer_queue_reqs",
             documentation="The number of requests in the decode transfer queue.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.num_decode_h2d_queue_reqs = Gauge(
+            name="sglang:num_decode_h2d_queue_reqs",
+            documentation="The number of decode requests whose host KV is ready and are queueing for host-to-device (H2D) copy in PD direct2host mode.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1291,6 +1298,9 @@ class SchedulerMetricsCollector:
         )
         self._log_gauge_queue_count(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
+        )
+        self._log_gauge(
+            self.num_decode_h2d_queue_reqs, stats.num_decode_h2d_queue_reqs
         )
         self._log_gauge(
             self.kv_transfer_rdma_speed_gb_s, stats.kv_transfer_rdma_speed_gb_s

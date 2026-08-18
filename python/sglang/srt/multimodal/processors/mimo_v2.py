@@ -1783,6 +1783,30 @@ class MiMoProcessor:
         return image
 
 
+def validate_offsets_match_embedding(
+    modality: Modality,
+    offsets: List[tuple],
+    num_embedding_rows: int,
+    context: str = "",
+) -> None:
+    total_span = sum(end - start + 1 for start, end in offsets)
+    if total_span == num_embedding_rows:
+        return
+    logger.error(
+        f"Multimodal placeholder/embedding mismatch for {modality}: input_ids has "
+        f"{len(offsets)} placeholder run(s) spanning {total_span} token(s) but the "
+        f"encoder returned {num_embedding_rows} embedding row(s). This usually means "
+        f'the prompt text contains a literal placeholder token (e.g. "<|image_pad|>") '
+        f"that was tokenized into a real multimodal token id. offsets={offsets}"
+        + (f", {context}" if context else "")
+    )
+    raise ValueError(
+        "Multimodal data is corrupted or cannot be processed: the prompt text contains "
+        'literal multimodal placeholder tokens (e.g. "<|image_pad|>") that conflict with '
+        "the attached multimodal data. Please remove them from the prompt."
+    )
+
+
 class MiMoV2Processor(BaseMultimodalProcessor):
     models = [MiMoV2ForCausalLM]
     gpu_image_decode = False
@@ -2545,6 +2569,10 @@ class MiMoV2Processor(BaseMultimodalProcessor):
         # Slice precomputed embeddings into per-placeholder items
         mm_items = []
         consumed = {}
+        mismatch_context = (
+            f"len(input_ids)={len(input_ids)}, img_grid_thw={img_grid_thw}, "
+            f"video_grid_thw={video_grid_thw}, audio_feature_lens={audio_feature_lens}"
+        )
         for mod, token_id in [
             (Modality.IMAGE, mp.image_token_id),
             (Modality.VIDEO, mp.video_token_id),
@@ -2552,7 +2580,11 @@ class MiMoV2Processor(BaseMultimodalProcessor):
         ]:
             if mod not in embeddings:
                 continue
-            for offset in self.get_mm_items_offset(input_ids_tensor, token_id):
+            offsets = self.get_mm_items_offset(input_ids_tensor, token_id)
+            validate_offsets_match_embedding(
+                mod, offsets, embeddings[mod].shape[0], context=mismatch_context
+            )
+            for offset in offsets:
                 n = offset[1] - offset[0] + 1
                 s = consumed.get(mod, 0)
                 mm_items.append(

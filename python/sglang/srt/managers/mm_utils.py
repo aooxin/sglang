@@ -399,6 +399,13 @@ def get_embedding_chunk(
     # some models' embedding is 3-dim, reshape it to 2-dim
     embedding = embedding.reshape(-1, embedding.shape[-1])
     embedding_chunk = embedding[start_index:end_index]
+    if embedding_chunk.shape[0] != end_index - start_index:
+        logger.error(
+            "get_embedding_chunk out of range: requested rows "
+            f"[{start_index}:{end_index}] but embedding has {embedding.shape[0]} rows "
+            f"({embedding_chunk.shape[0]} returned). {extend_prefix_len=}, "
+            f"{extend_seq_len=}, {items_offset=}"
+        )
     return embedding_chunk, start_index, end_index
 
 

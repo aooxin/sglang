@@ -110,6 +110,7 @@ class SchedulerStats:
     num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_h2d_queue_reqs: int = 0
+    pd_direct2host_host_usage: float = 0.0
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
     kv_transfer_rdma_speed_gb_s: float = 0.0
@@ -389,6 +390,12 @@ class SchedulerMetricsCollector:
         self.num_decode_h2d_queue_reqs = Gauge(
             name="sglang:num_decode_h2d_queue_reqs",
             documentation="The number of decode requests whose host KV is ready and are queueing for host-to-device (H2D) copy in PD direct2host mode.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.pd_direct2host_host_usage = Gauge(
+            name="sglang:pd_direct2host_host_usage",
+            documentation="The fraction of the host transit pool preallocated in PD direct2host mode (0-1).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1301,6 +1308,9 @@ class SchedulerMetricsCollector:
         )
         self._log_gauge(
             self.num_decode_h2d_queue_reqs, stats.num_decode_h2d_queue_reqs
+        )
+        self._log_gauge(
+            self.pd_direct2host_host_usage, stats.pd_direct2host_host_usage
         )
         self._log_gauge(
             self.kv_transfer_rdma_speed_gb_s, stats.kv_transfer_rdma_speed_gb_s

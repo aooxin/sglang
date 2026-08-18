@@ -146,6 +146,19 @@ class PDDirect2HostManager:
             len(self.transit_state_pools),
         )
 
+    def host_pool_usage(self) -> float:
+        """Fraction of the host transit pool currently preallocated, in [0, 1].
+
+        Covers all host-resident stages: waiting for prefill RDMA, HOST_READY
+        (waiting for device admission), and inflight H2D copies. All transit
+        pools share the same indices, so the target pool is representative.
+        """
+        total = self.transit_pool.size
+        if total <= 0:
+            return 0.0
+        used = total - self.transit_pool.available_size()
+        return used / total
+
     def h2d_required_tokens(self, req: "Req") -> Tuple[int, int]:
         host_indices = getattr(req, "host_kv_indices", None)
         if host_indices is None:

@@ -599,6 +599,11 @@ class SchedulerMetricsMixin:
                 self.stats.num_decode_h2d_queue_reqs = (
                     self.disagg_decode_transfer_queue.num_h2d_queue_reqs
                 )
+                pd_d2h_mgr = getattr(self, "pd_direct2host_manager", None)
+                if pd_d2h_mgr is not None:
+                    self.stats.pd_direct2host_host_usage = (
+                        pd_d2h_mgr.host_pool_usage()
+                    )
 
             # Others
             self.calculate_utilization()
@@ -842,6 +847,11 @@ class SchedulerMetricsMixin:
                 self.stats.num_decode_h2d_queue_reqs = (
                     self.disagg_decode_transfer_queue.num_h2d_queue_reqs
                 )
+                pd_d2h_mgr = getattr(self, "pd_direct2host_manager", None)
+                if pd_d2h_mgr is not None:
+                    self.stats.pd_direct2host_host_usage = (
+                        pd_d2h_mgr.host_pool_usage()
+                    )
             running_routing_keys = [r.routing_key for r in batch.reqs]
             waiting_routing_keys = [r.routing_key for r in self.waiting_queue]
             (

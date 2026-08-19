@@ -108,7 +108,7 @@ class VideoDecoderWrapper:
             return self._decoder.get_batch(indices).asnumpy()
 
     def get_frames_as_tensor(self, indices: list):
-        """Return frames at given indices as a torch tensor (NHWC, uint8, pinned memory)."""
+        """Return frames at given indices as a torch tensor (NHWC, uint8)."""
         import torch
 
         if _BACKEND == "torchcodec" and self._num_decode_threads != 1 and len(indices) > 1:
@@ -120,11 +120,10 @@ class VideoDecoderWrapper:
                 return self._parallel_decode(indices, num_threads)
 
         if _BACKEND == "torchcodec":
-            batch = self._decoder.get_frames_at(indices)
-            return batch.data.pin_memory()
+            return self._decoder.get_frames_at(indices).data
         else:
             arr = self._decoder.get_batch(indices).asnumpy()
-            return torch.from_numpy(arr).pin_memory()
+            return torch.from_numpy(arr)
 
     def _parallel_decode(self, indices, num_threads):
         """Decode frames using multiple VideoDecoder instances in parallel threads."""
@@ -150,7 +149,7 @@ class VideoDecoderWrapper:
                 idx = future_to_idx[future]
                 results[idx] = future.result()
 
-        return torch.cat(results, dim=0).pin_memory()
+        return torch.cat(results, dim=0)
 
     def close(self):
         """Explicitly clean up temporary files."""

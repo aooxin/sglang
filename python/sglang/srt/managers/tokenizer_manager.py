@@ -1001,6 +1001,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
+        if (
+            self.server_args.disaggregation_mode == "decode"
+            and envs.SGLANG_MM_SKIP_COMPUTE_HASH.get()
+            and mm_inputs
+            and getattr(mm_inputs, "mm_items", None)
+        ):
+            for item in mm_inputs.mm_items:
+                if isinstance(item, MultimodalDataItem):
+                    item.feature = None
+                    item.precomputed_embeddings = None
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params

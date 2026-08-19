@@ -1,3 +1,4 @@
+import functools
 import logging
 import weakref
 from typing import Dict, List, Optional, Tuple
@@ -44,6 +45,8 @@ class SWAKVPool(KVCache):
         enable_kvcache_transpose: bool,
         device: str,
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        swa_token_to_kv_pool_class: Optional[KVCache] = None,
+        full_token_to_kv_pool_class: Optional[KVCache] = None,
         **kwargs,
     ):
         self.size = size
@@ -71,7 +74,12 @@ class SWAKVPool(KVCache):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        self.swa_kv_pool = token_to_kv_pool_class(
+        # Sub-pool classes can be customized separately (e.g. MiMoSWAKVPool
+        # uses a quantized pool for full layers and MHA pool for SWA layers).
+        swa_pool_class = swa_token_to_kv_pool_class or token_to_kv_pool_class
+        full_pool_class = full_token_to_kv_pool_class or token_to_kv_pool_class
+
+        self.swa_kv_pool = swa_pool_class(
             size=size_swa,
             dtype=dtype,
             layer_num=self.swa_layer_nums,
@@ -80,7 +88,7 @@ class SWAKVPool(KVCache):
         kwargs.pop("swa_head_num", None)
         kwargs.pop("swa_head_dim", None)
         kwargs.pop("swa_v_head_dim", None)
-        self.full_kv_pool = token_to_kv_pool_class(
+        self.full_kv_pool = full_pool_class(
             size=size,
             dtype=dtype,
             layer_num=self.full_layer_nums,
@@ -706,3 +714,97 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+
+
+class MiMoSWAKVPool(SWAKVPool):
+    """Hybrid SWA KV cache pool for MiMoV2 with a quantized full-layer cache.
+
+    Sub-pool selection:
+    - full attention layers: MiMoTokenToKVPool, the FP8-quantized paged cache
+      (page_size = 64).
+    - SWA layers: MHATokenToKVPool, standard BF16 buffers served by the
+      regular FA3 path.
+
+    The inherited SWAKVPool methods route by layers_mapping and keep working;
+    for full layers, set_kv_buffer quantizes and packs. The two extra methods
+    below expose the quantized-pool read paths used by the attention backend:
+    get_quant_kv_buffer for the fused decode kernel and dequant_tokens for
+    the extend path. Both are only valid for full attention layers.
+    """
+
+    def __init__(self, *args, partial_rotary_factor: Optional[float] = None, **kwargs):
+        # Deferred import: mimo_memory_pool imports ez_kernel_kit at module
+        # level, which is a hard dependency of this pool only.
+        from sglang.srt.mem_cache.mimo_memory_pool import MiMoTokenToKVPool
+
+        assert partial_rotary_factor is not None, (
+            "MiMoSWAKVPool requires partial_rotary_factor (from the model "
+            "config) to derive the rope/nope split of the quantized "
+            "full-layer KV layout."
+        )
+        # Force the sub-pool classes regardless of what the caller passes.
+        kwargs.pop("token_to_kv_pool_class", None)
+        kwargs.pop("swa_token_to_kv_pool_class", None)
+        kwargs.pop("full_token_to_kv_pool_class", None)
+        super().__init__(
+            *args,
+            token_to_kv_pool_class=None,
+            swa_token_to_kv_pool_class=MHATokenToKVPool,
+            full_token_to_kv_pool_class=functools.partial(
+                MiMoTokenToKVPool, partial_rotary_factor=partial_rotary_factor
+            ),
+            **kwargs,
+        )
+
+    def get_quant_kv_buffer(self, layer_id: int):
+        """Return the raw quantized page buffers of a full attention layer.
+
+        Args:
+            layer_id: global layer id; must be a full attention layer.
+
+        Returns:
+            k_buffer: [num_pages, h_kv, 16640] uint8
+            v_buffer: [num_pages, h_kv, 8448] uint8
+        """
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        assert not is_swa_layer, (
+            f"Layer {layer_id} is a SWA layer; the quantized paged KV cache "
+            f"only exists for full attention layers."
+        )
+        return self.full_kv_pool.get_quant_kv_buffer(layer_id_pool, layer_id)
+
+    def dequant_tokens(
+        self,
+        layer_id: int,
+        token_ids: torch.Tensor,
+        k_out: torch.Tensor,
+        v_out: torch.Tensor,
+    ):
+        """Dequantize the given token slots of a full attention layer.
+
+        Used by the attention backend's extend path: only the tokens attended
+        by the current batch are dequantized into the caller-owned workspace,
+        so the peak intermediate memory is bounded by the batch size instead
+        of the pool size.
+
+        Args:
+            layer_id: global layer id; must be a full attention layer.
+            token_ids: [N] token slot indices in the full pool.
+            k_out: [N, h_kv, 192] BF16 destination workspace.
+            v_out: [N, h_kv, 128] BF16 destination workspace.
+
+        Returns:
+            k: [N, h_kv, 192] BF16 in the model head order [rope | nope].
+            v: [N, h_kv, 128] BF16.
+        """
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        assert (
+            not is_swa_layer
+        ), f"Layer {layer_id} is a SWA layer; its KV cache is not quantized."
+        return self.full_kv_pool.dequant_tokens(
+            layer_id_pool,
+            token_ids,
+            k_out=k_out,
+            v_out=v_out,
+            global_layer_id=layer_id,
+        )

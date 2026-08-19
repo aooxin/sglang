@@ -96,5 +96,9 @@ RUN python3 -m pip install https://git-assert.cnbj1.mi-fds.com/git-assert/pro/mi
 
 COPY . .
 
+# ez_kernel_kit: CUDA decode kernel for MiMo FP8 KV cache
+RUN python3 -m pip install https://artifactory.d.xiaomi.net/artifactory/mimo-core-pypi-local/ez-kernel-kit/0.3.0.dev89+fp8kv.g57e0e0e/ez_kernel_kit-0.3.0.dev89+fp8kv.g57e0e0e-cp312-cp312-linux_x86_64.whl \
+    --no-cache-dir --no-dependencies --force-reinstall
+
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang

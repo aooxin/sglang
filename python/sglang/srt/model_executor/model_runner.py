@@ -2144,6 +2144,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 init_new_workspace=init_new_workspace,
             )
 
+        if (
+            self.is_draft_worker
+            and self.server_args.attention_backend == "mimo_flash_attn"
+        ):
+            # The MiMo draft model (MiMoV2MTP) is SWA-only and uses a standard
+            # BF16 SWAKVPool, so it is served by plain FA3, consistent with
+            # DraftBackendFactory in sglang/srt/speculative/draft_utils.py.
+            logger.info(
+                "mimo_flash_attn: using fa3 attention backend for the draft worker."
+            )
+            return self._get_attention_backend_from_str(
+                "fa3",
+                init_new_workspace=init_new_workspace,
+            )
+
         (
             self.prefill_attention_backend_str,
             self.decode_attention_backend_str,

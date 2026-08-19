@@ -144,6 +144,7 @@ ATTENTION_BACKEND_CHOICES = [
     "trtllm_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
+    "mimo_flash_attn",
     # AMD specific
     "aiter",
     "wave",
@@ -2376,6 +2377,83 @@ class ServerArgs:
 
         # Major NVIDIA platforms backends
         if (
+            self.attention_backend == "mimo_flash_attn"
+            or self.decode_attention_backend == "mimo_flash_attn"
+            or self.prefill_attention_backend == "mimo_flash_attn"
+        ):
+            # The KV pool selection (MiMoSWAKVPool) and the capacity profiling
+            # key off attention_backend only, and no other backend can read
+            # the quantized paged full-layer cache — so mixing mimo_flash_attn
+            # with a different prefill/decode backend is not supported.
+            assert (
+                self.attention_backend == "mimo_flash_attn"
+                and self.decode_attention_backend in (None, "mimo_flash_attn")
+                and self.prefill_attention_backend in (None, "mimo_flash_attn")
+            ), (
+                f"mimo_flash_attn must be set via --attention-backend and cannot "
+                f"be mixed with a different prefill/decode attention backend "
+                f"(the quantized paged KV cache is only readable by "
+                f"mimo_flash_attn), got attention_backend="
+                f"{self.attention_backend}, prefill_attention_backend="
+                f"{self.prefill_attention_backend}, decode_attention_backend="
+                f"{self.decode_attention_backend}."
+            )
+
+            # The MiMo quantized paged KV cache layout is fixed to 64-token
+            # pages (k_buffer [num_pages, h_kv, 16640] / v_buffer
+            # [num_pages, h_kv, 8448]), so page_size must be 64.
+            if self.page_size is None:
+                logger.warning(
+                    "Setting page_size=64 for the mimo_flash_attn attention backend."
+                )
+                self.page_size = 64
+            assert self.page_size == 64, (
+                f"mimo_flash_attn attention backend only supports page_size=64 "
+                f"(fixed quantized KV page layout), got page_size={self.page_size}. "
+                f"Please launch with --page-size 64."
+            )
+
+            # Context parallelism is not supported: the CP extend path needs
+            # paged BF16 KV buffers, which the quantized full-layer cache
+            # does not provide.
+            assert self.attn_cp_size <= 1, (
+                f"mimo_flash_attn attention backend does not support attention "
+                f"context parallelism, got --attn-cp-size {self.attn_cp_size}. "
+                f"Please remove the attention CP arguments."
+            )
+            # HiCache is supported via MiMoSWATokenToKVPoolHost, which stores
+            # the raw quantized page blocks on the host and moves them
+            # whole-page with the byte-copy transfer kernels. Only the kernel
+            # IO backend and the page_first host layout are supported.
+            if self.enable_hierarchical_cache:
+                assert self.hicache_io_backend == "kernel", (
+                    f"mimo_flash_attn attention backend requires "
+                    f"--hicache-io-backend kernel with "
+                    f"--enable-hierarchical-cache (the quantized page blocks "
+                    f"are moved by the byte-copy transfer kernels), got "
+                    f"{self.hicache_io_backend}."
+                )
+                if self.hicache_mem_layout != "page_first":
+                    logger.warning(
+                        "Setting hicache_mem_layout=page_first for the "
+                        "mimo_flash_attn attention backend (was %s).",
+                        self.hicache_mem_layout,
+                    )
+                    self.hicache_mem_layout = "page_first"
+                # L3 storage: the MiMo host pool only exposes the zero-copy
+                # page interface (get_page_buffer_meta), not the per-page
+                # tensor path (get_data_page / set_from_flat_data_page).
+                # gcache is byte-oriented and is the only validated backend
+                # for the quantized page blocks.
+                assert self.hicache_storage_backend in (None, "gcache"), (
+                    f"mimo_flash_attn attention backend only supports "
+                    f"--hicache-storage-backend gcache (zero-copy, "
+                    f"byte-oriented; other backends either use the "
+                    f"unimplemented per-page tensor path or have not been "
+                    f"validated against the quantized page layout), got "
+                    f"{self.hicache_storage_backend}."
+                )
+        if (
             self.attention_backend == "flashmla"
             or self.decode_attention_backend == "flashmla"
         ):
@@ -3345,6 +3423,31 @@ class ServerArgs:
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
                 )
+
+        # mimo_flash_attn: the fused FP8 kernel is the only target-verify path
+        # on the quantized full-layer KV cache and it supports exactly chain
+        # verification (topk == 1) with at most 8 draft tokens (kernel
+        # s_q <= 8); there is no tree-mask fallback. Validate the FINAL values
+        # here — auto_choose_speculative_params and the num-draft-tokens
+        # adjustments above run after _handle_attention_backend_compatibility,
+        # so checking there would miss auto-chosen values.
+        if (
+            self.speculative_algorithm is not None
+            and self.attention_backend == "mimo_flash_attn"
+        ):
+            assert self.speculative_eagle_topk in (None, 1), (
+                f"mimo_flash_attn attention backend only supports chain "
+                f"speculative verification (--speculative-eagle-topk 1), got "
+                f"speculative_eagle_topk={self.speculative_eagle_topk}."
+            )
+            assert (
+                self.speculative_num_draft_tokens is None
+                or self.speculative_num_draft_tokens <= 8
+            ), (
+                f"mimo_flash_attn attention backend supports at most 8 draft "
+                f"tokens for target verification (fused kernel s_q <= 8), got "
+                f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}."
+            )
 
         # Defensive check for multi-layer EAGLE with CUDA graph:
         # The non-CUDA-graph fallback path is not fully implemented and may have

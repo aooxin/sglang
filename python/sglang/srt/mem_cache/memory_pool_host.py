@@ -1440,6 +1440,197 @@ class MHATokenToKVPoolHost(HostKVCache):
         return ptr_list, element_size_list
 
 
+class MiMoTokenToKVPoolHost(MHATokenToKVPoolHost):
+    """Host pool for the MiMoV2 FP8-quantized paged full-attention KV cache.
+
+    The device pool (MiMoTokenToKVPool) stores opaque quantized 64-token page
+    blocks: k_buffer [num_pages, h_kv, 16640] uint8 and v_buffer
+    [num_pages, h_kv, 8448] uint8 (see mimo_memory_pool.py for the in-page
+    layout). The host pool mirrors them with page-first uint8 buffers
+    [page_num + 1, layer_num, h_kv, page_dim] and moves whole page blocks
+    through the byte-copy transfer kernels, treating one page block as one
+    record (K: h_kv * 16640 bytes, V: h_kv * 8448 bytes). The token-granular
+    indices handed over by the cache controller are converted to page indices
+    at the transfer boundary; this relies on the HiCache invariant that
+    indices are page-aligned and the tokens of a page occupy contiguous
+    ascending slots.
+
+    External bookkeeping (size / alloc / free / indices) stays token-granular,
+    so the surrounding HiCache machinery works unchanged. Only the page_first
+    layout and the kernel IO backend are supported; server_args validates
+    this for the mimo_flash_attn backend.
+    """
+
+    def get_size_per_token(self):
+        # The byte layout is derived from the model config by the device pool
+        # (MiMoTokenToKVPool.kv_layout); mirror it here.
+        layout = self.device_pool.kv_layout
+        assert self.page_size == layout.page_size, (
+            f"MiMoTokenToKVPoolHost requires page_size={layout.page_size}, "
+            f"got {self.page_size}"
+        )
+        self.head_num = self.device_pool.head_num
+        self.head_dim = self.device_pool.head_dim
+        self.v_head_dim = self.device_pool.v_head_dim
+        self.layer_num = self.device_pool.layer_num
+        # The host buffers hold raw quantized page bytes; override the
+        # model-dtype default set by HostKVCache.__init__ before any sizing.
+        self.dtype = torch.uint8
+        self._k_page_dim = layout.k_page_bytes
+        self._v_page_dim = layout.v_page_bytes
+        # Bytes per page block, i.e. the transfer record unit.
+        self.k_page_bytes = self.head_num * layout.k_page_bytes
+        self.v_page_bytes = self.head_num * layout.v_page_bytes
+        # The byte-copy kernels require 8-byte-divisible record sizes.
+        assert self.k_page_bytes % 8 == 0 and self.v_page_bytes % 8 == 0
+        # Exact quantized bytes per token per layer (page bytes are multiples
+        # of the page size, so these are integers). Used for sizing and for
+        # page-base pointer math on page-aligned indices.
+        self.token_stride_size = self.k_page_bytes // self.page_size
+        self.v_token_stride_size = self.v_page_bytes // self.page_size
+        return (self.token_stride_size + self.v_token_stride_size) * self.layer_num
+
+    def get_ksize_per_token(self):
+        return self.token_stride_size * self.layer_num
+
+    def init_kv_buffer(self):
+        if self.layout != "page_first":
+            raise ValueError(
+                f"MiMoTokenToKVPoolHost only supports the page_first layout "
+                f"(quantized page blocks are transferred as whole records), "
+                f"got {self.layout}"
+            )
+        # Per-page-block strides across layers.
+        self.k_page_layout_dim = self.k_page_bytes * self.layer_num
+        self.v_page_layout_dim = self.v_page_bytes * self.layer_num
+        # Per-token cross-layer strides. For page-aligned token indices,
+        # base_ptr + index * layout_dim is the page base pointer, which is
+        # what get_page_buffer_meta needs.
+        self.layout_dim = self.token_stride_size * self.layer_num
+        self.v_layout_dim = self.v_token_stride_size * self.layer_num
+
+        # One host page-block slot per page_size tokens. Token indices start
+        # at page_size (page 0 is reserved), so provision page_num + 1 slots,
+        # mirroring the size + page_size provisioning of the token-granular
+        # pools.
+        k_dims = (self.page_num + 1, self.layer_num, self.head_num, self._k_page_dim)
+        v_dims = (self.page_num + 1, self.layer_num, self.head_num, self._v_page_dim)
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        return alloc_func(
+            None,
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+            k_dims=k_dims,
+            v_dims=v_dims,
+        )
+
+    def _to_page_indices(self, token_indices: torch.Tensor) -> torch.Tensor:
+        """Convert page-aligned token indices to page-block indices.
+
+        HiCache transfers are page-granular and the tokens of a page occupy
+        contiguous ascending slots, so the first token of every page_size
+        chunk determines the page.
+        """
+        assert token_indices.numel() % self.page_size == 0, (
+            f"MiMo HiCache transfers must be page-granular; got "
+            f"{token_indices.numel()} token indices (page_size={self.page_size})."
+        )
+        return token_indices[:: self.page_size] // self.page_size
+
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+    ):
+        assert io_backend == "kernel", (
+            f"MiMoTokenToKVPoolHost only supports the kernel IO backend, "
+            f"got {io_backend}"
+        )
+        host_pages = self._to_page_indices(host_indices)
+        device_pages = self._to_page_indices(device_indices)
+        # One page block per record. K and V records have different sizes, so
+        # issue two single-buffer (MLA-shaped) transfers.
+        transfer_kv_per_layer_mla_pf_lf(
+            src=self.k_buffer,
+            dst=device_pool.k_buffer[layer_id],
+            src_indices=host_pages,
+            dst_indices=device_pages,
+            layer_id=layer_id,
+            item_size=self.k_page_bytes,
+            src_layout_dim=self.k_page_layout_dim,
+            block_quota=self.h2d_block_quota,
+        )
+        transfer_kv_per_layer_mla_pf_lf(
+            src=self.v_buffer,
+            dst=device_pool.v_buffer[layer_id],
+            src_indices=host_pages,
+            dst_indices=device_pages,
+            layer_id=layer_id,
+            item_size=self.v_page_bytes,
+            src_layout_dim=self.v_page_layout_dim,
+            block_quota=self.h2d_block_quota,
+        )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        assert io_backend == "kernel", (
+            f"MiMoTokenToKVPoolHost only supports the kernel IO backend, "
+            f"got {io_backend}"
+        )
+        host_pages = self._to_page_indices(host_indices)
+        device_pages = self._to_page_indices(device_indices)
+        # Fused K+V backup from the device layer-first buffers (via the
+        # per-layer pointer table) to the host page-first buffers, with
+        # separate K/V record sizes.
+        transfer_kv_all_layer_fuse_lf_pf(
+            src_k_layers=device_pool.k_data_ptrs,
+            dst_k=self.k_buffer,
+            src_v_layers=device_pool.v_data_ptrs,
+            dst_v=self.v_buffer,
+            src_indices=device_pages,
+            dst_indices=host_pages,
+            item_size=self.k_page_bytes,
+            dst_layout_dim=self.k_page_layout_dim,
+            v_item_size=self.v_page_bytes,
+            v_dst_layout_dim=self.v_page_layout_dim,
+            num_layers=self.layer_num,
+            block_quota=self.d2h_block_quota,
+        )
+
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        raise NotImplementedError(
+            "MiMoTokenToKVPoolHost does not support get_data_page."
+        )
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        raise NotImplementedError(
+            "MiMoTokenToKVPoolHost does not support get_dummy_flat_data_page."
+        )
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        raise NotImplementedError(
+            "MiMoTokenToKVPoolHost does not support set_from_flat_data_page."
+        )
+
+    def get_split_heads_page_buffer_meta(self, indices, split_factor):
+        raise NotImplementedError(
+            "MiMoTokenToKVPoolHost does not support "
+            "get_split_heads_page_buffer_meta."
+        )
+
+    def get_page_buffer_meta(self, indices):
+        raise NotImplementedError(
+            "MiMoTokenToKVPoolHost is only used inside MiMoSWATokenToKVPoolHost; "
+            "use the composite pool's get_page_buffer_meta instead."
+        )
+
+
 class MLATokenToKVPoolHost(HostKVCache):
     device_pool: MLATokenToKVPool
 
@@ -2611,6 +2802,11 @@ class SWATokenToKVPoolHost:
     device_pool: SWAKVPool
     # Only used on prefill; requires swa kv indices length == full kv indices length.
 
+    # Sub-pool host classes; subclasses may override them to use specialized
+    # host pools (e.g. MiMoSWATokenToKVPoolHost).
+    full_pool_host_class = MHATokenToKVPoolHost
+    swa_pool_host_class = MHATokenToKVPoolHost
+
     def __init__(
         self,
         device_pool: SWAKVPool,
@@ -2637,7 +2833,7 @@ class SWATokenToKVPoolHost:
             host_to_device_ratio_swa = host_to_device_ratio
         # full layers host pool
         with startup_timer("Initializing full pool host cache"):
-            self.full_pool_host = MHATokenToKVPoolHost(
+            self.full_pool_host = self.full_pool_host_class(
                 device_pool=self.device_pool.full_kv_pool,
                 host_to_device_ratio=host_to_device_ratio,
                 host_size=host_size,
@@ -2650,7 +2846,7 @@ class SWATokenToKVPoolHost:
 
         # swa layers host pool (different kv shape handled by swa_kv_pool)
         with startup_timer("Initializing SWA pool host cache"):
-            self.swa_pool_host = MHATokenToKVPoolHost(
+            self.swa_pool_host = self.swa_pool_host_class(
                 device_pool=self.device_pool.swa_kv_pool,
                 host_to_device_ratio=host_to_device_ratio_swa,
                 host_size=host_size_swa,
@@ -3274,6 +3470,19 @@ class SWATokenToKVPoolHost:
             "SWATokenToKVPoolHost.backup_from_device_all_layer(swa_host_indices)",
         )
         # Backup full-attention KV cache.
+        self._backup_full_from_device_all_layer(
+            device_pool, host_indices, device_indices, io_backend
+        )
+        # Backup SWA KV cache.
+        if swa_host_indices.numel() == 0:
+            return
+        self._backup_swa_from_device_all_layer(
+            device_pool, swa_host_indices, swa_device_indices, io_backend
+        )
+
+    def _backup_full_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
         transfer_kv_all_layer_fuse_lf_pf(
             src_k_layers=device_pool.full_kv_pool.k_data_ptrs,
             dst_k=self.full_pool_host.k_buffer,
@@ -3288,9 +3497,10 @@ class SWATokenToKVPoolHost:
             num_layers=self.device_pool.full_layer_nums,
             block_quota=self.d2h_block_quota,
         )
-        # Backup SWA KV cache.
-        if swa_host_indices.numel() == 0:
-            return
+
+    def _backup_swa_from_device_all_layer(
+        self, device_pool, swa_host_indices, swa_device_indices, io_backend
+    ):
         transfer_kv_all_layer_fuse_lf_pf(
             src_k_layers=device_pool.swa_kv_pool.k_data_ptrs,
             dst_k=self.swa_pool_host.k_buffer,
@@ -3334,25 +3544,17 @@ class SWATokenToKVPoolHost:
         )
 
     def _compute_page_meta(self):
-        itemsize = self.dtype.itemsize
-        # TODO(yingchun): 与已有的 full/swa_pool_host.layout_dim/v_layout_dim 完全相同
+        # Per-token cross-layer strides of the page-first host buffers. For
+        # page-aligned indices, base_ptr + token_index * stride is the page
+        # base pointer, which is all get_page_buffer_meta needs. Read the
+        # sub-pool attributes instead of recomputing from head_num/head_dim
+        # so that specialized sub-pools (e.g. MiMoTokenToKVPoolHost with
+        # quantized page records) stay correct.
         stride_sizes = (
-            self.device_pool.full_layer_nums
-            * self.full_pool_host.head_num
-            * self.full_pool_host.head_dim
-            * itemsize,
-            self.device_pool.full_layer_nums
-            * self.full_pool_host.head_num
-            * self.full_pool_host.v_head_dim
-            * itemsize,
-            self.device_pool.swa_layer_nums
-            * self.swa_pool_host.head_num
-            * self.swa_pool_host.head_dim
-            * itemsize,
-            self.device_pool.swa_layer_nums
-            * self.swa_pool_host.head_num
-            * self.swa_pool_host.v_head_dim
-            * itemsize,
+            self.full_pool_host.layout_dim,
+            self.full_pool_host.v_layout_dim,
+            self.swa_pool_host.layout_dim,
+            self.swa_pool_host.v_layout_dim,
         )
         element_sizes = tuple(s * self.page_size for s in stride_sizes)
         return stride_sizes, element_sizes
@@ -3422,3 +3624,28 @@ class SWATokenToKVPoolHost:
                 ptr_list.extend([swa_k_ptrs[page_idx], swa_v_ptrs[page_idx]])
                 element_size_list.extend([swa_k_element_size, swa_v_element_size])
         return ptr_list, element_size_list, swa_valid_list
+
+
+class MiMoSWATokenToKVPoolHost(SWATokenToKVPoolHost):
+    """SWA composite host pool for MiMoV2 (device pool: MiMoSWAKVPool).
+
+    Sub-pool selection mirrors the device side: full attention layers use
+    MiMoTokenToKVPoolHost (raw quantized page blocks, moved whole-page by the
+    byte-copy kernels) and SWA layers use MHATokenToKVPoolHost (standard BF16
+    host buffers). Only the full-layer D2H backup is overridden, because the
+    K/V page records have different sizes and page-granular indices;
+    everything else (allocation, mapping, SWA transfers, storage-page
+    metadata) is inherited.
+    """
+
+    full_pool_host_class = MiMoTokenToKVPoolHost
+
+    def _backup_full_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        self.full_pool_host.backup_from_device_all_layer(
+            device_pool.full_kv_pool,
+            host_indices,
+            device_indices,
+            io_backend,
+        )

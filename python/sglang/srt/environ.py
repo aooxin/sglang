@@ -205,6 +205,9 @@ class Envs:
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_DEBUG_SWA_INVARIANT = EnvBool(False)
     SGLANG_DEBUG_SWA_INVARIANT_INTERVAL = EnvInt(500)
+    # Debug-only consistency check of the MiMo attention backend's ragged
+    # token ids against cu_seqlens_k. Costs one GPU sync per extend forward.
+    SGLANG_MIMO_CHECK_RAGGED_TOKEN_IDS = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)

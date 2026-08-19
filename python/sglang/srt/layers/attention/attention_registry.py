@@ -241,3 +241,12 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("mimo_flash_attn")
+def create_mimo_flash_attn_backend(runner):
+    from sglang.srt.layers.attention.mimo_flashattention_backend import (
+        MiMoFlashAttentionBackend,
+    )
+
+    return MiMoFlashAttentionBackend(runner)

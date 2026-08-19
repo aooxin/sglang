@@ -119,9 +119,30 @@ class ModelRunnerKVCacheMixin:
                     get_attention_tp_size()
                 ) * (self.model_config.swa_head_dim + self.model_config.swa_v_head_dim)
 
-                cell_size = (
-                    full_per_token * full_layers_num + swa_per_token * swa_layers_num
-                ) * kv_size
+                swa_cell_size = (swa_per_token * swa_layers_num) * kv_size
+                if (
+                    self.server_args.attention_backend == "mimo_flash_attn"
+                    and not self.is_draft_worker
+                ):
+                    # Full layers live in the FP8-quantized paged pool
+                    # (MiMoTokenToKVPool); derive its exact per-token byte
+                    # cost from the model config. The draft worker (SWA-only
+                    # MiMoV2MTP) keeps the plain BF16 pool, matching the pool
+                    # selection in _init_pools.
+                    from sglang.srt.mem_cache.mimo_memory_pool import (
+                        derive_mimo_kv_layout_from_config,
+                    )
+
+                    mimo_layout = derive_mimo_kv_layout_from_config(self.model_config, page_size=self.page_size)
+                    full_cell_size = (
+                        mimo_layout.quant_bytes_per_token_per_head
+                        * full_layers_num
+                        * self.model_config.get_num_kv_heads(get_attention_tp_size())
+                    )
+                else:
+                    full_cell_size = (full_per_token * full_layers_num) * kv_size
+
+                cell_size = full_cell_size + swa_cell_size
             else:
                 cell_size = (
                     self.model_config.get_num_kv_heads(get_attention_tp_size())
@@ -366,11 +387,29 @@ class ModelRunnerKVCacheMixin:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
 
         # Full layer per-token memory
-        full_per_token = (
-            self.model_config.get_num_kv_heads(get_attention_tp_size())
-            * (self.model_config.head_dim + self.model_config.v_head_dim)
-            * kv_size
-        )
+        if (
+            self.server_args.attention_backend == "mimo_flash_attn"
+            and not self.is_draft_worker
+        ):
+            # Exact per-token bytes of the FP8-quantized paged pool, derived
+            # from the model config; the draft worker keeps the plain BF16
+            # pool (see _init_pools).
+            from sglang.srt.mem_cache.mimo_memory_pool import (
+                derive_mimo_kv_layout_from_config,
+            )
+
+            full_per_token = (
+                self.model_config.get_num_kv_heads(get_attention_tp_size())
+                * derive_mimo_kv_layout_from_config(
+                    self.model_config, page_size=page_size
+                ).quant_bytes_per_token_per_head
+            )
+        else:
+            full_per_token = (
+                self.model_config.get_num_kv_heads(get_attention_tp_size())
+                * (self.model_config.head_dim + self.model_config.v_head_dim)
+                * kv_size
+            )
 
         # SWA layer per-token memory
         swa_per_token = (
@@ -680,7 +719,7 @@ class ModelRunnerKVCacheMixin:
                         "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.hf_text_config.v_head_dim,
                     }
-                self.token_to_kv_pool = SWAKVPool(
+                swa_pool_kwargs = dict(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
                     page_size=self.page_size,
@@ -695,6 +734,30 @@ class ModelRunnerKVCacheMixin:
                     device=self.device,
                     **kwargs,
                 )
+                if (
+                    self.server_args.attention_backend == "mimo_flash_attn"
+                    and not self.is_draft_worker
+                ):
+                    # The quantized paged pool (MiMoTokenToKVPool) only serves
+                    # the target model's full attention layers. The MiMo draft
+                    # model (MiMoV2MTP) is SWA-only and runs on the plain FA3
+                    # backend (see DraftBackendFactory), so it uses the
+                    # standard BF16 SWAKVPool below. MiMoSWAKVPool selects its
+                    # own sub-pool classes and derives the quantized K layout
+                    # from partial_rotary_factor.
+                    from sglang.srt.mem_cache.mimo_memory_pool import (
+                        get_mimo_partial_rotary_factor,
+                    )
+                    from sglang.srt.mem_cache.swa_memory_pool import MiMoSWAKVPool
+
+                    self.token_to_kv_pool = MiMoSWAKVPool(
+                        partial_rotary_factor=get_mimo_partial_rotary_factor(
+                            self.model_config
+                        ),
+                        **swa_pool_kwargs,
+                    )
+                else:
+                    self.token_to_kv_pool = SWAKVPool(**swa_pool_kwargs)
             elif config := self.mambaish_config:
                 extra_args = {}
                 if self.use_mla_backend:

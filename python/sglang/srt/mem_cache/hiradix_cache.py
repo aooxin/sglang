@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
+    MiMoSWATokenToKVPoolHost,
     MLATokenToKVPoolHost,
     NSATokenToKVPoolHost,
     SWATokenToKVPoolHost,
@@ -137,8 +138,15 @@ class BaseHiRadixCache(abc.ABC):
                 allocator_type=server_args.hicache_storage_backend,
             )
         elif isinstance(self.kv_cache, SWAKVPool):
+            from sglang.srt.mem_cache.swa_memory_pool import MiMoSWAKVPool
+
+            swa_host_pool_class = (
+                MiMoSWATokenToKVPoolHost
+                if isinstance(self.kv_cache, MiMoSWAKVPool)
+                else SWATokenToKVPoolHost
+            )
             with startup_timer("L2 cache init"):
-                self.token_to_kv_pool_host = SWATokenToKVPoolHost(
+                self.token_to_kv_pool_host = swa_host_pool_class(
                     self.kv_cache,
                     server_args.hicache_ratio,
                     server_args.hicache_size,
@@ -1816,9 +1824,7 @@ class BaseHiRadixCache(abc.ABC):
             "hicache_prefetch_done.tp_completed_tokens": completed_tokens,
             "hicache_prefetch_done.min_completed_tokens": min_completed_tokens,
             "hicache_prefetch_done.requested_tokens": len(key),
-            "hicache_prefetch_done.io_duration_ms": round(
-                (io_duration or 0) * 1000, 2
-            ),
+            "hicache_prefetch_done.io_duration_ms": round((io_duration or 0) * 1000, 2),
         }
 
         # Track tokens actually loaded from storage for this request (L3 hits)
@@ -1933,9 +1939,7 @@ class BaseHiRadixCache(abc.ABC):
         prefix_keys: Optional[List[str]] = None,
     ) -> PrefetchStatus:
         prefetch_key = RadixKey(new_input_tokens)
-        prefetch_key.maybe_to_ngram_view(
-            self.is_eagle, step=self.speculative_num_steps
-        )
+        prefetch_key.maybe_to_ngram_view(self.is_eagle, step=self.speculative_num_steps)
         # align the number of fetching tokens to the page size
         prefetch_length = len(prefetch_key) - (len(prefetch_key) % self.page_size)
         aligned_key = prefetch_key[:prefetch_length]

@@ -56,6 +56,10 @@ class DraftBackendFactory:
             "nsa": self._create_nsa_decode_backend,
             "ascend": self._create_ascend_decode_backend,
             "fa4": self._create_fa4_decode_backend,
+            # The MiMo draft model (MiMoV2MTP) is SWA-only with its own BF16
+            # pool; the quantized paged cache only exists for the target
+            # model's full layers, so plain FA3 serves the draft.
+            "mimo_flash_attn": self._create_fa3_decode_backend,
         }
 
         return self._create_backend(
@@ -81,6 +85,9 @@ class DraftBackendFactory:
             "nsa": self._create_nsa_prefill_backend,
             "ascend": self._create_ascend_prefill_backend,
             "fa4": self._create_fa4_prefill_backend,
+            # See the note in create_decode_backend: the MiMo draft model is
+            # SWA-only with a BF16 pool, served by plain FA3.
+            "mimo_flash_attn": self._create_fa3_prefill_backend,
         }
         backend_name = (
             "decode_attention_backend"

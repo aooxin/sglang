@@ -65,6 +65,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import (
+    MMDownloadError,
     add_prometheus_middleware,
     configure_logger,
     load_audio,
@@ -108,6 +109,10 @@ ENCODER_MAX_BATCH_SIZE = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.get()
 # Watchdog: max time to wait for a batched /encode result. Bounds HTTP latency
 # if the batch worker stalls (NCCL hang, dead worker proc, etc.).
 ENCODER_REQ_TIMEOUT = envs.SGLANG_ENCODER_REQ_TIMEOUT.get()
+
+# Per-modality dispatch weight (image=1 baseline). Tunable.
+MODALITY_WEIGHTS: Dict[str, int] = {"image": 1, "audio": 20, "video": 50}
+DEFAULT_MODALITY_WEIGHT = 1
 
 # per-task batch timing sink, for span emission
 _batch_timing_var: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
@@ -891,6 +896,10 @@ class MMEncoder:
             elif modality == Modality.AUDIO:
                 return load_audio(data, self.model_audio_sr, timing=timing)
 
+        except MMDownloadError:
+            # Network failure with an already-concise message; let it surface
+            # as a 500 instead of being wrapped into a 400.
+            raise
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")
 
@@ -1663,6 +1672,8 @@ class MMEncoder:
             )
         except NotImplementedError as e:
             raise InternalError(f"Not implemented error: {str(e)}")
+        except MMDownloadError as e:
+            raise InternalError(str(e))
         except Exception as e:
             raise BadRequestError(f"Failed to process mm items: {str(e)}")
         _observe_single_request_load(mc, stage_timing, modality_str)
@@ -2243,6 +2254,8 @@ class MMEncoder:
                 return self._batch_set_error(
                     requests, modality, InternalError(f"Not implemented error: {e}")
                 )
+            except MMDownloadError as e:
+                return self._batch_set_error(requests, modality, InternalError(str(e)))
             except Exception as e:
                 return self._batch_set_error(
                     requests,
@@ -2359,6 +2372,8 @@ class MMEncoder:
             return self._batch_set_error(
                 requests, modality, InternalError(f"Not implemented error: {e}")
             )
+        except MMDownloadError as e:
+            return self._batch_set_error(requests, modality, InternalError(str(e)))
         except Exception as e:
             return self._batch_set_error(
                 requests, modality, BadRequestError(f"Failed to process mm items: {e}")
@@ -3176,7 +3191,7 @@ async def _dp_worker_health_encode(enc: MMEncoder) -> None:
 
 
 class DPDispatcher:
-    """Routes encode requests across DP ranks by least-pending count."""
+    """Routes encode requests across DP ranks by least modality-weighted load."""
 
     def __init__(
         self,
@@ -3195,6 +3210,8 @@ class DPDispatcher:
             {} for _ in range(dp_size)
         ]
         self.req_id_to_rank: Dict[str, int] = {}
+        # Only encode requests are tracked here; send/broadcast skip it.
+        self.pending_items: List[Dict[str, dict]] = [{} for _ in range(dp_size)]
         self._rr_counter = 0
         self._broadcast_counter = 0
         self._dead_ranks: Set[int] = set()
@@ -3205,6 +3222,7 @@ class DPDispatcher:
 
         # Prometheus gauge: pending requests per DP rank.
         self.pending_gauge = None
+        self.pending_weight_gauge = None
         if enable_metrics:
             from prometheus_client import Gauge
 
@@ -3214,16 +3232,49 @@ class DPDispatcher:
                 labelnames=["dp_rank"],
                 multiprocess_mode="mostrecent",
             )
+            self.pending_weight_gauge = Gauge(
+                name="sglang:encoder_dp_pending_weight",
+                documentation=(
+                    "Accumulated modality-weighted in-flight encode load per "
+                    "encoder DP rank (image=1, audio=20, video=50)."
+                ),
+                labelnames=["dp_rank"],
+                multiprocess_mode="mostrecent",
+            )
 
     @property
     def pending_counts(self) -> List[int]:
         return [len(d) for d in self.pending_futures]
+
+    @staticmethod
+    def _weight_for(modality: str) -> int:
+        return MODALITY_WEIGHTS.get(modality, DEFAULT_MODALITY_WEIGHT)
+
+    @staticmethod
+    def _mm_count(request: dict) -> int:
+        mm_items = request.get("mm_items", [])
+        if isinstance(mm_items, (list, tuple)):
+            return max(1, len(mm_items))
+        return 1
+
+    @property
+    def pending_weights(self) -> List[int]:
+        return [
+            sum(
+                self._weight_for(item["modality"]) * item["count"]
+                for item in rank_items.values()
+            )
+            for rank_items in self.pending_items
+        ]
 
     def _update_pending_gauge(self) -> None:
         """Push current pending counts to the Prometheus gauge (absolute set)."""
         if self.pending_gauge is not None:
             for i, c in enumerate(self.pending_counts):
                 self.pending_gauge.labels(dp_rank=str(i)).set(c)
+        if self.pending_weight_gauge is not None:
+            for i, w in enumerate(self.pending_weights):
+                self.pending_weight_gauge.labels(dp_rank=str(i)).set(w)
 
     @property
     def alive_ranks(self) -> List[int]:
@@ -3246,6 +3297,7 @@ class DPDispatcher:
     def _drop_pending_and_mapping(self, rank: int, req_id: str) -> None:
         # dispatch / broadcast failure: no follow-up /send expected.
         self.pending_futures[rank].pop(req_id, None)
+        self.pending_items[rank].pop(req_id, None)
         self.req_id_to_rank.pop(req_id, None)
         self._update_pending_gauge()
 
@@ -3265,6 +3317,7 @@ class DPDispatcher:
                     }
                 )
             pending.pop(key, None)
+        self.pending_items[rank].clear()
         self._update_pending_gauge()
 
     def _fail_all_pending(self, reason: str, error_type: str) -> None:
@@ -3285,7 +3338,6 @@ class DPDispatcher:
         }
 
     async def dispatch(self, request: dict) -> dict:
-        counts = self.pending_counts
         # Skip ranks whose worker process has died.
         alive_ranks = self.alive_ranks
         if not alive_ranks:
@@ -3293,19 +3345,25 @@ class DPDispatcher:
                 "All encoder DP workers are dead.",
                 code=HTTPStatus.SERVICE_UNAVAILABLE,
             )
-        min_p = min(counts[r] for r in alive_ranks)
-        candidates = [r for r in alive_ranks if counts[r] == min_p]
+        # Pick the rank with the least modality-weighted pending load
+        # (video/audio items cost far more encode time than images).
+        modality = str(request.get("modality", "image")).lower()
+        count = self._mm_count(request)
+        weights = self.pending_weights
+        min_w = min(weights[r] for r in alive_ranks)
+        candidates = [r for r in alive_ranks if weights[r] == min_w]
         rank = candidates[self._rr_counter % len(candidates)]
         self._rr_counter += 1
         req_id = request["req_id"]
         self.req_id_to_rank[req_id] = rank
         future = asyncio.get_running_loop().create_future()
         self.pending_futures[rank][req_id] = future
+        self.pending_items[rank][req_id] = {"modality": modality, "count": count}
         self._update_pending_gauge()
         logger.info(
             f"MM-Encoder DP dispatch: req_id={req_id}, "
-            f"modality={request.get('modality', 'image')}, "
-            f"dp_rank={rank}, pending={self.pending_counts}"
+            f"modality={modality}, count={count}, dp_rank={rank}, "
+            f"pending_weights={self.pending_weights}, pending={self.pending_counts}"
         )
 
         try:
@@ -3513,6 +3571,7 @@ class DPDispatcher:
                 )
                 continue
             future = self.pending_futures[rank].pop(key)
+            self.pending_items[rank].pop(key, None)
             self._update_pending_gauge()
             # Only mooncake encode (content=request dict) needs the mapping
             # kept for the follow-up /send.

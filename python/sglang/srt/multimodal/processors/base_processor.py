@@ -20,6 +20,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    MMDownloadError,
     envs,
     is_cpu,
     is_npu,
@@ -513,6 +514,10 @@ class BaseMultimodalProcessor(ABC):
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
+        except MMDownloadError:
+            # Network failure with an already-concise message (the full
+            # requests chain repeats the URL several times); maps to 500.
+            raise
         except ValueError as e:
             # Invalid input data; keep the type so it maps to 400 BadRequest.
             raise ValueError(f"Error while loading data {data}: {e}") from e

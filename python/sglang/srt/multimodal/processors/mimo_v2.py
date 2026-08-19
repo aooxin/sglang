@@ -6,7 +6,6 @@ import copy
 import io
 import json
 import math
-import os
 import re
 import subprocess
 import time
@@ -18,7 +17,6 @@ from typing import List, Literal, Optional, Union
 
 import numpy as np
 import pybase64
-import requests
 import torch
 import torch.nn.functional as F
 from fastapi import HTTPException
@@ -41,7 +39,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.qwen_vl import FRAME_FACTOR
 from sglang.srt.utils import ImageData, VideoData
-from sglang.srt.utils.common import get_int_env_var
+from sglang.srt.utils.common import download_mm_data, get_int_env_var
 from sglang.utils import logger
 
 try:
@@ -515,7 +513,6 @@ class MiMoProcessor:
             "min_frames": min_frames,
         }
 
-        self.http_session = requests.Session()
         for k in kwargs:
             logger.info(f"[Warning] Ignored unknown parameter {k} for MiMoProcessor")
 
@@ -849,20 +846,15 @@ class MiMoProcessor:
                     )
                 elif audio.startswith("http://") or audio.startswith("https://"):
                     dl_start = time.perf_counter()
-                    timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
                     try:
-                        response = self.http_session.get(
-                            audio, stream=True, timeout=timeout
-                        )
+                        content = download_mm_data(audio)
                         dl_elapsed_ms = (time.perf_counter() - dl_start) * 1000
                         if dl_elapsed_ms > 1000.0:
-                            content_len = len(response.content)
                             logger.warning(
                                 f"Slow audio download: {dl_elapsed_ms:.2f}ms, "
-                                f"size={content_len / 1024:.1f}KB, url={audio}"
+                                f"size={len(content) / 1024:.1f}KB, url={audio}"
                             )
-                        file = io.BytesIO(response.content)
-                        response.close()
+                        file = io.BytesIO(content)
                     except Exception as e:
                         dl_elapsed_ms = (time.perf_counter() - dl_start) * 1000
                         logger.error(
@@ -1759,10 +1751,8 @@ class MiMoProcessor:
             image_obj = image
         elif isinstance(image, str):
             if image.startswith("http://") or image.startswith("https://"):
-                with requests.get(image, stream=True) as response:
-                    response.raise_for_status()
-                    with BytesIO(response.content) as bio:
-                        image_obj = copy.deepcopy(Image.open(bio))
+                with BytesIO(download_mm_data(image)) as bio:
+                    image_obj = copy.deepcopy(Image.open(bio))
             elif image.startswith("file://"):
                 image_obj = Image.open(image[7:])
             elif image.startswith("data:image"):

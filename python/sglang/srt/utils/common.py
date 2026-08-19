@@ -36,6 +36,7 @@ import re
 import resource
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -706,6 +707,117 @@ def get_mm_http_session() -> requests.Session:
     return session
 
 
+def _abort_response_socket(response: requests.Response) -> None:
+    # response.close() would block on the buffer lock held by an in-progress
+    # read; shutting down the raw socket wakes a blocked recv immediately.
+    # urllib3 detaches conn.sock while streaming, so also try the http.client
+    # fp chain (raw._fp.fp.raw._sock); its [closed] flag is only an io_refs
+    # marker — the fd stays valid and shutdown() still takes effect.
+    raw = response.raw
+    fp_chain = getattr(getattr(getattr(raw, "_fp", None), "fp", None), "raw", None)
+    for sock in (
+        getattr(getattr(raw, "_connection", None), "sock", None),
+        getattr(fp_chain, "_sock", None),
+    ):
+        if sock is None:
+            continue
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+            return
+        except OSError:
+            continue
+
+
+class MMDownloadError(RuntimeError):
+    """A multimodal URL download failed for network reasons (DNS, connect,
+    timeout), as opposed to invalid input data. Callers should surface this
+    as a server-side (5xx) error, not a client error. The message is
+    client-facing and must not contain the URL/host; those go to server
+    logs only."""
+
+
+def download_mm_data(url: str) -> bytes:
+    """Download multimodal data from a URL with a bounded total duration.
+
+    requests' timeout only bounds the TCP connect and each socket read; a
+    slow-dripping or stalled server can stretch one download indefinitely
+    (2026-08-19 encoder outage). REQUEST_TIMEOUT is therefore treated as a
+    wall-clock deadline for the whole download, enforced by a watchdog that
+    kills the connection to unblock any in-progress read. Connect and
+    per-read timeouts stay short so a dead peer fails fast.
+    """
+    total_timeout = float(os.getenv("REQUEST_TIMEOUT", "120"))
+    connect_timeout = min(5.0, total_timeout)
+    read_timeout = min(30.0, total_timeout)
+    deadline = time.monotonic() + total_timeout
+    try:
+        with get_mm_http_session().get(
+            url, stream=True, timeout=(connect_timeout, read_timeout)
+        ) as response:
+            response.raise_for_status()
+            watchdog = threading.Timer(
+                max(deadline - time.monotonic(), 0.001),
+                _abort_response_socket,
+                args=(response,),
+            )
+            watchdog.daemon = True
+            watchdog.start()
+            chunks = []
+            try:
+                for chunk in response.iter_content(chunk_size=1 << 20):
+                    chunks.append(chunk)
+            except Exception as e:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Multimodal download exceeded total deadline of "
+                        f"{total_timeout}s ({sum(map(len, chunks))} bytes read)"
+                    ) from e
+                raise
+            finally:
+                watchdog.cancel()
+            if time.monotonic() >= deadline:
+                # The watchdog may have cut the stream mid-body without an
+                # exception; do not trust possibly-truncated data.
+                raise TimeoutError(
+                    f"Multimodal download exceeded total deadline of "
+                    f"{total_timeout}s ({sum(map(len, chunks))} bytes read)"
+                )
+            return b"".join(chunks)
+    except TimeoutError as e:
+        logger.warning("Multimodal download failed for %s: %s", url, e)
+        raise MMDownloadError(str(e)) from e
+    except requests.HTTPError:
+        # The server answered; a 4xx/5xx status usually means the URL itself
+        # is bad, so keep the existing (client-error) handling.
+        raise
+    except requests.RequestException as e:
+        # Report only the innermost cause: the full requests/urllib3 chain
+        # repeats the URL several times and leaks into client-facing errors.
+        root = e
+        for _ in range(10):
+            nxt = root.__cause__ or root.__context__
+            if nxt is None:
+                break
+            root = nxt
+        detail = (
+            root.args[-1] if root.args and isinstance(root.args[-1], str) else str(root)
+        )
+        logger.warning(
+            "Multimodal download failed for %s: %s: %s",
+            url,
+            type(root).__name__,
+            detail,
+        )
+        # Scrub the URL/host so the client-facing message does not leak them.
+        detail = detail.replace(url, "<url>")
+        host = urlparse(url).hostname
+        if host:
+            detail = detail.replace(host, "<host>")
+        raise MMDownloadError(
+            f"Failed to download multimodal data: {type(root).__name__}: {detail}"
+        ) from e
+
+
 def load_audio(
     audio_file: str,
     sr: Optional[int] = None,
@@ -725,10 +837,7 @@ def load_audio(
     elif isinstance(audio_file, str) and (
         audio_file.startswith("http://") or audio_file.startswith("https://")
     ):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        with get_mm_http_session().get(audio_file, timeout=timeout) as response:
-            response.raise_for_status()
-            source = response.content
+        source = download_mm_data(audio_file)
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
         source = unquote(urlparse(audio_file).path)
     elif isinstance(audio_file, str):
@@ -940,14 +1049,7 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     if isinstance(image_file, bytes):
         return image_file
     if image_file.startswith(("http://", "https://")):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = get_mm_http_session().get(image_file, timeout=timeout)
-        try:
-            response.raise_for_status()
-            result = response.content
-        finally:
-            response.close()
-        return result
+        return download_mm_data(image_file)
     if image_file.startswith(("file://", "/")):
         with open(image_file, "rb") as f:
             return f.read()
@@ -972,12 +1074,7 @@ def _normalize_video_input(
         return video_file
     elif isinstance(video_file, str):
         if video_file.startswith(("http://", "https://")):
-            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-            with get_mm_http_session().get(
-                video_file, stream=True, timeout=timeout
-            ) as response:
-                response.raise_for_status()
-                return response.content
+            return download_mm_data(video_file)
         elif video_file.startswith("data:"):
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)

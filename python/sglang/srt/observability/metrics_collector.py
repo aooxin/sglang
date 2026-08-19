@@ -106,6 +106,7 @@ class SchedulerStats:
     # PD disaggregation
     num_prefill_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_prefill_inflight_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_prefetch_pending_queue_reqs: int = 0
     num_prefill_total_reqs: int = 0
     num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
@@ -366,6 +367,12 @@ class SchedulerMetricsCollector:
         self.num_prefill_inflight_queue_reqs = Gauge(
             name="sglang:num_prefill_inflight_queue_reqs",
             documentation="The number of requests in the prefill inflight queue.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.num_prefetch_pending_queue_reqs = Gauge(
+            name="sglang:num_prefetch_pending_queue_reqs",
+            documentation="The number of PREFILL requests parked in the prefetch pending queue (rate-limited prefetch awaiting retry).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1299,6 +1306,10 @@ class SchedulerMetricsCollector:
         self._log_gauge_queue_count(
             self.num_prefill_inflight_queue_reqs, stats.num_prefill_inflight_queue_reqs
         )
+        self._log_gauge(
+            self.num_prefetch_pending_queue_reqs,
+            stats.num_prefetch_pending_queue_reqs,
+        )
         self._log_gauge(self.num_prefill_total_reqs, stats.num_prefill_total_reqs)
         self._log_gauge_queue_count(
             self.num_decode_prealloc_queue_reqs, stats.num_decode_prealloc_queue_reqs
@@ -2080,6 +2091,25 @@ class StorageMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        self.prefetch_retry_total = Counter(
+            name="sglang:prefetch_retry_total",
+            documentation="Number of prefetch retries scheduled after rate limiting.",
+            labelnames=labels.keys(),
+        )
+
+        self.prefetch_dropped_total = Counter(
+            name="sglang:prefetch_dropped_total",
+            documentation="Number of requests aborted (429) after prefetch retry budget exhausted.",
+            labelnames=labels.keys(),
+        )
+
+        self.histogram_prefetch_pending_dropped_seconds = Histogram(
+            name="sglang:prefetch_pending_dropped_seconds",
+            documentation="Time a rate-limited request spent parked in the prefetch pending queue before being dropped (429) once its retry budget was exhausted.",
+            labelnames=labels.keys(),
+            buckets=[0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60],
+        )
+
         self.prefetch_capacity_usage_ratio = Gauge(
             name="sglang:prefetch_capacity_usage_ratio",
             documentation="Ratio of prefetch tokens occupied to capacity limit (0.0 ~ 1.0+).",
@@ -2118,6 +2148,16 @@ class StorageMetricsCollector:
 
     def log_prefetch_rate_limited(self):
         self.prefetch_rate_limited_total.labels(**self.labels).inc()
+
+    def log_prefetch_retry(self):
+        self.prefetch_retry_total.labels(**self.labels).inc()
+
+    def log_prefetch_dropped(self, pending_seconds: Optional[float] = None):
+        self.prefetch_dropped_total.labels(**self.labels).inc()
+        if pending_seconds is not None and pending_seconds >= 0:
+            self.histogram_prefetch_pending_dropped_seconds.labels(
+                **self.labels
+            ).observe(pending_seconds)
 
     def log_prefetch_capacity_usage(self, tokens_occupied: int, capacity_limit: int):
         self.prefetch_capacity_usage_ratio.labels(**self.labels).set(

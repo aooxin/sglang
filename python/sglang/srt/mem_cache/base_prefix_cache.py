@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 import time
 from abc import ABC, abstractmethod
 from typing import (
@@ -22,6 +23,21 @@ from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollecto
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.radix_cache import RadixKey
+
+
+class PrefetchStatus(enum.IntEnum):
+    """Outcome of HiRadixCache.prefetch_from_storage.
+
+    Only RATE_LIMITED is retryable — the host prefetch pool is transiently
+    saturated and capacity may free up on a later scheduler pass. All other
+    statuses mean "let the request proceed to bootstrap now" (matching trunk
+    behavior where prefetch is simply skipped).
+    """
+
+    STARTED = 0
+    SKIPPED = 1
+    RATE_LIMITED = 2
+    HOST_ALLOC_FAILED = 3
 
 
 @runtime_checkable

@@ -184,6 +184,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
+from sglang.srt.mem_cache.base_prefix_cache import PrefetchStatus
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.hiradix_cache import BaseHiRadixCache
@@ -909,6 +910,8 @@ class Scheduler(
         if server_args.enable_streaming_session:
             self.tree_cache = SessionAwareCache(self.tree_cache)
 
+        self._validate_prefetch_pending_config()
+
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
@@ -958,6 +961,11 @@ class Scheduler(
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
+        # PREFILL-only holding queue: requests parked before bootstrap because
+        # prefetch was RATE_LIMITED. Drained every scheduler pass (see
+        # _drain_prefetch_pending_queue). Empty and unused unless
+        # prefetch_max_retry_rounds > 0.
+        self.prefetch_pending_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -2304,42 +2312,119 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _prefetch_kvcache(self, req: Req):
-        if self.enable_hicache_storage:
-            if req.fake_cache_hit_ratio is not None:
-                return
-            req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            last_host_node = req.last_host_node
-            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
-                last_hash = last_host_node.get_last_hash_value()
-                matched_len = len(req.prefix_indices) + req.host_hit_length
-                new_input_tokens = req.fill_ids[matched_len:]
+    def _prefetch_kvcache(self, req: Req) -> PrefetchStatus:
+        if not self.enable_hicache_storage:
+            return PrefetchStatus.SKIPPED
+        if req.fake_cache_hit_ratio is not None:
+            return PrefetchStatus.SKIPPED
+        req.init_next_round_input(self.tree_cache, cow_mamba=False)
+        last_host_node = req.last_host_node
+        if not (
+            last_host_node.backuped or last_host_node is self.tree_cache.root_node
+        ):
+            return PrefetchStatus.SKIPPED
+        last_hash = last_host_node.get_last_hash_value()
+        matched_len = len(req.prefix_indices) + req.host_hit_length
+        new_input_tokens = req.fill_ids[matched_len:]
 
-                prefix_keys = (
-                    last_host_node.get_prefix_hash_values(last_host_node.parent)
-                    if self.tree_cache.hicache_storage_pass_prefix_keys
-                    else None
+        prefix_keys = (
+            last_host_node.get_prefix_hash_values(last_host_node.parent)
+            if self.tree_cache.hicache_storage_pass_prefix_keys
+            else None
+        )
+        status = self.tree_cache.prefetch_from_storage(
+            req.rid,
+            last_host_node,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+        )
+        if status == PrefetchStatus.STARTED:
+            req.time_stats.set_hicache_prefetch_wait_total_start_time()
+            req.time_stats.trace_ctx.trace_slice_add_attr(
+                {
+                    "hicache_prefetch_started.prefetch_tokens": len(
+                        new_input_tokens
+                    ),
+                    "hicache_prefetch_started.gpu_cached_tokens": len(
+                        req.prefix_indices
+                    ),
+                    "hicache_prefetch_started.host_cached_tokens": req.host_hit_length,
+                },
+            )
+        return status
+
+    def _prefetch_pending_enabled(self) -> bool:
+        return getattr(self.tree_cache, "prefetch_max_retry_rounds", 0) > 0
+
+    def _validate_prefetch_pending_config(self):
+        # Rate-limited prefetch re-queue is not supported under pipeline
+        # parallelism: the PP disagg-prefill event loop routes requests through
+        # the park gate (_add_request_to_queue) but has no _drain_prefetch_pending_queue
+        # call, so parked PREFILL requests would be stranded (never promoted,
+        # counted, or 429'd). Reject at startup rather than silently stranding.
+        if self.pp_size > 1 and self._prefetch_pending_enabled():
+            raise ValueError(
+                "prefetch_max_retry_rounds > 0 (rate-limited prefetch re-queue) "
+                "is not supported with pipeline parallelism (pp_size > 1). "
+                "Set prefetch_max_retry_rounds to 0 or run with pp_size == 1."
+            )
+
+    def _drain_prefetch_pending_queue(self):
+        if not self.prefetch_pending_queue:
+            return
+        max_rounds = self.tree_cache.prefetch_max_retry_rounds
+        collector = getattr(self.tree_cache, "storage_metrics_collector", None)
+        still_pending = []
+        for req in self.prefetch_pending_queue:  # FIFO, no break (avoid HOL blocking)
+            status = self._prefetch_kvcache(req)  # fire directly; internal check is source of truth
+            if status == PrefetchStatus.RATE_LIMITED:
+                req.prefetch_rate_limited_rounds += 1
+                if req.prefetch_rate_limited_rounds > max_rounds:
+                    self._abort_pending_prefetch(req)
+                else:
+                    if collector is not None:
+                        collector.log_prefetch_retry()
+                    still_pending.append(req)
+            else:
+                # STARTED / SKIPPED / HOST_ALLOC_FAILED: let it proceed to bootstrap
+                # (matches trunk "fall through to compute" semantics).
+                self.disagg_prefill_bootstrap_queue.add(
+                    req, self.model_config.num_key_value_heads
                 )
-                prefetch_started = self.tree_cache.prefetch_from_storage(
-                    req.rid,
-                    last_host_node,
-                    new_input_tokens,
-                    last_hash,
-                    prefix_keys,
-                )
-                if prefetch_started:
-                    req.time_stats.set_hicache_prefetch_wait_total_start_time()
-                    req.time_stats.trace_ctx.trace_slice_add_attr(
-                        {
-                            "hicache_prefetch_started.prefetch_tokens": len(
-                                new_input_tokens
-                            ),
-                            "hicache_prefetch_started.gpu_cached_tokens": len(
-                                req.prefix_indices
-                            ),
-                            "hicache_prefetch_started.host_cached_tokens": req.host_hit_length,
-                        },
-                    )
+        self.prefetch_pending_queue = still_pending
+
+    def _abort_pending_prefetch(self, req: Req):
+        # Pending reqs never fired prefetch / bootstrap: no metadata_buffer_index,
+        # no disagg_kv_sender. Abort is a pure local drop, no collective comm.
+        if self.enable_hicache_storage:
+            # Defensive + idempotent: pending reqs are not in ongoing_prefetch,
+            # so release_aborted_request early-returns before its TP barrier
+            # (hiradix_cache.py:2358), consistent across ranks.
+            self.tree_cache.release_aborted_request(req.rid)
+        message = "Prefetch rate limited; retry budget exhausted."
+        abort_req = AbortReq(
+            finished_reason={
+                "type": "abort",
+                "status_code": HTTPStatus.TOO_MANY_REQUESTS,
+                "message": message,
+            },
+            rid=req.rid,
+        )
+        self.send_to_tokenizer.send_output(abort_req, req)
+        req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+        collector = getattr(self.tree_cache, "storage_metrics_collector", None)
+        if collector is not None:
+            # Time spent parked in the pending queue: park set
+            # prefill_bootstrap_queue_entry_time (time.perf_counter basis) when
+            # the request was first rate-limited. Wall-clock is TP-safe here —
+            # this histogram is per-rank observation only, never fed back into a
+            # collective; the drop decision itself is the TP-uniform round count.
+            entry = getattr(
+                req.time_stats, "prefill_bootstrap_queue_entry_time", 0.0
+            )
+            pending_seconds = time.perf_counter() - entry if entry > 0 else None
+            collector.log_prefetch_dropped(pending_seconds)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
@@ -2351,11 +2436,20 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._prefetch_kvcache(req)
-            self.disagg_prefill_bootstrap_queue.add(
-                req, self.model_config.num_key_value_heads
-            )
-            req.time_stats.set_prefill_bootstrap_queue_entry_time()
+            if (
+                self._prefetch_pending_enabled()
+                and self.tree_cache.cache_controller.prefetch_rate_limited()
+            ):
+                # Rate limited: park before bootstrap. Fires no prefetch, allocates
+                # no metadata_buffer_index / host protect / ongoing_prefetch entry.
+                self.prefetch_pending_queue.append(req)
+                req.time_stats.set_prefill_bootstrap_queue_entry_time()
+            else:
+                self._prefetch_kvcache(req)
+                self.disagg_prefill_bootstrap_queue.add(
+                    req, self.model_config.num_key_value_heads
+                )
+                req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
@@ -3488,6 +3582,7 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
+                idle &= len(self.prefetch_pending_queue) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
@@ -3757,6 +3852,23 @@ class Scheduler(
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
+
+        # Delete requests parked in the prefetch pending queue (PREFILL only).
+        # Mirror the waiting-queue early-pop: these requests have not started
+        # anything (no metadata_buffer_index, no disagg_kv_sender), so we only
+        # release prefetch tracking (defensive/idempotent) and notify the tokenizer.
+        # We do NOT call release_req_to_metadata_buffer — no buffer was allocated.
+        if self.prefetch_pending_queue:
+            remaining = []
+            for req in self.prefetch_pending_queue:
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    if self.enable_hicache_storage:
+                        self.tree_cache.release_aborted_request(req.rid)
+                    self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+                    logger.debug(f"Abort pending prefetch request. {req.rid=}")
+                else:
+                    remaining.append(req)
+            self.prefetch_pending_queue = remaining
 
         # Delete the requests in the grammar queue
         # Abort method 2: call `set_finish_with_abort`

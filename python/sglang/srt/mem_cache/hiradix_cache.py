@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertResult,
     MatchPrefixParams,
     MatchResult,
+    PrefetchStatus,
 )
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
@@ -163,6 +164,7 @@ class BaseHiRadixCache(abc.ABC):
             prefetch_timeout_base,
             prefetch_timeout_per_ki_token,
             hicache_storage_pass_prefix_keys,
+            prefetch_max_retry_rounds,
         ) = self._parse_storage_backend_extra_config(
             server_args.hicache_storage_backend_extra_config
         )
@@ -195,6 +197,7 @@ class BaseHiRadixCache(abc.ABC):
             prefetch_timeout_base=prefetch_timeout_base,
             prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
             hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
+            prefetch_max_retry_rounds=prefetch_max_retry_rounds,
             enable_storage=self.enable_storage,
             enable_storage_metrics=self.enable_storage_metrics,
             extra_metric_labels=self.extra_metric_labels,
@@ -291,6 +294,7 @@ class BaseHiRadixCache(abc.ABC):
         prefetch_timeout_base: float,
         prefetch_timeout_per_ki_token: float,
         hicache_storage_pass_prefix_keys: bool,
+        prefetch_max_retry_rounds: int,
         enable_storage: bool,
         enable_storage_metrics: bool,
         extra_metric_labels: Optional[Dict[str, str]],
@@ -301,6 +305,7 @@ class BaseHiRadixCache(abc.ABC):
 
         self.enable_storage = enable_storage
         self.prefetch_threshold = prefetch_threshold
+        self.prefetch_max_retry_rounds = prefetch_max_retry_rounds
         self.prefetch_timeout_base = prefetch_timeout_base
         self.prefetch_timeout_per_page = prefetch_timeout_per_page
         self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
@@ -414,6 +419,7 @@ class BaseHiRadixCache(abc.ABC):
                 prefetch_timeout_base,
                 prefetch_timeout_per_ki_token,
                 hicache_storage_pass_prefix_keys,
+                prefetch_max_retry_rounds,
             ) = self._parse_storage_backend_extra_config(
                 storage_backend_extra_config_json
             )
@@ -443,6 +449,7 @@ class BaseHiRadixCache(abc.ABC):
             prefetch_timeout_base=prefetch_timeout_base,
             prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
             hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
+            prefetch_max_retry_rounds=prefetch_max_retry_rounds,
             enable_storage=True,
             enable_storage_metrics=self._enable_metrics_flag,
             extra_metric_labels=self.extra_metric_labels,
@@ -702,12 +709,26 @@ class BaseHiRadixCache(abc.ABC):
                 f"{type(hicache_storage_pass_prefix_keys).__name__}"
             )
 
+        prefetch_max_retry_rounds = extra_config.pop("prefetch_max_retry_rounds", 0)
+        if isinstance(prefetch_max_retry_rounds, bool) or not isinstance(
+            prefetch_max_retry_rounds, int
+        ):
+            raise ValueError(
+                "prefetch_max_retry_rounds must be a non-negative int, got "
+                f"{type(prefetch_max_retry_rounds).__name__}"
+            )
+        if prefetch_max_retry_rounds < 0:
+            raise ValueError(
+                f"prefetch_max_retry_rounds must be >= 0, got {prefetch_max_retry_rounds}"
+            )
+
         return (
             extra_config,
             prefetch_threshold,
             float(prefetch_timeout_base),
             float(prefetch_timeout_per_ki_token),
             hicache_storage_pass_prefix_keys,
+            prefetch_max_retry_rounds,
         )
 
     def reset(self):
@@ -1910,7 +1931,7 @@ class BaseHiRadixCache(abc.ABC):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
-    ) -> bool:
+    ) -> PrefetchStatus:
         prefetch_key = RadixKey(new_input_tokens)
         prefetch_key.maybe_to_ngram_view(
             self.is_eagle, step=self.speculative_num_steps
@@ -1919,12 +1940,10 @@ class BaseHiRadixCache(abc.ABC):
         prefetch_length = len(prefetch_key) - (len(prefetch_key) % self.page_size)
         aligned_key = prefetch_key[:prefetch_length]
 
-        if (
-            not self.enable_storage
-            or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
-        ):
-            return False
+        if not self.enable_storage or prefetch_length < self.prefetch_threshold:
+            return PrefetchStatus.SKIPPED
+        if self.cache_controller.prefetch_rate_limited():
+            return PrefetchStatus.RATE_LIMITED
 
         last_host_node.protect_host()
         full_host_indices, swa_host_indices, lack_full_size, lack_swa_size, host_indices_ready_event = (
@@ -1953,7 +1972,7 @@ class BaseHiRadixCache(abc.ABC):
                 )
             last_host_node.release_host()
             # no sufficient host memory for prefetch
-            return False
+            return PrefetchStatus.HOST_ALLOC_FAILED
         assert swa_host_indices is not None
         operation = self.cache_controller.prefetch(
             req_id,
@@ -1971,7 +1990,7 @@ class BaseHiRadixCache(abc.ABC):
             operation,
         )
         self.cache_controller.prefetch_tokens_occupied += len(aligned_key)
-        return True
+        return PrefetchStatus.STARTED
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value

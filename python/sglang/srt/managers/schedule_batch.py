@@ -870,6 +870,11 @@ class Req(ReqDllmMixin):
 
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
+        # Number of scheduler passes this request has been kept in the
+        # prefetch_pending_queue due to RATE_LIMITED. Bounded by
+        # tree_cache.prefetch_max_retry_rounds; exceeding it triggers a 429 abort.
+        # Counted in scheduler passes (TP-lockstep), never wall-clock.
+        self.prefetch_rate_limited_rounds = 0
         self.retraction_mb_id = None
 
         # For observability
@@ -1334,6 +1339,9 @@ class Req(ReqDllmMixin):
         # Increment retraction count before resetting other state. We should not reset this
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
+        # A retracted request re-enters _add_request_to_queue fresh; do not carry
+        # stale rate-limit rounds across preemption.
+        self.prefetch_rate_limited_rounds = 0
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None

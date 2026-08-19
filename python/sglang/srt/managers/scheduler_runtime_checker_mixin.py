@@ -356,6 +356,9 @@ class SchedulerRuntimeCheckerMixin:
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
                     self.disagg_prefill_inflight_queue, priority_enabled
                 )
+                self.stats.num_prefetch_pending_queue_reqs = len(
+                    self.prefetch_pending_queue
+                )
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
                     self.disagg_decode_prealloc_queue.queue, priority_enabled

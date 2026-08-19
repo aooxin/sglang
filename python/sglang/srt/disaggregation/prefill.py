@@ -416,6 +416,7 @@ class SchedulerDisaggregationPrefillMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            self._drain_prefetch_pending_queue()
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
@@ -481,6 +482,7 @@ class SchedulerDisaggregationPrefillMixin:
                 prev_recv_reqs = recv_reqs
 
                 # ── 4. Schedule (from requests dispatched in step 1) ──
+                self._drain_prefetch_pending_queue()
                 self.waiting_queue.extend(
                     self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
                 )

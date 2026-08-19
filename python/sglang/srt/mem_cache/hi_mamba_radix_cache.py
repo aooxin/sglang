@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
+    PrefetchStatus,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -193,6 +194,7 @@ class HiMambaRadixCache(MambaRadixCache):
             prefetch_timeout_base,
             prefetch_timeout_per_ki_token,
             hicache_storage_pass_prefix_keys,
+            prefetch_max_retry_rounds,
         ) = self._parse_storage_backend_extra_config(
             server_args.hicache_storage_backend_extra_config
         )
@@ -228,6 +230,7 @@ class HiMambaRadixCache(MambaRadixCache):
             prefetch_timeout_base=prefetch_timeout_base,
             prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
             hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
+            prefetch_max_retry_rounds=prefetch_max_retry_rounds,
             enable_storage=self.enable_storage,
             enable_storage_metrics=self.enable_storage_metrics,
             extra_metric_labels=self.extra_metric_labels,
@@ -1294,6 +1297,7 @@ class HiMambaRadixCache(MambaRadixCache):
         prefetch_timeout_base: float,
         prefetch_timeout_per_ki_token: float,
         hicache_storage_pass_prefix_keys: bool,
+        prefetch_max_retry_rounds: int,
         enable_storage: bool,
         enable_storage_metrics: bool,
         extra_metric_labels: Optional[Dict[str, str]],
@@ -1317,6 +1321,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
         self.enable_storage = enable_storage
         self.prefetch_threshold = prefetch_threshold
+        self.prefetch_max_retry_rounds = prefetch_max_retry_rounds
         self.prefetch_timeout_base = prefetch_timeout_base
         self.prefetch_timeout_per_page = prefetch_timeout_per_page
         self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
@@ -1388,6 +1393,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 prefetch_timeout_base,
                 prefetch_timeout_per_ki_token,
                 hicache_storage_pass_prefix_keys,
+                prefetch_max_retry_rounds,
             ) = self._parse_storage_backend_extra_config(
                 storage_backend_extra_config_json
             )
@@ -1419,6 +1425,7 @@ class HiMambaRadixCache(MambaRadixCache):
             prefetch_timeout_base=prefetch_timeout_base,
             prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
             hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
+            prefetch_max_retry_rounds=prefetch_max_retry_rounds,
             enable_storage=True,
             enable_storage_metrics=self._enable_metrics_flag,
             extra_metric_labels=self.extra_metric_labels,
@@ -1629,12 +1636,26 @@ class HiMambaRadixCache(MambaRadixCache):
                 f"{type(hicache_storage_pass_prefix_keys).__name__}"
             )
 
+        prefetch_max_retry_rounds = extra_config.pop("prefetch_max_retry_rounds", 0)
+        if isinstance(prefetch_max_retry_rounds, bool) or not isinstance(
+            prefetch_max_retry_rounds, int
+        ):
+            raise ValueError(
+                "prefetch_max_retry_rounds must be a non-negative int, got "
+                f"{type(prefetch_max_retry_rounds).__name__}"
+            )
+        if prefetch_max_retry_rounds < 0:
+            raise ValueError(
+                f"prefetch_max_retry_rounds must be >= 0, got {prefetch_max_retry_rounds}"
+            )
+
         return (
             extra_config,
             prefetch_threshold,
             float(prefetch_timeout_base),
             float(prefetch_timeout_per_ki_token),
             hicache_storage_pass_prefix_keys,
+            prefetch_max_retry_rounds,
         )
 
     def clear_storage_backend(self) -> bool:
@@ -1764,17 +1785,15 @@ class HiMambaRadixCache(MambaRadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
-    ):
+    ) -> PrefetchStatus:
         prefetch_length = len(new_input_tokens) - (
             len(new_input_tokens) % self.page_size
         )
         new_input_tokens = new_input_tokens[:prefetch_length]
-        if (
-            not self.enable_storage
-            or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
-        ):
-            return
+        if not self.enable_storage or prefetch_length < self.prefetch_threshold:
+            return PrefetchStatus.SKIPPED
+        if self.cache_controller.prefetch_rate_limited():
+            return PrefetchStatus.RATE_LIMITED
 
         self._protect_host_node(last_host_node, protect_mamba=False)
 
@@ -1786,14 +1805,14 @@ class HiMambaRadixCache(MambaRadixCache):
         )
         if host_indices is None:
             self._release_host_node(last_host_node, release_mamba=False)
-            return
+            return PrefetchStatus.HOST_ALLOC_FAILED
 
         # Allocate host mamba slot
         extra_pools = self.mamba_prefetch_alloc(new_input_tokens, last_hash)
         if extra_pools is None:
             self.cache_controller.mem_pool_host.free(host_indices)
             self._release_host_node(last_host_node, release_mamba=False)
-            return
+            return PrefetchStatus.HOST_ALLOC_FAILED
 
         # mamba is also being loaded, protect host mamba as well
         last_host_node.protect_host_mamba()
@@ -1815,6 +1834,7 @@ class HiMambaRadixCache(MambaRadixCache):
             operation,
         )
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
+        return PrefetchStatus.STARTED
 
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:

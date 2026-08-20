@@ -155,6 +155,56 @@ DEFAULT_VIDEO_URL = "https://raw.githubusercontent.com/EvolvingLMMs-Lab/sglang/d
 
 DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 
+# Gated HuggingFace repos (e.g. meta-llama/*) are unreachable on networks
+# restricted to ModelScope. Under SGLANG_USE_MODELSCOPE the ids above are
+# rewritten to ModelScope equivalents so both server and tokenizer/processor
+# loads resolve; the default HF path is unaffected.
+_MODELSCOPE_MODEL_ID_MAP = {
+    "meta-llama/Llama-3.1-8B-Instruct": "LLM-Research/Meta-Llama-3.1-8B-Instruct",
+    "meta-llama/Llama-3.2-1B-Instruct": "LLM-Research/Llama-3.2-1B-Instruct",
+    "meta-llama/Llama-3.2-1B": "LLM-Research/Llama-3.2-1B",
+    "Qwen/Qwen2.5-VL-3B-Instruct": "Qwen/Qwen2.5-VL-3B-Instruct",
+    "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat": "z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat",
+}
+
+
+def _maybe_use_modelscope_model(hf_model_id: str) -> str:
+    if not get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+        return hf_model_id
+    return _MODELSCOPE_MODEL_ID_MAP.get(hf_model_id)
+
+
+def resolve_model_path_for_loading(model_id: str) -> str:
+    """Return a path loadable by transformers AutoTokenizer/AutoProcessor.
+
+    Under SGLANG_USE_MODELSCOPE the id is a ModelScope repo, which transformers
+    cannot fetch directly, so download it and return the local snapshot path.
+    """
+    if not get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+        return model_id
+    from modelscope.hub.snapshot_download import snapshot_download
+
+    return snapshot_download(model_id)
+
+
+if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
+    DEFAULT_MODEL_NAME_FOR_TEST = _maybe_use_modelscope_model(
+        DEFAULT_MODEL_NAME_FOR_TEST
+    )
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST = _maybe_use_modelscope_model(
+        DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+    )
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE = _maybe_use_modelscope_model(
+        DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE
+    )
+    DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST = _maybe_use_modelscope_model(
+        DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
+    )
+    DEFAULT_TARGET_MODEL_DFLASH = _maybe_use_modelscope_model(
+        DEFAULT_TARGET_MODEL_DFLASH
+    )
+    DEFAULT_DRAFT_MODEL_DFLASH = _maybe_use_modelscope_model(DEFAULT_DRAFT_MODEL_DFLASH)
+
 
 def download_image_with_retry(image_url: str, max_retries: int = 3) -> Image.Image:
     for i in range(max_retries):

@@ -1977,7 +1977,7 @@ class BaseHiRadixCache(abc.ABC):
             last_host_node.release_host()
             # no sufficient host memory for prefetch
             return PrefetchStatus.HOST_ALLOC_FAILED
-        assert swa_host_indices is not None
+        assert not self.cache_controller.is_hybrid_swa or swa_host_indices is not None
         operation = self.cache_controller.prefetch(
             req_id,
             full_host_indices,

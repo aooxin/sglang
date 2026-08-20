@@ -516,10 +516,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
     ):
         self.auto_create_handle_loop()
 
+        # Reject client-supplied rids that duplicate an in-flight request before
+        # force_unique_rid suffixing makes them unique and hides the conflict.
+        self._validate_rid_not_in_flight(obj)
+
         # Normalize the request
         obj.normalize_batch_and_arguments(force_unique_rid=True)
         self._set_default_priority(obj)
-        self._validate_rid_not_in_flight(obj)
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             dp_size = self.server_args.dp_size
@@ -840,7 +843,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         if obj.rid is None:
             return
         rids = obj.rid if isinstance(obj.rid, list) else [obj.rid]
-        conflicts = set(rids) & self.rid_to_state.keys()
+        # In-flight rids are suffixed by force_unique_rid, so match against both
+        # the suffixed keys and the preserved original client rids.
+        in_flight = set(self.rid_to_state.keys())
+        in_flight |= {
+            state.obj.original_rid
+            for state in self.rid_to_state.values()
+            if state.obj.original_rid is not None
+        }
+        conflicts = set(rids) & in_flight
         if conflicts:
             raise ValueError(f"Duplicate request IDs detected: {list(conflicts)}")
 

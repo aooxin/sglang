@@ -49,6 +49,7 @@ else:
 @dataclass
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
+    original_rid: Optional[str] = field(default=None, kw_only=True)
     http_worker_ipc: Optional[str] = field(default=None, kw_only=True)
 
     def regenerate_rid(self):
@@ -374,6 +375,7 @@ class GenerateReqInput(BaseReq):
             self.rid = uuid.uuid4().hex
         elif force_unique_rid:
             # Keep client rid as prefix (abort-by-prefix), add suffix to avoid collision.
+            self.original_rid = self.rid
             self.rid = f"{self.rid}_{uuid.uuid4().hex}"
         if self.return_logprob is None:
             self.return_logprob = False
@@ -523,7 +525,9 @@ class GenerateReqInput(BaseReq):
                 raise ValueError(
                     "The specified rids length mismatch with the batch_size for batch processing."
                 )
-            if force_unique_rid:
+            # Suffix only already-unique lists; genuine duplicates must fall
+            # through to _validate_rid_uniqueness() and be rejected.
+            if force_unique_rid and len(set(self.rid)) == len(self.rid):
                 self.rid = [f"{rid}_{uuid.uuid4().hex}" for rid in self.rid]
         else:
             raise ValueError("The rid should be a string or a list of strings.")

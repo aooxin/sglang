@@ -583,8 +583,12 @@ class DFlashVerifyInput(SpecInput):
         batch.seq_lens_cpu.add_(
             torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
         )
-        # Keep seq_lens_sum in sync; flashinfer indices updaters rely on this for buffer sizing.
-        batch.seq_lens_sum += sum(commit_lens_cpu)
+        # Keep seq_lens_sum in sync; flashinfer indices updaters rely on this for
+        # buffer sizing. It may be None after a filter/merge (retraction), in which
+        # case ForwardBatch.init_new lazily recomputes it from seq_lens_cpu, which
+        # is already updated above; only patch the incremental value when present.
+        if batch.seq_lens_sum is not None:
+            batch.seq_lens_sum += sum(commit_lens_cpu)
 
         # Build next-step context features from the committed verify-input tokens.
         hidden = logits_output.hidden_states

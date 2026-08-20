@@ -231,6 +231,10 @@ class TestStartProfileWithNsys(CustomTestCase):
             "cudaProfilerApi",
             "--capture-range-end",
             "stop",  # Stop after first cudaProfilerStop()
+            # Skip symbol resolution: it triggers a network symbol-file download
+            # that hangs on offline runners, blocking .nsys-rep generation until
+            # the process is killed (leaving only a .qdstrm behind).
+            "--resolve-symbols=false",
             "-o",
             os.path.join(OUTPUT_DIR, output_file),
             "python3",
@@ -247,11 +251,14 @@ class TestStartProfileWithNsys(CustomTestCase):
         # Create output directory if it doesn't exist
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-        # Launch the process - capture output to keep test output clean
+        # Launch the process. Inherit the parent's stdout/stderr instead of
+        # piping: under nsys the server emits enough startup output to fill an
+        # undrained pipe buffer (~64KB), which would deadlock server init and
+        # hang the test. Inheriting matches popen_launch_server's default path.
         process = subprocess.Popen(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stdout=None,
+            stderr=None,
         )
 
         # Wait for server to be ready
@@ -324,22 +331,36 @@ class TestStartProfileWithNsys(CustomTestCase):
         response = requests.post(
             f"{self.base_url}/start_profile",
             json=kwargs if kwargs else None,
+            timeout=60,
         )
         self.assertEqual(response.status_code, 200)
         return response
 
     def _post_request(self):
-        response = requests.post(
-            f"{self.base_url}/generate",
-            json={
-                "text": "The capital of France is",
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 32,
+        # This request drives enough decode steps to trigger the CUDA profiler
+        # stop (num_steps). With `nsys ... --capture-range-end stop`, nsys tears
+        # down the profiled process on the first cudaProfilerStop(), so the
+        # in-flight /generate response may never complete. That is expected: the
+        # authoritative check is the .nsys-rep file verified in tearDown().
+        # Use a bounded timeout and tolerate a broken connection so the test
+        # never hangs waiting on a process nsys is shutting down.
+        try:
+            response = requests.post(
+                f"{self.base_url}/generate",
+                json={
+                    "text": "The capital of France is",
+                    "sampling_params": {
+                        "temperature": 0,
+                        "max_new_tokens": 32,
+                    },
                 },
-            },
-        )
-        self.assertEqual(response.status_code, 200)
+                timeout=60,
+            )
+            self.assertEqual(response.status_code, 200)
+        except (requests.RequestException, requests.Timeout):
+            # nsys stopped the server mid-generation; profile capture already
+            # happened. tearDown() verifies the resulting .nsys-rep file.
+            pass
 
 
 if __name__ == "__main__":

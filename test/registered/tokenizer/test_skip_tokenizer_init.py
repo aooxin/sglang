@@ -21,6 +21,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     download_image_with_retry,
     popen_launch_server,
+    resolve_model_path_for_loading,
 )
 
 register_cuda_ci(est_time=77, suite="stage-b-test-1-gpu-small")
@@ -40,7 +41,8 @@ class TestSkipTokenizerInit(CustomTestCase):
         )
         cls.eos_token_id = [119690]
         cls.tokenizer = AutoTokenizer.from_pretrained(
-            DEFAULT_SMALL_MODEL_NAME_FOR_TEST, use_fast=False
+            resolve_model_path_for_loading(DEFAULT_SMALL_MODEL_NAME_FOR_TEST),
+            use_fast=False,
         )
 
     @classmethod
@@ -209,8 +211,9 @@ class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
         cls.image_url = DEFAULT_IMAGE_URL
         cls.image = download_image_with_retry(cls.image_url)
         cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
-        cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, use_fast=False)
-        cls.processor = AutoProcessor.from_pretrained(cls.model, trust_remote_code=True)
+        _local = resolve_model_path_for_loading(cls.model)
+        cls.tokenizer = AutoTokenizer.from_pretrained(_local, use_fast=False)
+        cls.processor = AutoProcessor.from_pretrained(_local, trust_remote_code=True)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,

@@ -865,6 +865,7 @@ def _make_hicache_evicted_node(parent: TreeNode, host_value: torch.Tensor) -> Tr
 class _RecordingDeviceAllocator:
     def __init__(self):
         self.calls = []
+        self.device = torch.device("cpu")
 
     def alloc_device(self, host_indices, swa_valid_mask):
         self.calls.append((host_indices, swa_valid_mask))

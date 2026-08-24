@@ -1669,7 +1669,7 @@ class TokenizerMetricsCollector:
         self.histogram_time_to_first_token = Histogram(
             name="sglang:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
-            labelnames=labels.keys(),
+            labelnames=[*labels.keys(), "is_streaming"],
             buckets=bucket_time_to_first_token,
         )
 
@@ -1872,11 +1872,17 @@ class TokenizerMetricsCollector:
             )
         self.num_retractions.labels(**labels).observe(retraction_count)
 
-    def observe_time_to_first_token(self, labels: Dict[str, str], value: float):
-        self.histogram_time_to_first_token.labels(**labels).observe(value)
+    def observe_time_to_first_token(
+        self, labels: Dict[str, str], value: float, *, stream: bool
+    ):
+        self.histogram_time_to_first_token.labels(
+            **labels, is_streaming="true" if stream else "false"
+        ).observe(value)
 
     def check_time_to_first_token_straggler(self, value: float) -> bool:
-        his = self.histogram_time_to_first_token.labels(**self.labels)
+        his = self.histogram_time_to_first_token.labels(
+            **self.labels, is_streaming="true"
+        )
         total_observations = sum(bucket._value for bucket in his._buckets)
         if total_observations < 100:
             return False

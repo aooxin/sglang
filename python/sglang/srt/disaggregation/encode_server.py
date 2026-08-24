@@ -2173,9 +2173,7 @@ class MMEncoder:
                     modality=modality_str,
                 )
             except Exception:
-                logger.warning(
-                    "Failed to record batch encode metrics", exc_info=True
-                )
+                logger.warning("Failed to record batch encode metrics", exc_info=True)
         stage_timing.update(forward_timing)
         stage_timing["num_miss_items"] = num_miss_items
         stage_timing["num_total_items"] = num_total_items
@@ -2923,9 +2921,7 @@ def _observe_download_decode_per_request(
         miss_pos = {i: i for i in range(len(load_timings))}
     offset = 0
     for n in items_per_req:
-        idxs = [
-            miss_pos[i] for i in range(offset, offset + n) if i in miss_pos
-        ]
+        idxs = [miss_pos[i] for i in range(offset, offset + n) if i in miss_pos]
         dl = sum((load_timings[j].get("download", 0.0) for j in idxs), 0.0)
         dec = sum((load_timings[j].get("decode", 0.0) for j in idxs), 0.0)
         offset += n
@@ -3761,7 +3757,12 @@ async def run_dp_worker(
         enc.dp_rank = dp_rank
 
     if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            "encoder",
+            server_args.otlp_traces_resource_attrs,
+        )
         trace_set_thread_info(f"Encoder-DP{dp_rank}", dp_rank=dp_rank)
 
     sched = EncoderScheduler(
@@ -3927,7 +3928,12 @@ def launch_server(server_args: ServerArgs):
         add_prometheus_middleware(app)
 
     if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            "encoder",
+            server_args.otlp_traces_resource_attrs,
+        )
         trace_set_thread_info("Encoder")
 
     ctx = mp.get_context("spawn")
@@ -3969,6 +3975,15 @@ def _launch_server_dp(server_args: ServerArgs):
     if server_args.enable_metrics:
         set_prometheus_multiproc_dir()
         add_prometheus_middleware(app)
+
+    if server_args.enable_trace:
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            "encoder",
+            server_args.otlp_traces_resource_attrs,
+        )
+        trace_set_thread_info("Encoder DP Dispatcher")
 
     ctx = mp.get_context("spawn")
     ipc_prefix = random_uuid()

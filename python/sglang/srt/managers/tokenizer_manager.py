@@ -704,6 +704,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
+        tokenize_enter_ts = monotonic_time()
         # Tokenize
         input_embeds = None
         input_text = obj.text
@@ -748,6 +749,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
             self._validate_mm_limits(obj)
+
+            mm_state = self.rid_to_state.get(obj.rid)
+            if mm_state is not None:
+                mm_state.time_stats.set_tokenize_preprocess_finish_time(
+                    tokenize_enter_ts
+                )
 
             mm_inputs = None
 

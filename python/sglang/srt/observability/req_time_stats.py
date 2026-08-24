@@ -94,6 +94,16 @@ class RequestStage:
         "tokenize",
         level=1,
     )
+    # HTTP handler entry → request registration in TokenizerManager
+    ENTRYPOINT_PREPROCESS = RequestStageConfig(
+        "entrypoint_preprocess",
+        level=2,
+    )
+    # Tokenize entry → start of multimodal preprocessing (mm requests only)
+    TOKENIZE_PREPROCESS = RequestStageConfig(
+        "tokenize_preprocess",
+        level=2,
+    )
     API_SERVER_DISPATCH = RequestStageConfig(
         "dispatch",
         level=2,
@@ -206,6 +216,38 @@ class RequestStage:
         "prefill_transfer_kv_cache",
         level=1,
         metrics_is_observed=True,
+    )
+    # disaggregation prefill forward-to-transfer breakdown.
+    # PREFILL_SCHEDULE / PREFILL_GPU_FORWARD are nested inside the open
+    # PREFILL_FORWARD slice; the others chain right after it.
+    PREFILL_SCHEDULE = RequestStageConfig(
+        "prefill_schedule",
+        level=2,
+    )
+    PREFILL_GPU_FORWARD = RequestStageConfig(
+        "prefill_gpu_forward",
+        level=2,
+    )
+    PREFILL_CACHE_UNFINISHED = RequestStageConfig(
+        "prefill_cache_unfinished",
+        level=2,
+    )
+    PREFILL_SEND_KV = RequestStageConfig(
+        "prefill_send_kv",
+        level=2,
+    )
+    # chunked prefill sub-stages
+    PREFILL_CHUNK_CACHE = RequestStageConfig(
+        "prefill_chunk_cache",
+        level=3,
+    )
+    PREFILL_CHUNK_SEND_KV = RequestStageConfig(
+        "prefill_chunk_send_kv",
+        level=3,
+    )
+    PREFILL_CHUNK_OVERLAP_SEND_KV = RequestStageConfig(
+        "prefill_chunk_overlap_send_kv",
+        level=3,
     )
 
     # disaggregation decode
@@ -377,11 +419,21 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
         return state
 
     def set_created_time(self, ts=None):
+        now = time.perf_counter()
         if ts is None:
-            ts = time.perf_counter()
+            ts = now
         self.created_time = ts
 
         self.trace_ctx.trace_req_start(convert_time_to_realtime_ns(ts))
+        # HTTP handler entry (obj.received_time) → request registration here
+        if now > ts:
+            self.trace_slice(RequestStage.ENTRYPOINT_PREPROCESS, ts, now)
+
+    def set_tokenize_preprocess_finish_time(self, start_ts, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        if start_ts and ts > start_ts:
+            self.trace_slice(RequestStage.TOKENIZE_PREPROCESS, start_ts, ts)
 
     def set_finished_time(self, ts=None):
         if ts is None:
@@ -591,6 +643,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     prefill_bootstrap_queue_entry_time: float = 0.0
     prefill_transfer_queue_entry_time: float = 0.0
     prefill_kv_transfer_finish_time: float = 0.0
+    prefill_cache_unfinished_time: float = 0.0
 
     # decode node, get by time.perf_counter()
     decode_prealloc_queue_entry_time: float = 0.0
@@ -755,12 +808,88 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def set_prefill_run_batch_start_time(self, ts=None):
         if ts is None:
             ts = time.perf_counter()
+        # Schedule gap: from batch admission (or the previous chunk's forward
+        # end) to the launch of this run_batch. Nested inside the open
+        # PREFILL_FORWARD slice; disaggregation prefill only.
+        if (
+            self.disagg_mode == DisaggregationMode.PREFILL
+            and self.trace_ctx.tracing_enable
+        ):
+            start = max(
+                self.last_forward_entry_time,
+                self.prefill_run_batch_end_time,
+                self.last_chunked_prefill_finish_time,
+                self.prefill_cache_unfinished_time,
+            )
+            if start > 0 and ts > start:
+                self.trace_slice(RequestStage.PREFILL_SCHEDULE, start, ts)
         self.prefill_run_batch_start_time = ts
 
     def set_prefill_run_batch_end_time(self, ts=None):
         if ts is None:
             ts = time.perf_counter()
         self.prefill_run_batch_end_time = ts
+        # GPU forward launch window of this run_batch. Nested inside the open
+        # PREFILL_FORWARD slice; disaggregation prefill only.
+        if (
+            self.disagg_mode == DisaggregationMode.PREFILL
+            and self.trace_ctx.tracing_enable
+            and self.prefill_run_batch_start_time > 0
+            and ts > self.prefill_run_batch_start_time
+        ):
+            self.trace_slice(
+                RequestStage.PREFILL_GPU_FORWARD,
+                self.prefill_run_batch_start_time,
+                ts,
+            )
+
+    def set_prefill_cache_unfinished_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        self.prefill_cache_unfinished_time = ts
+        if self.trace_ctx.tracing_enable and self.prefill_finished_time > 0:
+            self.trace_slice(
+                RequestStage.PREFILL_CACHE_UNFINISHED,
+                self.prefill_finished_time,
+                ts,
+            )
+
+    def set_prefill_send_kv_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        if self.trace_ctx.tracing_enable:
+            start = self.prefill_cache_unfinished_time or self.prefill_finished_time
+            if start > 0 and ts > start:
+                self.trace_slice(RequestStage.PREFILL_SEND_KV, start, ts)
+
+    def set_prefill_chunk_cache_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        self.prefill_cache_unfinished_time = ts
+        if self.trace_ctx.tracing_enable and self.last_chunked_prefill_finish_time > 0:
+            self.trace_slice(
+                RequestStage.PREFILL_CHUNK_CACHE,
+                self.last_chunked_prefill_finish_time,
+                ts,
+            )
+
+    def set_prefill_chunk_send_kv_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        if self.trace_ctx.tracing_enable:
+            start = self.prefill_cache_unfinished_time
+            if start > 0 and ts > start:
+                self.trace_slice(RequestStage.PREFILL_CHUNK_SEND_KV, start, ts)
+
+    def set_prefill_chunk_overlap_send_kv_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        if self.trace_ctx.tracing_enable and self.prefill_run_batch_end_time > 0:
+            self.trace_slice(
+                RequestStage.PREFILL_CHUNK_OVERLAP_SEND_KV,
+                self.prefill_run_batch_end_time,
+                ts,
+            )
 
     def set_last_chunked_prefill_finish_time(self, ts=None):
         if ts is None:

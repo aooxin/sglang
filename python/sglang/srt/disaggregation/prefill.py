@@ -580,6 +580,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
+                req.time_stats.set_prefill_cache_unfinished_time()
                 self.disagg_prefill_inflight_queue.append(req)
                 if self._pd_trace:
                     logger.info(
@@ -620,6 +621,7 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                     logprob_pt += num_input_logprobs
                 self.send_kv_chunk(req, last_chunk=True)
+                req.time_stats.set_prefill_send_kv_time()
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
                 if req.grammar is not None:
@@ -659,6 +661,7 @@ class SchedulerDisaggregationPrefillMixin:
 
                 if self.enable_overlap:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
+                    req.time_stats.set_prefill_chunk_overlap_send_kv_time()
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
@@ -835,6 +838,7 @@ class SchedulerDisaggregationPrefillMixin:
         if self.chunked_req:
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
+            self.chunked_req.time_stats.set_prefill_chunk_cache_time()
             if self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 self.chunked_req.tmp_end_idx = min(
@@ -843,6 +847,7 @@ class SchedulerDisaggregationPrefillMixin:
                 )
             else:
                 self.send_kv_chunk(self.chunked_req)
+                self.chunked_req.time_stats.set_prefill_chunk_send_kv_time()
             self.running_batch.batch_is_full = False
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():

@@ -603,7 +603,12 @@ def run_data_parallel_controller_process(
 
     configure_logger(server_args)
     if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            server_args.disaggregation_mode,
+            server_args.otlp_traces_resource_attrs,
+        )
         thread_label = "DP Controller"
         if server_args.disaggregation_mode == "prefill":
             thread_label = "Prefill DP Controller"

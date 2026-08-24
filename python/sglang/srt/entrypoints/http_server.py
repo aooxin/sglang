@@ -279,7 +279,12 @@ async def lifespan(fast_api_app: FastAPI):
 
     # Init tracing
     if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            server_args.disaggregation_mode,
+            server_args.otlp_traces_resource_attrs,
+        )
         if server_args.disaggregation_mode == "prefill":
             thread_label = "Prefill" + thread_label
         elif server_args.disaggregation_mode == "decode":
@@ -1935,8 +1940,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                 # This is a hack to ensure fake transfer is enabled during prefill warmup
                 # ensure each dp rank has a unique bootstrap_room during prefill warmup
                 "bootstrap_room": [
-                    warmup_room_base + i
-                    for i in range(server_args.dp_size)
+                    warmup_room_base + i for i in range(server_args.dp_size)
                 ],
                 "input_ids": [[10, 11, 12, 13]] * server_args.dp_size,
             }

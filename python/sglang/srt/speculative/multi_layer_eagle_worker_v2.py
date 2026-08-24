@@ -148,7 +148,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # Used for KV Cache reversion
         self.req_to_hidden_states_pool = torch.empty(
             (
-                self.req_to_token_pool.size,
+                self.req_to_token_pool.req_to_token.shape[0],
                 self.speculative_num_steps - 1,
                 self.model_config.hidden_size,
             ),

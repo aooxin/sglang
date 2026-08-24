@@ -278,7 +278,7 @@ class SchedulerRuntimeCheckerMixin:
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
                 f"session_held={session_req_count}, "
-                f"total_size={self.req_to_token_pool.size}\n"
+                f"total_size={req_total_size}\n"
             )
             raise_error_or_warn(
                 self,

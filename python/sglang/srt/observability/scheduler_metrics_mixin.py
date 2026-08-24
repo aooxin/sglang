@@ -493,7 +493,8 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = token_usage
             self.stats.req_pool_usage = (
                 1.0
-                - self.req_to_token_pool.available_size() / self.req_to_token_pool.size
+                - self.req_to_token_pool.available_size()
+                / self.req_to_token_pool.req_to_token.shape[0]
             )
             self.stats.full_token_usage = full_token_usage
             if self.is_hybrid_swa:
@@ -802,7 +803,8 @@ class SchedulerMetricsMixin:
             self.stats.token_usage = token_usage
             self.stats.req_pool_usage = (
                 1.0
-                - self.req_to_token_pool.available_size() / self.req_to_token_pool.size
+                - self.req_to_token_pool.available_size()
+                / self.req_to_token_pool.req_to_token.shape[0]
             )
             # usage of full attention
             self.stats.full_token_usage = full_token_usage

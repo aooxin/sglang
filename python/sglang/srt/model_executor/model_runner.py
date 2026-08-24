@@ -2563,7 +2563,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.layers.n_gram_embedding import NgramEmbedding
 
             self.token_table = torch.empty(
-                self.req_to_token_pool.size,
+                self.req_to_token_pool.req_to_token.shape[0],
                 self.model_config.context_len,
                 dtype=torch.int32,
                 device=self.device,

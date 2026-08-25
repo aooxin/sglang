@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import os
 import time
 from collections import defaultdict
@@ -883,10 +884,12 @@ class SchedulerMetricsMixin:
             return
 
         if (m := result.expert_distribution_metrics) is not None:
-            self.metrics_collector.increment_eplb_balancedness(
-                forward_mode=batch.forward_mode.name.lower(),
-                balancedness=m.eplb_balancedness.item(),
-            )
+            balancedness = m.eplb_balancedness.item()
+            if not math.isnan(balancedness):
+                self.metrics_collector.increment_eplb_balancedness(
+                    forward_mode=batch.forward_mode.name.lower(),
+                    balancedness=balancedness,
+                )
 
     def _emit_kv_metrics(self: Scheduler):
         if not self.enable_kv_cache_events:

@@ -1540,6 +1540,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # attention gather) stay in lockstep with the active DP group. The draft
             # block is skipped here: the draft forward's collectives are within-rank.
             idle_logits_output = None
+            idle_expert_distribution_metrics = None
             if self.server_args.enable_dp_attention:
                 idle_verify_input = DFlashVerifyInput(
                     draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
@@ -1558,6 +1559,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     skip_attn_backend_init=True,
                 )
                 idle_logits_output = idle_forward_output.logits_output
+                idle_expert_distribution_metrics = (
+                    idle_forward_output.expert_distribution_metrics
+                )
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
             next_draft_input = self._make_next_draft_input_decode(
@@ -1573,6 +1577,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 accept_lens=empty_lens,
                 next_draft_input=next_draft_input,
                 can_run_cuda_graph=False,
+                expert_distribution_metrics=idle_expert_distribution_metrics,
             )
 
         # `seq_lens` is carried over from the previous overlap iteration and may have been
@@ -2012,4 +2017,5 @@ class DFlashWorkerV2(BaseSpecWorker):
             accept_lens=commit_lens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
+            expert_distribution_metrics=target_out.expert_distribution_metrics,
         )

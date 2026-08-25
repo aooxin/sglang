@@ -141,6 +141,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
         self._recording = False
         self._disable_all = False
+        self._warned_missing_layer_idx = False
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
@@ -232,6 +233,22 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         if not (
             self._recording or torch.get_device_module().is_current_stream_capturing()
         ):
+            return
+        # The layer index is set by `with_current_layer`, which model forward
+        # loops enter around each layer. Some paths cannot set it safely (e.g.
+        # the piecewise-cuda-graph compiled region, where a context manager
+        # would break dynamo), so it may be None here. Skip such calls instead
+        # of feeding None into the gatherers, which would index the wrong dim.
+        if self._current_layer_idx.value is None:
+            if not self._warned_missing_layer_idx:
+                self._warned_missing_layer_idx = True
+                logger.warning(
+                    "Skipping expert distribution hook %s because the current "
+                    "layer index is not set. Per-layer expert-load stats will be "
+                    "missing for these forward passes (e.g. under piecewise CUDA "
+                    "graph). This warning is only logged once.",
+                    hook_name,
+                )
             return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
@@ -715,29 +732,31 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         if self._rank == 0:
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
-            utilization_rate_gpu = torch.mean(
+            utilization_rate_gpu = torch.nanmean(
                 compute_utilization_rate(gpu_physical_count)
             )
             if envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
-                print(f"hi {self._rank=} {utilization_rate_gpu=}")
+                # May be NaN for an empty pass (no expert load); the metrics
+                # consumer drops NaN so it does not report a spurious 1.0.
                 outputs["metrics"] = ExpertDistributionMetrics(
                     eplb_balancedness=utilization_rate_gpu,
                 )
             else:
                 # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
                 utilization_rate_cpu = utilization_rate_gpu.item()
-                self._history.append(utilization_rate_cpu)
+                if not math.isnan(utilization_rate_cpu):
+                    self._history.append(utilization_rate_cpu)
 
-                gpu_physical_count_sum = gpu_physical_count.sum().item()
+                    gpu_physical_count_sum = gpu_physical_count.sum().item()
 
-                logger.info(
-                    f"[Expert Balancedness] "
-                    f"forward_pass_id={forward_pass_id} "
-                    f"current_pass_balancedness={utilization_rate_cpu:.03f} "
-                    f"{''.join(f'last_{size}_average_balancedness={value:.03f} ' for size, value in self._history.mean().items())} "
-                    f"gpu_physical_count_sum={gpu_physical_count_sum}"
-                    # f"current_pass_per_layer={[round(x, 2) for x in utilization_rate_tensor.cpu().tolist()]}"
-                )
+                    logger.info(
+                        f"[Expert Balancedness] "
+                        f"forward_pass_id={forward_pass_id} "
+                        f"current_pass_balancedness={utilization_rate_cpu:.03f} "
+                        f"{''.join(f'last_{size}_average_balancedness={value:.03f} ' for size, value in self._history.mean().items())} "
+                        f"gpu_physical_count_sum={gpu_physical_count_sum}"
+                        # f"current_pass_per_layer={[round(x, 2) for x in utilization_rate_tensor.cpu().tolist()]}"
+                    )
 
     # TODO refactor
     def _handle_metric_eplb_heatmap(self, gpu_physical_count: torch.Tensor):
@@ -776,7 +795,9 @@ class _DequeCollection:
             d.clear()
 
     def mean(self) -> Dict[int, float]:
-        return {d.maxlen: sum(d) / len(d) for d in self._dequeues}
+        return {
+            d.maxlen: (sum(d) / len(d) if len(d) > 0 else 0.0) for d in self._dequeues
+        }
 
 
 class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
@@ -1050,4 +1071,7 @@ def compute_utilization_rate(
         "... num_layer num_gpu -> ... num_layer",
         "mean",
     )
-    return (avg_gpu_physical_count + 1e-5) / (max_gpu_physical_count + 1e-5)
+    utilization_rate = avg_gpu_physical_count / max_gpu_physical_count
+    # max == 0 means the layer had zero load this pass; avg/max is 0/0 = NaN,
+    # which is exactly the sentinel we want for the NaN-aware aggregation above.
+    return utilization_rate

@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import logging
+from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -981,13 +982,24 @@ class MiMoV2Model(nn.Module):
                 # the per-layer residual stream alternates scattered/gathered.
                 capture_buf = aux_hidden_states if i in self.layers_to_capture else None
                 layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                    captured_last_layer_outputs=capture_buf,
+                # Set the current layer index so the expert-distribution recorder
+                # can attribute per-layer expert load. Under piecewise cuda graph
+                # this loop body is inside the compiled region, where a
+                # graph-breaking context manager is not allowed, so fall back to
+                # nullcontext; the recorder skips hooks with an unset layer index.
+                ctx = (
+                    nullcontext()
+                    if not get_global_server_args().disable_piecewise_cuda_graph
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
+                with ctx:
+                    hidden_states, residual = layer(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        captured_last_layer_outputs=capture_buf,
+                    )
             # DFLASH may also request capture *after* the final layer (e.g.
             # target_layer_ids ends at num_hidden_layers-1, so layers_to_capture
             # contains end_layer). The final residual stream is already at the

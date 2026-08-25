@@ -1345,6 +1345,7 @@ class DFlashWorker:
                     next_token_ids=next_token_ids,
                     num_accepted_tokens=0,
                     can_run_cuda_graph=batch_result.can_run_cuda_graph,
+                    expert_distribution_metrics=batch_result.expert_distribution_metrics,
                 )
 
             if logits_output.hidden_states is None:
@@ -1393,6 +1394,7 @@ class DFlashWorker:
                 next_token_ids=next_token_ids,
                 num_accepted_tokens=0,
                 can_run_cuda_graph=batch_result.can_run_cuda_graph,
+                expert_distribution_metrics=batch_result.expert_distribution_metrics,
             )
 
         # Decode / target-verify stage.
@@ -1439,6 +1441,7 @@ class DFlashWorker:
                 next_token_ids=batch_result.next_token_ids,
                 num_accepted_tokens=0,
                 can_run_cuda_graph=batch_result.can_run_cuda_graph,
+                expert_distribution_metrics=batch_result.expert_distribution_metrics,
             )
 
         self._prepare_for_speculative_decoding(batch, draft_input)
@@ -1504,4 +1507,5 @@ class DFlashWorker:
             num_accepted_tokens=num_accepted_tokens,
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
+            expert_distribution_metrics=batch_result.expert_distribution_metrics,
         )

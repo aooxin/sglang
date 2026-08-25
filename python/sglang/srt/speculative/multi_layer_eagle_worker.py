@@ -19,6 +19,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
@@ -253,6 +254,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 next_token_ids,
                 seq_lens_cpu,
                 can_run_cuda_graph,
+                expert_distribution_metrics,
             ) = self.forward_target_extend(batch)
             with self.draft_tp_context(
                 self.mtp_model_runner(0).tp_group
@@ -265,15 +267,20 @@ class MultiLayerEagleWorker(TpModelWorker):
                 next_token_ids=next_token_ids,
                 num_accepted_tokens=0,
                 can_run_cuda_graph=can_run_cuda_graph,
+                expert_distribution_metrics=expert_distribution_metrics,
             )
         else:
             with self.draft_tp_context(
                 self.mtp_model_runner(0).tp_group
             ), speculative_moe_backend_context():
                 spec_info = self.draft(batch)
-            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
-                self.verify(batch, spec_info)
-            )
+            (
+                logits_output,
+                verify_output,
+                model_worker_batch,
+                can_run_cuda_graph,
+                expert_distribution_metrics,
+            ) = self.verify(batch, spec_info)
 
             with self.draft_tp_context(
                 self.mtp_model_runner(0).tp_group
@@ -292,6 +299,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 next_token_ids=verify_output.verified_id,
                 num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
                 can_run_cuda_graph=can_run_cuda_graph,
+                expert_distribution_metrics=expert_distribution_metrics,
             )
 
     def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
@@ -312,9 +320,13 @@ class MultiLayerEagleWorker(TpModelWorker):
         need_forward = global_need_forward_cnt > 0
         return need_forward
 
-    def forward_target_extend(
-        self, batch: ScheduleBatch
-    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, Optional[torch.Tensor], bool]:
+    def forward_target_extend(self, batch: ScheduleBatch) -> Tuple[
+        LogitsProcessorOutput,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        bool,
+        Optional[ExpertDistributionMetrics],
+    ]:
         """Run the target extend.
 
         Args:
@@ -341,6 +353,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             next_token_ids,
             model_worker_batch.seq_lens_cpu,
             batch_result.can_run_cuda_graph,
+            batch_result.expert_distribution_metrics,
         )
 
     def _draft_preprocess_decode(self, batch: ScheduleBatch):
@@ -590,7 +603,13 @@ class MultiLayerEagleWorker(TpModelWorker):
         )
         batch.spec_info = res.draft_input
 
-        return logits_output, res, model_worker_batch, can_run_cuda_graph
+        return (
+            logits_output,
+            res,
+            model_worker_batch,
+            can_run_cuda_graph,
+            batch_result.expert_distribution_metrics,
+        )
 
     def forward_draft_extend(
         self,

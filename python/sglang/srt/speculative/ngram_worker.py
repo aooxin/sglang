@@ -282,4 +282,5 @@ class NGRAMWorker:
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
             accept_lens=accept_lens,
+            expert_distribution_metrics=batch_result.expert_distribution_metrics,
         )

@@ -797,6 +797,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
+            expert_distribution_metrics=forward_batch_output.expert_distribution_metrics,
         )
 
     def _compute_spec_v2_logprobs(

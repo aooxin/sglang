@@ -20,7 +20,7 @@ import threading
 import time
 from collections import OrderedDict
 from queue import Empty, Full, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -48,6 +48,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import assert_indices_in_bounds
 from sglang.srt.observability.startup_func_log_and_timer import startup_timer
+from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -238,12 +239,15 @@ class PrefetchOperation(StorageOperation):
         prefix_keys: Optional[List[str]] = None,
         swa_host_indices: Optional[torch.Tensor] = None,
         host_indices_ready_event: Optional[torch.cuda.Event] = None,
+        trace_enabled: bool = False,
     ):
         self.request_id = request_id
         self.key = key
         self.swa_valid_mask: Optional[torch.Tensor] = None
         self.full_hit_count: int = 0
         self.swa_hit_count: int = 0
+        self.trace_enabled = trace_enabled
+        self.trace_attrs: Dict[str, Any] = {}
         # CUDA event marking that the async index-tensor clones (host_indices /
         # swa_host_indices) have completed on the producing (scheduler) stream.
         # The prefetch thread waits on it once before reading these tensors,
@@ -627,6 +631,7 @@ class HiCacheController:
         self.pp_rank = pp_rank
         self.pp_size = pp_size
         self.enable_storage_metrics = enable_storage_metrics
+        self.enable_trace = get_global_tracing_enabled()
         self.metrics_collector = None
         self.sliding_window_size = sliding_window_size
         self.sliding_window_pages = (
@@ -1644,6 +1649,7 @@ class HiCacheController:
             prefix_keys,
             swa_host_indices=swa_host_indices,
             host_indices_ready_event=host_indices_ready_event,
+            trace_enabled=self.enable_trace,
         )
         self.prefetch_queue.put(operation)
         self._enqueue_key_refresh(prefix_keys)
@@ -2042,10 +2048,11 @@ class HiCacheController:
 
         Returns (hash_values, hit_info, full_query_count, raw_query_hit_count).
 
-        hit_info is an IntTensor in a TP-sync-ready layout where hit_info[-1] always holds storage_hit_count:
+        hit_info is an IntTensor in a TP-sync-ready layout where hit_info[-1]
+        always holds storage_hit_count:
         - hybrid: shape [new_input_pages + 1] with
             [:swa_valid_len] = swa mask (0/1 int)
-            [swa_valid_len:-1] = 0 padding (preserves correctness under all_reduce(MIN)).
+            [swa_valid_len:-1] = 0 padding.
                 After all_reduce(MIN) the mask is a natural prefix hit_info[:hit_pages].
             [-1] = storage_hit_count
         - non-hybrid: shape [1], carrying only storage_hit_count.
@@ -2055,8 +2062,13 @@ class HiCacheController:
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
 
         storage_query_count = 0
+        queried_page_count = 0
         hash_values = []
         swa_valid_pages = []
+        backend_queried_keys = 0
+        backend_hit_keys = 0
+        first_gcache_miss_page = -1
+        first_miss_component = "none"
 
         logical_len = len(key)
 
@@ -2070,7 +2082,10 @@ class HiCacheController:
                     step = key.step if key.is_ngram else 0,
                 )
                 batch_hashes.append(last_hash)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys,
+                extra_info={} if operation.trace_enabled else None,
+            )
             t0_query = time.perf_counter()
             if self.is_hybrid_swa:
                 hit_page_num, part_swa_mask = self.storage_backend.batch_exists_hybrid(
@@ -2084,6 +2099,25 @@ class HiCacheController:
                 hit_page_num = self.storage_backend.batch_exists(
                     batch_hashes, extra_info
                 )
+            if operation.trace_enabled:
+                queried_page_count += len(batch_hashes)
+                backend_diagnostics = extra_info.extra_info or {}
+                backend_queried_keys += int(
+                    backend_diagnostics.get("gcache_queried_keys", 0)
+                )
+                backend_hit_keys += int(
+                    backend_diagnostics.get("gcache_hit_keys", 0)
+                )
+                batch_first_miss_page = int(
+                    backend_diagnostics.get("first_miss_page", -1)
+                )
+                if first_gcache_miss_page < 0 and batch_first_miss_page >= 0:
+                    first_gcache_miss_page = (
+                        start // self.page_size + batch_first_miss_page
+                    )
+                    first_miss_component = str(
+                        backend_diagnostics.get("first_miss_component", "unknown")
+                    )
             if self.metrics_collector is not None:
                 self.metrics_collector.log_storage_query_latency(
                     time.perf_counter() - t0_query
@@ -2096,6 +2130,37 @@ class HiCacheController:
                 prefix_keys += batch_hashes
 
         raw_query_hit_count = storage_query_count
+        if operation.trace_enabled:
+            local_full_hit_pages = raw_query_hit_count // self.page_size
+            first_full_miss_page = (
+                local_full_hit_pages
+                if local_full_hit_pages < queried_page_count
+                else -1
+            )
+            operation.trace_attrs.update(
+                {
+                    "hicache_prefetch_query.queried_pages": queried_page_count,
+                    "hicache_prefetch_query.local_full_hit_pages": local_full_hit_pages,
+                    "hicache_prefetch_query.first_full_miss_page": first_full_miss_page,
+                    "hicache_prefetch_query.full_hit_ratio": round(
+                        local_full_hit_pages / queried_page_count, 6
+                    )
+                    if queried_page_count > 0
+                    else 0.0,
+                }
+            )
+            if backend_queried_keys > 0:
+                operation.trace_attrs.update(
+                    {
+                        "hicache_prefetch_query.gcache_queried_keys": backend_queried_keys,
+                        "hicache_prefetch_query.gcache_hit_keys": backend_hit_keys,
+                        "hicache_prefetch_query.gcache_key_hit_ratio": round(
+                            backend_hit_keys / backend_queried_keys, 6
+                        ),
+                        "hicache_prefetch_query.first_gcache_miss_page": first_gcache_miss_page,
+                        "hicache_prefetch_query.first_miss_component": first_miss_component,
+                    }
+                )
         if self._fault_injector.enabled:
             hash_values, storage_query_count, swa_valid_pages = (
                 self._fault_injector.maybe_inject_exists_fault(
@@ -2111,7 +2176,10 @@ class HiCacheController:
             assert (
                 valid_page_count <= new_input_pages
             ), f"{valid_page_count=}, {new_input_pages=}"
-            # 构造 hit_info: [swa mask | 0 padding | storage_hit_count]
+            if operation.trace_enabled:
+                operation.trace_attrs[
+                    "hicache_prefetch_query.local_swa_valid_pages"
+                ] = sum(bool(value) for value in swa_valid_pages)
             hit_info = torch.zeros(new_input_pages + 1, dtype=torch.int)
             if valid_page_count > 0:
                 hit_info[:valid_page_count] = torch.tensor(
@@ -2122,6 +2190,10 @@ class HiCacheController:
                 hit_info[:valid_page_count],
                 self.sliding_window_pages,
             )
+            if operation.trace_enabled:
+                operation.trace_attrs[
+                    "hicache_prefetch_query.local_swa_safe_pages"
+                ] = swa_valid_len
             hit_info[-1] = swa_valid_len * self.page_size
             return (
                 hash_values[:swa_valid_len],
@@ -2195,6 +2267,11 @@ class HiCacheController:
                 operation.mark_query_finish()
                 storage_hit_count = int(hit_info[-1].item())
                 hit_pages = storage_hit_count // self.page_size
+                local_usable_hit_pages = hit_pages
+                if operation.trace_enabled:
+                    operation.trace_attrs[
+                        "hicache_prefetch_query.local_usable_hit_pages"
+                    ] = hit_pages
                 operation.full_hit_count = full_query_count
                 operation.swa_hit_count = storage_hit_count if self.is_hybrid_swa else 0
                 operation.raw_query_hit_count = raw_query_hit_count
@@ -2222,6 +2299,19 @@ class HiCacheController:
                         or int(hit_info[:hit_pages].sum()) == pre_mask_true_count
                     )
 
+                if operation.trace_enabled:
+                    operation.trace_attrs.update(
+                        {
+                            "hicache_prefetch_query.aligned_usable_hit_pages": hit_pages,
+                            "hicache_prefetch_query.tp_alignment_shrunk": hit_pages
+                            < local_usable_hit_pages,
+                        }
+                    )
+                    if self.is_hybrid_swa:
+                        operation.trace_attrs[
+                            "hicache_prefetch_query.aligned_swa_valid_pages"
+                        ] = int(hit_info[:hit_pages].sum())
+
                 valid_swa_mask = (
                     hit_info[:hit_pages].bool() if self.is_hybrid_swa else None
                 )
@@ -2231,6 +2321,22 @@ class HiCacheController:
                 #  可以把阈值设置成 0
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
+                    if operation.trace_enabled:
+                        if storage_hit_count == 0:
+                            revoke_reason = (
+                                "tp_alignment_miss"
+                                if local_usable_hit_pages > 0
+                                else "all_ranks_no_l3_hits"
+                            )
+                        else:
+                            revoke_reason = "insufficient_l3_hits"
+                        operation.trace_attrs.update(
+                            {
+                                "hicache_prefetch_revoke.reason": revoke_reason,
+                                "hicache_prefetch_revoke.storage_hit_tokens": storage_hit_count,
+                                "hicache_prefetch_revoke.prefetch_threshold": self.prefetch_threshold,
+                            }
+                        )
                     operation.mark_resolve_finish()
                     self._put_prefetch_revoke(operation.request_id)
                     revoke_tokens = len(operation.host_indices)
@@ -2263,6 +2369,14 @@ class HiCacheController:
                             self.sliding_window_pages,
                         )
                     if swa_valid_len < self.sliding_window_pages:
+                        if operation.trace_enabled:
+                            operation.trace_attrs.update(
+                                {
+                                    "hicache_prefetch_revoke.reason": "insufficient_swa_hits",
+                                    "hicache_prefetch_revoke.swa_valid_pages": swa_valid_len,
+                                    "hicache_prefetch_revoke.required_swa_pages": self.sliding_window_pages,
+                                }
+                            )
                         operation.mark_resolve_finish()
                         self._put_prefetch_revoke(operation.request_id)
                         revoke_tokens = len(operation.host_indices)

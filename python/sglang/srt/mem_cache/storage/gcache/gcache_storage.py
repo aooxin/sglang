@@ -26,6 +26,36 @@ GCACHE_CONFIG_FILE = "/sgl-workspace/gcache.flags"
 
 
 class GcacheStorage(HiCacheStorage):
+    _EXISTS_COMPONENTS = ("full_k", "full_v", "swa_k", "swa_v")
+
+    @classmethod
+    def _record_exists_diagnostics(
+        cls,
+        extra_info: Optional[HiCacheStorageExtraInfo],
+        exist_mask: List[bool],
+        key_multiplier: int,
+    ) -> None:
+        if extra_info is None or extra_info.extra_info is None:
+            return
+
+        first_miss_index = next(
+            (index for index, exists in enumerate(exist_mask) if not exists), -1
+        )
+        extra_info.extra_info.update(
+            {
+                "gcache_queried_keys": len(exist_mask),
+                "gcache_hit_keys": sum(bool(exists) for exists in exist_mask),
+                "first_miss_page": first_miss_index // key_multiplier
+                if first_miss_index >= 0
+                else -1,
+                "first_miss_component": cls._EXISTS_COMPONENTS[
+                    first_miss_index % key_multiplier
+                ]
+                if first_miss_index >= 0
+                else "none",
+            }
+        )
+
     def __init__(
         self, hicache_config: HiCacheStorageConfig, mem_pool_host: HostKVCache
     ):
@@ -318,6 +348,7 @@ class GcacheStorage(HiCacheStorage):
             query_keys, for_read=True, size_list=size_list
         )
         assert len(exist_mask) == len(query_keys)
+        self._record_exists_diagnostics(extra_info, exist_mask, key_multiplier)
 
         prefix_success = 0
         for exist in exist_mask:
@@ -343,6 +374,7 @@ class GcacheStorage(HiCacheStorage):
             query_keys, for_read=True, size_list=size_list
         )
         assert len(exist_mask) == len(query_keys)
+        self._record_exists_diagnostics(extra_info, exist_mask, key_multiplier)
 
         full_prefix_success = len(keys)
         for i in range(full_prefix_success):

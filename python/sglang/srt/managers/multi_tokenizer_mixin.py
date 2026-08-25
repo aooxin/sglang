@@ -46,6 +46,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket
@@ -355,6 +356,27 @@ class MultiTokenizerRouter:
     ):
         self.server_args = server_args
         self.model_config = server_args.get_model_config()
+
+        # The router runs in the main process, which never executes the uvicorn
+        # worker lifespan, so tracing must be initialized here. Otherwise the
+        # unpickle (recv_pyobj) / re-pickle (send_pyobj) round trip in
+        # router_worker_obj would degrade every TraceReqContext to
+        # {"tracing_enable": False} (see TraceReqContext.__setstate__), silently
+        # dropping all scheduler-side spans.
+        if server_args.enable_trace:
+            process_tracing_init(
+                server_args.otlp_traces_endpoint,
+                "sglang",
+                server_args.disaggregation_mode,
+                server_args.otlp_traces_resource_attrs,
+            )
+            thread_label = "MultiTokenizerRouter"
+            if server_args.disaggregation_mode == "prefill":
+                thread_label = "Prefill" + thread_label
+            elif server_args.disaggregation_mode == "decode":
+                thread_label = "Decode" + thread_label
+            trace_set_thread_info(thread_label)
+
         context = zmq.asyncio.Context(3)
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True

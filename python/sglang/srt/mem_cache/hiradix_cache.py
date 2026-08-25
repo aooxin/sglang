@@ -10,7 +10,7 @@ import threading
 import time
 from dataclasses import dataclass
 from queue import Empty
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
@@ -264,7 +264,7 @@ class BaseHiRadixCache(abc.ABC):
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
-        self.prefetch_trace_attrs_by_reqid: dict[str, dict[str, float | int]] = {}
+        self.prefetch_trace_attrs_by_reqid: dict[str, dict[str, Any]] = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -592,10 +592,13 @@ class BaseHiRadixCache(abc.ABC):
                 self.storage_full_hit_by_reqid.pop(req_id, None)
                 self.storage_swa_hit_by_reqid.pop(req_id, None)
                 self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
-                self.prefetch_trace_attrs_by_reqid.pop(req_id, None)
                 info = self.ongoing_prefetch.pop(req_id, None)
                 if info is not None:
                     last_host_node, key, _, operation = info
+                    if operation.trace_enabled:
+                        self.prefetch_trace_attrs_by_reqid[req_id] = dict(
+                            operation.trace_attrs
+                        )
                     self.prefetch_stage_durations_by_reqid[req_id] = (
                         operation.get_stage_durations(finish_time=time.monotonic())
                     )
@@ -603,6 +606,8 @@ class BaseHiRadixCache(abc.ABC):
                     cc.prefetch_tokens_occupied -= len(key)
                     if cc.prefetch_tokens_occupied < 0:
                         cc.prefetch_tokens_occupied = 0
+                else:
+                    self.prefetch_trace_attrs_by_reqid.pop(req_id, None)
 
         def _drain_backup():
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
@@ -1820,12 +1825,16 @@ class BaseHiRadixCache(abc.ABC):
         del self.ongoing_prefetch[req_id]
         # Match the += at prefetch time which used len(aligned_key).
         self.cache_controller.prefetch_tokens_occupied -= len(key)
-        self.prefetch_trace_attrs_by_reqid[req_id] = {
-            "hicache_prefetch_done.tp_completed_tokens": completed_tokens,
-            "hicache_prefetch_done.min_completed_tokens": min_completed_tokens,
-            "hicache_prefetch_done.requested_tokens": len(key),
-            "hicache_prefetch_done.io_duration_ms": round((io_duration or 0) * 1000, 2),
-        }
+        if operation.trace_enabled:
+            self.prefetch_trace_attrs_by_reqid[req_id] = {
+                **operation.trace_attrs,
+                "hicache_prefetch_done.tp_completed_tokens": completed_tokens,
+                "hicache_prefetch_done.min_completed_tokens": min_completed_tokens,
+                "hicache_prefetch_done.requested_tokens": len(key),
+                "hicache_prefetch_done.io_duration_ms": round(
+                    (io_duration or 0) * 1000, 2
+                ),
+            }
 
         # Track tokens actually loaded from storage for this request (L3 hits)
         loaded_from_storage = min_completed_tokens - matched_length
@@ -1859,7 +1868,7 @@ class BaseHiRadixCache(abc.ABC):
     def pop_prefetch_stage_durations(self, req_id: str) -> dict[str, float]:
         return self.prefetch_stage_durations_by_reqid.pop(req_id, {})
 
-    def pop_prefetch_trace_attrs(self, req_id: str) -> dict[str, float | int]:
+    def pop_prefetch_trace_attrs(self, req_id: str) -> dict[str, Any]:
         return self.prefetch_trace_attrs_by_reqid.pop(req_id, {})
 
     def pop_storage_full_hit(self, req_id: str) -> int:

@@ -54,7 +54,10 @@ from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.nvtx_utils import nvtx_annotated_method
-from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.observability.req_time_stats import (
+    RequestStage,
+    set_schedule_time_batch,
+)
 from sglang.srt.speculative.dflash_info import DFlashDraftInput
 
 if TYPE_CHECKING:
@@ -400,11 +403,21 @@ class SchedulerDisaggregationPrefillMixin:
 
         self.process_prefill_chunk()
 
+        trace_enabled = self.enable_trace
+        schedule_start_time = time.perf_counter() if trace_enabled else 0.0
         batch = self.get_new_batch_prefill()
+        schedule_end_time = time.perf_counter() if trace_enabled else 0.0
         batch = self.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
             set_schedule_time_batch(batch)
+            if trace_enabled:
+                for req in batch.reqs:
+                    req.time_stats.set_prefill_trace_stage(
+                        RequestStage.PREFILL_SCHEDULE,
+                        schedule_start_time,
+                        schedule_end_time,
+                    )
 
         return batch
 
@@ -548,6 +561,7 @@ class SchedulerDisaggregationPrefillMixin:
         if copy_done is not None:
             copy_done.synchronize()
 
+        trace_enabled = self.enable_trace
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
@@ -835,6 +849,7 @@ class SchedulerDisaggregationPrefillMixin:
     def process_prefill_chunk(self: Scheduler) -> None:
         chunked_req_to_exclude = set()
         if self.chunked_req:
+            trace_enabled = self.enable_trace
             chunked_req_to_exclude.add(self.chunked_req)
             self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
             self.chunked_req.time_stats.set_prefill_chunk_cache_time()

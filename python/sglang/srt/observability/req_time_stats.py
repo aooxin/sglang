@@ -659,6 +659,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     scheduler_recv_time: float = 0.0
     last_chunked_prefill_finish_time: float = 0.0
     last_decode_finish_time: float = 0.0
+    decode_loop_start_time: float = 0.0
     decode_ct: int = 0
     last_decode_scheduled_time: float = 0.0
     last_forward_entry_time: float = 0.0
@@ -891,6 +892,13 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 ts,
             )
 
+    def set_prefill_trace_stage(self, stage: RequestStageConfig, start, end=None):
+        if not self.trace_ctx.tracing_enable:
+            return
+        if end is None:
+            end = time.perf_counter()
+        self.trace_slice(stage, start, end)
+
     def set_last_chunked_prefill_finish_time(self, ts=None):
         if ts is None:
             ts = time.perf_counter()
@@ -966,10 +974,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                         last_time = self.last_prefill_finished_time
                     else:
                         last_time = self.last_decode_scheduled_time
-            stage = RequestStage.DECODE_LOOP
-            self.observe_per_stage_req_latency(stage, ts - last_time)
-            attrs = {"decode_ct": self.decode_ct}
-            self.trace_slice(stage, last_time, ts, attrs)
+
+            if self.trace_ctx.tracing_enable and self.decode_loop_start_time == 0.0:
+                self.decode_loop_start_time = last_time
+
+            self.observe_per_stage_req_latency(RequestStage.DECODE_LOOP, ts - last_time)
             self.decode_ct += 1
 
     def set_last_scheduled_time(self, forward_mode: ForwardMode, ts=None, attrs=None):
@@ -1043,6 +1052,19 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if ts is None:
             ts = time.perf_counter()
         self.completion_time = ts
+
+        if self.trace_ctx.tracing_enable and self.decode_ct > 0:
+            decode_duration = ts - self.decode_loop_start_time
+            attrs = {
+                "decode_tokens": self.decode_ct,
+                "decode_duration_ms": round(decode_duration * 1000, 2),
+                "avg_decode_latency_ms": round(
+                    decode_duration / self.decode_ct * 1000, 2
+                ),
+            }
+            self.trace_slice(
+                RequestStage.DECODE_LOOP, self.decode_loop_start_time, ts, attrs
+            )
 
         self.trace_ctx.abort()
 

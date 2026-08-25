@@ -21,7 +21,6 @@ import os
 import random
 import threading
 import time
-import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -142,17 +141,15 @@ def __get_host_id() -> str:
     In distributed tracing systems, obtain a unique node identifier
     and inject it into all subsequently generated spans
     to prevent PID conflicts between threads on different nodes.
-    """
-    if os.path.exists("/etc/machine-id"):
-        try:
-            with open("/etc/machine-id", "r") as f:
-                return f.read().strip()
-        except:
-            pass
 
-    mac = uuid.getnode()
-    if mac != 0:
-        return uuid.UUID(int=mac).hex
+    Extracts host_id from POD_NAME env var.
+    e.g. POD_NAME=s-20260305111358-v891t-61v8r-prefill-0 -> host_id="prefill-0"
+    """
+    pod_name = os.environ.get("POD_NAME", "")
+    if pod_name:
+        # Ported verbatim from v0.5.5-pro-online commit 6f3f34900c to
+        # preserve its established POD_NAME-to-host_id convention.
+        return pod_name[29:]
 
     return "unknown"
 
@@ -218,7 +215,16 @@ def get_global_tracing_enabled():
 
 
 def get_otlp_span_exporter(endpoint):
-    protocol = os.environ.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, "grpc")
+    # Infer the protocol from the endpoint scheme (aligned with the
+    # v0.5.5-pro-online behavior): an http(s):// endpoint targets an
+    # OTLP/HTTP collector, otherwise assume OTLP/gRPC. The
+    # OTEL_EXPORTER_OTLP_TRACES_PROTOCOL env var explicitly overrides this.
+    default_protocol = (
+        "http/protobuf"
+        if endpoint.startswith(("http://", "https://"))
+        else "grpc"
+    )
+    protocol = os.environ.get(OTEL_EXPORTER_OTLP_TRACES_PROTOCOL, default_protocol)
     supported_protocols = {"grpc", "http/protobuf"}
 
     if protocol not in supported_protocols:
@@ -312,7 +318,7 @@ class TraceReqContext:
         thread_name = f"{thread_info.thread_label}"
         if thread_info.tp_rank is not None:
             thread_name += f" [TP {thread_info.tp_rank}] "
-        thread_name += f"(host:{thread_info.host_id[:8]} | pid:{self.pid})"
+        thread_name += f"(host:{thread_info.host_id} | pid:{self.pid})"
         thread_context.thread_span = tracer.start_span(
             name=thread_name,
             start_time=ts,
@@ -417,8 +423,12 @@ class TraceReqContext:
         orig_rid = self.rid.split("_")[-1]
         role = "" if self.role == "unified" else self.role
         attrs = {"rid": orig_rid, "module": f"sglang::{self.module_name}"}
-        if self.bootstrap_room:
-            attrs["bootstrap_room"] = str(hex(self.bootstrap_room))
+        if self.bootstrap_room is not None:
+            attrs["bootstrap_room"] = (
+                hex(self.bootstrap_room)
+                if isinstance(self.bootstrap_room, int)
+                else str(self.bootstrap_room)
+            )
         root_span = tracer.start_span(
             name=f"{role} Req {orig_rid[:8]}",
             start_time=ts,

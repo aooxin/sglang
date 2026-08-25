@@ -336,6 +336,7 @@ class Scheduler(
 
         # Parse args
         self.server_args = server_args
+        self.enable_trace = server_args.enable_trace
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank

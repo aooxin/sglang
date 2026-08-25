@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPoo
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
+from sglang.srt.speculative.dflash_info import DFlashDraftInput
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -594,14 +595,12 @@ class SchedulerDisaggregationPrefillMixin:
                     req.hidden_states_tensor = (
                         batch.spec_info.hidden_states[i].cpu().clone()
                     )
-                elif (
-                    self.spec_algorithm.is_dflash()
-                    and not batch.is_spec_v2
-                    and batch.spec_info is not None
-                ):
-                    req.dflash_draft_seq_len = int(
-                        batch.spec_info.draft_seq_lens[i].item()
-                    )
+                elif self.spec_algorithm.is_dflash() and batch.spec_info is not None:
+                    # Spec-v1 rebuilds DFlashDraftInput from the draft KV cursor; spec-v2 rebuilds from seq lens.
+                    if isinstance(batch.spec_info, DFlashDraftInput):
+                        req.dflash_draft_seq_len = int(
+                            batch.spec_info.draft_seq_lens[i].item()
+                        )
                     req.hidden_states_tensor = None
                 else:
                     req.hidden_states_tensor = None

@@ -336,7 +336,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
         self.memory_pool_config = memory_pool_config
-        self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (

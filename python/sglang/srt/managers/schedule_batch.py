@@ -2589,10 +2589,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             sliding_window_size = self.tree_cache.sliding_window_size
             server_args = get_global_server_args()
 
+            evict_backlog_tokens = max(
+                envs.SGLANG_SWA_EVICT_LENGTH_PER_STEP.get(), self.tree_cache.page_size
+            )
+
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
-                    live_len = (req.seqlen - 1) - req.swa_evicted_seqlen
-                    if req.decode_batch_idx > 0 and live_len >= 2 * sliding_window_size:
+                    # Skip step 0 in overlap (prev extend still running); evict per token backlog, the pacing DecodePreallocQueue._swa_required_tokens assumes.
+                    if (
+                        req.decode_batch_idx >= 1
+                        and req.seqlen - 1 - sliding_window_size - req.swa_evicted_seqlen
+                        >= evict_backlog_tokens
+                    ):
                         self._evict_swa(req, req.seqlen - 1)
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
                     # SWAChunkCache reclaims request-local SWA KV immediately before the next

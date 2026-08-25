@@ -1193,6 +1193,13 @@ def wrap_multi_turn_request_func(request_func: Callable, backend: str) -> Callab
     return f
 
 
+def _with_fake_prefill_room(body: Dict[str, Any]) -> Dict[str, Any]:
+    # The decode-side PD poller keys requests by bootstrap_room and raises on duplicates.
+    if body.get("bootstrap_host") == FAKE_BOOTSTRAP_HOST:
+        body = {**body, "bootstrap_room": random.getrandbits(63)}
+    return body
+
+
 async def benchmark(
     backend: str,
     api_url: str,
@@ -1294,8 +1301,12 @@ async def benchmark(
     # Run warmup requests
     warmup_tasks = []
     for _ in range(warmup_requests):
+        task_input = replace(
+            test_input,
+            extra_request_body=_with_fake_prefill_room(extra_request_body),
+        )
         warmup_tasks.append(
-            asyncio.create_task(request_func(request_func_input=test_input))
+            asyncio.create_task(request_func(request_func_input=task_input))
         )
 
     warmup_outputs = await asyncio.gather(*warmup_tasks)
@@ -1389,7 +1400,9 @@ async def benchmark(
 
         # Merge global extra_request_body with per-request extras
         # Per-request parameters take precedence over global ones
-        merged_extra_body = {**extra_request_body, **request.extra_request_body}
+        merged_extra_body = _with_fake_prefill_room(
+            {**extra_request_body, **request.extra_request_body}
+        )
 
         request_func_input = RequestFuncInput(
             model=model_id,
@@ -1747,7 +1760,6 @@ def run_benchmark(args_: argparse.Namespace):
     # Inject bootstrap fields for fake decode benchmarking
     if getattr(args, "fake_prefill", False):
         extra_request_body["bootstrap_host"] = FAKE_BOOTSTRAP_HOST
-        extra_request_body["bootstrap_room"] = 0
 
     if args.tokenize_prompt:
         assert (

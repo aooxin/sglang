@@ -638,6 +638,11 @@ class DFlashWorker:
         if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
             return
 
+        # Evict beyond-window SWA KV here: the spec early-return in prepare_for_decode bypasses the generic alloc_for_decode call site.
+        batch.maybe_evict_swa()
+        for req in batch.reqs:
+            req.decode_batch_idx += 1
+
         if batch.has_grammar:
             raise RuntimeError(
                 "Invariant broken: DFLASH batch has grammar constraints, but scheduler should have rejected this request."

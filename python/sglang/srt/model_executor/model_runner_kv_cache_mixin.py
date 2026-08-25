@@ -162,6 +162,111 @@ class ModelRunnerKVCacheMixin:
                 )
         return cell_size
 
+    def _hybrid_swa_per_token_bytes(self: ModelRunner) -> Tuple[int, int]:
+        """(full_per_token, swa_per_token) bytes for the hybrid-SWA target pools.
+
+        Honors the mimo_flash_attn FP8 paged pool for the full layers; SWA
+        layers always use the plain kv_cache_dtype layout. The FP8 branch is
+        target-only (the draft worker keeps its plain pool).
+        """
+        page_size = self.server_args.page_size
+        kv_size = torch._utils._element_size(self.kv_cache_dtype)
+
+        if (
+            self.server_args.attention_backend == "mimo_flash_attn"
+            and not self.is_draft_worker
+        ):
+            # Exact per-token bytes of the FP8-quantized paged pool, derived
+            # from the model config; the draft worker keeps the plain BF16
+            # pool (see _init_pools).
+            from sglang.srt.mem_cache.mimo_memory_pool import (
+                derive_mimo_kv_layout_from_config,
+            )
+
+            full_per_token = (
+                self.model_config.get_num_kv_heads(get_attention_tp_size())
+                * derive_mimo_kv_layout_from_config(
+                    self.model_config, page_size=page_size
+                ).quant_bytes_per_token_per_head
+            )
+        else:
+            full_per_token = (
+                self.model_config.get_num_kv_heads(get_attention_tp_size())
+                * (self.model_config.head_dim + self.model_config.v_head_dim)
+                * kv_size
+            )
+
+        swa_per_token = (
+            self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
+            * (self.model_config.swa_head_dim + self.model_config.swa_v_head_dim)
+            * kv_size
+        )
+        return full_per_token, swa_per_token
+
+    def get_draft_cell_size_per_token(self: ModelRunner) -> int:
+        """Per-token DFLASH draft KV budget (bytes) to fold into the target cell_size.
+
+        The draft runs a separate KV pool. For a hybrid-SWA target the draft
+        pool rides on the SWA side, so profile_max_num_token must reserve the
+        full draft cell (Cd) scaled by k = swa_tokens / token_capacity (times
+        window_ratio when the draft window differs from the target window),
+        clamped to the full-token fraction kf. Returns 0 when inapplicable.
+        """
+        if not (self.spec_algorithm.is_dflash() and not self.is_draft_worker):
+            return 0
+        draft_num_layers = getattr(self, "dflash_draft_num_layers", None)
+        draft_cfg = getattr(self, "dflash_draft_model_config", None)
+        if not draft_num_layers or int(draft_num_layers) <= 0 or draft_cfg is None:
+            return 0
+
+        # Cd: full per-token draft KV cost, using the draft's OWN dims + KV dtype
+        # (DFLASH draft is a plain MHA model, never MLA).
+        draft_kv_dtype = (
+            draft_cfg.dtype
+            if self.server_args.kv_cache_dtype == "auto"
+            else self.kv_cache_dtype
+        )
+        draft_kv_size = torch._utils._element_size(draft_kv_dtype)
+        draft_cell = (
+            draft_cfg.get_num_kv_heads(get_attention_tp_size())
+            * (draft_cfg.head_dim + draft_cfg.v_head_dim)
+            * int(draft_num_layers)
+            * draft_kv_size
+        )
+
+        from sglang.srt.speculative.dflash_utils import _get_dflash_config
+
+        dflash_cfg = _get_dflash_config(draft_cfg.hf_config)
+        if not (self.model_config.is_hybrid_swa and dflash_cfg.get("use_swa", False)):
+            # Draft shares the full token_capacity index space -> full Cd.
+            return draft_cell
+
+        # k = swa_tokens / token_capacity, kf = full_tokens / token_capacity.
+        # Use the same per-token BYTE costs as the allocator so the budget stays
+        # consistent under every backend (e.g. the mimo_flash_attn FP8 full pool).
+        full_per_token, swa_per_token = self._hybrid_swa_per_token_bytes()
+        n_full = len(self.model_config.full_attention_layer_ids)
+        n_swa = len(self.model_config.swa_attention_layer_ids)
+        r = self.server_args.swa_full_tokens_ratio
+        ct = full_per_token * n_full + swa_per_token * n_swa
+        denom = full_per_token * n_full + r * swa_per_token * n_swa
+        k = (ct * r / denom) if denom > 0 else 1.0
+        kf = (ct / denom) if denom > 0 else 1.0
+
+        # Single-window (draft_window == target_window) reuses the target SWA
+        # pool (ratio 1); a smaller draft window needs proportionally fewer rows.
+        draft_window = dflash_cfg.get("swa_window_size", None)
+        target_window = self.sliding_window_size
+        window_ratio = 1.0
+        if draft_window and target_window and draft_window != target_window:
+            window_ratio = draft_window / target_window
+
+        factor = k * window_ratio
+        if n_full > 0:
+            factor = min(factor, kf)
+
+        return max(1, int(round(draft_cell * factor)))
+
     def profile_max_num_token(self: ModelRunner, pre_model_load_memory: int):
         post_model_load_memory = get_available_gpu_memory(
             self.device,
@@ -188,37 +293,18 @@ class ModelRunnerKVCacheMixin:
             num_layers = self.num_effective_layers
 
         cell_size = self.get_cell_size_per_token(num_layers)
-        if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+        draft_cell_size_per_token = self.get_draft_cell_size_per_token()
+        if draft_cell_size_per_token > 0:
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )
 
-            draft_num_layers = getattr(self, "dflash_draft_num_layers", None)
-            draft_cfg = getattr(self, "dflash_draft_model_config", None)
-            if (
-                draft_num_layers is not None
-                and int(draft_num_layers) > 0
-                and int(num_layers) > 0
-                and draft_cfg is not None
-            ):
-                draft_kv_dtype = (
-                    draft_cfg.dtype
-                    if self.server_args.kv_cache_dtype == "auto"
-                    else self.kv_cache_dtype
-                )
-                draft_kv_size = torch._utils._element_size(draft_kv_dtype)
-                draft_cell_size_per_token = (
-                    draft_cfg.get_num_kv_heads(get_attention_tp_size())
-                    * (draft_cfg.head_dim + draft_cfg.v_head_dim)
-                    * int(draft_num_layers)
-                    * draft_kv_size
-                )
-                cell_size = scale_kv_cell_size_per_token_for_dflash(
-                    target_cell_size_per_token=cell_size,
-                    target_num_layers=int(num_layers),
-                    draft_num_layers=int(draft_num_layers),
-                    draft_cell_size_per_token=draft_cell_size_per_token,
-                )
+            cell_size = scale_kv_cell_size_per_token_for_dflash(
+                target_cell_size_per_token=cell_size,
+                target_num_layers=int(num_layers),
+                draft_num_layers=int(self.dflash_draft_num_layers),
+                draft_cell_size_per_token=draft_cell_size_per_token,
+            )
 
         rest_memory = post_model_load_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
@@ -372,7 +458,9 @@ class ModelRunnerKVCacheMixin:
         #   r = swa_full_tokens_ratio = swa_tokens / full_tokens
         #
         # The profile phase computed:
-        #   cell_size = F * n_full + S * n_swa
+        #   cell_size = F * n_full + S * n_swa (plus, under DFLASH, a draft KV
+        #   budget already prescaled by get_draft_cell_size_per_token so that it
+        #   rides the SWA side; no separate draft term is needed here)
         #   token_capacity = rest_memory / cell_size
         #   => total_memory = token_capacity * (F * n_full + S * n_swa)
         #
@@ -382,41 +470,8 @@ class ModelRunnerKVCacheMixin:
         #
         # Solution:
         #   full_tokens = total_memory / (F * n_full + r * S * n_swa)
-        #               = token_capacity * (F * n_full + S * n_swa) / (F * n_full + r * S * n_swa)
 
-        kv_size = torch._utils._element_size(self.kv_cache_dtype)
-
-        # Full layer per-token memory
-        if (
-            self.server_args.attention_backend == "mimo_flash_attn"
-            and not self.is_draft_worker
-        ):
-            # Exact per-token bytes of the FP8-quantized paged pool, derived
-            # from the model config; the draft worker keeps the plain BF16
-            # pool (see _init_pools).
-            from sglang.srt.mem_cache.mimo_memory_pool import (
-                derive_mimo_kv_layout_from_config,
-            )
-
-            full_per_token = (
-                self.model_config.get_num_kv_heads(get_attention_tp_size())
-                * derive_mimo_kv_layout_from_config(
-                    self.model_config, page_size=page_size
-                ).quant_bytes_per_token_per_head
-            )
-        else:
-            full_per_token = (
-                self.model_config.get_num_kv_heads(get_attention_tp_size())
-                * (self.model_config.head_dim + self.model_config.v_head_dim)
-                * kv_size
-            )
-
-        # SWA layer per-token memory
-        swa_per_token = (
-            self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
-            * (self.model_config.swa_head_dim + self.model_config.swa_v_head_dim)
-            * kv_size
-        )
+        full_per_token, swa_per_token = self._hybrid_swa_per_token_bytes()
 
         # Total memory available from profile
         total_memory = token_capacity * (

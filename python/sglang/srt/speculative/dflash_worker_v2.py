@@ -301,7 +301,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
-        self._use_triton_accept_bonus = supports_gpu_triton
+        from sglang.srt.environ import envs as _envs
+
+        self._use_triton_accept_bonus = (
+            supports_gpu_triton and _envs.SGLANG_SIMULATE_ACC_LEN.get() < 0
+        )
         self._accept_bonus_buffer_cap: int = 0
         self._accept_bonus_buffer_slot: int = 0
         self._accept_len_buf: Optional[torch.Tensor] = None

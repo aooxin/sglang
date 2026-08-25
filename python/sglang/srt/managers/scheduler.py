@@ -941,7 +941,7 @@ class Scheduler(
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             return None, None
 
-        if self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
+        if self.spec_algorithm.is_eagle() and self.enable_overlap:
             if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
@@ -1576,15 +1576,10 @@ class Scheduler(
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
+        # Order schedule-stream writes (e.g. free_swa) after in-flight forward-stream reads.
         if not self._war_barrier_enabled:
             return
-        runner = self.model_worker.war_fastpath_runner
-        ev = runner.war_fastpath_read_done_event
-        if ev is not None:
-            self.schedule_stream.wait_event(ev)
-            runner.war_fastpath_read_done_event = None
-        else:
-            self.schedule_stream.wait_stream(self.forward_stream)
+        self.schedule_stream.wait_stream(self.forward_stream)
 
     @DynamicGradMode()
     def event_loop_normal(self):

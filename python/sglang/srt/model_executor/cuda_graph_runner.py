@@ -1095,7 +1095,10 @@ class CudaGraphRunner:
         raw_num_token = raw_bs * self.num_tokens_per_bs
 
         # Pad
-        if self.require_mlp_tp_gather:
+        if (
+            self.require_mlp_tp_gather
+            and forward_batch.global_num_tokens_cpu is not None
+        ):
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
                 max_num_tokens / self.num_tokens_per_bs

@@ -8,11 +8,30 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.utils import is_cuda
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
+
+
+def _dflash_maybe_simulate_accept_len(accept_len: torch.Tensor) -> torch.Tensor:
+    sim = envs.SGLANG_SIMULATE_ACC_LEN.get()
+    if sim < 0:
+        return accept_len
+    # Env value is the EAGLE-style total accept count (>= 1); dflash draft-only count = value - 1.
+    target = max(0.0, float(sim) - 1.0)
+    lower = int(math.floor(target))
+    frac = target - lower
+    if frac == 0.0:
+        return torch.full_like(accept_len, lower)
+    # Bernoulli mix of floor/ceil keeps the mean accept length exact (EAGLE "match-expected").
+    bump = (torch.rand(accept_len.shape, device=accept_len.device) < frac).to(
+        accept_len.dtype
+    )
+    return torch.full_like(accept_len, lower) + bump
+
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
@@ -527,6 +546,7 @@ def compute_dflash_accept_len_and_bonus(
 
     matches = candidates[:, 1:] == target_predict[:, :-1]
     accept_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
+    accept_len = _dflash_maybe_simulate_accept_len(accept_len)
     bonus = target_predict[torch.arange(bs, device=target_predict.device), accept_len]
     return accept_len, bonus.to(torch.int64)
 
@@ -712,6 +732,7 @@ def compute_dflash_sampling_accept_len_and_bonus(
     )
 
     accept_len = accept_token_num
+    accept_len = _dflash_maybe_simulate_accept_len(accept_len)
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, accept_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)

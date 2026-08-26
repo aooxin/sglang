@@ -1007,6 +1007,7 @@ class SchedulerMetricsMixin:
         waiting_queues = [self.waiting_queue]
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
+            waiting_queues.append(self.prefetch_pending_queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
             waiting_queues.append(self.disagg_decode_transfer_queue.queue)
@@ -1044,6 +1045,7 @@ class SchedulerMetricsMixin:
         waiting_queues = [self.waiting_queue]
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
+            waiting_queues.append(self.prefetch_pending_queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
             waiting_queues.append(self.disagg_decode_transfer_queue.queue)

@@ -134,34 +134,19 @@ class TestTraceCustomIdGenerator(unittest.TestCase):
 
 # __get_host_id
 class TestGetHostId(unittest.TestCase):
-    def test_from_machine_id_file(self):
-        with patch("os.path.exists", return_value=True), patch(
-            "builtins.open",
-            unittest.mock.mock_open(read_data="abc123\n"),
+    # __get_host_id derives the host id from the POD_NAME env var:
+    #   POD_NAME=s-20260305111358-v891t-61v8r-prefill-0 -> "prefill-0"
+    # (chars after index 29), falling back to "unknown" when unset.
+    def test_from_pod_name(self):
+        with patch.dict(
+            os.environ,
+            {"POD_NAME": "s-20260305111358-v891t-61v8r-prefill-0"},
         ):
-            self.assertEqual(_get_host_id(), "abc123")
+            self.assertEqual(_get_host_id(), "prefill-0")
 
-    def test_from_machine_id_file_error(self):
-        """Falls back to MAC address when file read fails."""
-        with patch("os.path.exists", return_value=True), patch(
-            "builtins.open", side_effect=IOError("read error")
-        ):
-            result = _get_host_id()
-            self.assertIsInstance(result, str)
-            self.assertGreater(len(result), 0)
-
-    def test_from_mac_address(self):
-        with patch("os.path.exists", return_value=False), patch(
-            "uuid.getnode", return_value=0x112233445566
-        ):
-            result = _get_host_id()
-            self.assertIsInstance(result, str)
-            self.assertGreater(len(result), 0)
-
-    def test_unknown_fallback(self):
-        with patch("os.path.exists", return_value=False), patch(
-            "uuid.getnode", return_value=0
-        ):
+    def test_unknown_when_no_pod_name(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("POD_NAME", None)
             self.assertEqual(_get_host_id(), "unknown")
 
 

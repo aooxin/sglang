@@ -601,6 +601,9 @@ class ServerArgs:
     enable_hisparse: bool = False
     hisparse_config: Optional[str] = None
 
+    # Use the physical page-first device KV layout with FA3.
+    enable_page_first_kv_layout: bool = False
+
     # LMCache
     enable_lmcache: bool = False
 
@@ -4501,6 +4504,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.page_size,
             help="The number of tokens in a page.",
+        )
+        parser.add_argument(
+            "--enable-page-first-kv-layout",
+            action="store_true",
+            default=ServerArgs.enable_page_first_kv_layout,
+            help="Store the device KV cache in page-first layout for FA3.",
         )
         parser.add_argument(
             "--hybrid-kvcache-ratio",

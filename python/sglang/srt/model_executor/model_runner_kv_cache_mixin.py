@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.memory_pool import (
     DoubleSparseTokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
+    MHAPageFirstTokenToKVPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
@@ -805,6 +806,8 @@ class ModelRunnerKVCacheMixin:
                     device=self.device,
                     **kwargs,
                 )
+                if self.server_args.enable_page_first_kv_layout:
+                    swa_pool_kwargs["token_to_kv_pool_class"] = MHAPageFirstTokenToKVPool
                 if (
                     self.server_args.attention_backend == "mimo_flash_attn"
                     and not self.is_draft_worker
@@ -884,7 +887,12 @@ class ModelRunnerKVCacheMixin:
                         ),
                     )
                 else:
-                    self.token_to_kv_pool = MHATokenToKVPool(
+                    mha_pool_cls = (
+                        MHAPageFirstTokenToKVPool
+                        if self.server_args.enable_page_first_kv_layout
+                        else MHATokenToKVPool
+                    )
+                    self.token_to_kv_pool = mha_pool_cls(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,

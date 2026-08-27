@@ -1088,6 +1088,208 @@ class MHATokenToKVPool(KVCache):
             )
 
 
+class MHAPageFirstTokenToKVPool(MHATokenToKVPool):
+    """MHA KV pool with a physical page-first (4D) device layout.
+
+    Each layer's buffer is stored as ``[num_pages, page_size, head_num, head_dim]``
+    instead of the token-linear ``[size + page_size, head_num, head_dim]`` used by
+    the base class. This makes the tokens of a page physically contiguous so that
+    the page becomes the natural unit for allocation, D2H/H2D transfer and paged
+    attention.
+
+    Key invariant: the page-first layout is *memory-equivalent* to the token-linear
+    layout once flattened to ``(total_tokens, head_num, head_dim)`` — page-first just
+    splits dim0 into ``num_pages x page_size``. The allocator already produces
+    page-aligned locations (``page_id * page_size + intra``), so every flat-loc
+    access point is adapted for free via a flattened view of the 4D buffer.
+    """
+
+    def _flat_view(self, buf: torch.Tensor) -> torch.Tensor:
+        """Return a zero-copy flat token view of a strided layer view."""
+        return torch.as_strided(
+            buf,
+            size=(self.num_pages * self.page_size, buf.shape[-2], buf.shape[-1]),
+            stride=(buf.stride(1), buf.stride(2), buf.stride(3)),
+        )
+
+    def _init_kv_copy_and_warmup(self):
+        # Page-first FA3 does not use the Triton KV-copy kernel.
+        self._kv_copy_config = None
+
+    def _create_buffers(self):
+        total = self.size + self.page_size
+        assert total % self.page_size == 0, (
+            f"size + page_size ({total}) must be divisible by page_size "
+            f"({self.page_size}) for the page-first layout"
+        )
+        num_pages = total // self.page_size
+        self.num_pages = num_pages
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                # Physical layout: [page, token, layer, head, dim].
+                self._k_raw = torch.zeros(
+                    (num_pages, self.page_size, self.layer_num, self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                self._v_raw = torch.zeros(
+                    (num_pages, self.page_size, self.layer_num, self.head_num, self.v_head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                self.k_buffer = [self._k_raw[:, :, i] for i in range(self.layer_num)]
+                self.v_buffer = [self._v_raw[:, :, i] for i in range(self.layer_num)]
+
+        self.k_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        # The per-token stride includes all layers in the PF raw buffer.
+        self.data_strides = torch.tensor(
+            [
+                x.stride(1) * x.dtype.itemsize
+                for x in self.k_buffer + self.v_buffer
+            ],
+            device=self.device,
+        )
+
+    def _get_key_buffer(self, layer_id: int):
+        # attention reshapes with .view(-1, page_size, head, dim); the 4D buffer is
+        # already exactly that shape so the view is a zero-copy no-op.
+        if self.store_dtype != self.dtype:
+            return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def _get_value_buffer(self, layer_id: int):
+        if self.store_dtype != self.dtype:
+            return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
+        return self.v_buffer[layer_id - self.start_layer]
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+        if cache_k.dtype != self.dtype:
+            if k_scale is not None:
+                cache_k.div_(k_scale)
+            if v_scale is not None:
+                cache_v.div_(v_scale)
+            cache_k = cache_k.to(self.dtype)
+            cache_v = cache_v.to(self.dtype)
+
+        if self.store_dtype != self.dtype:
+            cache_k = cache_k.view(self.store_dtype)
+            cache_v = cache_v.view(self.store_dtype)
+
+        # Flat loc indexes the flattened (total_tokens, head, dim) view of the 4D
+        # buffer — memory-equivalent to the token-linear pool, zero extra cost.
+        _set_kv_buffer_impl(
+            cache_k,
+            cache_v,
+            self._flat_view(self.k_buffer[layer_id - self.start_layer]),
+            self._flat_view(self.v_buffer[layer_id - self.start_layer]),
+            loc,
+            row_dim=self.row_dim,
+            store_dtype=self.store_dtype,
+            device_module=self.device_module,
+            alt_stream=self.alt_stream,
+            same_kv_dim=self.same_kv_dim,
+        )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # Always use the native flat-loc move on the flattened view; the CUDA JIT
+        # tiled copy is intentionally not used for the FA3 PF prototype.
+        k_flat = [self._flat_view(b) for b in self.k_buffer]
+        v_flat = [self._flat_view(b) for b in self.v_buffer]
+        move_kv_cache_native(k_flat, v_flat, tgt_loc, src_loc)
+
+    def get_cpu_copy(self, indices):
+        self.device_module.synchronize()
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            kv_cache_cpu.append([])
+            k_flat = self._flat_view(self.k_buffer[layer_id])
+            v_flat = self._flat_view(self.v_buffer[layer_id])
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                k_cpu = k_flat[chunk_indices].to("cpu", non_blocking=True)
+                v_cpu = v_flat[chunk_indices].to("cpu", non_blocking=True)
+                kv_cache_cpu[-1].append([k_cpu, v_cpu])
+        self.device_module.synchronize()
+        return kv_cache_cpu
+
+    def load_cpu_copy(self, kv_cache_cpu, indices):
+        self.device_module.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            k_flat = self._flat_view(self.k_buffer[layer_id])
+            v_flat = self._flat_view(self.v_buffer[layer_id])
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                k_cpu, v_cpu = (
+                    kv_cache_cpu[layer_id][i // chunk_size][0],
+                    kv_cache_cpu[layer_id][i // chunk_size][1],
+                )
+                assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
+                k_chunk = k_cpu.to(k_flat.device, non_blocking=True)
+                v_chunk = v_cpu.to(v_flat.device, non_blocking=True)
+                k_flat[chunk_indices] = k_chunk
+                v_flat[chunk_indices] = v_chunk
+        self.device_module.synchronize()
+
+    def get_contiguous_buf_infos(self):
+        # Layer views retain the raw page pointer and expose one logical page
+        # item per layer for existing descriptor consumers.
+        kv_data_ptrs = [
+            self._get_key_buffer(i).data_ptr()
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ] + [
+            self._get_value_buffer(i).data_ptr()
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        kv_data_lens = [
+            self._get_key_buffer(i).nbytes
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ] + [
+            self._get_value_buffer(i).nbytes
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        # One item is one page. In the 4D layout, buffer[0] is already a full page
+        # (page_size, head_num, head_dim), so we must NOT multiply by page_size
+        # again (unlike the 3D layout where buffer[0] is a single token).
+        kv_item_lens = [
+            self._get_key_buffer(i)[0].nbytes
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ] + [
+            self._get_value_buffer(i)[0].nbytes
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+
 class MHATokenToKVPoolFP4(MHATokenToKVPool):
 
     def _create_buffers(self):

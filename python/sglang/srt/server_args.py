@@ -3102,6 +3102,9 @@ class ServerArgs:
         if self.hicache_io_backend != "kernel":
             return False
 
+        if self.enable_page_first_kv_layout:
+            return False
+
         # Only patch settings when the effective decode backend is FA3.
         effective_decode_backend = (
             self.decode_attention_backend or self.attention_backend
@@ -4026,6 +4029,38 @@ class ServerArgs:
             self.enable_mixed_chunk = False
 
     def _handle_other_validations(self):
+        if self.enable_page_first_kv_layout:
+            effective_backends = {
+                self.attention_backend,
+                self.prefill_attention_backend or self.attention_backend,
+                self.decode_attention_backend or self.attention_backend,
+            }
+            if effective_backends != {"fa3"}:
+                raise ValueError(
+                    "--enable-page-first-kv-layout currently requires FA3 for "
+                    "attention, prefill, and decode"
+                )
+            if self.use_mla_backend():
+                raise ValueError(
+                    "--enable-page-first-kv-layout currently supports MHA only"
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "--enable-page-first-kv-layout is not yet supported by PD "
+                    "disaggregation"
+                )
+            if self.enable_hierarchical_cache:
+                if self.hicache_mem_layout != "page_first":
+                    raise ValueError(
+                        "--enable-page-first-kv-layout requires "
+                        "--hicache-mem-layout page_first"
+                    )
+                if self.hicache_io_backend != "kernel":
+                    raise ValueError(
+                        "--enable-page-first-kv-layout currently requires "
+                        "--hicache-io-backend kernel"
+                    )
+
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
             logger.warning(

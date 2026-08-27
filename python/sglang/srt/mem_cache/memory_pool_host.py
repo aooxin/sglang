@@ -35,6 +35,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MambaPool,
+    MHAPageFirstTokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     NSATokenToKVPool,
@@ -91,6 +92,7 @@ if _is_npu:
 
 
 logger = logging.getLogger(__name__)
+_CPU_DEVICE = torch.device("cpu")
 
 # Cached once at import: gating envs.SGLANG_SWA_DIAG_ENABLED.get() per alloc/free
 # would add an os.getenv lookup to the hot path, defeating the purpose.
@@ -381,6 +383,43 @@ def assert_indices_in_bounds(
         f"{legal_domain} (min={min_val}, max={max_val}); foreign write into "
         f"allocator bookkeeping or index tensor suspected"
     )
+
+
+def _split_token_index(
+    token_indices: torch.Tensor, page_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    page_id = torch.div(token_indices, page_size, rounding_mode="floor")
+    return page_id, token_indices - page_id * page_size
+
+
+def _gather_device_tokens(
+    buf: torch.Tensor, token_indices: torch.Tensor
+) -> torch.Tensor:
+    if buf.dim() == 3:
+        return buf[token_indices]
+    if buf.dim() == 4:
+        page_id, intra = _split_token_index(token_indices, buf.shape[1])
+        return buf[page_id, intra, :, :]
+    raise ValueError(
+        f"Unsupported KV buffer rank {buf.dim()}: shape={tuple(buf.shape)}"
+    )
+
+
+def _scatter_device_tokens(
+    buf: torch.Tensor, token_indices: torch.Tensor, values: torch.Tensor
+) -> None:
+    pad = buf.shape[-1] - values.shape[-1]
+    if pad > 0:
+        values = torch.nn.functional.pad(values, (0, pad))
+    if buf.dim() == 3:
+        buf.index_copy_(0, token_indices, values)
+    elif buf.dim() == 4:
+        page_id, intra = _split_token_index(token_indices, buf.shape[1])
+        buf[page_id, intra, :, :] = values
+    else:
+        raise ValueError(
+            f"Unsupported KV buffer rank {buf.dim()}: shape={tuple(buf.shape)}"
+        )
 
 
 class HostTensorAllocator(abc.ABC):
@@ -1004,7 +1043,17 @@ class MHATokenToKVPoolHost(HostKVCache):
                         block_quota=self.h2d_block_quota,
                     )
             elif self.layout == "page_first":
-                if self.can_use_jit:
+                if isinstance(device_pool, MHAPageFirstTokenToKVPool):
+                    if layer_id == 0:
+                        device_k, device_v = device_pool.get_page_first_raw_buffers()
+                        transfer_kv_direct(
+                            src_layers=[self.k_buffer, self.v_buffer],
+                            dst_layers=[device_k, device_v],
+                            src_indices=host_indices,
+                            dst_indices=device_indices,
+                            page_size=self.page_size,
+                        )
+                elif self.can_use_jit:
                     # Transpose [page, layer, ...] -> [layer, page, ...] then
                     # index by layer_id to get a per-layer view with strided layout.
                     # The kernel handles different src/dst strides automatically.
@@ -1147,7 +1196,16 @@ class MHATokenToKVPoolHost(HostKVCache):
                         block_quota=self.d2h_block_quota,
                     )
             elif self.layout == "page_first":
-                if self.can_use_jit:
+                if isinstance(device_pool, MHAPageFirstTokenToKVPool):
+                    device_k, device_v = device_pool.get_page_first_raw_buffers()
+                    transfer_kv_direct(
+                        src_layers=[device_k, device_v],
+                        dst_layers=[self.k_buffer, self.v_buffer],
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        page_size=self.page_size,
+                    )
+                elif self.can_use_jit:
                     # Use transposed data ptrs so the kernel writes to
                     # [layer, page, item] view with stride layout_dim per token.
                     jit_transfer_hicache_all_layer(

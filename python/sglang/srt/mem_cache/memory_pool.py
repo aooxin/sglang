@@ -1165,6 +1165,22 @@ class MHAPageFirstTokenToKVPool(MHATokenToKVPool):
             device=self.device,
         )
 
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
+        del self._k_raw
+        del self._v_raw
+
+    @property
+    def kv_transfer_layout(self) -> str:
+        return "page_first"
+
+    def get_page_first_raw_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return (
+            self._k_raw.flatten(0, 1),
+            self._v_raw.flatten(0, 1),
+        )
+
     def _get_key_buffer(self, layer_id: int):
         # attention reshapes with .view(-1, page_size, head, dim); the 4D buffer is
         # already exactly that shape so the view is a zero-copy no-op.
@@ -1261,33 +1277,10 @@ class MHAPageFirstTokenToKVPool(MHATokenToKVPool):
         self.device_module.synchronize()
 
     def get_contiguous_buf_infos(self):
-        # Layer views retain the raw page pointer and expose one logical page
-        # item per layer for existing descriptor consumers.
-        kv_data_ptrs = [
-            self._get_key_buffer(i).data_ptr()
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ] + [
-            self._get_value_buffer(i).data_ptr()
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ]
-        kv_data_lens = [
-            self._get_key_buffer(i).nbytes
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ] + [
-            self._get_value_buffer(i).nbytes
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ]
-        # One item is one page. In the 4D layout, buffer[0] is already a full page
-        # (page_size, head_num, head_dim), so we must NOT multiply by page_size
-        # again (unlike the 3D layout where buffer[0] is a single token).
-        kv_item_lens = [
-            self._get_key_buffer(i)[0].nbytes
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ] + [
-            self._get_value_buffer(i)[0].nbytes
-            for i in range(self.start_layer, self.start_layer + self.layer_num)
-        ]
-        return kv_data_ptrs, kv_data_lens, kv_item_lens
+        raise NotImplementedError(
+            "page-first device KV layout is not compatible with the current "
+            "per-layer disaggregation descriptor protocol"
+        )
 
 
 class MHATokenToKVPoolFP4(MHATokenToKVPool):

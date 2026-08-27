@@ -294,6 +294,9 @@ class ModelRunnerKVCacheMixin:
 
         cell_size = self.get_cell_size_per_token(num_layers)
         draft_cell_size_per_token = self.get_draft_cell_size_per_token()
+        logger.info(
+            f"KV cache sizing. cell size: {cell_size} bytes/token, draft cell size: {draft_cell_size_per_token} bytes/token"
+        )
         if draft_cell_size_per_token > 0:
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
@@ -312,7 +315,11 @@ class ModelRunnerKVCacheMixin:
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
-        return int(rest_memory * (1 << 30)) // cell_size
+        max_num_token = int(rest_memory * (1 << 30)) // cell_size
+        logger.info(
+            f"profile_max_num_token. rest_memory: {rest_memory:.2f} GB, cell size: {cell_size} bytes/token, max num token: {max_num_token}"
+        )
+        return max_num_token
 
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
         config = self.mambaish_config
@@ -511,7 +518,9 @@ class ModelRunnerKVCacheMixin:
                 )
 
         logger.info(
-            f"Use sliding window memory pool. full_layer_tokens={full_tokens}, swa_layer_tokens={swa_tokens}"
+            f"Use sliding window memory pool. total_memory={total_memory}, denominator={denominator}, "
+            f"full_per_token={full_per_token}, swa_per_token={swa_per_token}, "
+            f"full_layer_tokens={full_tokens}, swa_layer_tokens={swa_tokens}"
         )
         return full_tokens, full_tokens, swa_tokens
 
@@ -1006,6 +1015,9 @@ class ModelRunnerKVCacheMixin:
             )
             capacity = tensor.item()
 
+        logger.info(
+            f"_resolve_token_capacity. profiled tokens: {profiled_tokens}, token capacity: {capacity}"
+        )
         return capacity
 
     def _resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:

@@ -3215,6 +3215,7 @@ class DPDispatcher:
         self._pending_send_at: Dict[str, float] = {}
         # Set when _result_listener gives up; makes alive_ranks report empty.
         self._listener_failed = False
+        self._ready_ranks: Set[int] = set()
 
         # Prometheus gauge: pending requests per DP rank.
         self.pending_gauge = None
@@ -3283,6 +3284,12 @@ class DPDispatcher:
     def all_ranks_alive(self) -> bool:
         # Strict health (only /health uses this); routing still degrades.
         return len(self.alive_ranks) == self.dp_size
+
+    @property
+    def all_ranks_ready(self) -> bool:
+        return not self._listener_failed and self._ready_ranks == set(
+            range(self.dp_size)
+        )
 
     def start(self) -> None:
         logger.info(f"DP dispatcher started: {self.dp_size} ranks (all remote)")
@@ -3520,6 +3527,7 @@ class DPDispatcher:
                     f"with code={proc.exitcode}; failing pending requests"
                 )
                 self._dead_ranks.add(rank)
+                self._ready_ranks.discard(rank)
                 reason = f"DP worker rank={rank} died (exitcode={proc.exitcode})"
                 self._fail_pending_for_rank(rank, reason, "WorkerDied")
                 dead_rids = [r for r, rk in self.req_id_to_rank.items() if rk == rank]
@@ -3558,6 +3566,19 @@ class DPDispatcher:
                 continue
             req_id = msg.get("req_id", "")
             dp_type = msg.get("_dp_type", "encode")
+            if dp_type == "worker_ready":
+                rank = msg.get("dp_rank")
+                if rank in range(self.dp_size):
+                    self._ready_ranks.add(rank)
+                    logger.info(
+                        "Encoder DP worker rank=%s ready (%d/%d)",
+                        rank,
+                        len(self._ready_ranks),
+                        self.dp_size,
+                    )
+                else:
+                    logger.warning("Ignoring invalid encoder DP ready rank=%s", rank)
+                continue
             key = (req_id + "_send") if dp_type == "send" else req_id
             rank = self.req_id_to_rank.get(req_id)
             if rank is None or key not in self.pending_futures[rank]:
@@ -3785,6 +3806,12 @@ async def run_dp_worker(
         )
     inflight_sem = asyncio.Semaphore(max_inflight)
     sched.start()
+    await send_sock.send_pyobj(
+        {
+            "_dp_type": "worker_ready",
+            "dp_rank": dp_rank,
+        }
+    )
     logger.info(f"DP worker {dp_rank} ready")
 
     # Task-per-request so EncoderScheduler.pending_queue accumulates and
@@ -4337,6 +4364,8 @@ async def health_generate():
     Returns 200 if the encoder is initialized and ready.
     """
     if dp_dispatcher is not None:
+        if not dp_dispatcher.all_ranks_ready:
+            return Response(status_code=503)
         # Strict: any dead (exited) rank fails health → orchestrator restarts.
         if not dp_dispatcher.all_ranks_alive:
             return Response(status_code=503)

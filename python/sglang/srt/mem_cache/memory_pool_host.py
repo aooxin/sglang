@@ -65,6 +65,7 @@ if not (_is_npu or _is_xpu or _is_mps):
             transfer_kv_per_layer_mla,
             transfer_kv_per_layer_mla_pf_lf,
             transfer_kv_per_layer_pf_lf,
+            transfer_kv_per_layer_pf_pf,
             transfer_kv_per_layer_ph_lf,
         )
     except ImportError:
@@ -83,6 +84,7 @@ if not (_is_npu or _is_xpu or _is_mps):
         transfer_kv_per_layer = None
         transfer_kv_per_layer_direct_mla = None
         transfer_kv_per_layer_direct_pf_lf = None
+        transfer_kv_per_layer_pf_pf = None
         transfer_kv_per_layer_mla = None
         transfer_kv_per_layer_mla_pf_lf = None
         transfer_kv_per_layer_pf_lf = None
@@ -1044,15 +1046,20 @@ class MHATokenToKVPoolHost(HostKVCache):
                     )
             elif self.layout == "page_first":
                 if isinstance(device_pool, MHAPageFirstTokenToKVPool):
-                    if layer_id == 0:
-                        device_k, device_v = device_pool.get_page_first_raw_buffers()
-                        transfer_kv_direct(
-                            src_layers=[self.k_buffer, self.v_buffer],
-                            dst_layers=[device_k, device_v],
-                            src_indices=host_indices,
-                            dst_indices=device_indices,
-                            page_size=self.page_size,
-                        )
+                    device_k, device_v = device_pool.get_page_first_raw_buffers()
+                    transfer_kv_per_layer_pf_pf(
+                        src_k=self.k_buffer,
+                        dst_k=device_k,
+                        src_v=self.v_buffer,
+                        dst_v=device_v,
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=layer_id,
+                        item_size=self.token_stride_size,
+                        src_layout_dim=self.layout_dim,
+                        dst_layout_dim=device_k.stride(0) * device_k.element_size(),
+                        block_quota=self.h2d_block_quota,
+                    )
                 elif self.can_use_jit:
                     # Transpose [page, layer, ...] -> [layer, page, ...] then
                     # index by layer_id to get a per-layer view with strided layout.

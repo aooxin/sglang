@@ -62,6 +62,36 @@ def transfer_kv_per_layer_pf_lf(
     )
 
 
+def transfer_kv_per_layer_pf_pf(
+    src_k: torch.Tensor,
+    dst_k: torch.Tensor,
+    src_v: torch.Tensor,
+    dst_v: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    layer_id: int,
+    item_size: int,
+    src_layout_dim: int,
+    dst_layout_dim: int,
+    block_quota: int = 2,
+    num_warps_per_block: int = 16 if _is_hip else 32,
+):
+    torch.ops.sgl_kernel.transfer_kv_per_layer_pf_pf.default(
+        src_k,
+        dst_k,
+        src_v,
+        dst_v,
+        src_indices,
+        dst_indices,
+        layer_id,
+        item_size,
+        src_layout_dim,
+        dst_layout_dim,
+        block_quota,
+        num_warps_per_block,
+    )
+
+
 def transfer_kv_per_layer_ph_lf(
     src_k: torch.Tensor,
     dst_k: torch.Tensor,

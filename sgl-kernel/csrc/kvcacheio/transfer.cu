@@ -348,7 +348,8 @@ void transfer_kv_launcher(
     const int64_t head_num = 1,
     const int64_t k_head_dim = 0,
     const int64_t v_head_dim = 0,
-    bool device2host = true) {
+    bool device2host = true,
+    bool scale_both_layouts = false) {
   TORCH_CHECK(src_indices.is_cuda(), "Source indices must be a CUDA tensor");
   TORCH_CHECK(dst_indices.is_cuda(), "Destination indices must be a CUDA tensor");
   TORCH_CHECK(src_indices.scalar_type() == at::kLong, "Source indices must be of type long");
@@ -379,6 +380,15 @@ void transfer_kv_launcher(
         !different_head_dim || dst_layout_dim % k_head_dim == 0,
         "Destination layout dimension must be divisible by k head dimension");
     v_src_layout_dim = src_layout_dim;
+    v_dst_layout_dim = different_head_dim ? dst_layout_dim / k_head_dim * v_head_dim : dst_layout_dim;
+  } else if (scale_both_layouts) {
+    TORCH_CHECK(
+        !different_head_dim || src_layout_dim % k_head_dim == 0,
+        "Source layout dimension must be divisible by k head dimension");
+    TORCH_CHECK(
+        !different_head_dim || dst_layout_dim % k_head_dim == 0,
+        "Destination layout dimension must be divisible by k head dimension");
+    v_src_layout_dim = different_head_dim ? src_layout_dim / k_head_dim * v_head_dim : src_layout_dim;
     v_dst_layout_dim = different_head_dim ? dst_layout_dim / k_head_dim * v_head_dim : dst_layout_dim;
   } else {
     TORCH_CHECK(
@@ -575,7 +585,50 @@ void transfer_kv_per_layer_pf_lf(
       0,
       k_head_dim,
       v_head_dim,
-      false);
+      false,
+      true);
+}
+
+void transfer_kv_per_layer_pf_pf(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t dst_layout_dim,
+    int64_t block_quota,
+    int64_t num_warps_per_block) {
+  at::Tensor empty;
+  const int64_t k_head_dim = dst_k.size(-1);
+  const int64_t v_head_dim = dst_v.size(-1);
+  transfer_kv_launcher<get_global_offset_pf<const char>, get_global_offset_pf<char>, false>(
+      src_k,
+      dst_k,
+      src_v,
+      dst_v,
+      src_indices,
+      dst_indices,
+      layer_id,
+      1,
+      item_size,
+      src_layout_dim,
+      dst_layout_dim,
+      empty,
+      empty,
+      empty,
+      empty,
+      block_quota,
+      num_warps_per_block,
+      1,
+      1,
+      k_head_dim,
+      v_head_dim,
+      false,
+      true);
 }
 
 void transfer_kv_per_layer_ph_lf(

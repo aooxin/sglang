@@ -25,6 +25,20 @@ void transfer_kv_per_layer_pf_lf(
     int64_t block_quota,
     int64_t num_warps_per_block);
 
+void transfer_kv_per_layer_pf_pf(
+    const at::Tensor src_k,
+    at::Tensor dst_k,
+    const at::Tensor src_v,
+    at::Tensor dst_v,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t layer_id,
+    int64_t item_size,
+    int64_t src_layout_dim,
+    int64_t dst_layout_dim,
+    int64_t block_quota,
+    int64_t num_warps_per_block);
+
 void transfer_kv_per_layer_ph_lf(
     const at::Tensor src_k,
     at::Tensor dst_k,
@@ -200,6 +214,11 @@ TORCH_LIBRARY(transfer_kernel, m) {
       "transfer_kv_per_layer_pf_lf(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
       "dst_indices, int layer_id, int item_size, int src_layout_dim, int block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_per_layer_pf_lf", torch::kCUDA, &transfer_kv_per_layer_pf_lf);
+  m.def(
+      "transfer_kv_per_layer_pf_pf(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, "
+      "Tensor dst_indices, int layer_id, int item_size, int src_layout_dim, int dst_layout_dim, int block_quota, "
+      "int num_warps_per_block) -> ()");
+  m.impl("transfer_kv_per_layer_pf_pf", torch::kCUDA, &transfer_kv_per_layer_pf_pf);
   m.def(
       "transfer_kv_per_layer_ph_lf(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, Tensor "
       "dst_indices, int layer_id, int item_size, int src_layout_dim, int page_size, int head_num, int block_quota, int "

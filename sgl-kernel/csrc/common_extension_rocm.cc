@@ -157,6 +157,11 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "dst_indices, int layer_id, int item_size, int src_layout_dim, int block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_per_layer_pf_lf", torch::kCUDA, &transfer_kv_per_layer_pf_lf);
   m.def(
+      "transfer_kv_per_layer_pf_pf(Tensor src_k, Tensor dst_k, Tensor src_v, Tensor dst_v, Tensor src_indices, "
+      "Tensor dst_indices, int layer_id, int item_size, int src_layout_dim, int dst_layout_dim, int block_quota, "
+      "int num_warps_per_block) -> ()");
+  m.impl("transfer_kv_per_layer_pf_pf", torch::kCUDA, &transfer_kv_per_layer_pf_pf);
+  m.def(
       "transfer_kv_all_layer(Tensor src_k_layers, Tensor dst_k_layers, Tensor src_v_layers, Tensor dst_v_layers, "
       "Tensor src_indices, Tensor dst_indices, int item_size, int num_layers, int block_quota, int "
       "num_warps_per_block) -> ()");

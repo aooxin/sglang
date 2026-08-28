@@ -595,6 +595,18 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             buckets=bucket_decode_alloc_wait_time or _default_bootstrap_buckets,
         )
+        self.histogram_pd_commit_wait = Histogram(
+            name="sglang:pd_commit_wait_seconds",
+            documentation="Histogram of prefill-side wait duration for decode COMMIT in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_prefill_bootstrap_time or _default_bootstrap_buckets,
+        )
+        self.histogram_pd_decode_prefill_sched_wait = Histogram(
+            name="sglang:pd_decode_prefill_sched_wait_seconds",
+            documentation="Histogram of decode-side wait duration for PREFILL_SCHED in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_decode_bootstrap_time or _default_bootstrap_buckets,
+        )
 
         # Grammar metrics
         self.grammar_compilation_time = Histogram(
@@ -1150,6 +1162,12 @@ class SchedulerMetricsCollector:
 
     def observe_decode_alloc_wait_time(self, latency: float) -> None:
         self._log_histogram(self.histogram_decode_alloc_wait_time, latency)
+
+    def observe_pd_commit_wait(self, latency: float) -> None:
+        self._log_histogram(self.histogram_pd_commit_wait, latency)
+
+    def observe_pd_decode_prefill_sched_wait(self, latency: float) -> None:
+        self._log_histogram(self.histogram_pd_decode_prefill_sched_wait, latency)
 
     def observe_prefill_delayer_outcome(
         self,

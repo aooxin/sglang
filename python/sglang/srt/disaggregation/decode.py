@@ -890,7 +890,13 @@ class DecodePreallocQueue:
             prefill_dp_rank = self._resolve_prefill_dp_rank(req)
             logger.debug(f"prefill_dp_rank: {prefill_dp_rank}")
             if prefill_dp_rank is not None:
-                decode_req.kv_receiver.init(prefill_dp_rank)
+                initialized = decode_req.kv_receiver.init(prefill_dp_rank)
+                if initialized and self.kv_manager.two_phase_prealloc:
+                    send_reserve = getattr(
+                        decode_req.kv_receiver, "send_reserve", None
+                    )
+                    if send_reserve is not None:
+                        send_reserve()
                 return
 
             self.pending_reqs.append(decode_req)
@@ -1239,7 +1245,67 @@ class DecodePreallocQueue:
         self.pending_reqs = remaining
 
         for decode_req, prefill_dp_rank in resolved:
-            decode_req.kv_receiver.init(prefill_dp_rank)
+            initialized = decode_req.kv_receiver.init(prefill_dp_rank)
+            if initialized and self.kv_manager.two_phase_prealloc:
+                send_reserve = getattr(decode_req.kv_receiver, "send_reserve", None)
+                if send_reserve is not None:
+                    send_reserve()
+
+    def _check_projected_device_capacity(
+        self,
+        req: Req,
+        page_size: int,
+        allocatable_tokens: Union[int, Tuple[int, int]],
+        retractable_tokens: Optional[int],
+        swa_retractable_tokens: Optional[int],
+    ) -> Optional[Union[int, Tuple[int, int]]]:
+        required_tokens_for_request = self._full_required_tokens(
+            req, page_size, include_output_ids=False
+        )
+        max_tokens_for_request = self._max_full_tokens_for_req(
+            req, retractable_tokens, page_size
+        )
+
+        if not self.scheduler.model_config.is_hybrid_swa:
+            if max(
+                required_tokens_for_request,
+                max_tokens_for_request,
+            ) > allocatable_tokens:
+                return None
+            return allocatable_tokens - required_tokens_for_request
+
+        assert swa_retractable_tokens is not None
+        full_allocatable_tokens, swa_allocatable_tokens = allocatable_tokens
+        swa_required_tokens_for_request = self._swa_required_tokens(
+            req, page_size, include_output_ids=False
+        )
+        swa_max_tokens_for_request = self._max_swa_tokens_for_req(
+            req, swa_retractable_tokens, page_size
+        )
+        if (
+            max(required_tokens_for_request, max_tokens_for_request)
+            > full_allocatable_tokens
+            or max(swa_required_tokens_for_request, swa_max_tokens_for_request)
+            > swa_allocatable_tokens
+        ):
+            return None
+        if (
+            required_tokens_for_request > full_allocatable_tokens
+            or swa_required_tokens_for_request > swa_allocatable_tokens
+        ):
+            logger.warning(
+                f"Not enough space for req: {req.rid} {req.bootstrap_room=}, "
+                f"full_required_tokens_for_request: {required_tokens_for_request} > "
+                f"full_allocatable_tokens: {full_allocatable_tokens}, "
+                f"swa_required_tokens_for_request: {swa_required_tokens_for_request} > "
+                f"swa_allocatable_tokens: {swa_allocatable_tokens}"
+            )
+            return None
+
+        return (
+            full_allocatable_tokens - required_tokens_for_request,
+            swa_allocatable_tokens - swa_required_tokens_for_request,
+        )
 
     def pop_preallocated(
         self,
@@ -1254,23 +1320,24 @@ class DecodePreallocQueue:
         preallocated_reqs = []
         indices_to_remove = set()
 
-        # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
-        # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
-        retractable_tokens, swa_retractable_tokens = self._retractable_tokens()
-        allocatable_tokens = self._allocatable_tokens(
-            retractable_tokens=retractable_tokens,
-            swa_retractable_tokens=swa_retractable_tokens,
-            count_retracted=True,
-        )
+        pd_d2h_mgr = getattr(self.scheduler, "pd_direct2host_manager", None)
+        use_device_admission = pd_d2h_mgr is None
+        if use_device_admission:
+            # Keep enough device KV capacity for requests already admitted to decode.
+            retractable_tokens, swa_retractable_tokens = self._retractable_tokens()
+            allocatable_tokens = self._allocatable_tokens(
+                retractable_tokens=retractable_tokens,
+                swa_retractable_tokens=swa_retractable_tokens,
+                count_retracted=True,
+            )
         if self.scheduler.enable_hisparse:
             page_size = 1  # host pool page_size
         else:
             page_size = self.token_to_kv_pool_allocator.page_size
-        if self.scheduler.model_config.is_hybrid_swa:
+        if use_device_admission and self.scheduler.model_config.is_hybrid_swa:
             assert swa_retractable_tokens is not None
 
         # First, remove all failed requests from the queue
-        pd_d2h_mgr = getattr(self.scheduler, "pd_direct2host_manager", None)
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -1301,67 +1368,17 @@ class DecodePreallocQueue:
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
 
-            # Memory estimation: don't add if the projected memory cannot be met
-            # TODO: add new_token ratio
-            req = decode_req.req
-            required_tokens_for_request = self._full_required_tokens(
-                req, page_size, include_output_ids=False
-            )
-            max_tokens_for_request = self._max_full_tokens_for_req(
-                req, retractable_tokens, page_size
-            )
-            if not self.scheduler.model_config.is_hybrid_swa:
-                if (
-                    max(
-                        required_tokens_for_request,
-                        max_tokens_for_request,
-                    )
-                    > allocatable_tokens
-                ):
-                    break
-                if required_tokens_for_request > allocatable_tokens:
-                    break
-
-                allocatable_tokens -= required_tokens_for_request
-            else:
-                full_allocatable_tokens, swa_allocatable_tokens = allocatable_tokens
-                full_required_tokens_for_request = required_tokens_for_request
-                swa_required_tokens_for_request = self._swa_required_tokens(
-                    req, page_size, include_output_ids=False
+            if use_device_admission:
+                next_allocatable_tokens = self._check_projected_device_capacity(
+                    decode_req.req,
+                    page_size,
+                    allocatable_tokens,
+                    retractable_tokens,
+                    swa_retractable_tokens,
                 )
-                full_max_tokens_for_request = max_tokens_for_request
-                swa_max_tokens_for_request = self._max_swa_tokens_for_req(
-                    req, swa_retractable_tokens, page_size
-                )
-                # Estimate whether this request would exceed the token limit in the most extreme case,
-                # assuming all currently running requests are retracted.
-                if (
-                    max(
-                        required_tokens_for_request,
-                        full_max_tokens_for_request,
-                    )
-                    > full_allocatable_tokens
-                ) or (
-                    max(
-                        swa_required_tokens_for_request,
-                        swa_max_tokens_for_request,
-                    )
-                    > swa_allocatable_tokens
-                ):
+                if next_allocatable_tokens is None:
                     break
-                if (
-                    full_required_tokens_for_request > full_allocatable_tokens
-                    or swa_required_tokens_for_request > swa_allocatable_tokens
-                ):
-                    logger.warning(
-                        f"Not enough space for req: {decode_req.req.rid} {decode_req.req.bootstrap_room=}, "
-                        f"full_required_tokens_for_request: {full_required_tokens_for_request} > full_allocatable_tokens: {full_allocatable_tokens}, "
-                        f"swa_required_tokens_for_request: {swa_required_tokens_for_request} > swa_allocatable_tokens: {swa_allocatable_tokens}"
-                    )
-                    break
-                full_allocatable_tokens -= full_required_tokens_for_request
-                swa_allocatable_tokens -= swa_required_tokens_for_request
-                allocatable_tokens = (full_allocatable_tokens, swa_allocatable_tokens)
+                allocatable_tokens = next_allocatable_tokens
 
             origin_input_len = len(decode_req.req.origin_input_ids)
             kv_indices = self._pre_alloc_and_get_kv_indices(
@@ -1393,9 +1410,16 @@ class DecodePreallocQueue:
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
             if self.scheduler.enable_metrics:
                 ts = decode_req.req.time_stats
-                self.scheduler.metrics_collector.observe_decode_bootstrap_time(
+                prefill_sched_wait = (
                     ts.bootstrap_done_time - ts.decode_prealloc_queue_entry_time
                 )
+                self.scheduler.metrics_collector.observe_decode_bootstrap_time(
+                    prefill_sched_wait
+                )
+                if self.kv_manager.two_phase_prealloc:
+                    self.scheduler.metrics_collector.observe_pd_decode_prefill_sched_wait(
+                        prefill_sched_wait
+                    )
                 self.scheduler.metrics_collector.observe_decode_alloc_wait_time(
                     ts.decode_transfer_queue_entry_time - ts.bootstrap_done_time
                 )

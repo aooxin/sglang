@@ -9,7 +9,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -38,6 +38,8 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
+
+_PENDING_COMMIT_REAPER_INTERVAL_S = 5.0
 
 
 class KVTransferError(Exception):
@@ -78,8 +80,8 @@ class TransferInfo:
     endpoint: str
     dst_port: int
     mooncake_session_id: str
-    dst_kv_indices: npt.NDArray[np.int32]
-    dst_aux_index: int
+    dst_kv_indices: Optional[npt.NDArray[np.int32]]
+    dst_aux_index: Optional[int]
     dst_state_indices: List[int]
     required_dst_info_num: int
     is_dummy: bool
@@ -111,6 +113,20 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
+        )
+
+    @classmethod
+    def from_reserve_msg(cls, msg: List[bytes]):
+        return cls(
+            room=int(msg[1].decode("ascii")),
+            endpoint=msg[2].decode("ascii"),
+            dst_port=int(msg[3].decode("ascii")),
+            mooncake_session_id=msg[4].decode("ascii"),
+            dst_kv_indices=None,
+            dst_aux_index=None,
+            dst_state_indices=[],
+            required_dst_info_num=int(msg[6].decode("ascii")),
+            is_dummy=msg[5] == b"1",
         )
 
 
@@ -205,10 +221,18 @@ class MooncakeKVManager(CommonKVManager):
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.start_prefill_thread()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
+            self._sched_notified = set()
+            # Serializes decode-endpoint sends: shared PUSH sockets are used by
+            # transfer workers and (two-phase) the scheduler thread.
+            self._decode_send_lock = threading.Lock()
+            self._transfer_infos_lock = threading.Lock()
+            self._pending_commit_chunks: Dict[int, List[TransferKVChunk]] = {}
+            self._pending_commit_start_ts: Dict[int, float] = {}
+            self._pending_commit_wait_samples: List[float] = []
+            self._pending_commit_lock = threading.Lock()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -236,6 +260,12 @@ class MooncakeKVManager(CommonKVManager):
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
+            self.room_transfer_elapsed: dict[int, float] = {}
+            self.room_transfer_elapsed_lock = threading.Lock()
+            self._diag_slow_send_kvcache_s = envs.SGLANG_DIAG_SLOW_SEND_KVCACHE_S.get()
+            self._diag_slow_send_aux_s = envs.SGLANG_DIAG_SLOW_SEND_AUX_S.get()
+            self._diag_slow_queue_wait_s = envs.SGLANG_DIAG_SLOW_QUEUE_WAIT_S.get()
+            self._pd_trace = envs.SGLANG_PD_TRACE.get()
             for i, (queue, executor) in enumerate(
                 zip(self.transfer_queues, self.executors)
             ):
@@ -252,12 +282,11 @@ class MooncakeKVManager(CommonKVManager):
                     ),
                     daemon=True,
                 ).start()
-            self.room_transfer_elapsed: dict[int, float] = {}
-            self.room_transfer_elapsed_lock = threading.Lock()
-            self._diag_slow_send_kvcache_s = envs.SGLANG_DIAG_SLOW_SEND_KVCACHE_S.get()
-            self._diag_slow_send_aux_s = envs.SGLANG_DIAG_SLOW_SEND_AUX_S.get()
-            self._diag_slow_queue_wait_s = envs.SGLANG_DIAG_SLOW_QUEUE_WAIT_S.get()
-            self._pd_trace = envs.SGLANG_PD_TRACE.get()
+            threading.Thread(
+                target=self._pending_commit_reaper,
+                daemon=True,
+            ).start()
+            self.start_prefill_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
@@ -509,7 +538,9 @@ class MooncakeKVManager(CommonKVManager):
         if not self.enable_staging or self.kv_buffer_tensors is None:
             return
 
-        room_infos = self.transfer_infos.get(room, {})
+        with self._transfer_infos_lock:
+            room_infos = self.transfer_infos.get(room, {})
+            room_infos_snapshot = dict(room_infos)
         needs_staging = any(
             not tinfo.is_dummy
             and self.decode_kv_args_table.get(tinfo.mooncake_session_id) is not None
@@ -526,7 +557,7 @@ class MooncakeKVManager(CommonKVManager):
 
         prefetch_staging_reqs(
             room,
-            self.transfer_infos,
+            {room: room_infos_snapshot},
             self.kv_buffer_tensors,
             self.server_args.chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
@@ -1210,13 +1241,112 @@ class MooncakeKVManager(CommonKVManager):
         self, remote: str, dst_port: int, room: int, status: int, prefill_rank: int
     ):
         na = NetworkAddress(remote, dst_port)
-        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
-            [
-                str(room).encode("ascii"),
-                str(status).encode("ascii"),
-                str(prefill_rank).encode("ascii"),
-            ]
+        with self._decode_send_lock:
+            self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+                [
+                    str(room).encode("ascii"),
+                    str(status).encode("ascii"),
+                    str(prefill_rank).encode("ascii"),
+                ]
+            )
+
+    def notify_prefill_scheduled(self, bootstrap_room: int):
+        if not self.two_phase_prealloc:
+            return
+        with self._decode_send_lock:
+            if bootstrap_room in self._sched_notified:
+                return
+            with self._transfer_infos_lock:
+                infos = self.transfer_infos.get(bootstrap_room)
+                infos = list(infos.values()) if infos is not None else None
+            if infos is None:
+                return
+            for info in infos:
+                if info.is_dummy:
+                    continue
+                na = NetworkAddress(info.endpoint, info.dst_port)
+                self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+                    [b"PREFILL_SCHED", str(bootstrap_room).encode("ascii")]
+                )
+            self._sched_notified.add(bootstrap_room)
+
+    def _clear_transfer_room(self, bootstrap_room: int):
+        with self._decode_send_lock:
+            with self._transfer_infos_lock:
+                self.transfer_infos.pop(bootstrap_room, None)
+            self._sched_notified.discard(bootstrap_room)
+        with self._pending_commit_lock:
+            self._pending_commit_chunks.pop(bootstrap_room, None)
+            self._pending_commit_start_ts.pop(bootstrap_room, None)
+
+    def get_pending_commit_rooms(self) -> set[int]:
+        with self._pending_commit_lock:
+            return set(self._pending_commit_chunks)
+
+    def pop_pending_commit_wait_samples(self) -> List[float]:
+        with self._pending_commit_lock:
+            samples = self._pending_commit_wait_samples
+            self._pending_commit_wait_samples = []
+            return samples
+
+    def _wake_pending_commit_chunks(self, bootstrap_room: int):
+        with self._pending_commit_lock:
+            pending_chunks = self._pending_commit_chunks.pop(bootstrap_room, [])
+            start_ts = self._pending_commit_start_ts.pop(bootstrap_room, None)
+            if start_ts is not None:
+                self._pending_commit_wait_samples.append(
+                    max(0.0, time.monotonic() - start_ts)
+                )
+            if (
+                bootstrap_room not in self.request_status
+                or self.check_status(bootstrap_room) in (KVPoll.Failed, KVPoll.Success)
+            ):
+                return
+        for kv_chunk in pending_chunks:
+            self.transfer_queues[kv_chunk.shard_idx].put(kv_chunk)
+
+    def _pending_commit_reaper(self):
+        timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
+        while True:
+            now = time.monotonic()
+            expired_rooms = []
+            with self._pending_commit_lock:
+                for room, chunks in self._pending_commit_chunks.items():
+                    if chunks and now - min(
+                        chunk.enqueue_ts for chunk in chunks
+                    ) > timeout:
+                        expired_rooms.append(room)
+
+            for room in expired_rooms:
+                with self._pending_commit_lock:
+                    chunks = self._pending_commit_chunks.pop(room, None)
+                    self._pending_commit_start_ts.pop(room, None)
+                if chunks is None:
+                    continue
+                self._fail_pending_commit_room(room)
+            time.sleep(_PENDING_COMMIT_REAPER_INTERVAL_S)
+
+    def _fail_pending_commit_room(self, bootstrap_room: int):
+        self.record_failure(
+            bootstrap_room,
+            "Timed out waiting for decode COMMIT after prefill scheduling",
         )
+        self.update_status(bootstrap_room, KVPoll.Failed)
+        local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
+        try:
+            with self._transfer_infos_lock:
+                infos = list(self.transfer_infos.get(bootstrap_room, {}).values())
+            for info in infos:
+                if not info.is_dummy:
+                    self.sync_status_to_decode_endpoint(
+                        info.endpoint,
+                        info.dst_port,
+                        bootstrap_room,
+                        KVPoll.Failed,
+                        local_rank,
+                    )
+        finally:
+            self._clear_transfer_room(bootstrap_room)
 
     def transfer_worker(
         self,
@@ -1250,7 +1380,26 @@ class MooncakeKVManager(CommonKVManager):
                         f"queue_wait={(t_chunk_start - kv_chunk.enqueue_ts):.3f}s "
                         f"qsize={len(queue._buf)}"
                     )
-                if kv_chunk.room not in self.transfer_infos:
+                with self._transfer_infos_lock:
+                    room_infos = self.transfer_infos.get(kv_chunk.room)
+                    reqs_to_be_processed = (
+                        list(room_infos.values()) if room_infos is not None else []
+                    )
+                    pending_commit = any(
+                        not req.is_dummy and req.dst_kv_indices is None
+                        for req in reqs_to_be_processed
+                    )
+                    if pending_commit:
+                        with self._pending_commit_lock:
+                            self._pending_commit_start_ts.setdefault(
+                                kv_chunk.room, time.monotonic()
+                            )
+                            self._pending_commit_chunks.setdefault(
+                                kv_chunk.room, []
+                            ).append(kv_chunk)
+                        continue
+
+                if room_infos is None:
                     logger.warning(
                         f"[PD-Trace] transfer_worker shard={_shard_idx} "
                         f"room={kv_chunk.room} dropped: room not in transfer_infos "
@@ -1263,11 +1412,6 @@ class MooncakeKVManager(CommonKVManager):
                     and staging_buffer is not None
                 ):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
-                reqs_to_be_processed = (
-                    self.transfer_infos[kv_chunk.room].values()
-                    if kv_chunk.room in self.transfer_infos
-                    else []
-                )
                 polls = []
                 dst_ranks_infos = []
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
@@ -1489,12 +1633,10 @@ class MooncakeKVManager(CommonKVManager):
                 if staging_deferred:
                     continue
 
-                if (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Success
-                ):
-                    if kv_chunk.room in self.transfer_infos:
-                        self.transfer_infos.pop(kv_chunk.room)
+                if kv_chunk.room not in self.request_status or self.check_status(
+                    kv_chunk.room
+                ) in (KVPoll.Success, KVPoll.Failed):
+                    self._clear_transfer_room(kv_chunk.room)
 
             except Exception as e:
                 # fail only this request; never kill the worker (a dead worker stalls all transfers -> 300s timeouts)
@@ -1504,12 +1646,19 @@ class MooncakeKVManager(CommonKVManager):
                     f"bootstrap_port={self.bootstrap_port}): {e}",
                     exc_info=True,
                 )
-                if failed_room is not None and failed_room in self.request_status:
-                    self.record_failure(failed_room, f"transfer_worker exception: {e}")
-                    self.update_status(failed_room, KVPoll.Failed)
+                if failed_room is not None:
+                    if failed_room in self.request_status:
+                        self.record_failure(
+                            failed_room, f"transfer_worker exception: {e}"
+                        )
+                        self.update_status(failed_room, KVPoll.Failed)
                     # notify decode so it fails fast instead of waiting its own timeout
                     local_rank = self.attn_tp_rank * self.pp_size + self.pp_rank
-                    for info in list(self.transfer_infos.get(failed_room, {}).values()):
+                    with self._transfer_infos_lock:
+                        infos = list(
+                            self.transfer_infos.get(failed_room, {}).values()
+                        )
+                    for info in infos:
                         if info.is_dummy:
                             continue
                         try:
@@ -1522,6 +1671,7 @@ class MooncakeKVManager(CommonKVManager):
                             )
                         except Exception:
                             pass
+                    self._clear_transfer_room(failed_room)
                 continue
 
     def start_prefill_thread(self):
@@ -1559,8 +1709,9 @@ class MooncakeKVManager(CommonKVManager):
                     stg_round = int(waiting_req_bytes[4].decode("ascii"))
                     stg_end = int(waiting_req_bytes[5].decode("ascii"))
                     stg_session = waiting_req_bytes[6].decode("ascii")
-                    room_infos = self.transfer_infos.get(stg_room, {})
-                    tinfo = room_infos.get(stg_session)
+                    with self._transfer_infos_lock:
+                        room_infos = self.transfer_infos.get(stg_room, {})
+                        tinfo = room_infos.get(stg_session)
                     if tinfo is not None:
                         if tinfo.staging is None:
                             tinfo.staging = StagingTransferInfo()
@@ -1574,6 +1725,20 @@ class MooncakeKVManager(CommonKVManager):
                             stg_chunk_idx,
                             stg_session,
                         )
+                    continue
+                if room == "RESERVE":
+                    room = int(waiting_req_bytes[1].decode("ascii"))
+                    session_id = waiting_req_bytes[4].decode("ascii")
+                    with self._transfer_infos_lock:
+                        room_infos = self.transfer_infos.setdefault(room, {})
+                        room_infos[session_id] = TransferInfo.from_reserve_msg(
+                            waiting_req_bytes
+                        )
+                        reserve_complete = len(room_infos) == int(
+                            waiting_req_bytes[6].decode("ascii")
+                        )
+                    if reserve_complete:
+                        self.update_status(room, KVPoll.WaitingForInput)
                     continue
                 mooncake_session_id = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
@@ -1592,14 +1757,25 @@ class MooncakeKVManager(CommonKVManager):
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
-
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
-                    )
-                    # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
+                    info = TransferInfo.from_zmq(waiting_req_bytes)
+                    with self._transfer_infos_lock:
+                        room_infos = self.transfer_infos.setdefault(room, {})
+                        pending = room_infos.get(mooncake_session_id)
+                        if pending is not None and pending.dst_kv_indices is None:
+                            pending.dst_kv_indices = info.dst_kv_indices
+                            pending.dst_aux_index = info.dst_aux_index
+                            pending.dst_state_indices = info.dst_state_indices
+                        else:
+                            room_infos[mooncake_session_id] = info
+                        # NOTE: after bootstrapping we can mark the req as waiting for input
+                        room_ready = len(room_infos) == required_dst_info_num
+                        commit_ready = all(
+                            req.is_dummy or req.dst_kv_indices is not None
+                            for req in room_infos.values()
+                        )
+                        if commit_ready:
+                            self._wake_pending_commit_chunks(room)
+                    if room_ready:
                         self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
@@ -1646,6 +1822,11 @@ class MooncakeKVManager(CommonKVManager):
                 # Staging: prefill pre-requests staging allocation before forward
                 if msg[0] == b"STAGING_REQ":
                     self._handle_staging_req(msg)
+                    continue
+                if msg[0] == b"PREFILL_SCHED":
+                    room = int(msg[1].decode("ascii"))
+                    if self.check_status(room) == KVPoll.Bootstrapping:
+                        self.update_status(room, KVPoll.WaitingForInput)
                     continue
 
                 bootstrap_room, status, prefill_rank = msg
@@ -1784,7 +1965,11 @@ class MooncakeKVManager(CommonKVManager):
             )
             return
 
-        if bootstrap_room not in self.transfer_infos:
+        with self._transfer_infos_lock:
+            room_infos = self.transfer_infos.get(bootstrap_room)
+            room_exists = room_infos is not None
+            dst_infos = list(room_infos.keys()) if room_exists else []
+        if not room_exists:
             # This means that the current rank is a dummy rank for this request,
             # and it has already been marked as success, so there is no need to
             # add further chunks into the transfer queue.
@@ -1793,7 +1978,6 @@ class MooncakeKVManager(CommonKVManager):
         # NOTE(shangming): sharding according to the dst_infos to make sure
         # requests with the same dst_sessions will be added into the same
         # queue, which enables early abort with failed sessions.
-        dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
         _enqueue_ts = time.monotonic()
@@ -1973,6 +2157,8 @@ class MooncakeKVReceiver(CommonKVReceiver):
     ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
+        self.reserve_time = None
+        self.bootstrap_infos = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
     def _register_kv_args(self):
@@ -2088,7 +2274,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self,
         prefill_dp_rank: int,
     ):
-        super().init(prefill_dp_rank)
+        return super().init(prefill_dp_rank)
 
     def send_metadata(
         self,
@@ -2161,6 +2347,36 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 return
         self.init_time = time.time()
 
+    def send_reserve(self):
+        if self.bootstrap_infos is None:
+            return
+        for bootstrap_info in self.bootstrap_infos:
+            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+            ip_address = bootstrap_info["rank_ip"]
+            port = bootstrap_info["rank_port"]
+            endpoint = NetworkAddress(ip_address, port).to_tcp()
+            count = self._send_with_failure_tracking(
+                sock,
+                lock,
+                endpoint,
+                [
+                    b"RESERVE",
+                    str(self.bootstrap_room).encode("ascii"),
+                    self.kv_mgr.local_ip.encode("ascii"),
+                    str(self.kv_mgr.rank_port).encode("ascii"),
+                    self.session_id.encode("ascii"),
+                    b"1" if bootstrap_info["is_dummy"] else b"0",
+                    str(self.required_dst_info_num).encode("ascii"),
+                ],
+            )
+            if count is not None:
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room, f"Reserve send timed out to {endpoint}"
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                return
+        self.reserve_time = time.time()
+
     def poll(self) -> KVPoll:
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
@@ -2181,6 +2397,16 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         )
                         self.conclude_state = KVPoll.Failed
                         return KVPoll.Failed
+            elif status == KVPoll.Bootstrapping and self.reserve_time is not None:
+                elapsed = time.time() - self.reserve_time
+                if elapsed >= self.kv_mgr.waiting_timeout:
+                    self.kv_mgr.record_failure(
+                        self.bootstrap_room,
+                        f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s waiting for PREFILL_SCHED after reserve",
+                    )
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    self.conclude_state = KVPoll.Failed
+                    return KVPoll.Failed
 
             return status
 

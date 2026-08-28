@@ -423,6 +423,16 @@ class SchedulerMetricsMixin:
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
         iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
 
+        if (
+            self.enable_metrics
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+            and self.server_args.disaggregation_two_phase_prealloc
+        ):
+            for wait_seconds in (
+                self.disagg_prefill_bootstrap_queue.kv_manager.pop_pending_commit_wait_samples()
+            ):
+                self.metrics_collector.observe_pd_commit_wait(wait_seconds)
+
         msg = (
             f"Prefill batch{iter_msg}, "
             f"#new-seq: {prefill_stats.num_new_seqs}, "
@@ -435,8 +445,23 @@ class SchedulerMetricsMixin:
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            msg += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
-            msg += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
+            inflight_queue = self.disagg_prefill_inflight_queue
+            inflight_req = len(inflight_queue)
+            if not self.server_args.disaggregation_two_phase_prealloc:
+                msg += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
+                msg += f"#inflight-req: {inflight_req}, "
+            else:
+                kv_manager = self.disagg_prefill_bootstrap_queue.kv_manager
+                pending_commit_rooms = kv_manager.get_pending_commit_rooms()
+                commit_wait = sum(
+                    req.bootstrap_room in pending_commit_rooms
+                    for req in inflight_queue
+                )
+                msg += (
+                    f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
+                    f"#inflight-req: {inflight_req} "
+                    f"(commit-wait={commit_wait}, transfer={inflight_req - commit_wait}), "
+                )
 
         if (
             self.server_args.language_only
@@ -750,8 +775,19 @@ class SchedulerMetricsMixin:
         cache_hit_rate = 0.0
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:
+            prealloc_queue = self.disagg_decode_prealloc_queue.queue
+            prealloc_req = len(prealloc_queue)
+            if self.server_args.disaggregation_two_phase_prealloc:
+                prefill_wait = sum(
+                    not decode_req.waiting_for_input for decode_req in prealloc_queue
+                )
+                msg += (
+                    f"#prealloc-req: {prealloc_req} "
+                    f"(P{prefill_wait}+D{prealloc_req - prefill_wait}), "
+                )
+            else:
+                msg += f"#prealloc-req: {prealloc_req}, "
             msg += f"pre-allocated usage: {self.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
-            msg += f"#prealloc-req: {len(self.disagg_decode_prealloc_queue.queue)}, "
             msg += f"#transfer-req: {len(self.disagg_decode_transfer_queue.queue)}, "
             msg += f"#retracted-req: {len(self.disagg_decode_prealloc_queue.retracted_queue)}, "
 

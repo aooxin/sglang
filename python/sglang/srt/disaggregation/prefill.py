@@ -394,6 +394,16 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
+    def maybe_notify_prefill_scheduled(self: Scheduler, batch: ScheduleBatch) -> None:
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        notify = getattr(kv_mgr, "notify_prefill_scheduled", None)
+        if notify is None:
+            return
+        for req in batch.reqs:
+            room = getattr(req, "bootstrap_room", None)
+            if room is not None:
+                notify(room)
+
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
@@ -441,6 +451,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Launch the current batch
             if batch:
+                self.maybe_notify_prefill_scheduled(batch)
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
                 result = self.run_batch(batch)
@@ -507,6 +518,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # ── 5. GPU forward (bg thread runs concurrently) ──
                 batch_result = None
                 if batch:
+                    self.maybe_notify_prefill_scheduled(batch)
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(batch)
                     run_batch_start_time = time.perf_counter()

@@ -100,6 +100,7 @@ class CommonKVManager(BaseKVManager):
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
         self.enable_pd_direct2host = server_args.enable_pd_direct2host
+        self.two_phase_prealloc = server_args.disaggregation_two_phase_prealloc
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -582,7 +583,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
-    def init(self, prefill_dp_rank: int):
+    def init(self, prefill_dp_rank: int) -> bool:
         if self.bootstrap_addr not in self.kv_mgr.prefill_info_table:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
@@ -590,7 +591,7 @@ class CommonKVReceiver(BaseKVReceiver):
             )
             self.conclude_state = KVPoll.Failed
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-            return
+            return False
 
         # Read pre-computed rank mapping from prefill_info (computed in try_ensure_parallel_info)
         self.prefill_info = self.kv_mgr.prefill_info_table[self.bootstrap_addr]
@@ -615,7 +616,9 @@ class CommonKVReceiver(BaseKVReceiver):
 
         self.prefill_dp_rank = prefill_dp_rank
         self._setup_bootstrap_infos()
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+        if not self.kv_mgr.two_phase_prealloc:
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
+        return True
 
     def _setup_bootstrap_infos(self):
         all_bootstrap_infos = []

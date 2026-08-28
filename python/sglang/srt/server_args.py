@@ -737,6 +737,7 @@ class ServerArgs:
     # PD direct-to-host: P writes KV directly into pinned host memory on D,
     # then D pulls H2D asynchronously. Decode-only.
     enable_pd_direct2host: bool = False
+    disaggregation_two_phase_prealloc: bool = False
     pd_direct2host_host_size: Optional[int] = None  # GB
     pd_direct2host_host_ratio: float = 2.0
 
@@ -3788,6 +3789,11 @@ class ServerArgs:
                     "in the current implementation; promote-to-L2 is a follow-up."
                 )
 
+        if self.disaggregation_two_phase_prealloc and self.disaggregation_transfer_backend != "mooncake":
+            raise ValueError(
+                "--disaggregation-two-phase-prealloc requires the mooncake transfer backend."
+            )
+
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
@@ -6324,6 +6330,11 @@ class ServerArgs:
             help="Decode-only. Let prefill RDMA-write KV directly into pinned "
             "host memory on decode, then async H2D when forward needs it. "
             "Compresses device KV occupancy window.",
+        )
+        parser.add_argument(
+            "--disaggregation-two-phase-prealloc",
+            action="store_true",
+            help="Enable two-phase Mooncake KV preallocation handshake.",
         )
         parser.add_argument(
             "--pd-direct2host-host-size",

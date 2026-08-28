@@ -42,6 +42,8 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
+_MM_CONTEXT_TTL_S = envs.SGLANG_MM_CONTEXT_FORWARD_TIMEOUT.get()
+
 
 @dataclasses.dataclass
 class PrefillServerInfo:
@@ -835,6 +837,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             envs.SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL.get()
         )
 
+        self.mm_context_futures: Dict[
+            str, Tuple[asyncio.Future, asyncio.TimerHandle]
+        ] = {}
+
         # Start bootstrap server
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.run()
@@ -861,6 +867,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
         self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
         self.app.router.add_get("/health", self._handle_health_check)
+        self.app.router.add_put("/mm_context/{room}", self._handle_mm_context_put)
+        self.app.router.add_get("/mm_context/{room}", self._handle_mm_context_get)
 
     async def _handle_health_check(self, request):
         return web.json_response({"instance_epoch": self.instance_epoch}, status=200)
@@ -1046,6 +1054,59 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 logger.debug(
                     f"Cleaned up {len(expired_keys)} expired entries from room_to_dp_rank"
                 )
+
+    def _mm_expire(self, room: str, fut: asyncio.Future) -> None:
+        entry = self.mm_context_futures.get(room)
+        if entry is not None and entry[0] is fut:
+            del self.mm_context_futures[room]
+        if not fut.done():
+            fut.cancel()
+
+    def _mm_discard(self, room: str, fut: asyncio.Future) -> None:
+        entry = self.mm_context_futures.get(room)
+        if entry is not None and entry[0] is fut:
+            del self.mm_context_futures[room]
+            entry[1].cancel()
+
+    def _mm_arm(self, room: str) -> asyncio.Future:
+        fut = self._loop.create_future()
+        handle = self._loop.call_later(_MM_CONTEXT_TTL_S, self._mm_expire, room, fut)
+        self.mm_context_futures[room] = (fut, handle)
+        return fut
+
+    async def _handle_mm_context_put(self, request: web.Request):
+        room = request.match_info["room"]
+        payload = await request.read()
+        async with self.lock:
+            entry = self.mm_context_futures.get(room)
+            if entry is None:
+                self._mm_arm(room).set_result(payload)
+            else:
+                fut, _ = entry
+                if not fut.done():
+                    fut.set_result(payload)
+        return web.Response(status=200)
+
+    async def _handle_mm_context_get(self, request: web.Request):
+        room = request.match_info["room"]
+
+        async with self.lock:
+            entry = self.mm_context_futures.get(room)
+            if entry is None:
+                fut = self._mm_arm(room)
+            else:
+                fut, _ = entry
+
+        try:
+            payload = await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            async with self.lock:
+                self._mm_discard(room, fut)
+            return web.Response(status=204)
+
+        async with self.lock:
+            self._mm_discard(room, fut)
+        return web.Response(body=payload, status=200)
 
     def _run_server(self):
         try:

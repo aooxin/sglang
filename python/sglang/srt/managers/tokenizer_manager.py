@@ -31,6 +31,7 @@ from enum import Enum
 from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
+import aiohttp
 import fastapi
 import pybase64
 import uvloop
@@ -127,6 +128,8 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
+_MM_CONTEXT_FETCH_TIMEOUT_S = envs.SGLANG_MM_CONTEXT_FORWARD_TIMEOUT.get()
+_MM_CONTEXT_FORWARD_FALLBACK = envs.SGLANG_MM_CONTEXT_FORWARD_FALLBACK.get()
 
 logger = logging.getLogger(__name__)
 
@@ -423,6 +426,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 dtype=self.model_config.dtype,
                 hf_config=self.model_config.hf_config,
             )
+
+        self._enable_mm_context_forward = self.server_args.enable_mm_context_forward
+        self._mm_context_session: Optional[aiohttp.ClientSession] = None
+        self._mm_context_tasks: set = set()
 
     def init_metric_collector_watchdog(self):
         # Metrics
@@ -757,8 +764,29 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 )
 
             mm_inputs = None
+            mm_context_hit = False
 
             if (
+                self._enable_mm_context_forward
+                and self.disaggregation_mode == DisaggregationMode.DECODE
+                and obj.bootstrap_host is not None
+                and obj.bootstrap_room is not None
+            ):
+                expanded_len = await self._fetch_mm_context(obj)
+                if expanded_len:
+                    input_ids = [0] * expanded_len
+                    mm_context_hit = True
+                    logger.debug(
+                        f"mm_context hit for rid={obj.rid}, expanded_len={expanded_len}"
+                    )
+                if not mm_context_hit and not _MM_CONTEXT_FORWARD_FALLBACK:
+                    raise ValueError(
+                        f"mm_context forward miss for rid={obj.rid}, "
+                        f"room={obj.bootstrap_room}: no payload within the wait "
+                        f"window and local fallback is disabled."
+                    )
+
+            if not mm_context_hit and (
                 not self.server_args.language_only
                 or self.server_args.encoder_transfer_backend
                 in ["zmq_to_tokenizer", "mooncake"]
@@ -810,6 +838,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 self.server_args.language_only
                 and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
                 and not obj.need_wait_for_mm_inputs
+                and not mm_context_hit
             ):
                 # In language_only mode with zmq_to_scheduler, if we didn't dispatch
                 # to encoder (e.g., only one image), process locally like non-language_only mode
@@ -823,6 +852,16 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
 
             if mm_inputs and mm_inputs.input_ids is not None:
                 input_ids = mm_inputs.input_ids
+            if (
+                self._enable_mm_context_forward
+                and self.disaggregation_mode == DisaggregationMode.PREFILL
+                and obj.bootstrap_host is not None
+                and obj.bootstrap_room is not None
+                and mm_inputs is not None
+            ):
+                task = asyncio.create_task(self._push_mm_context(obj, len(input_ids)))
+                self._mm_context_tasks.add(task)
+                task.add_done_callback(self._mm_context_tasks.discard)
             if mm_inputs and mm_inputs.token_type_ids is not None:
                 token_type_ids = mm_inputs.token_type_ids
                 if not isinstance(token_type_ids, list):
@@ -842,6 +881,56 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         return self._create_tokenized_object(
             obj, input_text, input_ids, input_embeds, mm_inputs, token_type_ids
         )
+
+    def _get_mm_context_session(self) -> aiohttp.ClientSession:
+        if self._mm_context_session is None or self._mm_context_session.closed:
+            self._mm_context_session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=0)
+            )
+        return self._mm_context_session
+
+    def _mm_context_url(self, obj) -> str:
+        port = obj.bootstrap_port
+        if port is None:
+            port = self.server_args.disaggregation_bootstrap_port
+        return f"http://{obj.bootstrap_host}:{port}/mm_context/{obj.bootstrap_room}"
+
+    async def _push_mm_context(self, obj, expanded_len):
+        try:
+            payload = str(int(expanded_len)).encode()
+            timeout = aiohttp.ClientTimeout(total=2.0)
+            session = self._get_mm_context_session()
+            async with session.put(
+                self._mm_context_url(obj), data=payload, timeout=timeout
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(
+                        f"mm_context PUT status={resp.status} "
+                        f"room={obj.bootstrap_room}"
+                    )
+        except Exception as e:
+            logger.warning(
+                f"mm_context push failed room={getattr(obj, 'bootstrap_room', '?')}: "
+                f"{type(e).__name__}: {e}"
+            )
+
+    async def _fetch_mm_context(self, obj):
+        timeout = aiohttp.ClientTimeout(total=_MM_CONTEXT_FETCH_TIMEOUT_S + 5.0)
+        try:
+            session = self._get_mm_context_session()
+            async with session.get(self._mm_context_url(obj), timeout=timeout) as resp:
+                if resp.status == 200:
+                    try:
+                        return int(await resp.text())
+                    except (ValueError, TypeError):
+                        return None
+                return None
+        except Exception as e:
+            logger.warning(
+                f"mm_context fetch failed room={getattr(obj, 'bootstrap_room', '?')}: "
+                f"{type(e).__name__}: {e}"
+            )
+            return None
 
     def _validate_rid_not_in_flight(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

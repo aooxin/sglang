@@ -732,6 +732,7 @@ class ServerArgs:
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
     disaggregation_bootstrap_send_max_failures: int = 3
+    enable_mm_context_forward: bool = False
 
     # PD direct-to-host: P writes KV directly into pinned host memory on D,
     # then D pulls H2D asynchronously. Decode-only.
@@ -6309,6 +6310,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_bootstrap_send_max_failures,
             help="Max consecutive bootstrap PUSH send failures to a prefill endpoint before evicting its cached socket. Default is 3.",
+        )
+        parser.add_argument(
+            "--enable-mm-context-forward",
+            action="store_true",
+            help="Forward the multimodal-expanded input_ids length from Prefill to "
+            "Decode via the bootstrap server, letting Decode skip its redundant "
+            "multimodal download/preprocess.",
         )
         parser.add_argument(
             "--enable-pd-direct2host",

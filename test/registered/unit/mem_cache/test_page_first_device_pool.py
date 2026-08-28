@@ -86,6 +86,15 @@ class TestPageFirstDevicePool(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "descriptor protocol"):
             pool.get_contiguous_buf_infos()
 
+    def test_page_level_disaggregation_descriptors(self):
+        pool = make_pool(MHAPageFirstTokenToKVPool, v_head_dim=V_HEAD_DIM)
+        ptrs, lens, item_lens = pool.get_page_level_buf_infos()
+        self.assertEqual(len(ptrs), 2)
+        self.assertEqual(len(lens), 2)
+        self.assertEqual(len(item_lens), 2)
+        self.assertEqual(item_lens[0], PAGE_SIZE * LAYER_NUM * HEAD_NUM * HEAD_DIM * 4)
+        self.assertEqual(item_lens[1], PAGE_SIZE * LAYER_NUM * HEAD_NUM * V_HEAD_DIM * 4)
+
 
 if __name__ == "__main__":
     unittest.main()

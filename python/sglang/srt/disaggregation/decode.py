@@ -48,6 +48,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    get_kv_transfer_buf_infos,
     is_mla_backend,
     kv_to_page_indices,
     poll_and_all_reduce,
@@ -1006,14 +1007,22 @@ class DecodePreallocQueue:
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 host_pool.get_contiguous_buf_infos()
             )
+            kv_transfer_layout = "layer_first"
         else:
-            kv_data_ptrs, kv_data_lens, kv_item_lens = (
-                self.token_to_kv_pool.get_contiguous_buf_infos()
+            kv_data_ptrs, kv_data_lens, kv_item_lens, kv_transfer_layout = (
+                get_kv_transfer_buf_infos(self.token_to_kv_pool)
             )
         if len(self.draft_token_to_kv_pool_list):
             for draft_kv_pool in self.draft_token_to_kv_pool_list:
-                draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                    draft_kv_pool.get_contiguous_buf_infos()
+                (
+                    draft_kv_data_ptrs,
+                    draft_kv_data_lens,
+                    draft_kv_item_lens,
+                    draft_kv_layout,
+                ) = get_kv_transfer_buf_infos(draft_kv_pool)
+                assert draft_kv_layout == kv_transfer_layout, (
+                    f"draft KV layout ({draft_kv_layout}) must match "
+                    f"target KV layout ({kv_transfer_layout})"
                 )
                 kv_data_ptrs += draft_kv_data_ptrs
                 kv_data_lens += draft_kv_data_lens
@@ -1021,8 +1030,15 @@ class DecodePreallocQueue:
         elif self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
-            draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+            (
+                draft_kv_data_ptrs,
+                draft_kv_data_lens,
+                draft_kv_item_lens,
+                draft_kv_layout,
+            ) = get_kv_transfer_buf_infos(self.draft_token_to_kv_pool)
+            assert draft_kv_layout == kv_transfer_layout, (
+                f"draft KV layout ({draft_kv_layout}) must match "
+                f"target KV layout ({kv_transfer_layout})"
             )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
@@ -1031,6 +1047,7 @@ class DecodePreallocQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_transfer_layout = kv_transfer_layout
         # HiSparse Host pool has page_size=1; use it when hisparse is enabled
         kv_args.page_size = (
             1 if self.scheduler.enable_hisparse else self.token_to_kv_pool.page_size

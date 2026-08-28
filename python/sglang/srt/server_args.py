@@ -4044,11 +4044,17 @@ class ServerArgs:
                 raise ValueError(
                     "--enable-page-first-kv-layout currently supports MHA only"
                 )
-            if self.disaggregation_mode != "null":
-                raise ValueError(
-                    "--enable-page-first-kv-layout is not yet supported by PD "
-                    "disaggregation"
-                )
+            if self.disaggregation_mode in ("decode", "prefill"):
+                if self.disaggregation_transfer_backend != "mooncake":
+                    raise ValueError(
+                        "--enable-page-first-kv-layout with disaggregation "
+                        "requires mooncake transfer backend"
+                    )
+                if self.pp_size != 1:
+                    raise ValueError(
+                        "--enable-page-first-kv-layout with disaggregation "
+                        "does not support pipeline parallelism"
+                    )
             if self.enable_hierarchical_cache:
                 if self.hicache_mem_layout != "page_first":
                     raise ValueError(

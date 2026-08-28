@@ -1181,6 +1181,35 @@ class MHAPageFirstTokenToKVPool(MHATokenToKVPool):
             self._v_raw.flatten(0, 1),
         )
 
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "page-first KV layout uses the page-level descriptor protocol"
+        )
+
+    def get_page_level_buf_infos(self):
+        k_buffer, v_buffer = self.get_page_first_raw_buffers()
+        if k_buffer.nbytes == 0 or v_buffer.nbytes == 0:
+            return [], [], []
+        k_page_bytes = (
+            self.page_size
+            * self.layer_num
+            * self.head_num
+            * self.head_dim
+            * self.store_dtype.itemsize
+        )
+        v_page_bytes = (
+            self.page_size
+            * self.layer_num
+            * self.head_num
+            * self.v_head_dim
+            * self.store_dtype.itemsize
+        )
+        return (
+            [k_buffer.data_ptr(), v_buffer.data_ptr()],
+            [k_buffer.nbytes, v_buffer.nbytes],
+            [k_page_bytes, v_page_bytes],
+        )
+
     def _get_key_buffer(self, layer_id: int):
         # attention reshapes with .view(-1, page_size, head, dim); the 4D buffer is
         # already exactly that shape so the view is a zero-copy no-op.

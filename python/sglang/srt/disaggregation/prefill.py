@@ -37,6 +37,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_kv_class,
+    get_kv_transfer_buf_infos,
     is_mla_backend,
     kv_to_page_indices,
     kv_to_page_num,
@@ -140,14 +141,21 @@ class PrefillBootstrapQueue:
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
-        kv_data_ptrs, kv_data_lens, kv_item_lens = (
-            self.token_to_kv_pool.get_contiguous_buf_infos()
+        kv_data_ptrs, kv_data_lens, kv_item_lens, kv_transfer_layout = (
+            get_kv_transfer_buf_infos(self.token_to_kv_pool)
         )
 
         if len(self.draft_token_to_kv_pool_list):
             for draft_kv_pool in self.draft_token_to_kv_pool_list:
-                draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                    draft_kv_pool.get_contiguous_buf_infos()
+                (
+                    draft_kv_data_ptrs,
+                    draft_kv_data_lens,
+                    draft_kv_item_lens,
+                    draft_kv_layout,
+                ) = get_kv_transfer_buf_infos(draft_kv_pool)
+                assert draft_kv_layout == kv_transfer_layout, (
+                    f"draft KV layout ({draft_kv_layout}) must match "
+                    f"target KV layout ({kv_transfer_layout})"
                 )
                 kv_data_ptrs += draft_kv_data_ptrs
                 kv_data_lens += draft_kv_data_lens
@@ -155,8 +163,15 @@ class PrefillBootstrapQueue:
         elif self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
-            draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
-                self.draft_token_to_kv_pool.get_contiguous_buf_infos()
+            (
+                draft_kv_data_ptrs,
+                draft_kv_data_lens,
+                draft_kv_item_lens,
+                draft_kv_layout,
+            ) = get_kv_transfer_buf_infos(self.draft_token_to_kv_pool)
+            assert draft_kv_layout == kv_transfer_layout, (
+                f"draft KV layout ({draft_kv_layout}) must match "
+                f"target KV layout ({kv_transfer_layout})"
             )
             kv_data_ptrs += draft_kv_data_ptrs
             kv_data_lens += draft_kv_data_lens
@@ -165,6 +180,7 @@ class PrefillBootstrapQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        kv_args.kv_transfer_layout = kv_transfer_layout
         if not self.is_mla_backend:
             kv_args.kv_head_num = self.token_to_kv_pool.head_num
             kv_args.total_kv_head_num = (

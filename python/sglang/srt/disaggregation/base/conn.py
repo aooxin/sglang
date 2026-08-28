@@ -37,6 +37,7 @@ class KVArgs:
     kv_head_num: int
     total_kv_head_num: int
     page_size: int
+    kv_transfer_layout: str = "layer_first"
     # for pp prefill
     pp_rank: int
     prefill_start_layer: int

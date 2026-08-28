@@ -492,6 +492,13 @@ def get_kv_class(
 #########################
 
 
+def get_kv_transfer_buf_infos(kv_pool):
+    layout = getattr(kv_pool, "kv_transfer_layout", "layer_first")
+    if layout == "page_first":
+        return (*kv_pool.get_page_level_buf_infos(), layout)
+    return (*kv_pool.get_contiguous_buf_infos(), layout)
+
+
 def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
     # 1. The page is guaranteed to be full except the last page.
     # 2. page index = kv_index // page_size

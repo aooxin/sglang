@@ -157,6 +157,7 @@ class KVArgsRegisterInfo:
     # HiSparse: decode host pool stores KV at token granularity
     enable_hisparse: bool = False
     enable_pd_direct2host: bool = False
+    dst_kv_layout: str = "layer_first"
     # staging is logically optional (None when disabled) but ALWAYS occupies
     # two message frames; the sender emits empty frames when disabled, so frame
     # positions never shift.
@@ -167,6 +168,11 @@ class KVArgsRegisterInfo:
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        has_layout = len(msg) > 14 and msg[14] in (
+            b"layer_first",
+            b"page_first",
+        )
+        staging_index = 15 if has_layout else 14
         return cls(
             room=str(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -194,14 +200,17 @@ class KVArgsRegisterInfo:
             enable_pd_direct2host=(
                 msg[13].decode("ascii") == "1" if len(msg) > 13 else False
             ),
-            # staging reads msg[14], msg[15] (from_zmq_fields offset=14); both
+            dst_kv_layout=(
+                msg[14].decode("ascii") if has_layout else "layer_first"
+            ),
+            # staging reads msg[15], msg[16] (from_zmq_fields offset=15); both
             # are empty frames when disabled, so positions do NOT shift.
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
-            # DFLASH two-window: draft swa state buffer ptrs occupy msg[16],
-            # right after the two staging frames (see _register_kv_args order).
+            staging=StagingRegisterInfo.from_zmq_fields(msg, staging_index),
+            # DFLASH two-window: draft swa state buffer ptrs occupy msg[17],
+            # right after the layout and two staging frames.
             dst_draft_state_data_ptrs=(
-                list(struct.unpack(f"{len(msg[16])//8}Q", msg[16]))
-                if len(msg) > 16 and len(msg[16]) > 0
+                list(struct.unpack(f"{len(msg[17])//8}Q", msg[17]))
+                if len(msg) > 17 and len(msg[17]) > 0
                 else []
             ),
         )
@@ -755,6 +764,7 @@ class MooncakeKVManager(CommonKVManager):
         prefill_data_indices: npt.NDArray[np.int32],
         dst_data_indices: npt.NDArray[np.int32],
         executor: concurrent.futures.ThreadPoolExecutor,
+        layout: str = "layer_first",
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -767,8 +777,18 @@ class MooncakeKVManager(CommonKVManager):
 
         layers_params = None
 
+        # Page-first descriptors represent one whole page in each raw K/V buffer.
+        if layout == "page_first":
+            if len(src_data_ptrs) != len(dst_data_ptrs) or len(src_data_ptrs) != len(item_lens):
+                logger.error(
+                    "page-first KV descriptor count mismatch: "
+                    f"src={len(src_data_ptrs)} dst={len(dst_data_ptrs)} "
+                    f"item_lens={len(item_lens)}"
+                )
+                return -1
+            layers_params = list(zip(src_data_ptrs, dst_data_ptrs, item_lens))
         # Decode pp size should be equal to prefill pp size or 1
-        if self.is_mla_backend:
+        elif self.is_mla_backend:
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
@@ -872,6 +892,7 @@ class MooncakeKVManager(CommonKVManager):
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
+            layout=getattr(self.kv_args, "kv_transfer_layout", "layer_first"),
         )
 
     def send_kvcache_hisparse(
@@ -1597,6 +1618,45 @@ class MooncakeKVManager(CommonKVManager):
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
                         _t_send_start = time.monotonic()
+                        src_kv_layout = getattr(
+                            self.kv_args, "kv_transfer_layout", "layer_first"
+                        )
+                        if src_kv_layout != target_rank_registration_info.dst_kv_layout:
+                            self.record_failure(
+                                kv_chunk.room,
+                                f"KV layout mismatch: prefill={src_kv_layout} "
+                                f"decode={target_rank_registration_info.dst_kv_layout}",
+                            )
+                            self.update_status(kv_chunk.room, KVPoll.Failed)
+                            self.sync_status_to_decode_endpoint(
+                                req.endpoint,
+                                req.dst_port,
+                                req.room,
+                                KVPoll.Failed,
+                                prefill_unique_rank,
+                            )
+                            break
+                        if src_kv_layout == "page_first" and (
+                            target_rank_registration_info.enable_hisparse
+                            or self.attn_tp_size
+                            != target_rank_registration_info.dst_attn_tp_size
+                            or self.kv_args.kv_item_lens[0]
+                            != target_rank_registration_info.dst_kv_item_len
+                        ):
+                            self.record_failure(
+                                kv_chunk.room,
+                                "page-first KV transfer requires matching page "
+                                "geometry and attention TP size",
+                            )
+                            self.update_status(kv_chunk.room, KVPoll.Failed)
+                            self.sync_status_to_decode_endpoint(
+                                req.endpoint,
+                                req.dst_port,
+                                req.room,
+                                KVPoll.Failed,
+                                prefill_unique_rank,
+                            )
+                            break
                         if self.is_mla_backend or (
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
@@ -2442,6 +2502,11 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     packed_state_dim_per_tensor,
                     enable_hisparse,
                     enable_pd_direct2host,
+                    getattr(
+                        self.kv_mgr.kv_args,
+                        "kv_transfer_layout",
+                        "layer_first",
+                    ).encode("ascii"),
                     packed_staging_base_ptr,
                     staging_total_size_str,
                     packed_draft_state_data_ptrs,

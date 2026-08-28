@@ -131,7 +131,16 @@ class SWAKVPool(KVCache):
             full_kv_item_lens,
         )
 
+    @property
+    def kv_transfer_layout(self) -> str:
+        return self.full_kv_pool.kv_transfer_layout
+
+    def get_page_level_buf_infos(self):
+        return self.full_kv_pool.get_page_level_buf_infos()
+
     def get_state_buf_infos(self):
+        if self.swa_kv_pool.kv_transfer_layout == "page_first":
+            return self.swa_kv_pool.get_page_level_buf_infos()
         swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens = (
             self.swa_kv_pool.get_contiguous_buf_infos()
         )

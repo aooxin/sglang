@@ -194,8 +194,22 @@ class MoEGate(nn.Module):
         is_nextn: bool = False,
     ):
         super().__init__()
+        # Local import: the module-level `envs` import in this file was
+        # introduced by the disagg stress-test bench commit (SGLANG_FAKE_TOPK_IDS)
+        # and disappears when that commit is reverted; keep this feature
+        # self-contained.
+        from sglang.srt.environ import envs
+
         self.is_nextn = is_nextn
-        self.dtype = torch.float32
+        # Gate (router) precision: fp32 by default. With
+        # SGLANG_MIMO_V2_BF16_MOE_GATE=1, store the gate weight in bf16 and run
+        # the gate GEMM in bf16 with the fp32 accumulator written out directly
+        # (torch.mm out_dtype); router logits are always fp32.
+        self.dtype = (
+            torch.bfloat16
+            if envs.SGLANG_MIMO_V2_BF16_MOE_GATE.get()
+            else torch.float32
+        )
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
         )
@@ -205,7 +219,11 @@ class MoEGate(nn.Module):
                 if quant_config is not None
                 and quant_config.get_name() == "modelopt_fp4"
                 and get_moe_runner_backend().is_flashinfer_trtllm()
-                else self.dtype
+                # Keep the correction bias in fp32 regardless of the gate dtype:
+                # the fused top-k kernels (e.g. mimo_pro_moe_fused_gate) consume
+                # the bias without casting and expect fp32. A bf16 checkpoint
+                # bias is losslessly upcast by the weight loader's `copy_`.
+                else torch.float32
             )
             self.e_score_correction_bias = nn.Parameter(
                 torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
@@ -214,9 +232,19 @@ class MoEGate(nn.Module):
             self.e_score_correction_bias = None
 
     def forward(self, hidden_states, forward_batch=None):
-        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        if self.dtype != torch.float32 and hidden_states.is_cuda:
+            # bf16 gate GEMM with fp32 output: out_dtype makes cuBLAS store the
+            # fp32 accumulator directly, avoiding an intermediate bf16 rounding
+            # of the logits (torch.mm out_dtype requires CUDA + fp16/bf16 in,
+            # fp32 out; available since torch 2.8).
+            return torch.mm(
+                hidden_states.to(self.dtype),
+                self.weight.t(),
+                out_dtype=torch.float32,
+            )
 
-        return logits
+        logits = F.linear(hidden_states.to(self.dtype), self.weight, None)
+        return logits.to(torch.float32)
 
 
 class MiMoV2MoE(nn.Module):

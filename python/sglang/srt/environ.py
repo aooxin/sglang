@@ -528,6 +528,12 @@ class Envs:
     # output will not be truncated even found repetition in output.
     SGLANG_MIMO_NGRAM_NO_REPEAT_PROCESSOR_DEBUG_SKIP_TRUNCATION = EnvBool(False)
 
+    # MiMo-V2 MoE gate (router) precision. When enabled, the gate weight is stored
+    # in bfloat16 and the gate GEMM runs in bfloat16 with fp32 output written
+    # directly from the fp32 accumulator (torch.mm out_dtype), matching
+    # checkpoints that ship a bf16 gate. Default keeps fp32 storage + compute.
+    SGLANG_MIMO_V2_BF16_MOE_GATE = EnvBool(False)
+
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
 

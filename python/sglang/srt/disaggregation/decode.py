@@ -368,22 +368,19 @@ class PDD2HFusedPoller:
             world_size,
             int(KVPoll.Bootstrapping),
         )
-        transfer_polls = self._consensus_transfer_polls_by_room(
+        (
+            transfer_polls,
+            h2d_candidate_room,
+            candidate_entries_by_rank,
+        ) = self._summarize_transfer_entries(
             gathered_entries[:, max_p:],
             counts_t,
             world_size,
         )
-        h2d_candidate_room = self._common_room_with_state(
-            gathered_entries[:, max_p:],
-            counts_t,
-            world_size,
-            PDD2HState.HOST_READY.value,
-        )
-        h2d_admit = self._h2d_admit_from_snapshot(
+        h2d_admit = self._h2d_admit_from_summary(
             h2d_candidate_room,
             gathered_headers,
-            gathered_entries[:, max_p:],
-            counts_t,
+            candidate_entries_by_rank,
         )
         return prealloc_polls, transfer_polls, h2d_candidate_room, h2d_admit
 
@@ -399,13 +396,15 @@ class PDD2HFusedPoller:
         A room reaches a non-fallback status only when every rank reported it;
         Failed wins immediately; otherwise the min status across ranks is used.
         """
+        entries_array = gathered_entries.numpy()
         present_counts: Dict[int, int] = {}
         min_status_by_room: Dict[int, int] = {}
-        for entries, count in zip(gathered_entries, counts):
+        for rank, count in enumerate(counts):
             seen_rooms = set()
-            for i in range(count):
-                room = int(entries[i, 0].item())
-                poll = int(entries[i, 1].item())
+            for entry in entries_array[rank, :count]:
+                room_value, poll_value, *_ = entry
+                room = int(room_value)
+                poll = int(poll_value)
                 if room in seen_rooms:
                     min_status_by_room[room] = min(
                         min_status_by_room.get(room, poll), poll
@@ -428,116 +427,136 @@ class PDD2HFusedPoller:
         return polls_by_room
 
     @staticmethod
-    def _common_room_with_state(
+    def _summarize_transfer_entries(
         gathered_entries: torch.Tensor,
         counts: List[int],
         world_size: int,
-        required_state: int,
-    ) -> Optional[int]:
-        """Return the smallest room reported in the required state by every rank."""
-        states_by_room: Dict[int, Dict[int, int]] = {}
-        for rank, (entries, count) in enumerate(zip(gathered_entries, counts)):
-            for i in range(count):
-                room = int(entries[i, 0].item())
-                state = int(entries[i, 2].item())
-                states_by_room.setdefault(room, {})[rank] = state
+    ) -> Tuple[Dict[int, int], Optional[int], Dict[int, Tuple[int, int]]]:
+        entries_array = gathered_entries.numpy()
+        present_counts: Dict[int, int] = {}
+        min_status_by_room: Dict[int, int] = {}
+        last_entries_by_room: Dict[int, Dict[int, Tuple[int, int, int]]] = {}
+        first_entries_by_room: Dict[int, Dict[int, Tuple[int, int]]] = {}
 
-        common_rooms = [
-            room
-            for room, rank_states in states_by_room.items()
-            if len(rank_states) == world_size
-            and all(state == required_state for state in rank_states.values())
-        ]
-        return min(common_rooms) if common_rooms else None
+        for rank, count in enumerate(counts):
+            rank_rooms = set()
+            rank_entries = entries_array[rank, :count]
+            for entry in rank_entries:
+                (
+                    room_value,
+                    poll_value,
+                    state_value,
+                    metadata_room_value,
+                    need_full_value,
+                    need_swa_value,
+                ) = entry
+                room = int(room_value)
+                poll = int(poll_value)
+                state = int(state_value)
+                metadata_room = int(metadata_room_value)
 
-    @classmethod
-    def _consensus_transfer_polls_by_room(
-        cls,
-        gathered_entries: torch.Tensor,
-        counts: List[int],
-        world_size: int,
-    ) -> Dict[int, int]:
-        polls_by_room = cls._consensus_polls_by_room(
-            gathered_entries,
-            counts,
-            world_size,
-            int(KVPoll.Transferring),
-        )
-        entries_by_room: Dict[int, Dict[int, Tuple[int, int, int]]] = {}
-        for rank, (entries, count) in enumerate(zip(gathered_entries, counts)):
-            for i in range(count):
-                room = int(entries[i, 0].item())
-                entries_by_room.setdefault(room, {})[rank] = (
-                    int(entries[i, 1].item()),
-                    int(entries[i, 2].item()),
-                    int(entries[i, 3].item()),
+                if room not in rank_rooms:
+                    rank_rooms.add(room)
+                    present_counts[room] = present_counts.get(room, 0) + 1
+                    first_entries_by_room.setdefault(room, {})[rank] = (
+                        int(need_full_value),
+                        int(need_swa_value),
+                    )
+
+                min_status_by_room[room] = min(
+                    min_status_by_room.get(room, poll), poll
+                )
+                last_entries_by_room.setdefault(room, {})[rank] = (
+                    poll,
+                    state,
+                    metadata_room,
                 )
 
-        for room, poll in list(polls_by_room.items()):
-            if poll != KVPoll.Success:
-                continue
-            rank_entries = entries_by_room.get(room, {})
-            if len(rank_entries) != world_size:
-                polls_by_room[room] = int(KVPoll.Transferring)
-                continue
-            if all(
-                state == PDD2HState.WAIT_PREFILL.value
+        polls_by_room: Dict[int, int] = {}
+        for room, min_status in min_status_by_room.items():
+            if min_status == KVPoll.Failed:
+                poll = int(KVPoll.Failed)
+            elif present_counts.get(room, 0) != world_size:
+                poll = int(KVPoll.Transferring)
+            else:
+                poll = min_status
+
+            rank_entries = last_entries_by_room[room]
+            if poll == KVPoll.Success:
+                if len(rank_entries) != world_size:
+                    poll = int(KVPoll.Transferring)
+                elif all(
+                    state == PDD2HState.WAIT_PREFILL.value
+                    for _, state, _ in rank_entries.values()
+                ):
+                    metadata_rooms = [
+                        metadata_room
+                        for _, _, metadata_room in rank_entries.values()
+                    ]
+                    if any(
+                        metadata_room not in (0, room)
+                        for metadata_room in metadata_rooms
+                    ):
+                        poll = int(KVPoll.Failed)
+                    elif not all(
+                        metadata_room == room for metadata_room in metadata_rooms
+                    ):
+                        poll = int(KVPoll.Transferring)
+            polls_by_room[room] = poll
+
+        candidate_rooms = [
+            room
+            for room, rank_entries in last_entries_by_room.items()
+            if len(rank_entries) == world_size
+            and all(
+                state == PDD2HState.HOST_READY.value
                 for _, state, _ in rank_entries.values()
-            ):
-                metadata_rooms = [
-                    metadata_room for _, _, metadata_room in rank_entries.values()
-                ]
-                if any(
-                    metadata_room not in (0, room)
-                    for metadata_room in metadata_rooms
-                ):
-                    polls_by_room[room] = int(KVPoll.Failed)
-                elif not all(
-                    metadata_room == room for metadata_room in metadata_rooms
-                ):
-                    polls_by_room[room] = int(KVPoll.Transferring)
-        return polls_by_room
+            )
+        ]
+        candidate_room = min(candidate_rooms) if candidate_rooms else None
+
+        candidate_entries_by_rank: Dict[int, Tuple[int, int]] = {}
+        if candidate_room is not None:
+            candidate_entries_by_rank = first_entries_by_room.get(
+                candidate_room, {}
+            )
+
+        return polls_by_room, candidate_room, candidate_entries_by_rank
 
     @staticmethod
-    def _h2d_admit_from_snapshot(
+    def _h2d_admit_from_summary(
         candidate_room: Optional[int],
         gathered_headers: torch.Tensor,
-        gathered_transfer_entries: torch.Tensor,
-        transfer_counts: List[int],
+        candidate_entries_by_rank: Dict[int, Tuple[int, int]],
     ) -> bool:
         if candidate_room is None:
             return False
 
-        for rank, (entries, count) in enumerate(
-            zip(gathered_transfer_entries, transfer_counts)
-        ):
-            full_available = int(gathered_headers[rank, 3].item())
-            swa_available = int(gathered_headers[rank, 4].item())
-            reserved_decode_tokens = int(gathered_headers[rank, 5].item())
-            retract_in_progress = int(gathered_headers[rank, 6].item())
-            h2d_gate_busy = int(gathered_headers[rank, 7].item())
-
-            candidate_entry = next(
-                (
-                    entries[i]
-                    for i in range(count)
-                    if int(entries[i, 0].item()) == candidate_room
-                ),
-                None,
-            )
+        headers_array = gathered_headers.numpy()
+        for rank, header in enumerate(headers_array):
+            candidate_entry = candidate_entries_by_rank.get(rank)
             if candidate_entry is None:
                 return False
-            need_full = int(candidate_entry[4].item())
-            need_swa = int(candidate_entry[5].item())
+            need_full, need_swa = candidate_entry
+            (
+                _,
+                _,
+                _,
+                full_available_value,
+                swa_available_value,
+                reserved_decode_tokens_value,
+                retract_in_progress_value,
+                h2d_gate_busy_value,
+            ) = header
             if not PDDirect2HostManager.can_admit_h2d_from_snapshot(
                 need_full,
                 need_swa,
                 (
-                    full_available,
-                    swa_available,
-                    reserved_decode_tokens,
-                    retract_in_progress,
-                    h2d_gate_busy,
+                    int(full_available_value),
+                    int(swa_available_value),
+                    int(reserved_decode_tokens_value),
+                    int(retract_in_progress_value),
+                    int(h2d_gate_busy_value),
                 ),
             ):
                 return False

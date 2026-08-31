@@ -1831,17 +1831,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         model_worker_batch.seq_lens_cpu = seq_lens_cpu_backup
         model_worker_batch.seq_lens_sum = seq_lens_sum_backup
 
-        target_out = self.target_worker.forward_batch_generation(
-            model_worker_batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True,
-        )
-        logits_output = target_out.logits_output
-        can_run_cuda_graph = target_out.can_run_cuda_graph
-
-        # Grammar-constrained decoding
-        vocab_mask = None
+        # Prepare grammar data on CPU if needed
         if model_worker_batch.has_grammar:
             chain_len = int(self.block_size)
             retrieve_next_token_cpu = torch.full(
@@ -1855,6 +1845,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             draft_tokens_cpu = draft_tokens.cpu()
 
+        target_out = self.target_worker.forward_batch_generation(
+            model_worker_batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+            skip_attn_backend_init=True,
+        )
+        logits_output = target_out.logits_output
+        can_run_cuda_graph = target_out.can_run_cuda_graph
+
+        # Grammar-constrained decoding
+        vocab_mask = None
+        if model_worker_batch.has_grammar:
             vocab_mask = generate_token_bitmask(
                 model_worker_batch.reqs,
                 verify_input,

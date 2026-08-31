@@ -37,7 +37,7 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages --no-build-iso
     accelerate==1.12.0 \
     decord==0.6.0 \
     "apache-tvm-ffi>=0.1.5,<0.2" \
-    'fastokens>=0.2.0'
+    'fastokens==0.2.0'
 
 # for encoder endpoint discovery (--enable-encoder-endpoint-discovery):
 # K8s Endpoints watch. Install with deps (pyyaml/urllib3/python-dateutil/...).

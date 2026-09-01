@@ -41,4 +41,16 @@ RUN mkdir -p ~/.claude/skills/ \
 RUN python3 -m pip install https://cnbj1-fds.api.xiaomi.net/aie-shared-objects/20260514/transfer_kernel-0.4.1-cp310-abi3-linux_x86_64.whl \
     --no-cache-dir --force-reinstall
 
+# moe_fused_gate kernels used across the test suites.
+RUN python3 -m pip install https://cnbj1-fds.api.xiaomi.net/git-assert/moe_fused_gate-1.0.0-cp312-cp312-linux_x86_64.whl \
+    --no-cache-dir --force-reinstall
+RUN python3 -m pip install https://git-assert.cnbj1.mi-fds.com/git-assert/pro/mimo_pro_moe_fused_gate-1.0.0-cp312-cp312-linux_x86_64.whl \
+    --no-cache-dir --no-dependencies --force-reinstall
+
+# ez_kernel_kit: CUDA decode kernel for MiMo FP8 KV cache; imported at module
+# load time by mem_cache/mimo_memory_pool.py, so it must be present for every
+# job that imports the sglang runtime (including CPU import-only unit tests).
+RUN python3 -m pip install https://artifactory.d.xiaomi.net/artifactory/mimo-core-pypi-local/ez-kernel-kit/0.3.0.dev89+fp8kv.g57e0e0e/ez_kernel_kit-0.3.0.dev89+fp8kv.g57e0e0e-cp312-cp312-linux_x86_64.whl \
+    --no-cache-dir --no-dependencies --force-reinstall
+
 WORKDIR /

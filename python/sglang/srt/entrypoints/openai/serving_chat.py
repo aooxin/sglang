@@ -659,9 +659,17 @@ class OpenAIServingChat(OpenAIServingBase):
                         if "arguments" in item["function"] and isinstance(
                             item["function"]["arguments"], str
                         ):
-                            item["function"]["arguments"] = orjson.loads(
-                                item["function"]["arguments"]
-                            )
+                            try:
+                                parsed_args = orjson.loads(
+                                    item["function"]["arguments"]
+                                )
+                            except orjson.JSONDecodeError:
+                                # Freeform (custom) tool calls carry a raw
+                                # string (e.g. code), not JSON; chat templates
+                                # render string arguments verbatim.
+                                continue
+                            if isinstance(parsed_args, dict):
+                                item["function"]["arguments"] = parsed_args
 
                 openai_compatible_messages.append(processed_msg)
 
@@ -1931,7 +1939,13 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Get expected vs actual arguments
         expected_args = detector.prev_tool_call_arr[tool_index].get("arguments", {})
-        expected_call = json.dumps(expected_args, ensure_ascii=False)
+        # Freeform (custom) tool calls store arguments as a raw string that
+        # is streamed verbatim, so it must not be JSON-encoded here.
+        expected_call = (
+            expected_args
+            if isinstance(expected_args, str)
+            else json.dumps(expected_args, ensure_ascii=False)
+        )
         actual_call = detector.streamed_args_for_tool[tool_index]
 
         # Check if there are remaining arguments to send

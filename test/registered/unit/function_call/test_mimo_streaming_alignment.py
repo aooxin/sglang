@@ -6,7 +6,8 @@ For each test case:
   1. Run detect_and_parse on the full text → get ground-truth tool calls
   2. Simulate streaming by splitting text into random-sized chunks
   3. Feed each chunk to parse_streaming_increment → concatenate results
-  4. Assert: function names match, accumulated arguments JSON match
+  4. Assert: function names match, accumulated arguments match (JSON
+     semantically for regular calls, verbatim for freeform calls)
   5. Repeat with multiple random chunk splits for robustness
 """
 
@@ -16,6 +17,9 @@ import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.mimo_detector import MiMoDetector
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(10, "stage-a-test-cpu")
 
 
 def make_tool(name, params):
@@ -59,86 +63,91 @@ TOOLS = [
         "search",
         {"query": {"type": "string"}, "tags": {"type": "array"}},
     ),
+    # Freeform (custom) tool: arguments is a raw string, no schema
+    make_tool("exec", {}),
 ]
 
-# Test corpus: various model outputs covering edge cases
+# Test corpus: various model outputs covering edge cases.
+# Primary cases use the current chat template format (no separators between
+# tags); the "Legacy" group keeps the old newline-separated format, which
+# must remain accepted.
 TEST_CASES = [
     # 1. Simple single tool call
     (
         "Simple single tool",
-        "<tool_call>\n<function=bash>\n<parameter=command>ls -la /tmp</parameter>\n<parameter=description>list files</parameter>\n</function>\n</tool_call>",
+        "<tool_call><function=bash><parameter=command>ls -la /tmp</parameter><parameter=description>list files</parameter></function></tool_call>",
     ),
     # 2. Tool call with preceding text
     (
         "Text before tool call",
-        "Let me check the files for you.<tool_call>\n<function=bash>\n<parameter=command>pwd</parameter>\n</function>\n</tool_call>",
+        "Let me check the files for you.<tool_call><function=bash><parameter=command>pwd</parameter></function></tool_call>",
     ),
     # 3. HTML content with < > in string parameter
     (
         "HTML content with angle brackets",
-        '<tool_call>\n<function=write>\n<parameter=file_path>/tmp/test.html</parameter>\n<parameter=content><!DOCTYPE html>\n<html lang="zh-CN">\n<head><title>Test</title></head>\n<body>\n<div class="nav">Navigation</div>\n<div class="card">\n<h2>Title</h2>\n<p>Content here</p>\n</div>\n</body>\n</html></parameter>\n</function>\n</tool_call>',
+        '<tool_call><function=write><parameter=file_path>/tmp/test.html</parameter><parameter=content><!DOCTYPE html>\n<html lang="zh-CN">\n<head><title>Test</title></head>\n<body>\n<div class="nav">Navigation</div>\n<div class="card">\n<h2>Title</h2>\n<p>Content here</p>\n</div>\n</body>\n</html></parameter></function></tool_call>',
     ),
     # 4. Content with &copy; and &amp; (should NOT be unescaped)
     (
         "HTML entities preserved",
-        "<tool_call>\n<function=write>\n<parameter=file_path>/tmp/entity.html</parameter>\n<parameter=content>&copy; 2026 Xiaomi &amp; Partners\n&lt;div&gt; escaped tags &lt;/div&gt;</parameter>\n</function>\n</tool_call>",
+        "<tool_call><function=write><parameter=file_path>/tmp/entity.html</parameter><parameter=content>&copy; 2026 Xiaomi &amp; Partners\n&lt;div&gt; escaped tags &lt;/div&gt;</parameter></function></tool_call>",
     ),
     # 5. Content with quotes and backslashes (JSON escape stress)
     (
         "JSON escape stress test",
-        "<tool_call>\n<function=write>\n<parameter=file_path>/tmp/escape.txt</parameter>\n<parameter=content>He said \"hello\" and she said 'goodbye'\nLine 2 with\\backslash\nLine 3\twith\ttabs</parameter>\n</function>\n</tool_call>",
+        "<tool_call><function=write><parameter=file_path>/tmp/escape.txt</parameter><parameter=content>He said \"hello\" and she said 'goodbye'\nLine 2 with\\backslash\nLine 3\twith\ttabs</parameter></function></tool_call>",
     ),
-    # 6. Multiple tool calls
+    # 6. Multiple tool calls (back-to-back, no separator)
     (
         "Multiple tool calls",
-        "<tool_call>\n<function=bash>\n<parameter=command>ls</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=write>\n<parameter=file_path>/tmp/out.txt</parameter>\n<parameter=content>hello world</parameter>\n</function>\n</tool_call>",
+        "<tool_call><function=bash><parameter=command>ls</parameter></function></tool_call><tool_call><function=write><parameter=file_path>/tmp/out.txt</parameter><parameter=content>hello world</parameter></function></tool_call>",
     ),
     # 7. Multiple tool calls with text in between
     (
         "Multiple tool calls with interleaving text",
-        "First task.<tool_call>\n<function=bash>\n<parameter=command>date</parameter>\n</function>\n</tool_call>\nNow the second task.<tool_call>\n<function=write>\n<parameter=file_path>/tmp/date.txt</parameter>\n<parameter=content>today</parameter>\n</function>\n</tool_call>",
+        "First task.<tool_call><function=bash><parameter=command>date</parameter></function></tool_call>Now the second task.<tool_call><function=write><parameter=file_path>/tmp/date.txt</parameter><parameter=content>today</parameter></function></tool_call>",
     ),
     # 8. Object type parameter (deferred parsing)
     (
         "Object type parameter",
-        '<tool_call>\n<function=calc>\n<parameter=shape>rectangle</parameter>\n<parameter=dimensions>{"width": 10, "height": 20}</parameter>\n<parameter=precision>3</parameter>\n<parameter=enabled>true</parameter>\n</function>\n</tool_call>',
+        '<tool_call><function=calc><parameter=shape>rectangle</parameter><parameter=dimensions>{"width": 10, "height": 20}</parameter><parameter=precision>3</parameter><parameter=enabled>true</parameter></function></tool_call>',
     ),
     # 9. Array type parameter
     (
         "Array type parameter",
-        '<tool_call>\n<function=search>\n<parameter=query>sglang tool call</parameter>\n<parameter=tags>["python", "ml", "inference"]</parameter>\n</function>\n</tool_call>',
+        '<tool_call><function=search><parameter=query>sglang tool call</parameter><parameter=tags>["python", "ml", "inference"]</parameter></function></tool_call>',
     ),
     # 10. Edit tool with 3 string params
     (
         "Edit with multi-line strings",
-        '<tool_call>\n<function=edit>\n<parameter=file_path>/tmp/code.py</parameter>\n<parameter=old_string>def hello():\n    print("old")</parameter>\n<parameter=new_string>def hello():\n    print("new")\n    return True</parameter>\n</function>\n</tool_call>',
+        '<tool_call><function=edit><parameter=file_path>/tmp/code.py</parameter><parameter=old_string>def hello():\n    print("old")</parameter><parameter=new_string>def hello():\n    print("new")\n    return True</parameter></function></tool_call>',
     ),
     # 11. Large HTML content (~2000 chars)
     (
         "Large HTML content",
-        "<tool_call>\n<function=write>\n<parameter=file_path>/tmp/large.html</parameter>\n<parameter=content>"
+        "<tool_call><function=write><parameter=file_path>/tmp/large.html</parameter><parameter=content>"
         + "<!DOCTYPE html><html><body>"
         + "".join(
             f'<div class="item-{i}"><h3>Item {i}</h3><p>Description for item {i} with special chars: <>&"\'</p></div>\n'
             for i in range(50)
         )
         + "</body></html>"
-        + "</parameter>\n</function>\n</tool_call>",
+        + "</parameter></function></tool_call>",
     ),
     # 12. Unicode content
     (
         "Unicode Chinese content",
-        "<tool_call>\n<function=write>\n<parameter=file_path>/tmp/cn.txt</parameter>\n<parameter=content>你好世界！这是一段中文测试。\n包含特殊符号：《》「」【】\n以及 emoji 😀🎉\nEnd.</parameter>\n</function>\n</tool_call>",
+        "<tool_call><function=write><parameter=file_path>/tmp/cn.txt</parameter><parameter=content>你好世界！这是一段中文测试。\n包含特殊符号：《》「」【】\n以及 emoji 😀🎉\nEnd.</parameter></function></tool_call>",
     ),
     # 13. Empty tool call (no parameters)
     (
         "Empty parameters",
-        "<tool_call>\n<function=bash>\n</function>\n</tool_call>",
+        "<tool_call><function=bash></function></tool_call>",
     ),
     # 14. Content that looks like XML tags (partial tags that don't match real closers)
     (
         "Content with partial XML-like text",
-        "<tool_call>\n<function=write>\n<parameter=file_path>/tmp/xml_like.txt</parameter>\n<parameter=content>Some text with </para and <param=fake> tags\nAlso <bold> and </bold> like strings\nBut these are just content</parameter>\n</function>\n</tool_call>",
+        "<tool_call><function=write><parameter=file_path>/tmp/xml_like.txt</parameter><parameter=content>Some text with </para and <param=fake> tags\nAlso <bold> and </bold> like strings\nBut these are just content</parameter></function></tool_call>",
     ),
     # NOTE: Content containing literal </function> or </tool_call> is a known
     # limitation of BOTH streaming and non-streaming paths. The regex-based
@@ -148,9 +157,70 @@ TEST_CASES = [
     # 15. Three consecutive tool calls
     (
         "Three consecutive tool calls",
-        "<tool_call>\n<function=bash>\n<parameter=command>echo 1</parameter>\n</function>\n</tool_call>\n"
-        "<tool_call>\n<function=bash>\n<parameter=command>echo 2</parameter>\n</function>\n</tool_call>\n"
-        "<tool_call>\n<function=write>\n<parameter=file_path>/tmp/3.txt</parameter>\n<parameter=content>three</parameter>\n</function>\n</tool_call>",
+        "<tool_call><function=bash><parameter=command>echo 1</parameter></function></tool_call>"
+        "<tool_call><function=bash><parameter=command>echo 2</parameter></function></tool_call>"
+        "<tool_call><function=write><parameter=file_path>/tmp/3.txt</parameter><parameter=content>three</parameter></function></tool_call>",
+    ),
+    # 15b. String param whose value is the literal text "null" (must stay a
+    # string in both paths; regression for the null-before-string-type check)
+    (
+        "String param with literal null",
+        "<tool_call><function=bash><parameter=command>null</parameter></function></tool_call>",
+    ),
+    # 16. Freeform (custom) tool call: no <parameter=...> tags, body is the
+    # raw arguments string
+    (
+        "Freeform simple",
+        '<tool_call><function=exec>await tools.run({cmd:"ls -la"});</function></tool_call>',
+    ),
+    # 17. Freeform multi-line code with quotes, backslashes and shell syntax
+    (
+        "Freeform multi-line code",
+        "<tool_call><function=exec>const results = await Promise.all([\n"
+        "  tools.exec_command({cmd:\"pwd && rg --files -g '!*node_modules*' | sed -n '1,200p'\",workdir:\"/workspace\"}),\n"
+        '  tools.exec_command({cmd:"find . -type f \\\\( -name \'*.py\' \\\\) -print",workdir:"/workspace"})\n'
+        "]);\nfor (const r of results) text(r.output);\n</function></tool_call>",
+    ),
+    # 18. Freeform with angle brackets and HTML-ish content
+    (
+        "Freeform with angle brackets",
+        '<tool_call><function=exec>if (a < b && c > d) { render("<div class=\'x\'>hi</div>"); }</function></tool_call>',
+    ),
+    # 19. Freeform with leading and trailing newlines (part of the arguments)
+    (
+        "Freeform leading/trailing newlines",
+        "<tool_call><function=exec>\nconst x = 1;\nreturn x;\n</function></tool_call>",
+    ),
+    # 20. Freeform followed by a regular call, with interleaving text
+    (
+        "Freeform then regular call",
+        "Run this first.<tool_call><function=exec>await run();</function></tool_call>Then write.<tool_call><function=write><parameter=file_path>/tmp/a.txt</parameter><parameter=content>done</parameter></function></tool_call>",
+    ),
+    # --- Legacy format: newlines between tags (old chat template) ---
+    # 21. Legacy simple single tool
+    (
+        "Legacy simple single tool",
+        "<tool_call>\n<function=bash>\n<parameter=command>ls -la /tmp</parameter>\n<parameter=description>list files</parameter>\n</function>\n</tool_call>",
+    ),
+    # 22. Legacy multi-line string values
+    (
+        "Legacy edit with multi-line strings",
+        '<tool_call>\n<function=edit>\n<parameter=file_path>/tmp/code.py</parameter>\n<parameter=old_string>def hello():\n    print("old")</parameter>\n<parameter=new_string>def hello():\n    print("new")\n    return True</parameter>\n</function>\n</tool_call>',
+    ),
+    # 23. Legacy empty tool call (whitespace-only body is not freeform)
+    (
+        "Legacy empty parameters",
+        "<tool_call>\n<function=bash>\n</function>\n</tool_call>",
+    ),
+    # 24. Legacy multiple tool calls with text in between
+    (
+        "Legacy multiple tool calls with interleaving text",
+        "First task.<tool_call>\n<function=bash>\n<parameter=command>date</parameter>\n</function>\n</tool_call>\nNow the second task.<tool_call>\n<function=write>\n<parameter=file_path>/tmp/date.txt</parameter>\n<parameter=content>today</parameter>\n</function>\n</tool_call>",
+    ),
+    # 25. Legacy object type parameter
+    (
+        "Legacy object type parameter",
+        '<tool_call>\n<function=calc>\n<parameter=shape>rectangle</parameter>\n<parameter=dimensions>{"width": 10, "height": 20}</parameter>\n<parameter=precision>3</parameter>\n<parameter=enabled>true</parameter>\n</function>\n</tool_call>',
     ),
 ]
 
@@ -252,27 +322,28 @@ class TestMiMoStreamingAlignment(unittest.TestCase):
                 st["name"],
                 f"[{label}] [{chunk_desc}] tool[{i}] name mismatch",
             )
-            # Parse both as JSON and compare semantically
             if ns["params"] and st["params"]:
+                # Regular calls: params is JSON, compare semantically.
+                # Freeform calls: params is a raw string, compare verbatim.
                 try:
                     ns_parsed = json.loads(ns["params"])
-                except json.JSONDecodeError:
-                    self.fail(
-                        f"[{label}] [{chunk_desc}] tool[{i}] non-streaming params not valid JSON: {ns['params']!r}"
-                    )
-                try:
                     st_parsed = json.loads(st["params"])
                 except json.JSONDecodeError:
-                    self.fail(
-                        f"[{label}] [{chunk_desc}] tool[{i}] streaming params not valid JSON: {st['params']!r}"
+                    self.assertEqual(
+                        ns["params"],
+                        st["params"],
+                        f"[{label}] [{chunk_desc}] tool[{i}] freeform params mismatch:\n"
+                        f"  non-streaming: {ns['params']!r}\n"
+                        f"  streaming:     {st['params']!r}",
                     )
-                self.assertEqual(
-                    ns_parsed,
-                    st_parsed,
-                    f"[{label}] [{chunk_desc}] tool[{i}] params mismatch:\n"
-                    f"  non-streaming: {json.dumps(ns_parsed, ensure_ascii=False)}\n"
-                    f"  streaming:     {json.dumps(st_parsed, ensure_ascii=False)}",
-                )
+                else:
+                    self.assertEqual(
+                        ns_parsed,
+                        st_parsed,
+                        f"[{label}] [{chunk_desc}] tool[{i}] params mismatch:\n"
+                        f"  non-streaming: {json.dumps(ns_parsed, ensure_ascii=False)}\n"
+                        f"  streaming:     {json.dumps(st_parsed, ensure_ascii=False)}",
+                    )
 
     def test_alignment_char_by_char(self):
         """Stream one character at a time — worst case for boundary handling."""
@@ -346,8 +417,8 @@ class TestMiMoStreamingFailureModes(unittest.TestCase):
         and the consumed bytes should appear in normal_text just like
         detect_and_parse does."""
         text = (
-            "prefix <tool_call>\n<function=evil_unknown>\n"
-            "<parameter=command>rm -rf /</parameter>\n</function>\n</tool_call>"
+            "prefix <tool_call><function=evil_unknown>"
+            "<parameter=command>rm -rf /</parameter></function></tool_call>"
         )
 
         ns_text, ns_calls = run_non_streaming(text, TOOLS)
@@ -357,6 +428,21 @@ class TestMiMoStreamingFailureModes(unittest.TestCase):
         self.assertEqual(st_calls, [], "streaming must drop unknown tool")
         # Streaming normal_text must be a superset of non-streaming's --
         # they should both contain the raw <tool_call>...</tool_call>.
+        self.assertIn("evil_unknown", st_text)
+        self.assertIn("evil_unknown", ns_text)
+
+    def test_unknown_freeform_tool_matches_nonstreaming(self):
+        """Unknown freeform tool: same fail-closed behavior."""
+        text = (
+            "prefix <tool_call><function=evil_unknown>"
+            "await doBadThings();</function></tool_call>"
+        )
+
+        ns_text, ns_calls = run_non_streaming(text, TOOLS)
+        st_text, st_calls = run_streaming(text, TOOLS, [1] * len(text))
+
+        self.assertEqual(ns_calls, [], "non-streaming must drop unknown tool")
+        self.assertEqual(st_calls, [], "streaming must drop unknown tool")
         self.assertIn("evil_unknown", st_text)
         self.assertIn("evil_unknown", ns_text)
 

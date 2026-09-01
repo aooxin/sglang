@@ -55,15 +55,19 @@ def _convert_param_value(
     # MiMo emits raw parameter text. Do not call html.unescape() here: it can
     # corrupt values such as "&current" into a currency-sign escape.
 
-    # Handle null value for any type
+    param_type = _get_param_type(func_name, param_name, tools)
+
+    # String-typed parameters are taken verbatim, including the literal text
+    # "null". This keeps non-streaming parsing consistent with the streaming
+    # passthrough path and makes template rendering round-trippable.
+    if param_type in _STRING_TYPES:
+        return param_value
+
+    # Handle null value for non-string types
     if param_value.lower() == "null":
         return None
 
-    param_type = _get_param_type(func_name, param_name, tools)
-
-    if param_type in _STRING_TYPES:
-        return param_value
-    elif (
+    if (
         param_type.startswith("int")
         or param_type.startswith("integer")
         or param_type.startswith("uint")
@@ -193,6 +197,13 @@ class _MiMoStreamingSAX:
         self._defer_mode: bool = False
         self._defer_raw_value: str = ""
 
+        # Freeform (custom) tool call state: char data directly inside
+        # <function=...> with no <parameter=...> tag. The body is the
+        # arguments string, streamed verbatim.
+        self._freeform_mode: bool = False
+        self._freeform_pending_ws: str = ""
+        self._freeform_value: str = ""
+
         self._pre_inside_parameter: bool = False
         self._pre_param_buffer: str = ""
         self._pre_param_name: Optional[str] = None
@@ -246,6 +257,9 @@ class _MiMoStreamingSAX:
         self._trailing_newline_pending = False
         self._defer_mode = False
         self._defer_raw_value = ""
+        self._freeform_mode = False
+        self._freeform_pending_ws = ""
+        self._freeform_value = ""
         self._pre_inside_parameter = False
         self._pre_param_buffer = ""
         self._pre_param_name = None
@@ -431,6 +445,18 @@ class _MiMoStreamingSAX:
                     return
                 self._emit(name=func_name, parameters="")
         elif name == "parameter":
+            # Formatting whitespace between tags (legacy template), not
+            # freeform content.
+            self._freeform_pending_ws = ""
+            if self._freeform_mode:
+                # The template never mixes freeform content with parameter
+                # tags; raw text was already streamed, arguments will be
+                # malformed either way, so just note it.
+                logger.warning(
+                    "Mixed freeform content and <parameter=...> tags in "
+                    "tool_call for function '%s'",
+                    self._current_function_name,
+                )
             param_name = attrs.get("name", "").strip()
             self._current_param_name = param_name
             self._current_param_value = ""
@@ -448,6 +474,7 @@ class _MiMoStreamingSAX:
 
     def _char_data(self, data: str):
         if not self._current_param_name:
+            self._handle_function_body_char_data(data)
             return
 
         if self._defer_mode:
@@ -506,6 +533,36 @@ class _MiMoStreamingSAX:
             self._current_param_json_sent = output
             if diff:
                 self._emit(parameters=diff)
+
+    def _handle_function_body_char_data(self, data: str):
+        """
+        Character data directly inside <function=...> with no <parameter=...>
+        tag open. The current chat template renders freeform (custom) tool
+        call arguments verbatim in this position; the legacy template only
+        ever placed formatting newlines between tags.
+
+        Whitespace is buffered until either non-whitespace content arrives
+        (freeform call: stream everything verbatim) or a <parameter=...> tag
+        opens (regular call: discard the formatting whitespace).
+        """
+        if (
+            not self._in_tool_call
+            or self._current_function_name is None
+            or self._param_count > 0
+        ):
+            return
+
+        if not self._freeform_mode:
+            pending = self._freeform_pending_ws + data
+            if not pending.strip():
+                self._freeform_pending_ws = pending
+                return
+            self._freeform_mode = True
+            self._freeform_pending_ws = ""
+            data = pending
+
+        self._freeform_value += data
+        self._emit(parameters=data)
 
     def _end_element(self, name: str):
         if name == "root":
@@ -581,11 +638,16 @@ class _MiMoStreamingSAX:
             self._defer_raw_value = ""
 
         elif name == "function":
-            if self._parameters:
+            if self._freeform_mode:
+                # Freeform body was streamed verbatim; there is no JSON
+                # object to close.
+                pass
+            elif self._parameters:
                 self._emit(parameters="}")
             else:
                 self._emit(parameters="{}")
             self._current_function_name = None
+            self._freeform_pending_ws = ""
 
         elif name == "tool_call":
             self._tool_call_completed = True
@@ -596,16 +658,26 @@ class MiMoDetector(BaseFormatDetector):
     """
     Detector for MiMo function call format.
 
-    Format:
+    Format (current chat template; no separators between tags):
+        <tool_call><function=execute_bash><parameter=command>pwd && ls</parameter></function></tool_call>
+
+    The legacy format with newlines between tags is still accepted:
         <tool_call>
         <function=execute_bash>
         <parameter=command>pwd && ls</parameter>
         </function>
         </tool_call>
 
+    Freeform (custom) tool calls: when the <function=...> block contains no
+    <parameter=...> tags, the entire block body is the arguments string,
+    emitted verbatim (not a JSON dict):
+        <tool_call><function=exec>const r = await tools.foo();</function></tool_call>
+        -> arguments = "const r = await tools.foo();"
+
     Supports per-token streaming for string parameters via SAX-based
     incremental XML parsing. Complex-type parameters (object/array) are
-    buffered until </parameter> closes, then emitted at once.
+    buffered until </parameter> closes, then emitted at once. Freeform
+    bodies are streamed verbatim per-token.
     """
 
     def __init__(self):
@@ -647,7 +719,19 @@ class MiMoDetector(BaseFormatDetector):
                         normal_text += text[last_end : match.end()]
                         last_end = match.end()
                         continue
-                calls.extend(self.parse_base_json(parsed, tools))
+                freeform_input = parsed.get("input")
+                if freeform_input is not None:
+                    # Freeform (custom) call: arguments is the raw string,
+                    # not a JSON-encoded dict, so bypass parse_base_json.
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=tool_indices.get(func_name, -1),
+                            name=func_name,
+                            parameters=freeform_input,
+                        )
+                    )
+                else:
+                    calls.extend(self.parse_base_json(parsed, tools))
 
             last_end = match.end()
 
@@ -704,12 +788,18 @@ class MiMoDetector(BaseFormatDetector):
                         continue
                     break
 
-                if self._sax._parameters and self.current_tool_id < len(
-                    self.prev_tool_call_arr
-                ):
-                    self.prev_tool_call_arr[self.current_tool_id][
-                        "arguments"
-                    ] = self._sax._parameters.copy()
+                if self.current_tool_id < len(self.prev_tool_call_arr):
+                    if self._sax._freeform_mode:
+                        # Freeform call: arguments is the raw string. The
+                        # serving layer's unstreamed-args check compares it
+                        # against streamed_args_for_tool verbatim.
+                        self.prev_tool_call_arr[self.current_tool_id][
+                            "arguments"
+                        ] = self._sax._freeform_value
+                    elif self._sax._parameters:
+                        self.prev_tool_call_arr[self.current_tool_id][
+                            "arguments"
+                        ] = self._sax._parameters.copy()
                 self.current_tool_id += 1
                 remaining = self._sax.get_remaining_buffer()
                 self._sax = None
@@ -750,6 +840,10 @@ class MiMoDetector(BaseFormatDetector):
 
         Structure:
             tool_call_body contains: <function=name>...params...</function>
+
+        Returns {"name": ..., "parameters": {...}} for regular calls, or
+        {"name": ..., "input": "<raw string>"} for freeform (custom) calls
+        whose function body carries no <parameter=...> tags.
         """
         func_match = self.func_regex.search(tool_call_body)
         if not func_match:
@@ -759,12 +853,20 @@ class MiMoDetector(BaseFormatDetector):
         func_body = func_match.group(2)
 
         params = {}
+        has_param_tags = False
         for param_match in self.param_regex.finditer(func_body):
+            has_param_tags = True
             param_name = param_match.group(1).strip()
             param_value = param_match.group(2)
             params[param_name] = _convert_param_value(
                 param_value, param_name, func_name, tools
             )
+
+        if not has_param_tags and func_body.strip():
+            # Freeform (custom) tool call: the body is the arguments string,
+            # kept verbatim. Whitespace-only bodies (legacy inter-tag
+            # newlines) still mean "no arguments".
+            return {"name": func_name, "input": func_body}
 
         return {"name": func_name, "parameters": params}
 

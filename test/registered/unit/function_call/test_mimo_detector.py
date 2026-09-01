@@ -23,6 +23,18 @@ def _make_tool(name, properties):
     )
 
 
+# Freeform (custom) tool call arguments: raw code, not JSON.
+FREEFORM_EXEC_CODE = (
+    "const results = await Promise.all([\n"
+    "  tools.exec_command({cmd:\"pwd && rg --files -g '!*node_modules*' | sed -n '1,200p'\",workdir:\"/workspace\",yield_time_ms:10000,max_output_tokens:20000}),\n"
+    '  tools.exec_command({cmd:"find .. -name AGENTS.md -print",workdir:"/workspace",yield_time_ms:10000,max_output_tokens:2000}),\n'
+    '  tools.exec_command({cmd:"git status --short --branch",workdir:"/workspace",yield_time_ms:10000,max_output_tokens:4000}),\n'
+    "  tools.exec_command({cmd:\"find . -maxdepth 2 -type f \\\\( -name 'package.json' -o -name 'vite.config.*' \\\\) -print\",workdir:\"/workspace\",yield_time_ms:10000,max_output_tokens:4000})\n"
+    "]);\n"
+    "for (const r of results) text(r.output);\n"
+)
+
+
 class TestMiMoDetector(unittest.TestCase):
     def setUp(self):
         self.tools = [
@@ -43,6 +55,7 @@ class TestMiMoDetector(unittest.TestCase):
                     "enabled": {"type": "boolean"},
                 },
             ),
+            _make_tool("exec", {}),
         ]
         self.detector = MiMoDetector()
 
@@ -77,6 +90,20 @@ class TestMiMoDetector(unittest.TestCase):
         self.assertEqual(result.calls, [])
 
     def test_detect_and_parse_single_tool(self):
+        model_output = "<tool_call><function=get_current_weather><parameter=city>Dallas</parameter><parameter=state>TX</parameter><parameter=unit>fahrenheit</parameter></function></tool_call>"
+
+        result = self.detector.detect_and_parse(model_output, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_current_weather")
+        self.assertEqual(
+            json.loads(result.calls[0].parameters),
+            {"city": "Dallas", "state": "TX", "unit": "fahrenheit"},
+        )
+
+    def test_detect_and_parse_legacy_newline_format(self):
+        """Old chat template put newlines between tags; still accepted."""
         model_output = """<tool_call>
 <function=get_current_weather>
 <parameter=city>Dallas</parameter>
@@ -96,12 +123,7 @@ class TestMiMoDetector(unittest.TestCase):
         )
 
     def test_detect_and_parse_with_surrounding_content(self):
-        model_output = """Sure, checking now.<tool_call>
-<function=get_current_weather>
-<parameter=city>Dallas</parameter>
-<parameter=state>TX</parameter>
-</function>
-</tool_call>"""
+        model_output = "Sure, checking now.<tool_call><function=get_current_weather><parameter=city>Dallas</parameter><parameter=state>TX</parameter></function></tool_call>"
 
         result = self.detector.detect_and_parse(model_output, self.tools)
 
@@ -110,14 +132,7 @@ class TestMiMoDetector(unittest.TestCase):
         self.assertEqual(result.calls[0].name, "get_current_weather")
 
     def test_detect_and_parse_type_conversion(self):
-        model_output = """<tool_call>
-<function=calculate_area>
-<parameter=shape>rectangle</parameter>
-<parameter=dimensions>{"width": 10, "height": 20}</parameter>
-<parameter=precision>2</parameter>
-<parameter=enabled>true</parameter>
-</function>
-</tool_call>"""
+        model_output = '<tool_call><function=calculate_area><parameter=shape>rectangle</parameter><parameter=dimensions>{"width": 10, "height": 20}</parameter><parameter=precision>2</parameter><parameter=enabled>true</parameter></function></tool_call>'
 
         result = self.detector.detect_and_parse(model_output, self.tools)
 
@@ -134,18 +149,10 @@ class TestMiMoDetector(unittest.TestCase):
         )
 
     def test_detect_and_parse_multiple_tools(self):
-        model_output = """<tool_call>
-<function=get_current_weather>
-<parameter=city>Dallas</parameter>
-<parameter=state>TX</parameter>
-</function>
-</tool_call>
-<tool_call>
-<function=get_current_weather>
-<parameter=city>Orlando</parameter>
-<parameter=state>FL</parameter>
-</function>
-</tool_call>"""
+        model_output = (
+            "<tool_call><function=get_current_weather><parameter=city>Dallas</parameter><parameter=state>TX</parameter></function></tool_call>"
+            "<tool_call><function=get_current_weather><parameter=city>Orlando</parameter><parameter=state>FL</parameter></function></tool_call>"
+        )
 
         result = self.detector.detect_and_parse(model_output, self.tools)
 
@@ -154,6 +161,16 @@ class TestMiMoDetector(unittest.TestCase):
         self.assertEqual(json.loads(result.calls[1].parameters)["city"], "Orlando")
 
     def test_detect_and_parse_no_parameters(self):
+        model_output = "<tool_call><function=get_current_weather></function></tool_call>"
+
+        result = self.detector.detect_and_parse(model_output, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_current_weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {})
+
+    def test_detect_and_parse_no_parameters_legacy_whitespace(self):
+        """A whitespace-only body (legacy inter-tag newlines) is not freeform."""
         model_output = """<tool_call>
 <function=get_current_weather>
 </function>
@@ -173,14 +190,9 @@ class TestMiMoDetector(unittest.TestCase):
                 "content": {"type": "string"},
             },
         )
-        model_output = """<tool_call>
-<function=write_file>
-<parameter=path>/tmp/report.txt</parameter>
-<parameter=content>line 1
+        model_output = """<tool_call><function=write_file><parameter=path>/tmp/report.txt</parameter><parameter=content>line 1
 line 2
-line 3</parameter>
-</function>
-</tool_call>"""
+line 3</parameter></function></tool_call>"""
 
         result = self.detector.detect_and_parse(model_output, [write_tool])
 
@@ -192,11 +204,7 @@ line 3</parameter>
         )
 
     def test_detect_and_parse_special_chars_in_value(self):
-        model_output = """<tool_call>
-<function=get_current_weather>
-<parameter=city>Dallas->TX</parameter>
-</function>
-</tool_call>"""
+        model_output = "<tool_call><function=get_current_weather><parameter=city>Dallas->TX</parameter></function></tool_call>"
 
         result = self.detector.detect_and_parse(model_output, self.tools)
 
@@ -204,12 +212,7 @@ line 3</parameter>
         self.assertEqual(json.loads(result.calls[0].parameters)["city"], "Dallas->TX")
 
     def test_html_entities_are_preserved(self):
-        model_output = """<tool_call>
-<function=get_current_weather>
-<parameter=city>Dallas &amp; Fort Worth &current</parameter>
-<parameter=state>TX</parameter>
-</function>
-</tool_call>"""
+        model_output = "<tool_call><function=get_current_weather><parameter=city>Dallas &amp; Fort Worth &current</parameter><parameter=state>TX</parameter></function></tool_call>"
 
         result = self.detector.detect_and_parse(model_output, self.tools)
 
@@ -217,7 +220,79 @@ line 3</parameter>
         params = json.loads(result.calls[0].parameters)
         self.assertEqual(params["city"], "Dallas &amp; Fort Worth &current")
 
+    def test_string_param_literal_null_preserved(self):
+        """String-typed params take the text verbatim, including "null",
+        matching the streaming passthrough path and keeping the chat
+        template round-trippable."""
+        model_output = "<tool_call><function=get_current_weather><parameter=city>null</parameter></function></tool_call>"
+
+        result = self.detector.detect_and_parse(model_output, self.tools)
+
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "null"})
+
+    def test_detect_and_parse_freeform(self):
+        """No <parameter=...> tags: the body is the raw arguments string."""
+        model_output = (
+            f"<tool_call><function=exec>{FREEFORM_EXEC_CODE}</function></tool_call>"
+        )
+
+        result = self.detector.detect_and_parse(model_output, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "exec")
+        self.assertEqual(result.calls[0].parameters, FREEFORM_EXEC_CODE)
+
+    def test_detect_and_parse_freeform_special_chars(self):
+        code = 'if (a < b && c > d) { print("x <y> &amp; z"); }'
+        model_output = f"<tool_call><function=exec>{code}</function></tool_call>"
+
+        result = self.detector.detect_and_parse(model_output, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "exec")
+        self.assertEqual(result.calls[0].parameters, code)
+
+    def test_detect_and_parse_freeform_with_surrounding_content(self):
+        model_output = (
+            "Running it.<tool_call><function=exec>await run();</function></tool_call>"
+        )
+
+        result = self.detector.detect_and_parse(model_output, self.tools)
+
+        self.assertEqual(result.normal_text, "Running it.")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].parameters, "await run();")
+
+    def test_detect_and_parse_freeform_unknown_tool_dropped(self):
+        model_output = (
+            "<tool_call><function=not_a_tool>await run();</function></tool_call>"
+        )
+
+        result = self.detector.detect_and_parse(model_output, self.tools)
+
+        self.assertEqual(result.calls, [])
+        self.assertIn("not_a_tool", result.normal_text)
+
     def test_streaming_complete_tool_call(self):
+        chunks = [
+            "Let me check.",
+            "<tool_call>",
+            "<function=get_current_weather>",
+            "<parameter=city>Dallas</parameter>",
+            "<parameter=state>TX</parameter>",
+            "</function>",
+            "</tool_call>",
+        ]
+
+        normal_text, tool_calls = self._collect_streaming_result(chunks)
+
+        self.assertEqual(normal_text, "Let me check.")
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_current_weather")
+        self.assertEqual(json.loads(tool_calls[0]["parameters"])["city"], "Dallas")
+
+    def test_streaming_legacy_newline_format(self):
         chunks = [
             "Let me check.",
             "<tool_call>",
@@ -233,14 +308,17 @@ line 3</parameter>
         self.assertEqual(normal_text, "Let me check.")
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0]["name"], "get_current_weather")
-        self.assertEqual(json.loads(tool_calls[0]["parameters"])["city"], "Dallas")
+        self.assertEqual(
+            json.loads(tool_calls[0]["parameters"]),
+            {"city": "Dallas", "state": "TX"},
+        )
 
     def test_streaming_incomplete_tool_call_streams_completed_parts(self):
         chunks = [
             "<tool_call>",
-            "\n<function=get_current_weather>",
-            "\n<parameter=city>Dallas</parameter>",
-            "\n<parameter=state>",
+            "<function=get_current_weather>",
+            "<parameter=city>Dallas</parameter>",
+            "<parameter=state>",
         ]
 
         normal_text, tool_calls = self._collect_streaming_result(chunks)
@@ -251,7 +329,7 @@ line 3</parameter>
         self.assertEqual(tool_calls[0]["parameters"], '{"city": "Dallas", "state": ')
 
         result = self.detector.parse_streaming_increment(
-            "TX</parameter>\n</function>\n</tool_call>", self.tools
+            "TX</parameter></function></tool_call>", self.tools
         )
 
         self.assertEqual(result.normal_text, "")
@@ -264,21 +342,11 @@ line 3</parameter>
         )
 
     def test_streaming_multiple_tool_calls_with_interleaved_text(self):
-        model_output = """<tool_call>
-<function=get_current_weather>
-<parameter=city>Dallas</parameter>
-<parameter=state>TX</parameter>
-</function>
-</tool_call>
-Some text in between.
-<tool_call>
-<function=calculate_area>
-<parameter=shape>circle</parameter>
-<parameter=dimensions>{"radius": 5}</parameter>
-<parameter=precision>2</parameter>
-<parameter=enabled>false</parameter>
-</function>
-</tool_call>"""
+        model_output = (
+            "<tool_call><function=get_current_weather><parameter=city>Dallas</parameter><parameter=state>TX</parameter></function></tool_call>"
+            "Some text in between."
+            '<tool_call><function=calculate_area><parameter=shape>circle</parameter><parameter=dimensions>{"radius": 5}</parameter><parameter=precision>2</parameter><parameter=enabled>false</parameter></function></tool_call>'
+        )
         chunks = [model_output[i : i + 20] for i in range(0, len(model_output), 20)]
 
         normal_text, tool_calls = self._collect_streaming_result(chunks)
@@ -301,6 +369,79 @@ Some text in between.
             },
         )
 
+    def test_streaming_freeform(self):
+        model_output = (
+            f"Let me run it.<tool_call><function=exec>{FREEFORM_EXEC_CODE}</function></tool_call>"
+        )
+        chunks = [model_output[i : i + 16] for i in range(0, len(model_output), 16)]
+
+        normal_text, tool_calls = self._collect_streaming_result(chunks)
+
+        self.assertEqual(normal_text, "Let me run it.")
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "exec")
+        self.assertEqual(tool_calls[0]["parameters"], FREEFORM_EXEC_CODE)
+
+    def test_streaming_freeform_char_by_char(self):
+        code = 'if (a < b && c > d) { print("x <y> & z"); }\nreturn 1;'
+        model_output = f"<tool_call><function=exec>{code}</function></tool_call>"
+
+        normal_text, tool_calls = self._collect_streaming_result(list(model_output))
+
+        self.assertEqual(normal_text, "")
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "exec")
+        self.assertEqual(tool_calls[0]["parameters"], code)
+
+    def test_streaming_freeform_then_regular(self):
+        model_output = (
+            "<tool_call><function=exec>await run();</function></tool_call>"
+            "<tool_call><function=get_current_weather><parameter=city>Dallas</parameter></function></tool_call>"
+        )
+        chunks = [model_output[i : i + 10] for i in range(0, len(model_output), 10)]
+
+        normal_text, tool_calls = self._collect_streaming_result(chunks)
+
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "exec")
+        self.assertEqual(tool_calls[0]["parameters"], "await run();")
+        self.assertEqual(tool_calls[1]["name"], "get_current_weather")
+        self.assertEqual(
+            json.loads(tool_calls[1]["parameters"]), {"city": "Dallas"}
+        )
+
+    def test_streaming_freeform_tracking_state(self):
+        """The serving layer's unstreamed-args check requires that, for a
+        completed freeform call, prev_tool_call_arr holds the raw arguments
+        string and it equals what was streamed."""
+        model_output = (
+            f"<tool_call><function=exec>{FREEFORM_EXEC_CODE}</function></tool_call>"
+        )
+        chunks = [model_output[i : i + 16] for i in range(0, len(model_output), 16)]
+
+        _, tool_calls = self._collect_streaming_result(chunks)
+
+        self.assertEqual(tool_calls[0]["parameters"], FREEFORM_EXEC_CODE)
+        self.assertEqual(
+            self.detector.prev_tool_call_arr[0]["arguments"], FREEFORM_EXEC_CODE
+        )
+        self.assertEqual(
+            self.detector.streamed_args_for_tool[0], FREEFORM_EXEC_CODE
+        )
+
+    def test_streaming_empty_function_body_is_empty_dict(self):
+        chunks = [
+            "<tool_call>",
+            "<function=get_current_weather>",
+            "</function>",
+            "</tool_call>",
+        ]
+
+        normal_text, tool_calls = self._collect_streaming_result(chunks)
+
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(json.loads(tool_calls[0]["parameters"]), {})
+
 
 class TestMiMoReasoningToolCalls(unittest.TestCase):
     def setUp(self):
@@ -315,11 +456,7 @@ class TestMiMoReasoningToolCalls(unittest.TestCase):
         chat = OpenAIServingChat.__new__(OpenAIServingChat)
         chat.tool_call_parser = "mimo"
         finish_reason = {"type": "stop", "matched": "</s>"}
-        reasoning_text = """Need weather data.<tool_call>
-<function=get_current_weather>
-<parameter=city>Dallas</parameter>
-</function>
-</tool_call>"""
+        reasoning_text = "Need weather data.<tool_call><function=get_current_weather><parameter=city>Dallas</parameter></function></tool_call>"
 
         tool_calls, text, reasoning_text, finish_reason = (
             chat._process_tool_calls_with_reasoning_fallback(

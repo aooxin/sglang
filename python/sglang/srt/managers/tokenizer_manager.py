@@ -719,7 +719,33 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
-        if obj.input_embeds is not None:
+        is_mm_request = bool(self.mm_processor and obj.contains_mm_input())
+        mm_context_hit = False
+        attempted_mm_context = (
+            is_mm_request
+            and obj.input_embeds is None
+            and self._enable_mm_context_forward
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            and obj.bootstrap_host is not None
+            and obj.bootstrap_room is not None
+        )
+        expanded_len = (
+            await self._fetch_mm_context(obj) if attempted_mm_context else None
+        )
+
+        if expanded_len:
+            input_ids = [0] * expanded_len
+            mm_context_hit = True
+            logger.debug(
+                f"mm_context hit for rid={obj.rid}, expanded_len={expanded_len}"
+            )
+        elif attempted_mm_context and not _MM_CONTEXT_FORWARD_FALLBACK:
+            raise ValueError(
+                f"mm_context forward miss for rid={obj.rid}, "
+                f"room={obj.bootstrap_room}: no payload within the wait "
+                f"window and local fallback is disabled."
+            )
+        elif obj.input_embeds is not None:
             if not self.server_args.disable_radix_cache:
                 raise ValueError(
                     "input_embeds is provided while disable_radix_cache is False. "
@@ -737,10 +763,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     "accept text prompts. Please provide input_ids or re-initialize "
                     "the engine with skip_tokenizer_init=False."
                 )
-
             # For audio-only requests (e.g., Whisper), text may be empty.
             # The multimodal processor will provide input_ids later.
-            if not input_text and self.mm_processor and obj.contains_mm_input():
+            if not input_text and is_mm_request:
                 # Use empty placeholder - multimodal processor will override
                 input_ids = []
             else:
@@ -748,7 +773,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                     input_text, is_cross_encoder_request
                 )
 
-        if self.mm_processor and obj.contains_mm_input():
+        if is_mm_request:
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
             if obj.video_data is not None and not isinstance(obj.video_data, list):
@@ -764,27 +789,6 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 )
 
             mm_inputs = None
-            mm_context_hit = False
-
-            if (
-                self._enable_mm_context_forward
-                and self.disaggregation_mode == DisaggregationMode.DECODE
-                and obj.bootstrap_host is not None
-                and obj.bootstrap_room is not None
-            ):
-                expanded_len = await self._fetch_mm_context(obj)
-                if expanded_len:
-                    input_ids = [0] * expanded_len
-                    mm_context_hit = True
-                    logger.debug(
-                        f"mm_context hit for rid={obj.rid}, expanded_len={expanded_len}"
-                    )
-                if not mm_context_hit and not _MM_CONTEXT_FORWARD_FALLBACK:
-                    raise ValueError(
-                        f"mm_context forward miss for rid={obj.rid}, "
-                        f"room={obj.bootstrap_room}: no payload within the wait "
-                        f"window and local fallback is disabled."
-                    )
 
             if not mm_context_hit and (
                 not self.server_args.language_only
@@ -896,41 +900,49 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
         return f"http://{obj.bootstrap_host}:{port}/mm_context/{obj.bootstrap_room}"
 
     async def _push_mm_context(self, obj, expanded_len):
-        try:
-            payload = str(int(expanded_len)).encode()
-            timeout = aiohttp.ClientTimeout(total=2.0)
-            session = self._get_mm_context_session()
-            async with session.put(
-                self._mm_context_url(obj), data=payload, timeout=timeout
-            ) as resp:
-                if resp.status != 200:
-                    logger.warning(
-                        f"mm_context PUT status={resp.status} "
-                        f"room={obj.bootstrap_room}"
-                    )
-        except Exception as e:
-            logger.warning(
-                f"mm_context push failed room={getattr(obj, 'bootstrap_room', '?')}: "
-                f"{type(e).__name__}: {e}"
-            )
+        payload = str(int(expanded_len)).encode()
+        timeout = aiohttp.ClientTimeout(total=5.0)
+        last_err = None
+        for _ in range(2):
+            try:
+                session = self._get_mm_context_session()
+                async with session.put(
+                    self._mm_context_url(obj), data=payload, timeout=timeout
+                ) as resp:
+                    if resp.status == 200:
+                        return
+                    last_err = f"status={resp.status}"
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+        logger.warning(
+            f"mm_context push failed after retry "
+            f"room={getattr(obj, 'bootstrap_room', '?')}: {last_err}"
+        )
 
     async def _fetch_mm_context(self, obj):
         timeout = aiohttp.ClientTimeout(total=_MM_CONTEXT_FETCH_TIMEOUT_S + 5.0)
         try:
             session = self._get_mm_context_session()
             async with session.get(self._mm_context_url(obj), timeout=timeout) as resp:
-                if resp.status == 200:
-                    try:
-                        return int(await resp.text())
-                    except (ValueError, TypeError):
-                        return None
-                return None
+                if resp.status == 204:
+                    reason = "ttl_expired: nothing pushed within the wait window"
+                elif resp.status != 200:
+                    reason = f"bad_status status={resp.status}"
+                else:
+                    body = (await resp.text()).strip()
+                    expanded_len = int(body) if body.lstrip("-").isdigit() else 0
+                    if expanded_len > 0:
+                        return expanded_len
+                    reason = f"empty_payload body={body!r}"
+        except asyncio.TimeoutError:
+            reason = f"client_timeout: no response within {timeout.total}s"
         except Exception as e:
-            logger.warning(
-                f"mm_context fetch failed room={getattr(obj, 'bootstrap_room', '?')}: "
-                f"{type(e).__name__}: {e}"
-            )
-            return None
+            reason = f"connect_error {type(e).__name__}: {e}"
+        logger.warning(
+            f"mm_context fetch miss rid={getattr(obj, 'rid', '?')} "
+            f"room={getattr(obj, 'bootstrap_room', '?')} reason={reason}"
+        )
+        return None
 
     def _validate_rid_not_in_flight(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

@@ -185,33 +185,47 @@ class OpenAIServingTokenizeProxy:
         need_hash = body.pop("return_hash_values", False)
         rid = body.get("rid") or f"tokproxy-{uuid.uuid4().hex[:8]}"
 
+        # Determine endpoint: prefer X-Original-Path header, fall back to body fields.
+        original_path = raw_request.headers.get("x-original-path", "")
+        if original_path.startswith("/v1/chat"):
+            endpoint = "chat"
+        elif original_path.startswith("/v1/completions"):
+            endpoint = "completions"
+        elif original_path.startswith("/generate") or original_path.startswith(
+            "/v1/generate"
+        ):
+            endpoint = "generate"
+        elif "messages" in body:
+            endpoint = "chat"
+        elif "prompt" in body:
+            endpoint = "completions"
+        elif "text" in body:
+            endpoint = "generate"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot determine endpoint: set 'X-Original-Path' header to one of /v1/chat/completions, /v1/completions, /generate; or include 'messages', 'prompt', or 'text' in the request body",
+            )
+
         try:
-            if "messages" in body:
-                endpoint = "chat"
+            if endpoint == "chat":
                 body.setdefault("max_tokens", 1)
                 request = ChatCompletionRequest(**body)
                 t_validate = time.perf_counter()
                 result = await self.openai_serving_chat.handle_request(
                     request, raw_request
                 )
-            elif "prompt" in body:
-                endpoint = "completions"
+            elif endpoint == "completions":
                 body.setdefault("max_tokens", 1)
                 request = CompletionRequest(**body)
                 t_validate = time.perf_counter()
                 result = await self.openai_serving_completion.handle_request(
                     request, raw_request
                 )
-            elif "text" in body:
-                endpoint = "generate"
+            else:
                 request = GenerateReqInput(**body)
                 t_validate = time.perf_counter()
                 result = await self.generate_handler(request, raw_request)
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Missing 'messages', 'prompt' or 'text'",
-                )
         except HTTPException:
             raise
         except (TypeError, ValueError, ValidationError) as e:
@@ -232,21 +246,73 @@ class OpenAIServingTokenizeProxy:
             )
             return result
 
+        # If auto_truncate is not enabled and tokens exceed max_req_input_len,
+        # return empty tokens without computing hash.
+        # Uses the same condition as scheduler's validate_input_length:
+        # len(input_ids) >= max_req_input_len
+        if not self.tokenizer_manager.server_args.allow_auto_truncate:
+            max_len = self.tokenizer_manager.max_req_input_len
+            tokens = result["tokens"]
+            is_batch = isinstance(tokens, list) and tokens and isinstance(tokens[0], list)
+            exceeded = (
+                any(len(t) >= max_len for t in tokens)
+                if is_batch
+                else len(tokens) >= max_len
+            )
+            if exceeded:
+                n = len(tokens) if is_batch else 0
+                result["tokens"] = [[] for _ in range(n)] if is_batch else []
+                result["count"] = [0] * n if is_batch else 0
+                if need_hash:
+                    result["hash_values"] = [[] for _ in range(n)] if is_batch else []
+                result["max_model_len"] = self.tokenizer_manager.model_config.context_len
+                t_end = time.perf_counter()
+                logger.debug(
+                    "[tokenize_proxy] pid=%d rid=%s endpoint=%s tokens=0 "
+                    "exceeded_max_req_input_len=%d "
+                    "parse=%.1fms validate=%.1fms tokenize=%.1fms total=%.1fms",
+                    os.getpid(),
+                    rid,
+                    endpoint,
+                    max_len,
+                    (t_parse - t_start) * 1000,
+                    (t_validate - t_parse) * 1000,
+                    (t_tokenize - t_validate) * 1000,
+                    (t_end - t_start) * 1000,
+                )
+                return orjson_response(result)
+
         # Compute hash values if requested
         if need_hash:
             from sglang.srt.mem_cache.hicache_storage import compute_hash_values
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-            page_size = self.tokenizer_manager.server_args.page_size
+            server_args = self.tokenizer_manager.server_args
+            page_size = server_args.page_size
+            spec_algorithm = SpeculativeAlgorithm.from_string(
+                server_args.speculative_algorithm
+            )
+            if spec_algorithm.is_eagle():
+                step = (
+                    server_args.speculative_num_steps
+                    if server_args.enable_multi_layer_eagle
+                    else 1
+                )
+            else:
+                step = 0
+
             tokens = result["tokens"]
             if not tokens:
                 result["hash_values"] = []
             elif isinstance(tokens[0], list):
                 result["hash_values"] = await asyncio.to_thread(
-                    lambda: [compute_hash_values(t, page_size) for t in tokens]
+                    lambda: [
+                        compute_hash_values(t, page_size, step=step) for t in tokens
+                    ]
                 )
             else:
                 result["hash_values"] = await asyncio.to_thread(
-                    compute_hash_values, tokens, page_size
+                    compute_hash_values, tokens, page_size, step=step
                 )
 
         t_hash = time.perf_counter()

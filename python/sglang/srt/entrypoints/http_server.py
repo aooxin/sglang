@@ -679,15 +679,20 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     if obj.return_tokens_only:
         from sglang.srt.entrypoints.openai.utils import tokenize_or_passthrough
 
-        tokenizer = _global_state.tokenizer_manager.tokenizer
-        max_model_len = _global_state.tokenizer_manager.model_config.context_len
+        tm = _global_state.tokenizer_manager
+        tokenizer = tm.tokenizer
         if obj.input_ids is not None:
             inputs = obj.input_ids
         elif obj.text is not None:
             inputs = obj.text
         else:
             raise ValueError("return_tokens_only requires text or input_ids")
-        return tokenize_or_passthrough(tokenizer, inputs, max_model_len)
+        return tokenize_or_passthrough(
+            tokenizer,
+            inputs,
+            tm.server_args.allow_auto_truncate,
+            tm.max_req_input_len,
+        )
 
     if obj.stream:
 

@@ -186,12 +186,16 @@ class OpenAIServingCompletion(OpenAIServingBase):
         if request.return_tokens_only:
             from sglang.srt.entrypoints.openai.utils import tokenize_or_passthrough
 
-            tokenizer = self.tokenizer_manager.tokenizer
-            max_model_len = self.tokenizer_manager.model_config.context_len
+            tm = self.tokenizer_manager
             prompt = request.prompt
             if self.template_manager.completion_template_name is not None:
                 prompt = generate_completion_prompt_from_request(request)
-            return tokenize_or_passthrough(tokenizer, prompt, max_model_len)
+            return tokenize_or_passthrough(
+                tm.tokenizer,
+                prompt,
+                tm.server_args.allow_auto_truncate,
+                tm.max_req_input_len,
+            )
 
         generator = self._generate_completion_stream(
             adapted_request, request, raw_request
@@ -433,12 +437,16 @@ class OpenAIServingCompletion(OpenAIServingBase):
         if request.return_tokens_only:
             from sglang.srt.entrypoints.openai.utils import tokenize_or_passthrough
 
-            tokenizer = self.tokenizer_manager.tokenizer
-            max_model_len = self.tokenizer_manager.model_config.context_len
+            tm = self.tokenizer_manager
             prompt = request.prompt
             if self.template_manager.completion_template_name is not None:
                 prompt = generate_completion_prompt_from_request(request)
-            return tokenize_or_passthrough(tokenizer, prompt, max_model_len)
+            return tokenize_or_passthrough(
+                tm.tokenizer,
+                prompt,
+                tm.server_args.allow_auto_truncate,
+                tm.max_req_input_len,
+            )
 
         try:
             generator = self.tokenizer_manager.generate_request(

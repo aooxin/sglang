@@ -515,6 +515,14 @@ class TestSRTEndpoint(CustomTestCase):
         version = response_json["version"]
         self.assertIsInstance(version, str)
 
+        cache_info = response_json["cache_info"]
+        self.assertIsInstance(cache_info["attention_tp_size"], int)
+        self.assertIsInstance(cache_info["page_size_tokens"], int)
+        self.assertIn("hierarchical_cache_enabled", cache_info)
+        self.assertIn("storage_backend", cache_info)
+        self.assertIn("page_element_sizes_bytes", cache_info)
+        self.assertIsNone(cache_info["page_element_sizes_bytes"])
+
     def test_logit_bias(self):
         """Test that a very high logit bias forces sampling of a specific token."""
         # Choose a token ID to bias (using 5 as an example)

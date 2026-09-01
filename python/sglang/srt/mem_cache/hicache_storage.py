@@ -55,31 +55,36 @@ def hash_str_to_int64(hash_str: str) -> int:
 
 
 def compute_hash_values(
-    token_ids: List[int], page_size: int, prior_hash: Optional[str] = None
+    token_ids: List[int],
+    page_size: int,
+    prior_hash: Optional[str] = None,
+    step: int = 0,
 ) -> List[str]:
     """Compute SHA256-based hash values for token IDs, one per complete page.
 
     Uses the same logic as RadixCache.compute_node_hash_values() to ensure
     hash values are consistent with those used for HiCache block queries.
 
-    Only computes hashes for full pages (page_size tokens each). The trailing
-    tokens that don't fill a complete page are skipped because HiCache only
-    stores page-aligned blocks — a partial-page hash would never match.
+    In ngram mode (step > 0, used by EAGLE speculative decoding), the logical
+    length of token_ids is len(token_ids) - step, and each page hashes
+    page_size + step raw tokens with sliding-window ngram hashing.
 
     Args:
         token_ids: List of token IDs to hash.
         page_size: Page size for chunking tokens.
         prior_hash: Optional prior hash value to chain from (e.g., parent node's last hash).
+        step: Ngram step for EAGLE mode. 0 means plain mode.
 
     Returns:
         List of SHA256 hex strings, one per complete page.
     """
-    aligned_len = len(token_ids) // page_size * page_size
+    logical_len = len(token_ids) - step if step > 0 else len(token_ids)
+    aligned_len = logical_len // page_size * page_size
     hash_values: List[str] = []
     parent_hash = prior_hash
     for start in range(0, aligned_len, page_size):
-        page_tokens = token_ids[start : start + page_size]
-        hash_val = get_hash_str(page_tokens, prior_hash=parent_hash)
+        page_tokens = token_ids[start : start + page_size + step]
+        hash_val = get_hash_str(page_tokens, prior_hash=parent_hash, step=step)
         hash_values.append(hash_val)
         parent_hash = hash_val
     return hash_values

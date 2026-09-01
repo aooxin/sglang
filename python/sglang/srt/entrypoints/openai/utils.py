@@ -134,49 +134,72 @@ def process_cached_tokens_details_from_ret(
         )
 
 
+def _truncate_tokens(tokens: List[int], max_req_input_len: int) -> List[int]:
+    """Truncate token list to match scheduler-side validate_input_length behavior.
+
+    Uses the same max_req_input_len that the scheduler computes and propagates
+    via scheduler_info, so tokenize-only responses report the same token count
+    that the inference path will actually use.
+    """
+    if len(tokens) >= max_req_input_len:
+        logger.warning(
+            f"Input ({len(tokens)} tokens) reaches or exceeds "
+            f"max_req_input_len ({max_req_input_len} tokens). "
+            f"Truncating to match inference behavior."
+        )
+        return tokens[:max_req_input_len]
+    return tokens
+
+
 def tokenize_or_passthrough(
     tokenizer,
     prompts: Union[str, List[int], List[str], List[List[int]]],
-    max_model_len: int,
+    allow_auto_truncate: bool = False,
+    max_req_input_len: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Tokenize prompts or pass through pre-tokenized input_ids.
 
-    Returns a dict with "tokens", "count", and "max_model_len" suitable for
-    return_tokens_only responses. Handles both single and batch inputs.
+    Returns a dict with "tokens" and "count" suitable for return_tokens_only
+    responses. Handles both single and batch inputs.
+
+    When allow_auto_truncate is True and max_req_input_len is provided, tokens
+    are truncated to match the scheduler-side max_req_input_len limit.
     """
+    should_truncate = allow_auto_truncate and max_req_input_len is not None
+
     if isinstance(prompts, str):
         tokens = tokenizer.encode(prompts)
-        return {"tokens": tokens, "count": len(tokens), "max_model_len": max_model_len}
+        if should_truncate:
+            tokens = _truncate_tokens(tokens, max_req_input_len)
+        return {"tokens": tokens, "count": len(tokens)}
 
     if not isinstance(prompts, list):
         raise ValueError(f"prompts must be str or list, got {type(prompts).__name__}")
 
     # Empty batch
     if len(prompts) == 0:
-        return {"tokens": [], "count": [], "max_model_len": max_model_len}
+        return {"tokens": [], "count": []}
 
     # Single pre-tokenized sequence: List[int]
     is_single = isinstance(prompts[0], int)
     if is_single:
-        return {
-            "tokens": prompts,
-            "count": len(prompts),
-            "max_model_len": max_model_len,
-        }
+        tokens = prompts
+        if should_truncate:
+            tokens = _truncate_tokens(tokens, max_req_input_len)
+        return {"tokens": tokens, "count": len(tokens)}
 
     # Batch: List[str] or List[List[int]]
     all_tokens = []
     for p in prompts:
         if isinstance(p, str):
-            all_tokens.append(tokenizer.encode(p))
+            t = tokenizer.encode(p)
         elif isinstance(p, list):
-            all_tokens.append(p)
+            t = p
         else:
             raise ValueError(
                 f"Each prompt must be str or list of int, got {type(p).__name__}"
             )
-    return {
-        "tokens": all_tokens,
-        "count": [len(t) for t in all_tokens],
-        "max_model_len": max_model_len,
-    }
+        if should_truncate:
+            t = _truncate_tokens(t, max_req_input_len)
+        all_tokens.append(t)
+    return {"tokens": all_tokens, "count": [len(t) for t in all_tokens]}

@@ -807,13 +807,13 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> Union[StreamingResponse, ErrorResponse, ORJSONResponse, dict]:
         """Handle streaming chat completion request"""
         if request.return_tokens_only:
+            from sglang.srt.entrypoints.openai.utils import _truncate_tokens
+
             prompt_ids = adapted_request.input_ids
-            max_model_len = self.tokenizer_manager.model_config.context_len
-            return {
-                "tokens": prompt_ids,
-                "count": len(prompt_ids),
-                "max_model_len": max_model_len,
-            }
+            tm = self.tokenizer_manager
+            if tm.server_args.allow_auto_truncate and tm.max_req_input_len is not None:
+                prompt_ids = _truncate_tokens(prompt_ids, tm.max_req_input_len)
+            return {"tokens": prompt_ids, "count": len(prompt_ids)}
 
         generator = self._generate_chat_stream(adapted_request, request, raw_request)
 
@@ -1261,13 +1261,13 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> Union[ChatCompletionResponse, ErrorResponse, ORJSONResponse, dict]:
         """Handle non-streaming chat completion request"""
         if request.return_tokens_only:
+            from sglang.srt.entrypoints.openai.utils import _truncate_tokens
+
             prompt_ids = adapted_request.input_ids
-            max_model_len = self.tokenizer_manager.model_config.context_len
-            return {
-                "tokens": prompt_ids,
-                "count": len(prompt_ids),
-                "max_model_len": max_model_len,
-            }
+            tm = self.tokenizer_manager
+            if tm.server_args.allow_auto_truncate and tm.max_req_input_len is not None:
+                prompt_ids = _truncate_tokens(prompt_ids, tm.max_req_input_len)
+            return {"tokens": prompt_ids, "count": len(prompt_ids)}
 
         try:
             ret = await self.tokenizer_manager.generate_request(

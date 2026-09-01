@@ -1557,9 +1557,53 @@ class Scheduler(
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
+            "cache_info": self._get_cache_info(),
         }
 
         return result_dict
+
+    def _get_cache_info(self) -> Dict[str, Any]:
+        """Return runtime KV cache metadata exposed through ``/server_info``.
+
+        The page sizes must come from the initialized host KV pool instead of being
+        reconstructed from CLI arguments.  In particular, hybrid SWA may disable
+        HiCache during decode initialization, so the effective scheduler state is
+        the source of truth for whether these values are available.
+        """
+        storage_backend = (
+            self.server_args.hicache_storage_backend
+            if self.enable_hicache_storage
+            else None
+        )
+        page_element_sizes_bytes = None
+
+        if self.enable_hierarchical_cache and self.enable_hicache_storage:
+            cache = self.tree_cache
+            while hasattr(cache, "inner"):
+                cache = cache.inner
+
+            mem_pool_host = getattr(cache, "token_to_kv_pool_host", None)
+            get_page_element_sizes = getattr(
+                mem_pool_host, "get_page_element_sizes", None
+            )
+            if callable(get_page_element_sizes):
+                sizes = tuple(get_page_element_sizes())
+                if len(sizes) == 4:
+                    page_element_sizes_bytes = {
+                        "full_k": int(sizes[0]),
+                        "full_v": int(sizes[1]),
+                        "swa_k": int(sizes[2]),
+                        "swa_v": int(sizes[3]),
+                    }
+
+        return {
+            "hierarchical_cache_enabled": self.enable_hierarchical_cache,
+            "storage_backend": storage_backend,
+            "attention_tp_size": self.attn_tp_size,
+            "page_size_tokens": self.page_size,
+            "page_element_sizes_bytes": page_element_sizes_bytes,
+            "sliding_window_size": self.sliding_window_size,
+        }
 
     def run_event_loop(self) -> None:
         """Run the scheduler's event loop.

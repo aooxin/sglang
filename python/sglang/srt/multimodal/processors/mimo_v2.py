@@ -800,6 +800,11 @@ class MiMoProcessor:
             else:
                 kwargs[k] = self.default_video_processor_kwargs[k]
 
+        for k in ["total_max_pixels", "min_pixels"]:
+            limit = self.default_video_processor_kwargs[k]
+            if limit is not None and kwargs[k] is not None:
+                kwargs[k] = min(kwargs[k], limit)
+
         if video.max_frame_token is not None:
             kwargs["max_frame_token"] = video.max_frame_token
 

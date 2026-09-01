@@ -331,6 +331,11 @@ class Envs:
     SGLANG_DIAG_SLOW_SEND_AUX_S = EnvFloat(2.0)
     SGLANG_DIAG_SLOW_QUEUE_WAIT_S = EnvFloat(10.0)
 
+    # Warn (with URL) when a single multimodal download exceeds this wall-clock
+    # duration; <=0 disables the log. Distinct from REQUEST_TIMEOUT (the hard
+    # download deadline) — this only flags slow-but-successful downloads.
+    SGLANG_DIAG_SLOW_MM_DOWNLOAD_S = EnvFloat(30.0)
+
     # Mooncake Store
     SGLANG_HICACHE_MOONCAKE_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_MOONCAKE_REUSE_TE = EnvBool(True)

@@ -722,7 +722,25 @@ class MiMoProcessor:
                 all_timestamps.extend(aligned_ts[::step].tolist())
 
                 if self.has_audio_track(video_blob):
-                    audio_spec, audio_token_len = self.preprocess_audio(video_blob)
+                    try:
+                        audio_spec, audio_token_len = self.preprocess_audio(video_blob)
+                    except ValueError as e:
+                        # The blob is already downloaded, so preprocess_audio only
+                        # sees bytes and cannot name the source. Log the original
+                        # URL server-side; keep it OUT of the raised error, which
+                        # propagates to the client response.
+                        src = getattr(video_data, "url", video_data)
+                        label = (
+                            src
+                            if isinstance(src, str)
+                            and src.startswith(("http://", "https://", "file://"))
+                            else "<bytes or base64>"
+                        )
+                        logger.error(
+                            f"Failed to decode audio track of video: "
+                            f"source={label}, detail={e}"
+                        )
+                        raise ValueError(f"Invalid audio track in video: {e}") from e
                     units = self._build_video_audio_units(
                         grid,
                         aligned_ts,

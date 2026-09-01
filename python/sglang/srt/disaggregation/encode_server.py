@@ -160,6 +160,27 @@ class InternalError(MMError):
         super().__init__(message, code=HTTPStatus.INTERNAL_SERVER_ERROR)
 
 
+class DownloadError(InternalError):
+    """A multimodal download/parse failure (bad URL, flaky S3, truncated blob).
+
+    Still surfaces as HTTP 500 (an InternalError) so upstream doesn't retry the
+    same bad URL, but is a distinct type so the encode log sinks can drop its
+    traceback: it's an expected bad-input/network error already logged with the
+    URL at the load site, unlike a genuine server bug.
+    """
+
+
+def _omit_encode_traceback(exc: Exception) -> bool:
+    """Whether to suppress the traceback when logging a failed encode.
+
+    Download/parse failures (DownloadError, BadRequestError, MMDownloadError)
+    are expected bad-input/network errors, already logged with the URL at the
+    load site; their traceback at the sink is redundant noise. Genuine service
+    bugs (plain InternalError, unexpected exceptions) keep their traceback.
+    """
+    return isinstance(exc, (BadRequestError, DownloadError, MMDownloadError))
+
+
 class TensorWrapper:
     """Wrapper to keep tensor alive while exposing buffer for zero-copy."""
 
@@ -901,7 +922,14 @@ class MMEncoder:
             # as a 500 instead of being wrapped into a 400.
             raise
         except Exception as e:
-            raise RuntimeError(f"Error while loading data {data}: {e}")
+            # `data` may be a presigned URL; keep it out of the raised message
+            # (which reaches the client) and log it server-side only, without a
+            # traceback.
+            logger.error(
+                f"Rank {self.rank} failed to load {modality.name} data "
+                f"{data!r}: {e}"
+            )
+            raise RuntimeError(f"Failed to load {modality.name} data: {e}")
 
     def submit_data_loading_tasks(self, items, modalities, timings=None):
         futures = []
@@ -1673,7 +1701,7 @@ class MMEncoder:
         except NotImplementedError as e:
             raise InternalError(f"Not implemented error: {str(e)}")
         except MMDownloadError as e:
-            raise InternalError(str(e))
+            raise DownloadError(str(e))
         except Exception as e:
             raise BadRequestError(f"Failed to process mm items: {str(e)}")
         _observe_single_request_load(mc, stage_timing, modality_str)
@@ -1949,8 +1977,11 @@ class MMEncoder:
                 mm_embedding,
                 aux_data,
             )
-        except BadRequestError as e:
-            raise BadRequestError(f"Bad request error: {str(e)}")
+        except MMError:
+            # Already categorized upstream (BadRequest / Download / Internal)
+            # with an HTTP code; keep its type so the log sink can decide on the
+            # traceback. Only unexpected raw exceptions become InternalError.
+            raise
         except Exception as e:
             raise InternalError(f"Internal encoding error: {str(e)}")
 
@@ -2094,9 +2125,11 @@ class MMEncoder:
         except Exception as e:
             error_code = getattr(e, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
             error_msg = str(e)
+            # Drop the traceback for download/parse errors (already logged with
+            # the URL at the load site); keep it for genuine service bugs.
             logger.error(
                 f"Rank {self.rank} encode failed: {error_msg} {error_code = }",
-                exc_info=True,
+                exc_info=not _omit_encode_traceback(e),
             )
             if self.rank == 0:
                 mm_data = EmbeddingData(
@@ -2253,7 +2286,7 @@ class MMEncoder:
                     requests, modality, InternalError(f"Not implemented error: {e}")
                 )
             except MMDownloadError as e:
-                return self._batch_set_error(requests, modality, InternalError(str(e)))
+                return self._batch_set_error(requests, modality, DownloadError(str(e)))
             except Exception as e:
                 return self._batch_set_error(
                     requests,
@@ -2371,7 +2404,7 @@ class MMEncoder:
                 requests, modality, InternalError(f"Not implemented error: {e}")
             )
         except MMDownloadError as e:
-            return self._batch_set_error(requests, modality, InternalError(str(e)))
+            return self._batch_set_error(requests, modality, DownloadError(str(e)))
         except Exception as e:
             return self._batch_set_error(
                 requests, modality, BadRequestError(f"Failed to process mm items: {e}")
@@ -2435,8 +2468,11 @@ class MMEncoder:
     ) -> List[Tuple[int, int, int, str, int]]:
         code = getattr(exc, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
         msg = str(exc)
+        # Drop the traceback for download/parse errors (already logged with the
+        # URL at the load site); keep it for genuine service bugs.
         logger.error(
-            f"Rank {self.rank} batch_encode failed: {msg} {code = }", exc_info=True
+            f"Rank {self.rank} batch_encode failed: {msg} {code = }",
+            exc_info=not _omit_encode_traceback(exc),
         )
         if self.rank == 0:
             for req in requests:
@@ -3711,10 +3747,14 @@ async def _dp_worker_handle_request(
             "content": content,
         }
     except Exception as e:
+        # MMError == a soft/expected error (download/parse/bad-request), already
+        # logged with its root cause at the encode sink before being flattened
+        # here; a second traceback is noise. Keep the traceback only for
+        # unexpected non-MMError failures (send/profile/health infra bugs).
         logger.error(
             f"DP worker {dp_rank} error on {dp_type} "
             f"req_id={request.get('req_id', '?')}: {e}",
-            exc_info=True,
+            exc_info=not isinstance(e, MMError),
         )
         if count_metrics:
             encoder_metrics_collector.inc_requests_total(

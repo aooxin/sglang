@@ -749,7 +749,8 @@ def download_mm_data(url: str) -> bytes:
     total_timeout = float(os.getenv("REQUEST_TIMEOUT", "120"))
     connect_timeout = min(5.0, total_timeout)
     read_timeout = min(30.0, total_timeout)
-    deadline = time.monotonic() + total_timeout
+    _start = time.monotonic()
+    deadline = _start + total_timeout
     try:
         with get_mm_http_session().get(
             url, stream=True, timeout=(connect_timeout, read_timeout)
@@ -782,14 +783,28 @@ def download_mm_data(url: str) -> bytes:
                     f"Multimodal download exceeded total deadline of "
                     f"{total_timeout}s ({sum(map(len, chunks))} bytes read)"
                 )
+            slow_s = envs.SGLANG_DIAG_SLOW_MM_DOWNLOAD_S.get()
+            elapsed = time.monotonic() - _start
+            if slow_s > 0 and elapsed > slow_s:
+                logger.warning(
+                    "Slow multimodal download: %.1fs, %d bytes, url=%s",
+                    elapsed,
+                    sum(map(len, chunks)),
+                    url,
+                )
             return b"".join(chunks)
     except TimeoutError as e:
         logger.warning("Multimodal download failed for %s: %s", url, e)
         raise MMDownloadError(str(e)) from e
-    except requests.HTTPError:
-        # The server answered; a 4xx/5xx status usually means the URL itself
-        # is bad, so keep the existing (client-error) handling.
-        raise
+    except requests.HTTPError as e:
+        # The server answered with a 4xx/5xx. requests embeds the full URL in
+        # the message ("... for url: <url>"); log the URL server-side only and
+        # raise a scrubbed message so it never reaches the client.
+        status = getattr(getattr(e, "response", None), "status_code", "?")
+        logger.warning("Multimodal download failed for %s: HTTP %s", url, status)
+        raise MMDownloadError(
+            f"Failed to download multimodal data: HTTP {status}"
+        ) from e
     except requests.RequestException as e:
         # Report only the innermost cause: the full requests/urllib3 chain
         # repeats the URL several times and leaks into client-facing errors.

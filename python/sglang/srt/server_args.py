@@ -3822,6 +3822,10 @@ class ServerArgs:
                     "--enable-pd-direct2host is decode-only "
                     f"(current disaggregation_mode={self.disaggregation_mode!r})."
                 )
+            if self.use_mla_backend():
+                raise ValueError(
+                    "--enable-pd-direct2host currently supports MHA only."
+                )
             if self.pp_size > 1:
                 raise ValueError(
                     "--enable-pd-direct2host is not supported with "

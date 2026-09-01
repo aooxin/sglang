@@ -1011,6 +1011,34 @@ class MHATokenToKVPoolHost(HostKVCache):
     def v_buffer(self):
         return self.kv_buffer[1]
 
+    def load_to_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        if io_backend != "direct":
+            return
+
+        if self.layout == "layer_first":
+            src_layers = self.k_data_refs + self.v_data_refs
+            dst_layers = device_pool.k_buffer + device_pool.v_buffer
+        elif self.layout == "page_first":
+            if not isinstance(device_pool, MHAPageFirstTokenToKVPool):
+                raise ValueError(
+                    "page_first host layout requires a page-first device pool"
+                )
+            device_k, device_v = device_pool.get_page_first_raw_buffers()
+            src_layers = [self.k_buffer, self.v_buffer]
+            dst_layers = [device_k, device_v]
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+        transfer_kv_direct(
+            src_layers=src_layers,
+            dst_layers=dst_layers,
+            src_indices=host_indices,
+            dst_indices=device_indices,
+            page_size=self.page_size,
+        )
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -1111,6 +1139,19 @@ class MHATokenToKVPoolHost(HostKVCache):
                         device_pool.k_buffer[layer_id],
                         device_pool.v_buffer[layer_id],
                     ],
+                    src_indices=host_indices,
+                    dst_indices=device_indices,
+                    page_size=self.page_size,
+                )
+            elif self.layout == "page_first":
+                if not isinstance(device_pool, MHAPageFirstTokenToKVPool):
+                    raise ValueError(
+                        "page_first host layout requires a page-first device pool"
+                    )
+                device_k, device_v = device_pool.get_page_first_raw_buffers()
+                transfer_kv_direct(
+                    src_layers=[self.k_buffer, self.v_buffer],
+                    dst_layers=[device_k, device_v],
                     src_indices=host_indices,
                     dst_indices=device_indices,
                     page_size=self.page_size,
@@ -1261,6 +1302,19 @@ class MHATokenToKVPoolHost(HostKVCache):
                 transfer_kv_direct(
                     src_layers=device_pool.k_buffer + device_pool.v_buffer,
                     dst_layers=self.k_data_refs + self.v_data_refs,
+                    src_indices=device_indices,
+                    dst_indices=host_indices,
+                    page_size=self.page_size,
+                )
+            elif self.layout == "page_first":
+                if not isinstance(device_pool, MHAPageFirstTokenToKVPool):
+                    raise ValueError(
+                        "page_first host layout requires a page-first device pool"
+                    )
+                device_k, device_v = device_pool.get_page_first_raw_buffers()
+                transfer_kv_direct(
+                    src_layers=[device_k, device_v],
+                    dst_layers=[self.k_buffer, self.v_buffer],
                     src_indices=device_indices,
                     dst_indices=host_indices,
                     page_size=self.page_size,

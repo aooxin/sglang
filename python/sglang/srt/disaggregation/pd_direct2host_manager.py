@@ -17,12 +17,10 @@ import torch
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MHATokenToKVPool,
-    MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MiMoTransitTokenToKVPoolHost,
-    MLATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.mimo_memory_pool import MiMoTokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -43,8 +41,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# TODO: support other layout.
-_TRANSIT_LAYOUT = "layer_first"
 _MULTI_POOL_FUSE_NUM_WARPS_PER_BLOCK = 16
 
 
@@ -320,6 +316,8 @@ class PDDirect2HostManager:
         host_size = self.server_args.pd_direct2host_host_size
         host_ratio = self.server_args.pd_direct2host_host_ratio
 
+        if isinstance(device_pool, SWAKVPool):
+            device_pool = device_pool.full_kv_pool
         if isinstance(device_pool, MLATokenToKVPool):
             return MLATokenToKVPoolHost(
                 device_pool=device_pool,
@@ -338,15 +336,16 @@ class PDDirect2HostManager:
                 host_to_device_ratio=host_ratio,
                 host_size=host_size if host_size is not None else 0,
                 page_size=self.page_size,
-                layout=_TRANSIT_LAYOUT,
+                layout="layer_first",
             )
+        layout = getattr(device_pool, "kv_transfer_layout", "layer_first")
         if isinstance(device_pool, MHATokenToKVPool):
             return MHATokenToKVPoolHost(
                 device_pool=device_pool,
                 host_to_device_ratio=host_ratio,
                 host_size=host_size if host_size is not None else 0,
                 page_size=self.page_size,
-                layout=_TRANSIT_LAYOUT,
+                layout=layout,
             )
         raise NotImplementedError(
             f"PDDirect2HostManager does not support device pool "
@@ -386,13 +385,7 @@ class PDDirect2HostManager:
         return data_ptrs, data_lens, item_lens
 
     def _buf_infos_for(self, host_pool) -> Tuple[List[int], List[int], List[int]]:
-        """Mirror device-side get_contiguous_buf_infos for a host pool.
-
-        Returns (data_ptrs, data_lens, item_lens). For MHA it's
-        [k_layer_0..k_layer_{L-1}, v_layer_0..v_layer_{L-1}]; for MLA it's
-        [layer_0..layer_{L-1}]. layer_first layout guarantees each per-layer
-        slice is a contiguous tensor view.
-        """
+        """Return host descriptors matching the device transfer layout."""
         # MiMoTransitTokenToKVPoolHost is a subclass of MHATokenToKVPoolHost but
         # stores per-layer quantized page-block buffers with different K/V item
         # sizes; delegate to its own buf-info reporter, which mirrors the device
@@ -400,29 +393,36 @@ class PDDirect2HostManager:
         if isinstance(host_pool, MiMoTransitTokenToKVPoolHost):
             return host_pool.get_contiguous_buf_infos()
         if isinstance(host_pool, MHATokenToKVPoolHost):
-            k_buffer = host_pool.k_buffer
-            v_buffer = host_pool.v_buffer
-            layer_num = host_pool.layer_num
-            data_ptrs = [k_buffer[i].data_ptr() for i in range(layer_num)] + [
-                v_buffer[i].data_ptr() for i in range(layer_num)
-            ]
-            data_lens = [k_buffer[i].nbytes for i in range(layer_num)] + [
-                v_buffer[i].nbytes for i in range(layer_num)
-            ]
-            item_lens = [
-                k_buffer[i][0].nbytes * self.page_size for i in range(layer_num)
-            ] + [v_buffer[i][0].nbytes * self.page_size for i in range(layer_num)]
-            return data_ptrs, data_lens, item_lens
-        if isinstance(host_pool, MLATokenToKVPoolHost):
-            kv_buffer = host_pool.kv_buffer
-            layer_num = host_pool.layer_num
-            data_ptrs = [kv_buffer[i].data_ptr() for i in range(layer_num)]
-            data_lens = [kv_buffer[i].nbytes for i in range(layer_num)]
-            item_lens = [
-                kv_buffer[i][0].nbytes * self.page_size for i in range(layer_num)
-            ]
-            return data_ptrs, data_lens, item_lens
+            if host_pool.layout == "page_first":
+                return self._page_first_buf_infos(host_pool)
+            return self._layer_first_mha_buf_infos(host_pool)
         raise TypeError(f"Unsupported host pool {type(host_pool).__name__}")
+
+    def _page_first_buf_infos(
+        self, host_pool: MHATokenToKVPoolHost
+    ) -> Tuple[List[int], List[int], List[int]]:
+        k_buffer = host_pool.k_buffer
+        v_buffer = host_pool.v_buffer
+        if k_buffer.nbytes == 0 or v_buffer.nbytes == 0:
+            return [], [], []
+        return (
+            [k_buffer.data_ptr(), v_buffer.data_ptr()],
+            [k_buffer.nbytes, v_buffer.nbytes],
+            [
+                self.page_size * host_pool.layout_dim,
+                self.page_size * host_pool.v_layout_dim,
+            ],
+        )
+
+    def _layer_first_mha_buf_infos(
+        self, host_pool: MHATokenToKVPoolHost
+    ) -> Tuple[List[int], List[int], List[int]]:
+        buffers = list(host_pool.k_buffer) + list(host_pool.v_buffer)
+        return (
+            [buffer.data_ptr() for buffer in buffers],
+            [buffer.nbytes for buffer in buffers],
+            [self.page_size * buffer[0].nbytes for buffer in buffers],
+        )
 
     # Per-request host-side preallocation
 

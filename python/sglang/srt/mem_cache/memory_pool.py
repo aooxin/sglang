@@ -1180,11 +1180,6 @@ class MHAPageFirstTokenToKVPool(MHATokenToKVPool):
             self._v_raw.flatten(0, 1),
         )
 
-    def get_contiguous_buf_infos(self):
-        raise NotImplementedError(
-            "page-first KV layout uses the page-level descriptor protocol"
-        )
-
     def get_page_level_buf_infos(self):
         k_buffer, v_buffer = self.get_page_first_raw_buffers()
         if k_buffer.nbytes == 0 or v_buffer.nbytes == 0:

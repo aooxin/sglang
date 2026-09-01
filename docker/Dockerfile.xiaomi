@@ -100,5 +100,15 @@ COPY . .
 RUN python3 -m pip install https://artifactory.d.xiaomi.net/artifactory/mimo-core-pypi-local/ez-kernel-kit/0.3.0.dev89+fp8kv.g57e0e0e/ez_kernel_kit-0.3.0.dev89+fp8kv.g57e0e0e-cp312-cp312-linux_x86_64.whl \
     --no-cache-dir --no-dependencies --force-reinstall
 
+# --- Node.js (LTS) + latest Claude Code ------------------------------------
+# Claude Code is distributed as an npm package; install Node LTS from
+# NodeSource, then the latest Claude Code globally.
+RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g @anthropic-ai/claude-code \
+    && echo '{"hasCompletedOnboarding": true}' > /root/.claude.json \
+    && claude --version
+
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang

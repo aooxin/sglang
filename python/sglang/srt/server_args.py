@@ -601,7 +601,7 @@ class ServerArgs:
     enable_hisparse: bool = False
     hisparse_config: Optional[str] = None
 
-    # Use the physical page-first device KV layout with FA3.
+    # Use the physical page-first device KV layout.
     enable_page_first_kv_layout: bool = False
 
     # LMCache

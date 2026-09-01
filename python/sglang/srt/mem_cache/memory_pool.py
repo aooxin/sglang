@@ -1089,19 +1089,18 @@ class MHATokenToKVPool(KVCache):
 
 
 class MHAPageFirstTokenToKVPool(MHATokenToKVPool):
-    """MHA KV pool with a physical page-first (4D) device layout.
+    """MHA KV pool with a physical page-first device layout.
 
-    Each layer's buffer is stored as ``[num_pages, page_size, head_num, head_dim]``
-    instead of the token-linear ``[size + page_size, head_num, head_dim]`` used by
-    the base class. This makes the tokens of a page physically contiguous so that
-    the page becomes the natural unit for allocation, D2H/H2D transfer and paged
-    attention.
+    K and V are each allocated as one contiguous raw buffer with shape
+    ``[num_pages, page_size, layer_num, head_num, head_dim]``. Per-layer access is
+    exposed through zero-copy strided views with shape
+    ``[num_pages, page_size, head_num, head_dim]``. This keeps a complete page,
+    including all of its layers, physically contiguous for page-granular transfer.
 
-    Key invariant: the page-first layout is *memory-equivalent* to the token-linear
-    layout once flattened to ``(total_tokens, head_num, head_dim)`` — page-first just
-    splits dim0 into ``num_pages x page_size``. The allocator already produces
-    page-aligned locations (``page_id * page_size + intra``), so every flat-loc
-    access point is adapted for free via a flattened view of the 4D buffer.
+    Flattening the page and token-in-page dimensions gives the logical layout
+    ``[total_tokens, layer_num, head_num, head_dim]``. Consequently, a per-layer
+    strided view can still be addressed by the allocator's flat token location
+    ``page_id * page_size + token_in_page`` without changing allocator semantics.
     """
 
     def _flat_view(self, buf: torch.Tensor) -> torch.Tensor:
@@ -1264,8 +1263,9 @@ class MHAPageFirstTokenToKVPool(MHATokenToKVPool):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        # Always use the native flat-loc move on the flattened view; the CUDA JIT
-        # tiled copy is intentionally not used for the FA3 PF prototype.
+        # TODO: Extend copy_all_layer_kv_cache_tiled to accept separate token-stride
+        # and item-size arguments. In page-first layout, the per-layer token stride
+        # spans all layers while only one layer's [head, dim] payload should be copied.
         k_flat = [self._flat_view(b) for b in self.k_buffer]
         v_flat = [self._flat_view(b) for b in self.v_buffer]
         move_kv_cache_native(k_flat, v_flat, tgt_loc, src_loc)

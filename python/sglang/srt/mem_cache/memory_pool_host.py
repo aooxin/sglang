@@ -94,7 +94,6 @@ if _is_npu:
 
 
 logger = logging.getLogger(__name__)
-_CPU_DEVICE = torch.device("cpu")
 
 # Cached once at import: gating envs.SGLANG_SWA_DIAG_ENABLED.get() per alloc/free
 # would add an os.getenv lookup to the hot path, defeating the purpose.

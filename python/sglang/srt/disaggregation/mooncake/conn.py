@@ -775,59 +775,59 @@ class MooncakeKVManager(CommonKVManager):
             prefill_data_indices, dst_data_indices
         )
 
-        layers_params = None
-
         # Page-first descriptors represent one whole page in each raw K/V buffer.
         if layout == "page_first":
-            if len(src_data_ptrs) != len(dst_data_ptrs) or len(src_data_ptrs) != len(item_lens):
+            if not (
+                len(src_data_ptrs) == len(dst_data_ptrs) == len(item_lens)
+            ):
                 logger.error(
                     "page-first KV descriptor count mismatch: "
                     f"src={len(src_data_ptrs)} dst={len(dst_data_ptrs)} "
                     f"item_lens={len(item_lens)}"
                 )
                 return -1
-            layers_params = list(zip(src_data_ptrs, dst_data_ptrs, item_lens))
-        # Decode pp size should be equal to prefill pp size or 1
-        elif self.is_mla_backend:
-            src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
-                self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
-            )
-            layers_params = [
-                (
-                    src_kv_ptrs[layer_id],
-                    dst_kv_ptrs[layer_id],
-                    item_lens[layer_id],
-                )
-                for layer_id in range(layers_current_pp_stage)
-            ]
+            transfer_params = list(zip(src_data_ptrs, dst_data_ptrs, item_lens))
         else:
-            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
-                self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
-            )
-            # item_lens structure: [k_layer0, k_layer1, ..., k_layerN, v_layer0, v_layer1, ..., v_layerN]
-            # Use correct item lengths for K and V separately
-            if layers_current_pp_stage > len(dst_k_ptrs):
-                logger.error(
-                    "Prefill transfer kvcache error, layers_current_pp_stage is out of range: "
-                    f"layers_current_pp_stage={layers_current_pp_stage}, len(dst_k_ptrs)={len(dst_k_ptrs)}"
+            # Decode pp size should be equal to prefill pp size or 1.
+            if self.is_mla_backend:
+                src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
+                    self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
                 )
-                return -1
-            layers_params = [
-                (
-                    src_k_ptrs[layer_id],
-                    dst_k_ptrs[layer_id],
-                    item_lens[layer_id],  # K item length
+                transfer_params = [
+                    (
+                        src_kv_ptrs[layer_id],
+                        dst_kv_ptrs[layer_id],
+                        item_lens[layer_id],
+                    )
+                    for layer_id in range(layers_current_pp_stage)
+                ]
+            else:
+                src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, layers_current_pp_stage = (
+                    self.get_mha_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
                 )
-                for layer_id in range(layers_current_pp_stage)
-            ] + [
-                (
-                    src_v_ptrs[layer_id],
-                    dst_v_ptrs[layer_id],
-                    item_lens[layers_current_pp_stage + layer_id],  # V item length
-                )
-                for layer_id in range(layers_current_pp_stage)
-            ]
-        assert layers_params is not None
+                # item_lens: [K layer 0..N, V layer 0..N].
+                if layers_current_pp_stage > len(dst_k_ptrs):
+                    logger.error(
+                        "Prefill transfer kvcache error, layers_current_pp_stage is out of range: "
+                        f"layers_current_pp_stage={layers_current_pp_stage}, "
+                        f"len(dst_k_ptrs)={len(dst_k_ptrs)}"
+                    )
+                    return -1
+                transfer_params = [
+                    (
+                        src_k_ptrs[layer_id],
+                        dst_k_ptrs[layer_id],
+                        item_lens[layer_id],
+                    )
+                    for layer_id in range(layers_current_pp_stage)
+                ] + [
+                    (
+                        src_v_ptrs[layer_id],
+                        dst_v_ptrs[layer_id],
+                        item_lens[layers_current_pp_stage + layer_id],
+                    )
+                    for layer_id in range(layers_current_pp_stage)
+                ]
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int
@@ -848,9 +848,9 @@ class MooncakeKVManager(CommonKVManager):
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         # Worker function for processing all layers in a batch
-        def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
+        def process_layers(transfer_params: List[Tuple[int, int, int]]) -> int:
             transfer_blocks = []
-            for src_ptr, dst_ptr, item_len in layers_params:
+            for src_ptr, dst_ptr, item_len in transfer_params:
                 transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
@@ -862,7 +862,7 @@ class MooncakeKVManager(CommonKVManager):
                     dst_ptr,
                     item_len,
                 )
-                for (src_ptr, dst_ptr, item_len) in layers_params
+                for (src_ptr, dst_ptr, item_len) in transfer_params
             ]
             for future in concurrent.futures.as_completed(futures):
                 status = future.result()
@@ -874,7 +874,7 @@ class MooncakeKVManager(CommonKVManager):
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
-            return process_layers(layers_params)
+            return process_layers(transfer_params)
 
     def send_kvcache(
         self,

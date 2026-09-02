@@ -172,6 +172,9 @@ void transfer_kv_direct(
     const at::Tensor dst_indices,
     int64_t page_size);
 
+void transfer_kv_per_layer_direct_mla(
+    const at::Tensor src, at::Tensor dst, const at::Tensor src_indices, const at::Tensor dst_indices);
+
 void transfer_kv_per_layer_direct_pf_lf(
     const std::vector<at::Tensor>& src_ptrs,
     std::vector<at::Tensor> dst_ptrs,
@@ -256,6 +259,8 @@ TORCH_LIBRARY(transfer_kernel, m) {
       "transfer_kv_direct(Tensor[] src_layers, Tensor[] dst_layers, Tensor src_indices, Tensor dst_indices, int "
       "page_size) -> ()");
   m.impl("transfer_kv_direct", torch::kCUDA, &transfer_kv_direct);
+  m.def("transfer_kv_per_layer_direct_mla(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices) -> ()");
+  m.impl("transfer_kv_per_layer_direct_mla", torch::kCUDA, &transfer_kv_per_layer_direct_mla);
   m.def(
       "transfer_kv_per_layer_direct_pf_lf(Tensor[] src_ptrs, Tensor[] dst_ptrs, Tensor src_indices, "
       "Tensor dst_indices, int layer_id, int page_size)->() ");

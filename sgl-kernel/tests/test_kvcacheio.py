@@ -9,6 +9,7 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer_mla,
     transfer_kv_direct,
     transfer_kv_per_layer,
+    transfer_kv_per_layer_direct_mla,
     transfer_kv_per_layer_direct_pf_lf,
     transfer_kv_per_layer_mla,
 )
@@ -702,6 +703,50 @@ def test_transfer_kv_page_head(
         torch.testing.assert_close(dst_k_pool_kernel, dst_k_pool_ref)
         torch.testing.assert_close(dst_v_pool_kernel, dst_v_pool_ref)
     torch.set_default_dtype(original_dtype)
+
+
+@pytest.mark.parametrize("num_pages_to_transfer", [1, 8, 64])
+@pytest.mark.parametrize("total_pages_in_pool", [512])
+@pytest.mark.parametrize("head_num", [1, 8])
+def test_transfer_kv_per_layer_direct_mla(
+    num_pages_to_transfer, total_pages_in_pool, head_num
+):
+    # MiMoV2-style opaque page-block layout: dim0 is pages, K/V page blocks have
+    # different byte sizes, buffers are uint8. Host->device via direct copy.
+    torch.manual_seed(0)
+    k_page_bytes = 16640
+    v_page_bytes = 8448
+
+    src_k = torch.randint(
+        0, 256, (total_pages_in_pool, head_num, k_page_bytes), dtype=torch.uint8
+    )
+    src_v = torch.randint(
+        0, 256, (total_pages_in_pool, head_num, v_page_bytes), dtype=torch.uint8
+    )
+    dst_k = torch.zeros(
+        total_pages_in_pool, head_num, k_page_bytes, dtype=torch.uint8, device="cuda"
+    )
+    dst_v = torch.zeros(
+        total_pages_in_pool, head_num, v_page_bytes, dtype=torch.uint8, device="cuda"
+    )
+
+    perm = torch.randperm(total_pages_in_pool)
+    src_pages = perm[:num_pages_to_transfer].to(torch.int64)
+    dst_pages = torch.randperm(total_pages_in_pool)[:num_pages_to_transfer].to(
+        torch.int64
+    )
+
+    transfer_kv_per_layer_direct_mla(src_k, dst_k, src_pages, dst_pages)
+    transfer_kv_per_layer_direct_mla(src_v, dst_v, src_pages, dst_pages)
+    torch.cuda.synchronize()
+
+    ref_k = torch.zeros_like(dst_k)
+    ref_v = torch.zeros_like(dst_v)
+    ref_k[dst_pages] = src_k[src_pages].to("cuda")
+    ref_v[dst_pages] = src_v[src_pages].to("cuda")
+
+    torch.testing.assert_close(dst_k, ref_k)
+    torch.testing.assert_close(dst_v, ref_v)
 
 
 if __name__ == "__main__":

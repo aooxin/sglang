@@ -345,6 +345,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "transfer_kv_direct(Tensor[] src_layers, Tensor[] dst_layers, Tensor src_indices, Tensor dst_indices, int "
       "page_size) -> ()");
   m.impl("transfer_kv_direct", torch::kCUDA, &transfer_kv_direct);
+  m.def("transfer_kv_per_layer_direct_mla(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices) -> ()");
+  m.impl("transfer_kv_per_layer_direct_mla", torch::kCUDA, &transfer_kv_per_layer_direct_mla);
   m.def(
       "transfer_kv_per_layer_direct_pf_lf(Tensor[] src_ptrs, Tensor[] dst_ptrs, Tensor src_indices, "
       "Tensor dst_indices, int layer_id, int page_size)->() ");

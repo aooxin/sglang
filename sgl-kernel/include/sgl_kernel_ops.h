@@ -606,6 +606,9 @@ void transfer_kv_direct(
     const at::Tensor dst_indices,
     int64_t page_size);
 
+void transfer_kv_per_layer_direct_mla(
+    const at::Tensor src, at::Tensor dst, const at::Tensor src_indices, const at::Tensor dst_indices);
+
 void transfer_kv_per_layer_direct_pf_lf(
     const std::vector<at::Tensor>& src_ptrs,
     std::vector<at::Tensor> dst_ptrs,

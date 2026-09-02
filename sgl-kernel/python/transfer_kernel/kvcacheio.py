@@ -288,6 +288,19 @@ def transfer_kv_direct(
     )
 
 
+def transfer_kv_per_layer_direct_mla(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+):
+    # Single-buffer direct copy of whole page-block records along dim 0;
+    # src_indices/dst_indices are page-granular. Call once for K, once for V.
+    torch.ops.transfer_kernel.transfer_kv_per_layer_direct_mla.default(
+        src, dst, src_indices, dst_indices
+    )
+
+
 def transfer_kv_per_layer_direct_pf_lf(
     src_ptrs: List[torch.Tensor],
     dst_ptrs: List[torch.Tensor],

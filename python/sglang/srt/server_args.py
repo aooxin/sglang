@@ -2455,6 +2455,18 @@ class ServerArgs:
                     f"validated against the quantized page layout), got "
                     f"{self.hicache_storage_backend}."
                 )
+            # PD direct-to-host uses MiMoTransitTokenToKVPoolHost, whose H2D
+            # copy of the quantized page blocks is implemented only for the
+            # kernel and direct byte-copy backends; validate at startup so a
+            # bad backend fails fast instead of on the H2D CUDA stream.
+            if self.enable_pd_direct2host:
+                assert self.hicache_io_backend in ("kernel", "direct"), (
+                    f"mimo_flash_attn attention backend with "
+                    f"--enable-pd-direct2host requires --hicache-io-backend "
+                    f"kernel or direct (the quantized page blocks are moved by "
+                    f"the byte-copy transfer kernels), got "
+                    f"{self.hicache_io_backend}."
+                )
         if (
             self.attention_backend == "flashmla"
             or self.decode_attention_backend == "flashmla"

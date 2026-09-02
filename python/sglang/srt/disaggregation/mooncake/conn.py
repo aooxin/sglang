@@ -866,6 +866,21 @@ class MooncakeKVManager(CommonKVManager):
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
         page_size = self.kv_args.page_size
 
+        # The head-sliced transfer assumes a uniform per-token byte layout with
+        # evenly split heads and a single item_len shared by all K/V buffers.
+        # Quantized paged backends (e.g. mimo_flash_attn) pack per-token records
+        # plus a scale tail and use different K vs V page-block sizes, so this
+        # path cannot describe them correctly. Fail loudly instead of silently
+        # corrupting the transfer.
+        if len(set(self.kv_args.kv_item_lens)) > 1:
+            raise RuntimeError(
+                "Heterogeneous-TP (sliced) KV transfer is not supported for "
+                "backends with non-uniform K/V item sizes (e.g. the "
+                "mimo_flash_attn FP8 paged KV cache). Use matching "
+                "prefill/decode attention TP sizes so the generic same-TP "
+                "transfer path is used."
+            )
+
         # Use total KV head count (not per-rank) for correct head distribution.
         # Per-rank kv_head_num is max(1, total//tp) which loses info when total < tp.
         total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)

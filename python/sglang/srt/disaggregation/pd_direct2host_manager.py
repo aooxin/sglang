@@ -21,8 +21,10 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
+    MiMoTransitTokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
+from sglang.srt.mem_cache.mimo_memory_pool import MiMoTokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.nvtx_utils import nvtx_annotated_method
 
@@ -242,6 +244,18 @@ class PDDirect2HostManager:
                 page_size=self.page_size,
                 layout=_TRANSIT_LAYOUT,
             )
+        # MiMoTokenToKVPool is a subclass of MHATokenToKVPool but stores
+        # FP8-quantized paged blocks; it must use the quantized transit host
+        # pool (checked before the MHA branch below), otherwise the host buffer
+        # would be sized/laid-out as BF16 MHA and mismatch the device layout.
+        if isinstance(device_pool, MiMoTokenToKVPool):
+            return MiMoTransitTokenToKVPoolHost(
+                device_pool=device_pool,
+                host_to_device_ratio=host_ratio,
+                host_size=host_size if host_size is not None else 0,
+                page_size=self.page_size,
+                layout=_TRANSIT_LAYOUT,
+            )
         if isinstance(device_pool, MHATokenToKVPool):
             return MHATokenToKVPoolHost(
                 device_pool=device_pool,
@@ -294,6 +308,12 @@ class PDDirect2HostManager:
         [layer_0..layer_{L-1}]. layer_first layout guarantees each per-layer
         slice is a contiguous tensor view.
         """
+        # MiMoTransitTokenToKVPoolHost is a subclass of MHATokenToKVPoolHost but
+        # stores per-layer quantized page-block buffers with different K/V item
+        # sizes; delegate to its own buf-info reporter, which mirrors the device
+        # pool (item_len == one page block, i.e. already covers page_size tokens).
+        if isinstance(host_pool, MiMoTransitTokenToKVPoolHost):
+            return host_pool.get_contiguous_buf_infos()
         if isinstance(host_pool, MHATokenToKVPoolHost):
             k_buffer = host_pool.k_buffer
             v_buffer = host_pool.v_buffer

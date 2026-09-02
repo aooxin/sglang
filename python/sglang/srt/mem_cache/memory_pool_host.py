@@ -59,6 +59,7 @@ if not (_is_npu or _is_xpu or _is_mps):
             transfer_kv_all_layer_mla_lf_pf,
             transfer_kv_direct,
             transfer_kv_per_layer,
+            transfer_kv_per_layer_direct_mla,
             transfer_kv_per_layer_direct_pf_lf,
             transfer_kv_per_layer_mla,
             transfer_kv_per_layer_mla_pf_lf,
@@ -79,6 +80,7 @@ if not (_is_npu or _is_xpu or _is_mps):
         transfer_kv_all_layer_mla_lf_pf = None
         transfer_kv_direct = None
         transfer_kv_per_layer = None
+        transfer_kv_per_layer_direct_mla = None
         transfer_kv_per_layer_direct_pf_lf = None
         transfer_kv_per_layer_mla = None
         transfer_kv_per_layer_mla_pf_lf = None
@@ -1628,6 +1630,257 @@ class MiMoTokenToKVPoolHost(MHATokenToKVPoolHost):
         raise NotImplementedError(
             "MiMoTokenToKVPoolHost is only used inside MiMoSWATokenToKVPoolHost; "
             "use the composite pool's get_page_buffer_meta instead."
+        )
+
+
+class MiMoTransitTokenToKVPoolHost(MiMoTokenToKVPoolHost):
+    """Layer-first pinned transit host pool for the MiMoV2 FP8-quantized
+    full-attention KV cache, used by PD direct-to-host.
+
+    Unlike ``MiMoTokenToKVPoolHost`` (page_first, single fused buffer, used by
+    HiCache), the PD direct-to-host pipeline needs the host buffers to mirror
+    the device pool ``MiMoTokenToKVPool`` layer-by-layer, so that:
+
+    - mooncake can RDMA-write each device layer's quantized page blocks into a
+      contiguous per-layer host buffer (``get_contiguous_buf_infos`` returns
+      one pointer per K/V layer, matching the device pool's own
+      ``get_contiguous_buf_infos``), and
+    - the H2D copy is a straight per-layer page-block scatter.
+
+    The device pool stores opaque quantized 64-token page blocks:
+    ``k_buffer[layer] = [num_pages, h_kv, k_page_bytes]`` uint8 and
+    ``v_buffer[layer] = [num_pages, h_kv, v_page_bytes]`` uint8. This host pool
+    mirrors them with per-layer uint8 buffers ``[page_num + 1, h_kv, page_bytes]``
+    and moves whole page blocks with the byte-copy kernels, treating one page
+    block as one record (K: ``h_kv * k_page_bytes`` bytes, V:
+    ``h_kv * v_page_bytes`` bytes). External bookkeeping stays token-granular;
+    token-granular indices are converted to page indices at the transfer
+    boundary (see ``_to_page_indices``). Only the layer_first layout is
+    supported; both the kernel and direct IO backends are supported.
+    """
+
+    def __init__(
+        self,
+        device_pool,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+    ):
+        if layout != "layer_first":
+            raise ValueError(
+                f"MiMoTransitTokenToKVPoolHost only supports the layer_first "
+                f"layout (per-layer quantized page-block buffers mirror the "
+                f"device pool for RDMA + per-layer H2D), got {layout}"
+            )
+        # HostKVCache.__init__ calls get_size_per_token() and init_kv_buffer();
+        # both are overridden below to build the layer-first byte layout.
+        HostKVCache.__init__(
+            self,
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            pin_memory,
+            device,
+            allocator_type,
+        )
+        # Per-layer device-side pointer tables mirror MiMoTokenToKVPool; expose
+        # matching host tables for the transfer kernels / buf-info reporting.
+        self.k_data_ptrs = torch.tensor(
+            [buf.data_ptr() for buf in self.k_buffer],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [buf.data_ptr() for buf in self.v_buffer],
+            dtype=torch.uint64,
+            device=self.device_pool.device,
+        )
+
+    # k_buffer / v_buffer are the two-element list returned by init_kv_buffer;
+    # override the MHA properties (which index kv_buffer[0]/[1] as tensors)
+    # since our buffers are per-layer lists.
+    @property
+    def k_buffer(self):
+        return self.kv_buffer[0]
+
+    @property
+    def v_buffer(self):
+        return self.kv_buffer[1]
+
+    def init_kv_buffer(self):
+        # get_size_per_token() (inherited) has already populated the byte
+        # layout fields (head_num, layer_num, _k_page_dim, _v_page_dim,
+        # k_page_bytes, v_page_bytes, token strides). Build one uint8 buffer
+        # per layer for K and V so each layer is a contiguous RDMA target.
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        k_buffer = [
+            alloc_func(
+                (self.page_num + 1, self.head_num, self._k_page_dim),
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+            for _ in range(self.layer_num)
+        ]
+        v_buffer = [
+            alloc_func(
+                (self.page_num + 1, self.head_num, self._v_page_dim),
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+            for _ in range(self.layer_num)
+        ]
+        return [k_buffer, v_buffer]
+
+    def get_contiguous_buf_infos(self):
+        """Return (data_ptrs, data_lens, item_lens), matching the device pool's
+        MiMoTokenToKVPool.get_contiguous_buf_infos layout:
+        [k_layer0..k_layer_{L-1}, v_layer0..v_layer_{L-1}]. item_len is one
+        page block (h_kv * page_bytes)."""
+        k_buffer = self.k_buffer
+        v_buffer = self.v_buffer
+        data_ptrs = [buf.data_ptr() for buf in k_buffer] + [
+            buf.data_ptr() for buf in v_buffer
+        ]
+        data_lens = [buf.nbytes for buf in k_buffer] + [buf.nbytes for buf in v_buffer]
+        # buf[0] is a single page block: h_kv * page_bytes.
+        item_lens = [buf[0].nbytes for buf in k_buffer] + [
+            buf[0].nbytes for buf in v_buffer
+        ]
+        return data_ptrs, data_lens, item_lens
+
+    def get_multi_pool_h2d_descriptors(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+    ):
+        # The inherited MHA descriptor uses per-token strides and token
+        # indices; the quantized paged layout transfers whole page blocks, so
+        # provide page-granular item sizes (K/V page-block bytes) and page
+        # indices instead. Both host and device store per-layer page-block
+        # buffers, so the fused multi-pool kernel can scatter page records
+        # directly (src_base + page_id * page_bytes).
+        if io_backend != "kernel":
+            return None
+        host_pages = self._to_page_indices(host_indices)
+        device_pages = self._to_page_indices(device_indices)
+        return {
+            "src_k_layer_ptrs": self.k_data_ptrs,
+            "dst_k_layer_ptrs": device_pool.k_data_ptrs,
+            "src_v_layer_ptrs": self.v_data_ptrs,
+            "dst_v_layer_ptrs": device_pool.v_data_ptrs,
+            "src_indices": [host_pages],
+            "dst_indices": [device_pages],
+            "pool_num_items": [host_pages.numel()],
+            "pool_k_item_sizes": [self.k_page_bytes],
+            "pool_v_item_sizes": [self.v_page_bytes],
+            "max_num_items": host_pages.numel(),
+            "block_quota": self.h2d_block_quota,
+        }
+
+    def _load_layer_from_pages(
+        self,
+        device_pool,
+        host_pages,
+        device_pages,
+        layer_id,
+        io_backend,
+    ):
+        """Transfer a single layer given already-converted page indices.
+
+        Both host and device store layer-first per-layer page-block buffers,
+        so a straight per-layer record scatter (K and V separately, since the
+        page-block sizes differ) mirrors the device layout exactly.
+        """
+        lid = layer_id - self.start_layer
+        if io_backend == "kernel":
+            transfer_kv_per_layer_mla(
+                src=self.k_buffer[lid],
+                dst=device_pool.k_buffer[layer_id],
+                src_indices=host_pages,
+                dst_indices=device_pages,
+                item_size=self.k_page_bytes,
+                block_quota=self.h2d_block_quota,
+            )
+            transfer_kv_per_layer_mla(
+                src=self.v_buffer[lid],
+                dst=device_pool.v_buffer[layer_id],
+                src_indices=host_pages,
+                dst_indices=device_pages,
+                item_size=self.v_page_bytes,
+                block_quota=self.h2d_block_quota,
+            )
+        elif io_backend == "direct":
+            transfer_kv_per_layer_direct_mla(
+                src=self.k_buffer[lid],
+                dst=device_pool.k_buffer[layer_id],
+                src_indices=host_pages,
+                dst_indices=device_pages,
+            )
+            transfer_kv_per_layer_direct_mla(
+                src=self.v_buffer[lid],
+                dst=device_pool.v_buffer[layer_id],
+                src_indices=host_pages,
+                dst_indices=device_pages,
+            )
+        else:
+            raise ValueError(
+                f"MiMoTransitTokenToKVPoolHost only supports the kernel and "
+                f"direct IO backends, got {io_backend}"
+            )
+
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+    ):
+        host_pages = self._to_page_indices(host_indices)
+        device_pages = self._to_page_indices(device_indices)
+        self._load_layer_from_pages(
+            device_pool, host_pages, device_pages, layer_id, io_backend
+        )
+
+    def load_to_device_all_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+    ):
+        """Load every layer with a single index conversion.
+
+        The caller loops over layers with the same ``host_indices`` /
+        ``device_indices``; converting to page indices once here avoids the
+        per-layer ``_to_page_indices`` (stride slice + integer division) that
+        would otherwise repeat once per layer (e.g. 64x for a 64-layer model).
+        """
+        host_pages = self._to_page_indices(host_indices)
+        device_pages = self._to_page_indices(device_indices)
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            self._load_layer_from_pages(
+                device_pool, host_pages, device_pages, layer_id, io_backend
+            )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        raise NotImplementedError(
+            "MiMoTransitTokenToKVPoolHost is a PD direct-to-host transit pool; "
+            "device->host backup is performed by the prefill side via RDMA."
         )
 
 

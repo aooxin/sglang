@@ -1057,6 +1057,53 @@ void transfer_kv_direct(
   }
 }
 
+// Direct (cudaMemcpy-based) single-buffer transfer for one layer of an
+// opaque page-block KV cache (e.g. the MiMoV2 FP8 quantized paged pool).
+//
+// Unlike transfer_kv_per_layer_mla (the warp/byte-copy "kernel" backend), this
+// copies whole records along dim 0 via ATen slice/copy_, so it makes NO
+// assumption about a uniform per-token byte stride and works for arbitrary
+// page-block record shapes (K and V page blocks may differ in size; the caller
+// invokes this once for K and once for V).
+//
+// src / dst are single per-layer buffers whose dim 0 is indexed by
+// src_indices / dst_indices (page-granular; one row == one whole page block).
+// Contiguous ascending runs of indices are coalesced into a single slice copy.
+void transfer_kv_per_layer_direct_mla(
+    const at::Tensor src, at::Tensor dst, const at::Tensor src_indices, const at::Tensor dst_indices) {
+  TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
+
+  auto src_indices_cpu = src_indices.cpu();
+  auto dst_indices_cpu = dst_indices.cpu();
+
+  const auto num_indices = src_indices_cpu.numel();
+  int64_t* src_indices_ptr = src_indices_cpu.data_ptr<int64_t>();
+  int64_t* dst_indices_ptr = dst_indices_cpu.data_ptr<int64_t>();
+
+  int64_t start_index = 0;
+  int64_t end_index = 0;
+
+  for (int64_t i = 0; i < num_indices; ++i) {
+    if (i < num_indices - 1) {
+      auto src_diff = src_indices_ptr[i + 1] - src_indices_ptr[i];
+      auto dst_diff = dst_indices_ptr[i + 1] - dst_indices_ptr[i];
+
+      if (src_diff == 1 && dst_diff == 1) {
+        continue;
+      }
+      end_index = i + 1;
+    } else {  // last batch
+      end_index = num_indices;
+    }
+    auto src_index = src_indices_ptr[start_index];
+    auto dst_index = dst_indices_ptr[start_index];
+    auto num_pages = end_index - start_index;
+
+    transfer_page_direct(src, dst, src_index, dst_index, num_pages);
+    start_index = end_index;
+  }
+}
+
 template <bool IsLf2Pf>
 inline void transfer_kv_page_first_direct_impl(
     const std::vector<at::Tensor>& src_ptrs,

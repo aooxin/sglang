@@ -31,6 +31,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
     SchedulerStats,
     compute_routing_key_stats,
+    get_decode_prealloc_queue_counts,
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.device_timer import DeviceTimer, GapTimer
@@ -617,8 +618,13 @@ class SchedulerMetricsMixin:
                     self.kv_transfer_rdma_latency_ms
                 )
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
-                self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_prealloc_queue.queue, priority_enabled
+                (
+                    self.stats.num_decode_prealloc_queue_reqs,
+                    self.stats.num_decode_prefill_sched_wait_queue_reqs,
+                ) = get_decode_prealloc_queue_counts(
+                    self.disagg_decode_prealloc_queue.queue,
+                    self.server_args.disaggregation_two_phase_prealloc,
+                    priority_enabled,
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.disagg_decode_transfer_queue.queue, priority_enabled
@@ -877,8 +883,13 @@ class SchedulerMetricsMixin:
                     self.disagg_prefill_inflight_queue, priority_enabled
                 )
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
-                self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_prealloc_queue.queue, priority_enabled
+                (
+                    self.stats.num_decode_prealloc_queue_reqs,
+                    self.stats.num_decode_prefill_sched_wait_queue_reqs,
+                ) = get_decode_prealloc_queue_counts(
+                    self.disagg_decode_prealloc_queue.queue,
+                    self.server_args.disaggregation_two_phase_prealloc,
+                    priority_enabled,
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.disagg_decode_transfer_queue.queue, priority_enabled
@@ -1153,6 +1164,7 @@ class SchedulerMetricsMixin:
             prefill_prealloc = 0
             prefill_inflight = 0
             decode_prealloc = 0
+            decode_prefill_sched_wait = 0
             decode_transfer = 0
             decode_retracted = 0
 
@@ -1162,7 +1174,14 @@ class SchedulerMetricsMixin:
                 prefill_inflight = len(self.disagg_prefill_inflight_queue)
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 mode_str = "decode"
-                decode_prealloc = len(self.disagg_decode_prealloc_queue.queue)
+                decode_prealloc_count, decode_prefill_sched_wait_count = (
+                    get_decode_prealloc_queue_counts(
+                        self.disagg_decode_prealloc_queue.queue,
+                        self.server_args.disaggregation_two_phase_prealloc,
+                    )
+                )
+                decode_prealloc = decode_prealloc_count.total
+                decode_prefill_sched_wait = decode_prefill_sched_wait_count.total
                 decode_transfer = len(self.disagg_decode_transfer_queue.queue)
                 decode_retracted = len(
                     self.disagg_decode_prealloc_queue.retracted_queue
@@ -1173,6 +1192,7 @@ class SchedulerMetricsMixin:
                 prefill_prealloc_queue_reqs=prefill_prealloc,
                 prefill_inflight_queue_reqs=prefill_inflight,
                 decode_prealloc_queue_reqs=decode_prealloc,
+                decode_prefill_sched_wait_queue_reqs=decode_prefill_sched_wait,
                 decode_transfer_queue_reqs=decode_transfer,
                 decode_retracted_queue_reqs=decode_retracted,
                 kv_transfer_speed_gb_s=self.stats.kv_transfer_speed_gb_s,

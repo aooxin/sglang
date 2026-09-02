@@ -1858,6 +1858,12 @@ class DisaggregationMetrics:
     decode_prealloc_queue_reqs: int = field(
         default=0, metadata={"metric": ("gauge", "Decode prealloc queue requests")}
     )
+    decode_prefill_sched_wait_queue_reqs: int = field(
+        default=0,
+        metadata={
+            "metric": ("gauge", "Decode requests waiting for prefill scheduling")
+        },
+    )
     decode_transfer_queue_reqs: int = field(
         default=0, metadata={"metric": ("gauge", "Decode transfer queue requests")}
     )

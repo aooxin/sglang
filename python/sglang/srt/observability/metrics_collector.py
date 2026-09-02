@@ -74,6 +74,28 @@ class QueueCount:
         return cls(total=len(reqs), by_priority=by_priority)
 
 
+def get_decode_prealloc_queue_counts(
+    reqs, two_phase_prealloc: bool, enable_priority_scheduling: bool = False
+):
+    def unwrap(entries):
+        return [entry.req for entry in entries]
+
+    if not two_phase_prealloc:
+        return (
+            QueueCount.from_reqs(unwrap(reqs), enable_priority_scheduling),
+            QueueCount(),
+        )
+
+    prealloc_reqs = [req for req in reqs if req.waiting_for_input]
+    prefill_sched_wait_reqs = [req for req in reqs if not req.waiting_for_input]
+    return (
+        QueueCount.from_reqs(unwrap(prealloc_reqs), enable_priority_scheduling),
+        QueueCount.from_reqs(
+            unwrap(prefill_sched_wait_reqs), enable_priority_scheduling
+        ),
+    )
+
+
 @dataclass
 class SchedulerStats:
     # Basics
@@ -109,6 +131,9 @@ class SchedulerStats:
     num_prefetch_pending_queue_reqs: int = 0
     num_prefill_total_reqs: int = 0
     num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_decode_prefill_sched_wait_queue_reqs: QueueCount = field(
+        default_factory=QueueCount
+    )
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_h2d_queue_reqs: int = 0
     pd_direct2host_host_usage: float = 0.0
@@ -385,6 +410,12 @@ class SchedulerMetricsCollector:
         self.num_decode_prealloc_queue_reqs = Gauge(
             name="sglang:num_decode_prealloc_queue_reqs",
             documentation="The number of requests in the decode prealloc queue.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.num_decode_prefill_sched_wait_queue_reqs = Gauge(
+            name="sglang:num_decode_prefill_sched_wait_queue_reqs",
+            documentation="The number of decode requests waiting for prefill scheduling in two-phase preallocation.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1331,6 +1362,10 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.num_prefill_total_reqs, stats.num_prefill_total_reqs)
         self._log_gauge_queue_count(
             self.num_decode_prealloc_queue_reqs, stats.num_decode_prealloc_queue_reqs
+        )
+        self._log_gauge_queue_count(
+            self.num_decode_prefill_sched_wait_queue_reqs,
+            stats.num_decode_prefill_sched_wait_queue_reqs,
         )
         self._log_gauge_queue_count(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs

@@ -11,7 +11,10 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.mem_cache.simple_swa_radix_cache import SimpleSWARadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
-from sglang.srt.observability.metrics_collector import QueueCount
+from sglang.srt.observability.metrics_collector import (
+    QueueCount,
+    get_decode_prealloc_queue_counts,
+)
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
 from sglang.srt.utils.request_logger import disable_request_logging
 from sglang.srt.utils.watchdog import WatchdogRaw
@@ -360,8 +363,13 @@ class SchedulerRuntimeCheckerMixin:
                     self.prefetch_pending_queue
                 )
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_prealloc_queue.queue, priority_enabled
+                (
+                    self.stats.num_decode_prealloc_queue_reqs,
+                    self.stats.num_decode_prefill_sched_wait_queue_reqs,
+                ) = get_decode_prealloc_queue_counts(
+                    self.disagg_decode_prealloc_queue.queue,
+                    self.server_args.disaggregation_two_phase_prealloc,
+                    priority_enabled,
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.disagg_decode_transfer_queue.queue, priority_enabled

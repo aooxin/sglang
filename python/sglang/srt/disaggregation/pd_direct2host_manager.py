@@ -456,6 +456,21 @@ class PDDirect2HostManager:
                 )
                 keepalive.append(state_host_indices_for_io)
 
+        direct_kv_indices = None
+        direct_state_indices = None
+        if io_backend == "direct":
+            direct_kv_indices = torch.empty_like(
+                device_indices, device="cpu", pin_memory=True
+            )
+            direct_kv_indices.copy_(device_indices, non_blocking=True)
+            keepalive.append(direct_kv_indices)
+            if device_state_indices is not None:
+                direct_state_indices = torch.empty_like(
+                    device_state_indices, device="cpu", pin_memory=True
+                )
+                direct_state_indices.copy_(device_state_indices, non_blocking=True)
+                keepalive.append(direct_state_indices)
+
         self._write_req_to_token(req, device_indices)
         alloc_event = torch.cuda.Event()
         alloc_event.record(alloc_stream)
@@ -485,6 +500,7 @@ class PDDirect2HostManager:
                         host_indices=kv_host_indices_for_io,
                         device_indices=kv_device_indices_for_io,
                         io_backend=io_backend,
+                        direct_device_indices=direct_kv_indices,
                     )
                 if self.transit_state_pools:
                     for transit_state_pool in self.transit_state_pools:
@@ -493,6 +509,7 @@ class PDDirect2HostManager:
                             host_indices=state_host_indices_for_io,
                             device_indices=state_device_indices_for_io,
                             io_backend=io_backend,
+                            direct_device_indices=direct_state_indices,
                         )
             event = torch.cuda.Event()
             event.record(self.h2d_stream)
@@ -645,16 +662,23 @@ class PDDirect2HostManager:
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
         io_backend: str,
+        direct_device_indices: Optional[torch.Tensor] = None,
     ) -> None:
         if transit_pool.layer_num <= 0:
             return
+
+        io_device_indices = (
+            direct_device_indices
+            if io_backend == "direct" and direct_device_indices is not None
+            else device_indices
+        )
 
         load_all_layers = getattr(transit_pool, "load_to_device_all_layer", None)
         if io_backend == "direct" and load_all_layers is not None:
             load_all_layers(
                 device_pool=transit_pool.device_pool,
                 host_indices=host_indices,
-                device_indices=device_indices,
+                device_indices=io_device_indices,
                 io_backend=io_backend,
             )
             return
@@ -669,7 +693,7 @@ class PDDirect2HostManager:
             transit_pool.load_to_device_per_layer(
                 device_pool=transit_pool.device_pool,
                 host_indices=host_indices,
-                device_indices=device_indices,
+                device_indices=io_device_indices,
                 layer_id=layer_id,
                 io_backend=io_backend,
             )

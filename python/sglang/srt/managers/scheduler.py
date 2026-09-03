@@ -1740,9 +1740,14 @@ class Scheduler(
             and batch.has_grammar
             and batch.forward_mode.is_decode()
             and len(self.result_queue) > 0
+            and not batch.spec_algorithm.is_dflash()
         )
 
         return disable_overlap_for_batch or need_grammar_sync
+
+    def _advance_pending_grammar(self):
+        for prev_batch, prev_result in self.result_queue:
+            self._advance_grammar_fsm(prev_result, prev_batch)
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
         if self.max_recv_per_poll < 0:
@@ -3365,10 +3370,18 @@ class Scheduler(
                 with self.forward_stream_ctx, self.record_bubble_metrics(batch):
                     self.forward_stream.wait_stream(self.schedule_stream)
                     self.future_map.resolve_future(model_worker_batch)
+                    fwd_kwargs = {}
+                    if (
+                        batch.is_spec_v2
+                        and batch.has_grammar
+                        and batch.spec_algorithm.is_dflash()
+                    ):
+                        fwd_kwargs["grammar_barrier"] = self._advance_pending_grammar
                     with self.record_forward_metrics(batch):
                         batch_result = self.model_worker.forward_batch_generation(
-                            model_worker_batch
+                            model_worker_batch,
                             # here pp is not compatible with overlap
+                            **fwd_kwargs,
                         )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()

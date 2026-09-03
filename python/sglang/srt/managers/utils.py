@@ -43,6 +43,8 @@ class GenerationBatchResult:
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
 
+    grammar_advanced: bool = False
+
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 

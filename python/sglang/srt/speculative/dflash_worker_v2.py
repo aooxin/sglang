@@ -3,7 +3,7 @@ import logging
 import math
 import os
 from copy import deepcopy
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import torch
 
@@ -1446,6 +1446,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
+        grammar_barrier: Optional[Callable[[], None]] = None,
     ) -> GenerationBatchResult:
         if getattr(model_worker_batch, "return_logprob", False):
             raise ValueError(
@@ -1832,6 +1833,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         model_worker_batch.seq_lens_sum = seq_lens_sum_backup
 
         # Prepare grammar data on CPU if needed
+        grammar_copy_done = None
         if model_worker_batch.has_grammar:
             chain_len = int(self.block_size)
             retrieve_next_token_cpu = torch.full(
@@ -1843,7 +1845,20 @@ class DFlashWorkerV2(BaseSpecWorker):
             retrieve_next_sibling_cpu = torch.full(
                 (bs, chain_len), -1, dtype=torch.int64
             )
-            draft_tokens_cpu = draft_tokens.cpu()
+            if draft_tokens.is_cuda:
+                draft_tokens_cpu = torch.empty(
+                    draft_tokens.shape, dtype=draft_tokens.dtype, pin_memory=True
+                )
+                draft_tokens_cpu.copy_(draft_tokens, non_blocking=True)
+                draft_tokens.record_stream(
+                    torch.cuda.current_stream(draft_tokens.device)
+                )
+                grammar_copy_done = torch.get_device_module(
+                    draft_tokens.device
+                ).Event()
+                grammar_copy_done.record()
+            else:
+                draft_tokens_cpu = draft_tokens.to("cpu", non_blocking=True)
 
         target_out = self.target_worker.forward_batch_generation(
             model_worker_batch=None,
@@ -1857,6 +1872,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Grammar-constrained decoding
         vocab_mask = None
         if model_worker_batch.has_grammar:
+            if grammar_barrier is not None:
+                grammar_barrier()
+            if grammar_copy_done is not None:
+                grammar_copy_done.synchronize()
             vocab_mask = generate_token_bitmask(
                 model_worker_batch.reqs,
                 verify_input,
@@ -1867,7 +1886,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             if vocab_mask is not None:
                 assert verify_input.grammar is not None
-                vocab_mask = vocab_mask.to(logits_output.next_token_logits.device)
+                if vocab_mask.device.type == "cpu":
+                    vocab_mask = vocab_mask.pin_memory()
+                vocab_mask = verify_input.grammar.move_vocab_mask(
+                    vocab_mask, logits_output.next_token_logits.device
+                )
                 # NOTE: otherwise, this vocab mask will be the one from the
                 # previous extend stage and will be applied to produce wrong
                 # results (same as the eagle_worker_v2 verify path).

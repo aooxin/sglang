@@ -240,16 +240,17 @@ class SchedulerOutputProcessorMixin:
                         )
 
                     if req.grammar is not None:
-                        # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                        try:
-                            req.grammar.accept_token(next_token_id)
-                        except ValueError as e:
-                            # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                            # This can happen if the grammar is not set correctly or the token is invalid.
-                            logger.error(
-                                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                            )
-                            self.abort_request(AbortReq(rid=req.rid))
+                        if not result.grammar_advanced:
+                            # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                            try:
+                                req.grammar.accept_token(next_token_id)
+                            except ValueError as e:
+                                # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                                # This can happen if the grammar is not set correctly or the token is invalid.
+                                logger.error(
+                                    f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                                )
+                                self.abort_request(AbortReq(rid=req.rid))
                         req.grammar.finished = req.finished()
 
                 else:
@@ -335,6 +336,61 @@ class SchedulerOutputProcessorMixin:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _advance_grammar_fsm(
+        self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
+    ) -> None:
+        if result.grammar_advanced:
+            return
+        if not any(req.grammar is not None for req in batch.reqs):
+            return
+        is_decode = batch.forward_mode.is_decode()
+        if not (is_decode or batch.forward_mode.is_extend()):
+            return
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+        next_token_ids = result.next_token_ids.tolist()
+
+        if not is_decode:
+            for i, req in enumerate(batch.reqs):
+                if (
+                    req.grammar is None
+                    or req.is_retracted
+                    or req.finished()
+                    or req.is_chunked > 0
+                ):
+                    continue
+                try:
+                    req.grammar.accept_token(next_token_ids[i])
+                except ValueError as e:
+                    logger.error(
+                        f"Grammar accept_token failed for req {req.rid} with token "
+                        f"{next_token_ids[i]}: {e}"
+                    )
+                    self.abort_request(AbortReq(rid=req.rid))
+            result.grammar_advanced = True
+            return
+
+        # spec-v2 decode: accept the run of tokens each req committed this step.
+        if not (batch.is_spec_v2 and result.accept_lens is not None):
+            return
+        accept_lens = result.accept_lens.tolist()
+        stride = self.draft_worker.speculative_num_draft_tokens
+        for i, req in enumerate(batch.reqs):
+            if req.grammar is None or req.is_retracted or req.finished():
+                continue
+            accept_tokens = next_token_ids[i * stride : i * stride + accept_lens[i]]
+            # FIXME: this try-except block is for handling unexpected xgrammar issue.
+            try:
+                for token_id in accept_tokens:
+                    req.grammar.accept_token(token_id)
+            except ValueError as e:
+                logger.error(
+                    f"Grammar accept_token failed for req {req.rid} with tokens "
+                    f"{accept_tokens}: {e}"
+                )
+                self.abort_request(AbortReq(rid=req.rid))
+        result.grammar_advanced = True
 
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
@@ -531,22 +587,23 @@ class SchedulerOutputProcessorMixin:
                 )
 
             if req.grammar is not None:
-                # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                try:
-                    if batch.spec_algorithm.is_none():
-                        # Normal decode: single token
-                        req.grammar.accept_token(next_token_id)
-                    elif batch.is_spec_v2:
-                        # Speculative decode: next_token_id is a list of accepted tokens
-                        for token_id in next_token_id:
-                            req.grammar.accept_token(token_id)
-                except ValueError as e:
-                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                    # This can happen if the grammar is not set correctly or the token is invalid.
-                    logger.error(
-                        f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                    )
-                    self.abort_request(AbortReq(rid=req.rid))
+                if not result.grammar_advanced:
+                    # FIXME: this try-except block is for handling unexpected xgrammar issue.
+                    try:
+                        if batch.spec_algorithm.is_none():
+                            # Normal decode: single token
+                            req.grammar.accept_token(next_token_id)
+                        elif batch.is_spec_v2:
+                            # Speculative decode: next_token_id is a list of accepted tokens
+                            for token_id in next_token_id:
+                                req.grammar.accept_token(token_id)
+                    except ValueError as e:
+                        # Grammar accept_token can raise ValueError if the token is not in the grammar.
+                        # This can happen if the grammar is not set correctly or the token is invalid.
+                        logger.error(
+                            f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+                        )
+                        self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
         self.stream_output(batch.reqs, batch.return_logprob)

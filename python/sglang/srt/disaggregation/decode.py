@@ -301,7 +301,7 @@ class PDD2HFusedPoller:
         self,
         prealloc_entries: List[Tuple[int, int, int, int, int, int]],
         transfer_entries: List[Tuple[int, int, int, int, int, int]],
-        admission_snapshot: Tuple[int, int, int, int, int],
+        admission_snapshot: Tuple[int, int, int, int, int, int, int],
     ) -> Tuple[Dict[int, int], Dict[int, int], Optional[int], bool]:
         """Gather queue snapshots and select a TP-wide H2D candidate room.
 
@@ -323,7 +323,7 @@ class PDD2HFusedPoller:
             device="cpu",
         )
         gathered_headers = torch.empty(
-            (world_size, 8), dtype=torch.int64, device="cpu"
+            (world_size, 10), dtype=torch.int64, device="cpu"
         )
         torch.distributed.all_gather_into_tensor(
             gathered_headers.flatten(), header, group=group
@@ -547,6 +547,8 @@ class PDD2HFusedPoller:
                 reserved_decode_tokens_value,
                 retract_in_progress_value,
                 h2d_gate_busy_value,
+                req_rows_available_value,
+                has_retracted_reqs_value,
             ) = header
             if not PDDirect2HostManager.can_admit_h2d_from_snapshot(
                 need_full,
@@ -557,6 +559,8 @@ class PDD2HFusedPoller:
                     int(reserved_decode_tokens_value),
                     int(retract_in_progress_value),
                     int(h2d_gate_busy_value),
+                    int(req_rows_available_value),
+                    int(has_retracted_reqs_value),
                 ),
             ):
                 return False
@@ -1381,7 +1385,9 @@ class DecodePreallocQueue:
             if not decode_req.waiting_for_input:
                 continue
 
-            if self.req_to_token_pool.available_size() <= 0:
+            # D2H defers the req_to_token row to start_h2d, so prealloc does
+            # not consume rows and is not gated on them.
+            if pd_d2h_mgr is None and self.req_to_token_pool.available_size() <= 0:
                 break
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
@@ -2380,7 +2386,10 @@ class SchedulerDisaggregationDecodeMixin:
                 pd_d2h_mgr
             )
             admission_snapshot = pd_d2h_mgr.h2d_admission_snapshot(
-                reserved_decode_tokens
+                reserved_decode_tokens,
+                has_retracted_reqs=(
+                    len(self.disagg_decode_prealloc_queue.retracted_queue) > 0
+                ),
             )
             (
                 prealloc_polls_by_room,

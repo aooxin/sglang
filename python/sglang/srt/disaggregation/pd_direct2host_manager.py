@@ -181,8 +181,8 @@ class PDDirect2HostManager:
         return full_available, swa_available
 
     def h2d_admission_snapshot(
-        self, reserved_decode_tokens: int
-    ) -> Tuple[int, int, int, int, int]:
+        self, reserved_decode_tokens: int, has_retracted_reqs: bool = False
+    ) -> Tuple[int, int, int, int, int, int, int]:
         full_available, swa_available = self._available_tokens()
         return (
             full_available,
@@ -190,13 +190,15 @@ class PDDirect2HostManager:
             reserved_decode_tokens,
             int(self.retract_in_progress),
             int(self._h2d_gate_busy()),
+            self.req_to_token_pool.available_size(),
+            int(has_retracted_reqs),
         )
 
     @staticmethod
     def can_admit_h2d_from_snapshot(
         need_full: int,
         need_swa: int,
-        snapshot: Tuple[int, int, int, int, int],
+        snapshot: Tuple[int, int, int, int, int, int, int],
     ) -> bool:
         (
             full_available,
@@ -204,8 +206,12 @@ class PDDirect2HostManager:
             reserved_decode_tokens,
             retract_in_progress,
             h2d_gate_busy,
+            req_rows_available,
+            has_retracted_reqs,
         ) = snapshot
-        if retract_in_progress or h2d_gate_busy:
+        if retract_in_progress or h2d_gate_busy or has_retracted_reqs:
+            return False
+        if req_rows_available <= 0:
             return False
         if need_full + reserved_decode_tokens > full_available:
             return False
@@ -344,8 +350,9 @@ class PDDirect2HostManager:
     def pre_alloc(self, req: "Req") -> bool:
         """Allocate host transit slots and request bookkeeping for a decode req.
 
-        Device KV slots are allocated later in ``start_h2d`` after prefill has
-        finished writing into the host transit pool.
+        Device KV slots and the req_to_token row are allocated later in
+        ``start_h2d`` after prefill has finished writing into the host transit
+        pool, so host-resident requests do not hold request mapping rows.
         """
         seq_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         need_pages = (seq_len + self.page_size - 1) // self.page_size
@@ -379,13 +386,6 @@ class PDDirect2HostManager:
                 swa_buffer_len,
             )
 
-        req_pool_indices = self.req_to_token_pool.alloc([req])
-        if req_pool_indices is None:
-            self.transit_pool.free(host_indices)
-            if host_state_indices is not None and self.transit_state_pool is not None:
-                self.transit_state_pool.free(host_state_indices)
-            return False
-        req.req_pool_idx = req_pool_indices[0]
         req.host_kv_indices = host_indices
         req.host_state_indices = host_state_indices
         req.host_state_seq_len = seq_len
@@ -410,9 +410,10 @@ class PDDirect2HostManager:
 
     @nvtx_annotated_method("pd_d2h.start_h2d")
     def start_h2d(self, req: "Req") -> bool:
-        """Allocate device slots and enqueue the host->device copy.
+        """Allocate the req_to_token row and device slots, then enqueue the
+        host->device copy.
 
-        Returns False if device allocation unexpectedly fails after admission.
+        Returns False if allocation unexpectedly fails after admission.
 
         For SWA models the device allocator's pre_alloc returns full-pool
         indices and stashes the matching SWA-pool indices in its internal
@@ -426,9 +427,13 @@ class PDDirect2HostManager:
         io_backend = self.server_args.hicache_io_backend
         keepalive: List[Any] = []
 
+        if self.req_to_token_pool.alloc([req]) is None:
+            return False
+
         alloc_stream = torch.cuda.current_stream()
         device_indices = self._device_alloc(need_size, seq_len=seq_len_orig)
         if device_indices is None:
+            self.req_to_token_pool.free(req)
             return False
 
         device_state_indices: Optional[torch.Tensor] = None
@@ -442,6 +447,7 @@ class PDDirect2HostManager:
                 # SWA transit pool was constructed but the allocator does not
                 # have an SWA mapping — bug in either dispatch or allocator.
                 self.token_to_kv_pool_allocator.free(device_indices)
+                self.req_to_token_pool.free(req)
                 raise RuntimeError(
                     "SWA transit pool present but allocator has no "
                     "translate_loc_from_full_to_swa()."

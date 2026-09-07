@@ -394,7 +394,7 @@ pr-test-finish:
     - TAG="${BASE_IMAGE_VERSION}-xm-${CI_COMMIT_SHORT_SHA}-$(date +%Y%m%d-%H%M)"
     - echo "Building ${IMAGE}:${TAG}"
     - echo "$CI_REGISTRY_PASSWORD_IAM" | docker login -u "$CI_REGISTRY_USER_IAM" --password-stdin "$CI_REGISTRY"
-    - docker build -f docker/Dockerfile.xiaomi --build-arg BASE_IMAGE_VERSION="${BASE_IMAGE_VERSION}" -t "${IMAGE}:${TAG}" .
+    - docker build -f docker/Dockerfile.xiaomi --build-arg BASE_IMAGE_VERSION="${BASE_IMAGE_VERSION}" --build-arg GITLAB_API_TOKEN="${GITLAB_API_TOKEN}" -t "${IMAGE}:${TAG}" .
     - docker push "${IMAGE}:${TAG}"
     - echo "Pushed ${IMAGE}:${TAG}"
     - echo "SGLANG_IMAGE_URL=${IMAGE}:${TAG}" > build.env

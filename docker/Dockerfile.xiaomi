@@ -94,8 +94,6 @@ RUN python3 -m pip install https://git-assert.cnbj1.mi-fds.com/git-assert/mimo/m
 RUN python3 -m pip install https://git-assert.cnbj1.mi-fds.com/git-assert/pro/mimo_pro_moe_fused_gate-1.0.0-cp312-cp312-linux_x86_64.whl\
     --no-cache-dir --no-dependencies --force-reinstall
 
-COPY . .
-
 # ez_kernel_kit: CUDA decode kernel for MiMo FP8 KV cache
 RUN python3 -m pip install https://artifactory.d.xiaomi.net/artifactory/mimo-core-pypi-local/ez-kernel-kit/0.3.0.dev89+fp8kv.g57e0e0e/ez_kernel_kit-0.3.0.dev89+fp8kv.g57e0e0e-cp312-cp312-linux_x86_64.whl \
     --no-cache-dir --no-dependencies --force-reinstall
@@ -109,6 +107,23 @@ RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
     && npm install -g @anthropic-ai/claude-code \
     && echo '{"hasCompletedOnboarding": true}' > /root/.claude.json \
     && claude --version
+
+# --- Pre-install CloudML skill dependency (cloudml-mimo-analyze) ------------
+ARG GITLAB_API_TOKEN
+RUN if [ -n "${GITLAB_API_TOKEN}" ]; then \
+        AUTH="$(printf '%s:%s' oauth2 "${GITLAB_API_TOKEN}" | base64 -w0)"; \
+        git -c "http.https://git.n.xiaomi.com/.extraheader=Authorization: Basic ${AUTH}" \
+            clone --depth 1 https://git.n.xiaomi.com/ai-studio/cloudml-claude-plugins.git /opt/cloudml-claude-plugins; \
+    else \
+        GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=accept-new" \
+            git clone --depth 1 git@git.n.xiaomi.com:ai-studio/cloudml-claude-plugins.git /opt/cloudml-claude-plugins; \
+    fi \
+    && rm -rf /opt/cloudml-claude-plugins/.git \
+    && claude plugin marketplace add /opt/cloudml-claude-plugins \
+    && claude plugin install cloudml-mimo-analyze@cloudml-claude-plugins --yes \
+    && grep -q 'cloudml-mimo-analyze@cloudml-claude-plugins' /root/.claude/plugins/installed_plugins.json
+
+COPY . .
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang

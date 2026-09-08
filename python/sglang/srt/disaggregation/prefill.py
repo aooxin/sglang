@@ -575,6 +575,19 @@ class SchedulerDisaggregationPrefillMixin:
 
         trace_enabled = self.enable_trace
         logprob_pt = 0
+        aborted_reqs: List[Req] = []
+
+        def advance_logprob_offset(i: int, req: Req) -> None:
+            nonlocal logprob_pt
+            if not req.return_logprob:
+                return
+            assert extend_logprob_start_len_per_req is not None
+            assert extend_input_len_per_req is not None
+            extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+            extend_input_len = extend_input_len_per_req[i]
+            if extend_logprob_start_len < extend_input_len:
+                logprob_pt += extend_input_len - extend_logprob_start_len
+
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
         if batch.return_logprob:
@@ -603,6 +616,20 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if req.is_chunked <= 0:
                 req.time_stats.set_prefill_finished_time()
+
+                if isinstance(req.finished_reason, FINISH_ABORT) or isinstance(
+                    req.to_finish, FINISH_ABORT
+                ):
+                    # `to_finish` is set by `abort_request` (abort method 3) but
+                    # is only consumed by `check_finished()` during a decode
+                    # step, which never runs on a prefill instance. Consume it
+                    # here so the aborted request neither enters the inflight
+                    # queue nor sends its KV to the decode instance.
+                    advance_logprob_offset(i, req)
+                    if self.abort_disagg_prefill_running_req(req):
+                        req.time_stats.set_completion_time()
+                        aborted_reqs.append(req)
+                    continue
 
                 # There is no output_ids for prefill
                 req.output_ids.append(next_token_id)
@@ -668,6 +695,20 @@ class SchedulerDisaggregationPrefillMixin:
                 # being chunked reqs' prefill is not finished
                 req.is_chunked -= 1
 
+                if isinstance(req.finished_reason, FINISH_ABORT) or isinstance(
+                    req.to_finish, FINISH_ABORT
+                ):
+                    # Wait until every launched overlap chunk has completed
+                    # before releasing the request's KV slots.
+                    advance_logprob_offset(i, req)
+                    req.time_stats.set_last_chunked_prefill_finish_time()
+                    if req.is_chunked <= 0 and self.abort_disagg_prefill_running_req(
+                        req
+                    ):
+                        req.time_stats.set_completion_time()
+                        aborted_reqs.append(req)
+                    continue
+
                 if req.return_logprob:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                     extend_input_len = extend_input_len_per_req[i]
@@ -689,12 +730,72 @@ class SchedulerDisaggregationPrefillMixin:
                     req.time_stats.set_prefill_chunk_overlap_send_kv_time()
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
+        if aborted_reqs:
+            self.stream_output(
+                aborted_reqs,
+                any(req.return_logprob for req in aborted_reqs),
+            )
+
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def abort_disagg_prefill_running_req(self: Scheduler, req: Req) -> bool:
+        """Consume a pending abort (`req.to_finish`, set by `abort_request`)
+        for a request that is running prefill on this instance.
+
+        A prefill-only instance never runs `check_finished()` (there is no
+        decode step), so `to_finish` would otherwise never be consumed and the
+        aborted request would finish prefill and transfer its KV as usual.
+        Mark the KV sender failed and release locally owned resources. Return
+        whether the request was retired so the caller can send one terminal
+        response after all aborted requests in the batch have been cleaned up.
+        """
+        metadata_buffer_index = getattr(req, "metadata_buffer_index", -1)
+        owns_resources = (
+            req.req_pool_idx is not None
+            or req.mamba_pool_idx is not None
+            or (metadata_buffer_index is not None and metadata_buffer_index >= 0)
+        )
+        if not owns_resources:
+            return False
+
+        abort_reason = req.to_finish
+        if abort_reason is not None:
+            assert isinstance(abort_reason, FINISH_ABORT)
+            prepare_abort(
+                req,
+                abort_reason.message,
+                status_code=abort_reason.status_code,
+            )
+            req.to_finish = None
+        else:
+            abort_reason = req.finished_reason
+            assert isinstance(abort_reason, FINISH_ABORT)
+
+        logger.info(f"Abort running disagg prefill request. {req.rid=}")
+
+        sender = getattr(req, "disagg_kv_sender", None)
+        if sender is not None and hasattr(sender, "abort"):
+            try:
+                sender.abort()
+            except Exception:
+                logger.exception("Failed to abort KV sender for request %s", req.rid)
+
+        try:
+            req.time_stats.trace_ctx.abort(abort_info={"reason": abort_reason.message})
+        except Exception:
+            logger.exception("Failed to finish abort trace for request %s", req.rid)
+
+        release_req_to_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        if self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
+        if req.req_pool_idx is not None or req.mamba_pool_idx is not None:
+            release_kv_cache(req, self.tree_cache, is_insert=False)
+        return True
 
     @nvtx_annotated_method("scheduler.process_disagg_prefill_inflight_queue")
     def process_disagg_prefill_inflight_queue(
@@ -860,18 +961,32 @@ class SchedulerDisaggregationPrefillMixin:
 
     def process_prefill_chunk(self: Scheduler) -> None:
         chunked_req_to_exclude = set()
-        if self.chunked_req:
-            trace_enabled = self.enable_trace
-            chunked_req_to_exclude.add(self.chunked_req)
-            self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
-            self.chunked_req.time_stats.set_prefill_chunk_cache_time()
-            if self.enable_overlap:
+        aborted_req = None
+        if (req := self.chunked_req) is not None:
+            chunked_req_to_exclude.add(req)
+            if isinstance(req.finished_reason, FINISH_ABORT) or isinstance(
+                req.to_finish, FINISH_ABORT
+            ):
+                # Stop scheduling new chunks immediately. With overlap enabled,
+                # the previous chunk can still be using its KV slots, so defer
+                # retirement until its result is consumed.
+                self.chunked_req = None
+                if not self.enable_overlap and self.abort_disagg_prefill_running_req(
+                    req
+                ):
+                    req.time_stats.set_completion_time()
+                    aborted_req = req
+            else:
+                self.tree_cache.cache_unfinished_req(req, chunked=True)
+                req.time_stats.set_prefill_chunk_cache_time()
+
+            if self.chunked_req is not None and self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 self.chunked_req.tmp_end_idx = min(
                     len(self.chunked_req.fill_ids),
                     len(self.chunked_req.origin_input_ids),
                 )
-            else:
+            elif self.chunked_req is not None:
                 self.send_kv_chunk(self.chunked_req)
                 self.chunked_req.time_stats.set_prefill_chunk_send_kv_time()
             self.running_batch.batch_is_full = False
@@ -888,6 +1003,9 @@ class SchedulerDisaggregationPrefillMixin:
             )
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
+
+        if aborted_req is not None:
+            self.stream_output([aborted_req], aborted_req.return_logprob)
 
     def send_kv_chunk(
         self: Scheduler,

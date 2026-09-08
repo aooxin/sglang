@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import triton
@@ -448,7 +448,12 @@ class NgramVerifyInput(SpecInput):
 
         return logits_output, self.verified_id, num_accepted_tokens
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        keep_indices: Optional[List[int]] = None,
+        has_been_filtered: bool = True,
+    ):
         pass
 
     def merge_batch(self, spec_info: NgramVerifyInput):

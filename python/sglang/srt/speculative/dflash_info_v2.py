@@ -2,7 +2,7 @@
 
 import contextlib
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -283,16 +283,22 @@ class DFlashDraftInputV2(SpecInput):
         self.reserved_seq_lens_cpu = nxt_kv_lens_cpu_t
         self.reserved_seq_lens_sum = reserved_seq_lens_sum
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        keep_indices: Optional[List[int]] = None,
+        has_been_filtered: bool = True,
+    ):
+        cpu_indices = keep_indices if keep_indices is not None else new_indices.cpu()
         if self.cur_allocated_seq_lens_cpu is not None:
             self.cur_allocated_seq_lens_cpu = self.cur_allocated_seq_lens_cpu[
-                new_indices.cpu()
+                cpu_indices
             ]
         if self.planning_seq_lens_cpu is not None:
-            self.planning_seq_lens_cpu = self.planning_seq_lens_cpu[new_indices.cpu()]
+            self.planning_seq_lens_cpu = self.planning_seq_lens_cpu[cpu_indices]
             self.planning_seq_lens_sum = int(self.planning_seq_lens_cpu.sum().item())
         if self.reserved_seq_lens_cpu is not None:
-            self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices.cpu()]
+            self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[cpu_indices]
             self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
 
         if self.future_indices is not None:

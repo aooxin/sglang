@@ -758,7 +758,12 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        keep_indices: Optional[List[int]] = None,
+        has_been_filtered: bool = True,
+    ):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
             return

@@ -117,7 +117,12 @@ class DFlashDraftInput(SpecInput):
             draft_seq_lens=torch.empty((0,), dtype=torch.int32, device=device),
         )
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        keep_indices: Optional[List[int]] = None,
+        has_been_filtered: bool = True,
+    ):
         old_ctx_lens = self.ctx_lens
         old_target_hidden = self.target_hidden
 

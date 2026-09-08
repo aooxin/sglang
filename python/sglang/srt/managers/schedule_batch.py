@@ -2649,7 +2649,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             free_slots = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
             ]
-            self.token_to_kv_pool_allocator.free_swa(free_slots)
+            self.token_to_kv_pool_allocator.free_swa_page_aligned(free_slots)
             req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def __str__(self):

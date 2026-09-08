@@ -649,6 +649,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[free_index] = 0
         return swa_freed
 
+    def free_swa_page_aligned(self, free_index: torch.Tensor) -> None:
+        if free_index.numel() == 0:
+            return
+        swa_indices = self.full_to_swa_index_mapping[free_index]
+        if self.debug_mode:
+            assert (swa_indices > 0).all().item()
+        self.swa_attn_allocator.free(swa_indices, is_page_aligned=True)
+        self.full_to_swa_index_mapping[free_index] = self._mapping_zero_scalar
+
     def splice_swa_mapping(
         self, tgt_full_indices: torch.Tensor, src_full_indices: torch.Tensor
     ) -> int:

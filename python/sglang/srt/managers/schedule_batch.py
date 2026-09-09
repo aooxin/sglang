@@ -871,9 +871,11 @@ class Req(ReqDllmMixin):
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
         # Number of scheduler passes this request has been kept in the
-        # prefetch_pending_queue due to RATE_LIMITED. Bounded by
-        # tree_cache.prefetch_max_retry_rounds; exceeding it triggers a 429 abort.
-        # Counted in scheduler passes (TP-lockstep), never wall-clock.
+        # prefetch_pending_queue due to a transient prefetch-retry outcome
+        # (RATE_LIMITED occupancy over cap, or HOST_ALLOC_FAILED host pool full).
+        # Both share this single budget. Bounded by tree_cache.prefetch_max_retry_rounds;
+        # exceeding it triggers a 429 abort. Counted in scheduler passes
+        # (TP-lockstep), never wall-clock.
         self.prefetch_rate_limited_rounds = 0
         self.retraction_mb_id = None
 

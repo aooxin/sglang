@@ -28,16 +28,34 @@ if TYPE_CHECKING:
 class PrefetchStatus(enum.IntEnum):
     """Outcome of HiRadixCache.prefetch_from_storage.
 
-    Only RATE_LIMITED is retryable — the host prefetch pool is transiently
-    saturated and capacity may free up on a later scheduler pass. All other
-    statuses mean "let the request proceed to bootstrap now" (matching trunk
-    behavior where prefetch is simply skipped).
+    RATE_LIMITED and HOST_ALLOC_FAILED are the two retryable outcomes: both are
+    transient ("prefetch occupancy over cap" / "host prefetch pool full") and
+    capacity may free up on a later scheduler pass, so the scheduler parks the
+    request in prefetch_pending_queue and retries (dropping with 429 once the
+    shared retry budget is exhausted). STARTED and SKIPPED are terminal: the
+    request proceeds to bootstrap now (STARTED has its prefetch in flight;
+    SKIPPED had nothing worth prefetching, matching trunk skip behavior).
     """
 
     STARTED = 0
     SKIPPED = 1
     RATE_LIMITED = 2
     HOST_ALLOC_FAILED = 3
+
+    @property
+    def is_retryable(self) -> bool:
+        """True for the transient outcomes that share the pending-queue retry
+        budget (RATE_LIMITED / HOST_ALLOC_FAILED); False for the terminal ones
+        (STARTED / SKIPPED, which proceed to bootstrap now). Single source of
+        truth so the scheduler drain can't drift from this docstring."""
+        return self in _RETRYABLE_PREFETCH_STATUSES
+
+
+# Defined after the enum (references its members) but read only at call time by
+# PrefetchStatus.is_retryable, so the forward reference above is fine.
+_RETRYABLE_PREFETCH_STATUSES = frozenset(
+    {PrefetchStatus.RATE_LIMITED, PrefetchStatus.HOST_ALLOC_FAILED}
+)
 
 
 @runtime_checkable

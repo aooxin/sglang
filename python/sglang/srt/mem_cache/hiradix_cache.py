@@ -110,6 +110,15 @@ class BaseHiRadixCache(abc.ABC):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
+        # Cumulative token eviction counters (device tree). These back the
+        # sglang:full_evicted_from_tree_total / sglang:swa_evicted_from_tree_total
+        # metrics and are read by scheduler_metrics_mixin. They must live on the
+        # base class so both HiRadixCache (non-SWA) and HiSimpleSWARadixCache
+        # expose them and BaseHiRadixCache.evict() can accumulate into them.
+        self.swa_active_freed_tokens: int = 0
+        self.swa_evicted_from_tree: int = 0
+        self.full_evicted_from_tree: int = 0
+
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
@@ -1301,6 +1310,9 @@ class BaseHiRadixCache(abc.ABC):
                 f"{swa_evicted}/{swa_num_tokens} swa tokens from device cache"
             )
 
+        self.swa_evicted_from_tree += swa_evicted
+        self.full_evicted_from_tree += full_evicted
+
         self.update_eviction_metrics(full_evicted + swa_evicted, start_time)
         return EvictResult(
             num_tokens_evicted=full_evicted, swa_num_tokens_evicted=swa_evicted
@@ -2477,10 +2489,9 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
         BaseHiRadixCache.__init__(self, params, server_args)
 
         # SimpleSWA-specific state mirrored from SimpleSWARadixCache.__init__.
+        # (swa_active_freed_tokens / swa_evicted_from_tree / full_evicted_from_tree
+        # are initialized by BaseHiRadixCache.__init__ above.)
         self.sliding_window_size = params.sliding_window_size
-        self.swa_active_freed_tokens: int = 0
-        self.swa_evicted_from_tree: int = 0
-        self.full_evicted_from_tree: int = 0
         self._last_raw_match_len: int = 0
 
         # Force load_back_threshold to 0 for SWA mode: any host-resident hit

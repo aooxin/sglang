@@ -2423,31 +2423,45 @@ class Scheduler(
         still_pending = []
         for req in self.prefetch_pending_queue:  # FIFO, no break (avoid HOL blocking)
             status = self._prefetch_kvcache(req)  # fire directly; internal check is source of truth
-            if status == PrefetchStatus.RATE_LIMITED:
+            if status.is_retryable:
+                # Both retryable outcomes are transient "can't prefetch now, retry
+                # later" states and share the retry budget: RATE_LIMITED (occupancy
+                # over cap) and HOST_ALLOC_FAILED (host prefetch pool transiently
+                # full). Requeue and count the round; exceeding the budget triggers
+                # a 429 abort rather than a cache-miss recompute. Pass the
+                # PrefetchStatus enum itself downstream (never a hardcoded string);
+                # the reason label is derived with .name.lower() inside the metrics
+                # collector, so an enum rename can neither pick the wrong message
+                # branch nor silently spawn a new time series.
                 req.prefetch_rate_limited_rounds += 1
                 if req.prefetch_rate_limited_rounds > max_rounds:
-                    self._abort_pending_prefetch(req)
+                    self._abort_pending_prefetch(req, status)
                 else:
                     if collector is not None:
-                        collector.log_prefetch_retry()
+                        collector.log_prefetch_retry(status)
                     still_pending.append(req)
             else:
-                # STARTED / SKIPPED / HOST_ALLOC_FAILED: let it proceed to bootstrap
-                # (matches trunk "fall through to compute" semantics).
+                # STARTED / SKIPPED: let it proceed to bootstrap. STARTED will get
+                # its data; SKIPPED has nothing worth prefetching (below threshold /
+                # not backuped), so compute is correct (matches trunk semantics).
                 self.disagg_prefill_bootstrap_queue.add(
                     req, self.model_config.num_key_value_heads
                 )
         self.prefetch_pending_queue = still_pending
 
-    def _abort_pending_prefetch(self, req: Req):
+    def _abort_pending_prefetch(self, req: Req, status: PrefetchStatus):
         # Pending reqs never fired prefetch / bootstrap: no metadata_buffer_index,
         # no disagg_kv_sender. Abort is a pure local drop, no collective comm.
+        # status is the PrefetchStatus that triggered the drop.
         if self.enable_hicache_storage:
             # Defensive + idempotent: pending reqs are not in ongoing_prefetch,
             # so release_aborted_request early-returns before its TP barrier
             # (hiradix_cache.py:2358), consistent across ranks.
             self.tree_cache.release_aborted_request(req.rid)
-        message = "Prefetch rate limited; retry budget exhausted."
+        if status == PrefetchStatus.HOST_ALLOC_FAILED:
+            message = "Prefetch host pool full; retry budget exhausted."
+        else:
+            message = "Prefetch rate limited; retry budget exhausted."
         abort_req = AbortReq(
             finished_reason={
                 "type": "abort",
@@ -2469,7 +2483,7 @@ class Scheduler(
                 req.time_stats, "prefill_bootstrap_queue_entry_time", 0.0
             )
             pending_seconds = time.perf_counter() - entry if entry > 0 else None
-            collector.log_prefetch_dropped(pending_seconds)
+            collector.log_prefetch_dropped(status, pending_seconds)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if self.disaggregation_mode == DisaggregationMode.NULL:
@@ -2481,8 +2495,11 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # Resolve once: it's a getattr + compare read off the (constant during
+            # this call) prefetch_max_retry_rounds config; both branches reuse it.
+            pending_enabled = self._prefetch_pending_enabled()
             if (
-                self._prefetch_pending_enabled()
+                pending_enabled
                 and self.tree_cache.cache_controller.prefetch_rate_limited()
             ):
                 # Rate limited: park before bootstrap. Fires no prefetch, allocates
@@ -2490,10 +2507,18 @@ class Scheduler(
                 self.prefetch_pending_queue.append(req)
                 req.time_stats.set_prefill_bootstrap_queue_entry_time()
             else:
-                self._prefetch_kvcache(req)
-                self.disagg_prefill_bootstrap_queue.add(
-                    req, self.model_config.num_key_value_heads
-                )
+                status = self._prefetch_kvcache(req)
+                if pending_enabled and status == PrefetchStatus.HOST_ALLOC_FAILED:
+                    # Host prefetch pool transiently full: park & retry rather than
+                    # recompute now. prefetch_from_storage already released the host
+                    # protect on this path, so there is no buffer/protect leak; the
+                    # next drain pass re-attempts the alloc and shares the same retry
+                    # budget as RATE_LIMITED.
+                    self.prefetch_pending_queue.append(req)
+                else:
+                    self.disagg_prefill_bootstrap_queue.add(
+                        req, self.model_config.num_key_value_heads
+                    )
                 req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)

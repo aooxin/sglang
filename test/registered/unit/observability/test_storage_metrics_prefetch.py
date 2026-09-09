@@ -2,6 +2,7 @@ import unittest
 
 from prometheus_client import REGISTRY
 
+from sglang.srt.mem_cache.base_prefix_cache import PrefetchStatus
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -27,22 +28,56 @@ class TestStorageMetricsPrefetch(unittest.TestCase):
 
     def test_log_prefetch_retry_increments(self):
         collector = self._collector()
-        # Must not raise; counter exists and is callable.
-        collector.log_prefetch_retry()
-        sample = collector.prefetch_retry_total.labels(**collector.labels)._value.get()
+        # Pass the enum; the collector derives the reason label internally
+        # (.name.lower()). The lookup below by the *string* label proves the
+        # enum-to-label derivation lands on the expected time series.
+        collector.log_prefetch_retry(PrefetchStatus.RATE_LIMITED)
+        sample = collector.prefetch_retry_total.labels(
+            **collector.labels, reason="rate_limited"
+        )._value.get()
         self.assertEqual(sample, 1.0)
+
+    def test_prefetch_retry_labeled_by_reason(self):
+        # The reason label must keep rate_limited and host_alloc_failed as
+        # separate time series so the two retry causes can be attributed apart.
+        collector = self._collector()
+        collector.log_prefetch_retry(PrefetchStatus.RATE_LIMITED)
+        collector.log_prefetch_retry(PrefetchStatus.HOST_ALLOC_FAILED)
+        collector.log_prefetch_retry(PrefetchStatus.HOST_ALLOC_FAILED)
+        rl = collector.prefetch_retry_total.labels(
+            **collector.labels, reason="rate_limited"
+        )._value.get()
+        haf = collector.prefetch_retry_total.labels(
+            **collector.labels, reason="host_alloc_failed"
+        )._value.get()
+        self.assertEqual(rl, 1.0)
+        self.assertEqual(haf, 2.0)
 
     def test_log_prefetch_dropped_increments(self):
         collector = self._collector()
-        collector.log_prefetch_dropped()
-        sample = (
-            collector.prefetch_dropped_total.labels(**collector.labels)._value.get()
-        )
+        collector.log_prefetch_dropped(PrefetchStatus.HOST_ALLOC_FAILED)
+        sample = collector.prefetch_dropped_total.labels(
+            **collector.labels, reason="host_alloc_failed"
+        )._value.get()
         self.assertEqual(sample, 1.0)
+
+    def test_prefetch_dropped_labeled_by_reason(self):
+        collector = self._collector()
+        collector.log_prefetch_dropped(PrefetchStatus.RATE_LIMITED)
+        collector.log_prefetch_dropped(PrefetchStatus.HOST_ALLOC_FAILED)
+        rl = collector.prefetch_dropped_total.labels(
+            **collector.labels, reason="rate_limited"
+        )._value.get()
+        haf = collector.prefetch_dropped_total.labels(
+            **collector.labels, reason="host_alloc_failed"
+        )._value.get()
+        self.assertEqual(rl, 1.0)
+        self.assertEqual(haf, 1.0)
 
     def test_log_prefetch_dropped_observes_pending_seconds(self):
         collector = self._collector()
-        collector.log_prefetch_dropped(pending_seconds=2.5)
+        collector.log_prefetch_dropped(PrefetchStatus.RATE_LIMITED, pending_seconds=2.5)
+        # The pending-dwell histogram is not labeled by reason.
         hist = collector.histogram_prefetch_pending_dropped_seconds.labels(
             **collector.labels
         )
@@ -51,13 +86,17 @@ class TestStorageMetricsPrefetch(unittest.TestCase):
 
     def test_log_prefetch_dropped_skips_histogram_when_seconds_none(self):
         collector = self._collector()
-        collector.log_prefetch_dropped(pending_seconds=None)
+        collector.log_prefetch_dropped(
+            PrefetchStatus.RATE_LIMITED, pending_seconds=None
+        )
         hist = collector.histogram_prefetch_pending_dropped_seconds.labels(
             **collector.labels
         )
         # Counter still incremented, but no histogram observation.
         self.assertEqual(
-            collector.prefetch_dropped_total.labels(**collector.labels)._value.get(),
+            collector.prefetch_dropped_total.labels(
+                **collector.labels, reason="rate_limited"
+            )._value.get(),
             1.0,
         )
         self.assertEqual(hist._sum.get(), 0.0)

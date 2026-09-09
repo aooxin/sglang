@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from prometheus_client import Gauge
 
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.base_prefix_cache import PrefetchStatus
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
@@ -2152,14 +2153,14 @@ class StorageMetricsCollector:
 
         self.prefetch_retry_total = Counter(
             name="sglang:prefetch_retry_total",
-            documentation="Number of prefetch retries scheduled after rate limiting.",
-            labelnames=labels.keys(),
+            documentation="Number of prefetch retries scheduled, labeled by reason (rate_limited | host_alloc_failed).",
+            labelnames=[*labels.keys(), "reason"],
         )
 
         self.prefetch_dropped_total = Counter(
             name="sglang:prefetch_dropped_total",
-            documentation="Number of requests aborted (429) after prefetch retry budget exhausted.",
-            labelnames=labels.keys(),
+            documentation="Number of requests aborted (429) after prefetch retry budget exhausted, labeled by reason (rate_limited | host_alloc_failed).",
+            labelnames=[*labels.keys(), "reason"],
         )
 
         self.histogram_prefetch_pending_dropped_seconds = Histogram(
@@ -2208,11 +2209,21 @@ class StorageMetricsCollector:
     def log_prefetch_rate_limited(self):
         self.prefetch_rate_limited_total.labels(**self.labels).inc()
 
-    def log_prefetch_retry(self):
-        self.prefetch_retry_total.labels(**self.labels).inc()
+    def log_prefetch_retry(self, status: "PrefetchStatus"):
+        # Derive the Prometheus label from the enum here, at the metrics
+        # boundary — callers pass the PrefetchStatus, never a raw string, so a
+        # typo can't silently spawn a rogue time series.
+        self.prefetch_retry_total.labels(
+            **self.labels, reason=status.name.lower()
+        ).inc()
 
-    def log_prefetch_dropped(self, pending_seconds: Optional[float] = None):
-        self.prefetch_dropped_total.labels(**self.labels).inc()
+    def log_prefetch_dropped(
+        self, status: "PrefetchStatus", pending_seconds: Optional[float] = None
+    ):
+        # Same enum-at-the-boundary rule as log_prefetch_retry.
+        self.prefetch_dropped_total.labels(
+            **self.labels, reason=status.name.lower()
+        ).inc()
         if pending_seconds is not None and pending_seconds >= 0:
             self.histogram_prefetch_pending_dropped_seconds.labels(
                 **self.labels

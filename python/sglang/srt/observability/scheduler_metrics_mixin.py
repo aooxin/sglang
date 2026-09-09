@@ -602,12 +602,19 @@ class SchedulerMetricsMixin:
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
                     self.disagg_prefill_inflight_queue, priority_enabled
                 )
+                # Rate-limited prefetch re-queue depth (post-drain "still
+                # parked" count). Only live writer for this gauge — check_memory()
+                # (its other setter) is disabled in the disagg-prefill loop.
+                self.stats.num_prefetch_pending_queue_reqs = len(
+                    self.prefetch_pending_queue
+                )
                 self.stats.num_prefill_total_reqs = (
                     len(self.disagg_prefill_bootstrap_queue.queue)
                     + len(self.disagg_prefill_inflight_queue)
                     + len(self.waiting_queue)
                     + prefill_stats.num_running_reqs.total
                     + len(self.grammar_manager.grammar_queue)
+                    + self.stats.num_prefetch_pending_queue_reqs
                 )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms

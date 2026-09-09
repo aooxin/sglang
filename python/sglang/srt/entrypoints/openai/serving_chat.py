@@ -1716,17 +1716,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("thinking") is not False
             )
-        if self.reasoning_parser in ["qwen3", "glm45", "nemotron_3", "interns1"]:
+        if self.reasoning_parser in [
+            "qwen3",
+            "glm45",
+            "nemotron_3",
+            "interns1",
+            "mimo",
+        ]:
             # Models that thinking by default, and can be disabled by setting enable_thinking=False
             return (
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("enable_thinking") is not False
-            )
-        if self.reasoning_parser in ["mimo"]:
-            # Models that require explicit enable thinking (enable_thinking=True)
-            return (
-                request.chat_template_kwargs is not None
-                and request.chat_template_kwargs.get("enable_thinking") is True
             )
         if self.reasoning_parser in ["mistral"]:
             # Mistral models only reason when reasoning_effort is explicitly

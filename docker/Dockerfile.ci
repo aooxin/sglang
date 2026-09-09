@@ -38,8 +38,8 @@ RUN mkdir -p ~/.claude/skills/ \
     && git clone git@git.n.xiaomi.com:ai-studio/cloudml-service-deploy-skill.git \
   ~/.claude/skills/cloudml-service-deploy
 
-RUN python3 -m pip install https://cnbj1-fds.api.xiaomi.net/aie-shared-objects/20260514/transfer_kernel-0.4.1-cp310-abi3-linux_x86_64.whl \
-    --no-cache-dir --force-reinstall
+RUN python3 -m pip install https://cnbj1-fds.api.xiaomi.net/aie-shared-objects/20260901/transfer_kernel-0.4.1-cp310-abi3-linux_x86_64.whl \
+    --no-cache-dir --no-deps --force-reinstall
 
 # moe_fused_gate kernels used across the test suites.
 RUN python3 -m pip install https://cnbj1-fds.api.xiaomi.net/git-assert/moe_fused_gate-1.0.0-cp312-cp312-linux_x86_64.whl \

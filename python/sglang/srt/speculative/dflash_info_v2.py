@@ -161,6 +161,16 @@ class DFlashDraftInputV2(SpecInput):
         batch_seq_lens_cpu_t = self._prepare_batch_seq_lens_cpu_buf[:bs]
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
         cur_allocated_seq_lens_cpu = self.cur_allocated_seq_lens_cpu
+        cur_allocated_seq_lens_list = (
+            cur_allocated_seq_lens_cpu.tolist()
+            if cur_allocated_seq_lens_cpu is not None
+            else None
+        )
+        n_cur = (
+            len(cur_allocated_seq_lens_list)
+            if cur_allocated_seq_lens_list is not None
+            else 0
+        )
 
         # For DFLASH, each decode step needs a fixed-size verify block.
         block_size = int(get_global_server_args().speculative_num_draft_tokens)
@@ -170,36 +180,26 @@ class DFlashDraftInputV2(SpecInput):
             )
         page_size = batch.token_to_kv_pool_allocator.page_size
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
-        committed_seq_lens_sum = 0
-        planning_seq_lens_sum = 0
-        reserved_seq_lens_sum = 0
-        num_needed_tokens = 0
+        committed_sum = 0
+        cur_sum = 0
         max_top_k = 1
         uniform_top_k_value = None
         uniform_top_k = True
+        committed_list = []
+        cur_list = []
         for i, req in enumerate(batch.reqs):
             req.decode_batch_idx += 1
             committed_len = int(req.kv_committed_len)
-            if cur_allocated_seq_lens_cpu is not None and i < len(
-                cur_allocated_seq_lens_cpu
-            ):
-                cur_alloc_len = int(cur_allocated_seq_lens_cpu[i])
+            if i < n_cur:
+                cur_alloc_len = int(cur_allocated_seq_lens_list[i])
             else:
                 cur_alloc_len = int(req.kv_allocated_len)
-            planning_len = committed_len + block_size
-            reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)
             top_k = int(req.sampling_params.top_k)
 
-            committed_kv_lens_cpu_t[i] = committed_len
-            batch_seq_lens_cpu_t[i] = committed_len
-            cur_kv_lens_cpu_t[i] = cur_alloc_len
-            planning_kv_lens_cpu_t[i] = planning_len
-            nxt_kv_lens_cpu_t[i] = reserved_len
-
-            committed_seq_lens_sum += committed_len
-            planning_seq_lens_sum += planning_len
-            reserved_seq_lens_sum += reserved_len
-            num_needed_tokens += reserved_len - cur_alloc_len
+            committed_list.append(committed_len)
+            cur_list.append(cur_alloc_len)
+            committed_sum += committed_len
+            cur_sum += cur_alloc_len
 
             if top_k > max_top_k:
                 max_top_k = top_k
@@ -207,6 +207,23 @@ class DFlashDraftInputV2(SpecInput):
                 uniform_top_k_value = top_k
             elif uniform_top_k and top_k != uniform_top_k_value:
                 uniform_top_k = False
+
+        committed_t = torch.tensor(committed_list, dtype=torch.int32)
+        cur_t = torch.tensor(cur_list, dtype=torch.int32)
+        planning_t = committed_t + block_size
+        nxt_t = torch.maximum(cur_t, committed_t + (2 * block_size))
+
+        committed_kv_lens_cpu_t.copy_(committed_t)
+        batch_seq_lens_cpu_t.copy_(committed_t)
+        cur_kv_lens_cpu_t.copy_(cur_t)
+        planning_kv_lens_cpu_t.copy_(planning_t)
+        nxt_kv_lens_cpu_t.copy_(nxt_t)
+
+        committed_seq_lens_sum = committed_sum
+        planning_seq_lens_sum = committed_sum + bs * block_size
+        reserved_seq_lens_sum = int(nxt_t.sum())
+        num_needed_tokens = reserved_seq_lens_sum - cur_sum
+        nxt_list = nxt_t.tolist()
 
         self.max_top_k = max(max_top_k, 1)
         self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
@@ -270,7 +287,7 @@ class DFlashDraftInputV2(SpecInput):
         # This request-side high-water mark is what release_kv_cache() uses to
         # reclaim any DFLASH over-allocation if the request finishes later.
         for i, req in enumerate(batch.reqs):
-            req.kv_allocated_len = max(req.kv_allocated_len, int(nxt_kv_lens_cpu_t[i]))
+            req.kv_allocated_len = max(req.kv_allocated_len, nxt_list[i])
 
         # Preserve the lagging committed CPU view on the batch and carry the
         # tighter host-side planning bound separately from the full reserved

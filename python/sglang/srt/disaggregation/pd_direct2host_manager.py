@@ -478,23 +478,34 @@ class PDDirect2HostManager:
 
         direct_kv_indices = None
         direct_state_indices = None
+        self._write_req_to_token(req, device_indices)
+        alloc_event = torch.cuda.Event()
+        alloc_event.record(alloc_stream)
+        keepalive.append(alloc_event)
+
         if io_backend == "direct":
             direct_kv_indices = torch.empty_like(
                 device_indices, device="cpu", pin_memory=True
             )
-            direct_kv_indices.copy_(device_indices, non_blocking=True)
             keepalive.append(direct_kv_indices)
             if device_state_indices is not None:
                 direct_state_indices = torch.empty_like(
                     device_state_indices, device="cpu", pin_memory=True
                 )
-                direct_state_indices.copy_(device_state_indices, non_blocking=True)
                 keepalive.append(direct_state_indices)
 
-        self._write_req_to_token(req, device_indices)
-        alloc_event = torch.cuda.Event()
-        alloc_event.record(alloc_stream)
-        keepalive.append(alloc_event)
+            with torch.cuda.stream(self.h2d_stream):
+                self.h2d_stream.wait_event(alloc_event)
+                direct_kv_indices.copy_(device_indices, non_blocking=True)
+                if device_state_indices is not None:
+                    direct_state_indices.copy_(
+                        device_state_indices,
+                        non_blocking=True,
+                    )
+                indices_ready_event = torch.cuda.Event()
+                indices_ready_event.record(self.h2d_stream)
+            # _load_to_device_pool reads the pinned indices on the CPU, so the D2H copy must complete first.
+            indices_ready_event.synchronize()
 
         with torch.cuda.stream(self.h2d_stream):
             self.h2d_stream.wait_event(alloc_event)

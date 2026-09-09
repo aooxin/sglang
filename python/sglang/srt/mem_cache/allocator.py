@@ -171,7 +171,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def free(self, free_index: torch.Tensor):
+    def free(self, free_index: torch.Tensor, is_page_aligned: bool = False):
         raise NotImplementedError()
 
 
@@ -221,7 +221,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self._alloc_bitmap[select_index] = True
         return select_index
 
-    def free(self, free_index: torch.Tensor):
+    def free(self, free_index: torch.Tensor, is_page_aligned: bool = False):
         if free_index.numel() == 0:
             return
 

@@ -441,7 +441,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
-            result = self._apply_jinja_template(request, tools, is_multimodal)
+            result = self._apply_jinja_template(
+                request, tools, is_multimodal,
+                return_tokens_only=getattr(request, "return_tokens_only", False),
+            )
         else:
             result = self._apply_conversation_template(request, is_multimodal)
 
@@ -453,6 +456,7 @@ class OpenAIServingChat(OpenAIServingBase):
         messages: List[Dict],
         tools: Optional[List[Dict]],
         template_kwargs: Dict,
+        return_tokens_only: bool = False,
     ) -> List[int]:
         # Non-discretize path keeps the branch's normal single-pass encoding
         # (apply_chat_template tokenize=True), so default behavior is unchanged.
@@ -472,6 +476,12 @@ class OpenAIServingChat(OpenAIServingBase):
         # content are split into ordinary BPE tokens (e.g. '<','tool','_call','>')
         # instead of the single added-token id, while template structure and tool
         # definitions keep their normal encoding.
+        #
+        # For multimodal models, skip discretize and use plain tokenizer.encode()
+        # to match the inference path: _convert_to_internal_request sets `text`
+        # (prompt string) when is_multimodal=True, and the inference engine
+        # re-tokenizes via _tokenize_texts → tokenizer.encode().  The discretize
+        # encoding differs from plain encoding, causing token-count mismatches.
         rendered = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -479,7 +489,13 @@ class OpenAIServingChat(OpenAIServingBase):
             tools=tools,
             **template_kwargs,
         )
-        return self._encode_with_user_tags_discretized(rendered, messages)
+        if return_tokens_only and self.tokenizer_manager.model_config.is_multimodal:
+            # tokenize_proxy path for multimodal models: use plain encode to match
+            # the inference path (which re-tokenizes via _tokenize_texts).
+            result = tokenizer.encode(rendered, add_special_tokens=False)
+        else:
+            result = self._encode_with_user_tags_discretized(rendered, messages)
+        return result
 
     def _encode_with_user_tags_discretized(
         self, text: str, messages: List[Dict]
@@ -576,6 +592,7 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         tools: Optional[List[Dict]],
         is_multimodal: bool,
+        return_tokens_only: bool = False,
     ) -> MessageProcessingResult:
         """Apply Jinja chat template"""
         prompt = ""
@@ -689,6 +706,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     openai_compatible_messages,
                     tools,
                     extra_template_kwargs,
+                    return_tokens_only=return_tokens_only,
                 )
             except Exception as e:
                 # If the first attempt fails, try with flat function-only format.
@@ -703,6 +721,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         openai_compatible_messages,
                         tools,
                         extra_template_kwargs,
+                        return_tokens_only=return_tokens_only,
                     )
                 except jinja2.TemplateError as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)

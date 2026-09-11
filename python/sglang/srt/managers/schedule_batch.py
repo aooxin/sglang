@@ -2604,7 +2604,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         and req.seqlen - 1 - sliding_window_size - req.swa_evicted_seqlen
                         >= evict_backlog_tokens
                     ):
-                        self._evict_swa(req, req.seqlen - 1)
+                        self._evict_swa(req, req.seqlen - 1, page_aligned_free=True)
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
                     # SWAChunkCache reclaims request-local SWA KV immediately before the next
                     # extend allocation. SimpleSWARadixCache intentionally does not: its real
@@ -2629,7 +2629,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     else:
                         self._evict_swa(req, pre_len)
 
-    def _evict_swa(self, req: Req, pre_len: int):
+    def _evict_swa(self, req: Req, pre_len: int, page_aligned_free: bool = False):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
         sliding_window_size = self.tree_cache.sliding_window_size
 
@@ -2652,7 +2652,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             free_slots = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
             ]
-            self.token_to_kv_pool_allocator.free_swa_page_aligned(free_slots)
+            if page_aligned_free:
+                self.token_to_kv_pool_allocator.free_swa_page_aligned(free_slots)
+            else:
+                self.token_to_kv_pool_allocator.free_swa(free_slots)
             req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
     def __str__(self):

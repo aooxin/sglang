@@ -105,6 +105,14 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
+    @classmethod
+    def supports_remote_byte_image_preprocess(cls) -> bool:
+        """On CUDA this is a no-op, and the CPU AMX path processes the
+        weight parameter in place (parameter-complete). See
+        QuantizeMethodBase.supports_remote_byte_image_preprocess.
+        """
+        return True
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -159,6 +167,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     """MoE method without quantization."""
+
+    @classmethod
+    def supports_remote_byte_image_preprocess(cls) -> bool:
+        """The only non-trivial branch is the aiter shuffle, which uses
+        copy_or_rebind_param (parameter-complete). See
+        QuantizeMethodBase.supports_remote_byte_image_preprocess.
+        """
+        return True
 
     def __init__(
         self, use_triton_kernels: bool = False, use_flashinfer_trtllm_moe: bool = False

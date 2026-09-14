@@ -39,6 +39,36 @@ class QuantizeMethodBase(ABC):
         """
         return
 
+    @classmethod
+    def supports_remote_byte_image_preprocess(cls) -> bool:
+        """Whether process_weights_after_loading is safe to run BEFORE a
+        remote-instance byte-image weight copy (see
+        RemoteInstanceModelLoader._run_quant_postprocess_phase).
+
+        True means the method only establishes layout (dtype views,
+        transposes, repacks): it is deterministic and leaves every tensor
+        the forward pass reads as a registered parameter, so the byte copy
+        overwrites all values afterwards. Methods with no post-processing
+        of their own need no contract; methods that derive runtime state
+        from parameter values must instead declare
+        supports_remote_byte_image_postprocess. Defaults to False so a new
+        quant method with unclassified post-processing fails the remote
+        byte-image load fast instead of silently serving wrong weights.
+        """
+        return False
+
+    @classmethod
+    def supports_remote_byte_image_postprocess(cls) -> bool:
+        """Whether process_weights_after_loading must run AFTER a
+        remote-instance byte-image weight copy (see
+        RemoteInstanceModelLoader._run_quant_postprocess_phase).
+
+        True means the method derives runtime-consumed non-parameter state
+        (e.g. BaseKVCacheMethod's k_scale_float) from parameter values, so
+        it must observe the real copied values. Defaults to False.
+        """
+        return False
+
 
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
@@ -238,13 +268,23 @@ class QuantizationConfig(ABC):
         pass
 
 
+def method_overrides(method_class: type, name: str, base_class: type) -> bool:
+    """
+    Whether `name` as seen on method_class is defined by method_class (or an
+    intermediate base) rather than simply inherited from base_class. We
+    check this by comparing the static attribute against base_class's.
+    """
+    class_attr = inspect.getattr_static(method_class, name, None)
+    if class_attr is None:
+        return False
+    base_attr = inspect.getattr_static(base_class, name, None)
+    return class_attr is not base_attr
+
+
 def method_has_implemented_embedding(method_class: Type[QuantizeMethodBase]) -> bool:
     """
     Not all quant methods have embedding implemented, so we need to check that
     it exists for our given method. We check this by making sure the function
     has been changed from the base implementation.
     """
-    base_embedding = inspect.getattr_static(QuantizeMethodBase, "embedding", None)
-    class_embedding = inspect.getattr_static(method_class, "embedding", None)
-
-    return class_embedding is not None and class_embedding is not base_embedding
+    return method_overrides(method_class, "embedding", QuantizeMethodBase)

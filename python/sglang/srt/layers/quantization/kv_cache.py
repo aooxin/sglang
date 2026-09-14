@@ -27,6 +27,25 @@ class BaseKVCacheMethod(QuantizeMethodBase):
     def __init__(self, quant_config: QuantizationConfig):
         self.quant_config = quant_config
 
+    @classmethod
+    def supports_remote_byte_image_postprocess(cls) -> bool:
+        """Whether process_weights_after_loading must run after a
+        remote-instance byte-image weight copy instead of before it (see
+        QuantizeMethodBase.supports_remote_byte_image_postprocess).
+
+        This method derives k_scale_float / v_scale_float — plain attributes
+        consumed at runtime by attention backends for descaling — from the
+        k_scale/v_scale parameter values. Those floats are not parameters, so
+        the byte copy cannot refresh them: the method must observe the real
+        copied values. On CUDA the re-run is value pass-through (the scales
+        are read and copied back unchanged), so the already-processed seed
+        values are safe. On fnuz (ROCm) the fnuz branch multiplies the scales
+        by 2, which is NOT idempotent — re-running it would double the seed's
+        processed values — so fnuz platforms opt out and the byte-image load
+        fails fast to the local loader instead.
+        """
+        return not is_fp8_fnuz()
+
     def create_weights(self, layer: torch.nn.Module):
         """
         Create "weight" (aka k_scale and v_scale) for an attention layer.

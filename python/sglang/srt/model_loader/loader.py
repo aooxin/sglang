@@ -5,6 +5,7 @@ from __future__ import annotations
 # ruff: noqa: SIM117
 import collections
 import dataclasses
+import enum
 import fnmatch
 import gc
 import glob
@@ -78,7 +79,11 @@ from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+    method_overrides,
+)
 from sglang.srt.model_loader.utils import (
     get_model_architecture,
     post_load_weights,
@@ -2097,6 +2102,15 @@ class GGUFModelLoader(BaseModelLoader):
         return model
 
 
+class _QuantPostprocessPhase(enum.Enum):
+    """Which phase of a remote-instance byte-image load runs a quant
+    method's process_weights_after_loading. See
+    RemoteInstanceModelLoader._run_quant_postprocess_phase."""
+
+    PRE = "pre"  # layout-establishing: run before the byte copy
+    POST = "post"  # value-derived: run after the byte copy
+
+
 class RemoteInstanceModelLoader(BaseModelLoader):
     """Model loader that can load Tensors from remote sglang instance."""
 
@@ -2104,6 +2118,12 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         super().__init__(load_config)
         self.remote_instance_transfer_engine_weight_info = None
         self.remote_instance_registered_memory_addrs = []
+        # method_cls -> phase decision for the byte-image load path. Filled
+        # once per load attempt by _run_quant_postprocess_phase (PRE) and
+        # reused by its POST call after the byte copy.
+        self._byte_image_quant_phases: Optional[
+            Dict[type, Optional[_QuantPostprocessPhase]]
+        ] = None
 
     def _unregister_remote_instance_memory(self) -> None:
         if not self.remote_instance_registered_memory_addrs:
@@ -2117,6 +2137,101 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
     def download_model(self, model_config: ModelConfig) -> None:
         raise NotImplementedError
+
+    @classmethod
+    def _classify_quant_method(
+        cls, method_cls: type
+    ) -> Optional[_QuantPostprocessPhase]:
+        """Decide what a byte-image load does with the method's
+        process_weights_after_loading: PRE, POST, or None when the method
+        has none of its own. Raises for classes that satisfy neither
+        contract. See the docstrings of
+        QuantizeMethodBase.supports_remote_byte_image_preprocess /
+        .supports_remote_byte_image_postprocess.
+        """
+        # QuantizeMethodBase's process_weights_after_loading is a no-op;
+        # methods that inherit it (e.g. UnquantizedEmbeddingMethod) have no
+        # post-processing at all: the parameters are plain and the copy
+        # fills them directly. Trivially safe.
+        if not method_overrides(
+            method_cls, "process_weights_after_loading", QuantizeMethodBase
+        ):
+            return None
+        if method_cls.supports_remote_byte_image_preprocess():
+            return _QuantPostprocessPhase.PRE
+        if method_cls.supports_remote_byte_image_postprocess():
+            return _QuantPostprocessPhase.POST
+        raise RuntimeError(
+            f"{method_cls.__name__} does not support the "
+            "remote-instance byte-image load path: its "
+            "process_weights_after_loading may keep state the "
+            "weight copy cannot reach outside registered "
+            "parameters. Load this model with the local loader "
+            "(it needs the checkpoint files on disk), or teach the "
+            "quant method the supports_remote_byte_image_preprocess "
+            "/ supports_remote_byte_image_postprocess contract first."
+        )
+
+    def _run_quant_postprocess_phase(
+        self,
+        model: nn.Module,
+        device_config: DeviceConfig,
+        phase: _QuantPostprocessPhase,
+    ) -> None:
+        """Run one phase of the quant post-processing for a byte-image load.
+
+        The transfer-engine / modelexpress backends replicate the seed
+        instance's *storage bytes* per registered parameter, so the receiving
+        model must reach the seed's exact post-quant parameter set and layout
+        before the copy. Each quant method's ``process_weights_after_loading``
+        belongs to exactly one phase, decided per method class by
+        _classify_quant_method and cached in self._byte_image_quant_phases
+        (classified once per load attempt; the POST call after the copy
+        reuses the map):
+
+        - PRE (``supports_remote_byte_image_preprocess()``): the method
+          transforms LAYOUT (dtype views, transposes, repacks). It must be
+          deterministic and leave every tensor the forward pass reads as a
+          registered ``nn.Parameter`` — the copy then overwrites all values,
+          so anything computed from the uninitialized weights here is
+          superseded. Running such a method after the copy would double-
+          transform the already-transformed seed bytes. PRE runs in
+          load_model, on the freshly initialized, not-yet-filled parameters,
+          which mirrors DefaultModelLoader.load_weights_and_postprocess but
+          ordered before the weight fill: a value-based load (safetensors,
+          NCCL broadcast) can post-process after filling, but a byte-image
+          clone cannot, because the seed's bytes are already transformed.
+        - POST (``supports_remote_byte_image_postprocess()``): the method
+          derives runtime-consumed state from parameter VALUES (e.g.
+          BaseKVCacheMethod builds k_scale_float, a plain attribute the copy
+          cannot refresh). It must run on the real values, i.e. after the
+          copy, in load_model_from_transfer_engine /
+          load_model_from_modelexpress. Running it before the copy would
+          bake garbage into the derived state.
+
+        Methods that satisfy neither contract (e.g. Mxfp4MoEMethod's
+        triton_kernels path, which caches swizzled weights as plain
+        attributes and deletes the raw parameters) make the remote load fail
+        fast so the caller falls back to the local loader instead of
+        silently serving wrong weights. Methods without any post-processing
+        of their own are trivially safe and need no contract.
+        """
+        if self._byte_image_quant_phases is None:
+            self._byte_image_quant_phases = {}
+        target_device = torch.device(device_config.device)
+        for _, module in model.named_modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is None:
+                continue
+            method_cls = type(quant_method)
+            if method_cls not in self._byte_image_quant_phases:
+                self._byte_image_quant_phases[method_cls] = (
+                    self._classify_quant_method(method_cls)
+                )
+            if self._byte_image_quant_phases[method_cls] is not phase:
+                continue
+            with device_loading_context(module, target_device):
+                quant_method.process_weights_after_loading(module)
 
     def _probe_transfer_engine_seed(self, load_config: LoadConfig):
         model_idx = get_remote_instance_model_idx(load_config.draft_model_idx)
@@ -2180,13 +2295,36 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                     model = _initialize_model(
                         model_config, self.load_config, quant_config
                     )
-        except Exception:
+
+                # Byte-image backends (transfer_engine / modelexpress) clone the
+                # seed's storage bytes, so the receiving parameters must already
+                # be in their final post-quant layout before the copy. See
+                # _run_quant_postprocess_phase for details.
+                if load_config.remote_instance_weight_loader_backend in (
+                    RemoteInstanceWeightLoaderBackend.TRANSFER_ENGINE,
+                    RemoteInstanceWeightLoaderBackend.MODELEXPRESS,
+                ):
+                    # Re-classify per attempt; the POST call after the byte
+                    # copy reuses the resulting map.
+                    self._byte_image_quant_phases = None
+                    self._run_quant_postprocess_phase(
+                        model, device_config, _QuantPostprocessPhase.PRE
+                    )
+        except Exception as e:
             logger.error(
-                "Failed to initialize model for remote loading (load_format=%s).",
+                "Failed to initialize or post-process model for remote loading "
+                "(load_format=%s).",
                 load_config.load_format,
                 exc_info=True,
             )
-            raise
+            # Release the failed attempt before the caller falls back: the
+            # exception traceback keeps every frame alive, and those frames
+            # hold the half-built model — the fallback load would otherwise
+            # run with a second full model in memory and OOM at KV-pool
+            # sizing.
+            e.__traceback__ = None
+            model = None
+            raise RuntimeError(f"remote byte-image load failed: {e}") from None
 
         # 3. Transfer weights from remote instance.
         try:
@@ -2197,15 +2335,19 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 load_config=load_config,
                 transfer_engine_seed_info=transfer_engine_seed_info,
             )
-        except Exception:
+        except Exception as e:
             logger.error(
                 "Remote instance weight transfer failed (backend=%s).",
                 load_config.remote_instance_weight_loader_backend,
                 exc_info=True,
             )
             self._unregister_remote_instance_memory()
-            del model
-            raise
+            # Same release as the init/post-process handler above: the
+            # traceback frames (including the transfer function's) hold the
+            # model, which must not survive into the caller's fallback.
+            e.__traceback__ = None
+            model = None
+            raise RuntimeError(f"remote instance weight transfer failed: {e}") from None
 
     def _try_load_from_remote_instance(
         self,
@@ -2247,6 +2389,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 seed_session_id, seed_weight_info = transfer_engine_seed_info
                 success = self.load_model_from_remote_instance_by_transfer_engine(
                     model,
+                    device_config,
                     load_config.remote_instance_weight_loader_transfer_engine,
                     seed_session_id,
                     seed_weight_info,
@@ -2336,6 +2479,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
     def load_model_from_remote_instance_by_transfer_engine(
         self,
         model,
+        device_config: DeviceConfig,
         transfer_engine,
         seed_transfer_engine_session_id,
         seed_transfer_engine_weight_info,
@@ -2382,6 +2526,12 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         if ret < 0:
             logger.error(f"batch transfer failed, error: {ret}")
             return False
+
+        # Value-derived quant state (e.g. KV-cache scale floats) must be built
+        # from the copied parameter values, not from the empty weights.
+        self._run_quant_postprocess_phase(
+            model, device_config, _QuantPostprocessPhase.POST
+        )
 
         if hasattr(model, "post_load_weights"):
             model.post_load_weights()
@@ -2512,6 +2662,12 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             raise RuntimeError(
                 f"ModelExpress: batch_transfer_sync_read failed, error={ret}"
             )
+
+        # Value-derived quant state (e.g. KV-cache scale floats) must be built
+        # from the copied parameter values, not from the empty weights.
+        self._run_quant_postprocess_phase(
+            model, device_config, _QuantPostprocessPhase.POST
+        )
 
         if hasattr(model, "post_load_weights"):
             model.post_load_weights()

@@ -324,6 +324,15 @@ class Fp8LinearMethod(LinearMethodBase):
         self.use_aiter_fp8_per_token = envs.SGLANG_USE_AITER_FP8_PER_TOKEN.get()
         self.use_per_token_if_dynamic = False
 
+    @classmethod
+    def supports_remote_byte_image_preprocess(cls) -> bool:
+        """All post-loading paths rebind or re-register parameters
+        (`copy_or_rebind_param`, `.data` rebinding, in-place requantization),
+        so the weight copy covers every tensor the forward reads. See
+        QuantizeMethodBase.supports_remote_byte_image_preprocess.
+        """
+        return True
+
     def validate_block_quant_shapes(
         self,
         input_size: int,
@@ -833,6 +842,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 or get_moe_a2a_backend().is_nixl()
             )
         return False
+
+    @classmethod
+    def supports_remote_byte_image_preprocess(cls) -> bool:
+        """All post-loading paths rebind or re-register parameters and
+        requantize in place, so the weight copy covers every tensor the
+        forward reads. This includes the MegaMoE a2a path:
+        build_mega_moe_experts_weights aliases the transformed tensors back
+        into the source parameters in place (shapes asserted unchanged), and
+        an end-to-end transfer-engine load with MegaMoE enabled reproduced
+        matching precision against the local loader. See
+        QuantizeMethodBase.supports_remote_byte_image_preprocess.
+        """
+        return True
 
     def create_weights(
         self,

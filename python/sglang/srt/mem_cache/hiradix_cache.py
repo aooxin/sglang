@@ -1602,6 +1602,8 @@ class BaseHiRadixCache(abc.ABC):
         """
         cc = self.cache_controller
 
+        cc.raise_if_storage_thread_dead()
+
         if cc.is_hybrid_swa:
             qsizes = torch.tensor(
                 [

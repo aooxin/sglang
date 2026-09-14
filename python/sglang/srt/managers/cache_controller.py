@@ -675,6 +675,13 @@ class HiCacheController:
         # storage without stopping the whole controller.
         self.storage_stop_event = threading.Event()
 
+        # Set by a storage background thread (prefetch/backup/aux/key-refresh) when
+        # it dies from an unexpected exception, and re-raised on the scheduler
+        # thread at the next drain point. Without this, a dead daemon thread only
+        # prints a traceback while the main process keeps running with broken host
+        # pool / TP invariants (silent hang instead of fail-fast).
+        self._storage_thread_fatal_error: Optional[BaseException] = None
+
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
         self.layer_done_counter = LayerDoneCounter(self.layer_num)
@@ -732,9 +739,28 @@ class HiCacheController:
         def wrapper():
             if device.type == "cuda":
                 torch.cuda.set_device(device)
-            thread_func()
+            try:
+                thread_func()
+            except BaseException as e:
+                if not self.storage_stop_event.is_set():
+                    logger.exception(
+                        "Storage background thread %s died unexpectedly; "
+                        "flagging for fail-fast on the scheduler thread.",
+                        thread_func.__name__,
+                    )
+                    if self._storage_thread_fatal_error is None:
+                        self._storage_thread_fatal_error = e
+                raise
 
         return wrapper
+
+    def raise_if_storage_thread_dead(self) -> None:
+        err = self._storage_thread_fatal_error
+        if err is not None:
+            raise RuntimeError(
+                "A HiCache storage background thread died; aborting to avoid a "
+                "silent hang with inconsistent host pool / TP state"
+            ) from err
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -743,6 +769,8 @@ class HiCacheController:
         """
         assert self.enable_storage
         assert not self.storage_stop_event.is_set()
+
+        self._storage_thread_fatal_error = None
 
         from sglang.srt.environ import Envs
 
@@ -1080,6 +1108,7 @@ class HiCacheController:
         self.storage_stop_event.clear()
 
         if self.enable_storage:
+            self._storage_thread_fatal_error = None
             self.prefetch_thread = threading.Thread(
                 target=self._run_on_controller_device(self.prefetch_thread_func),
                 daemon=True,
@@ -2240,10 +2269,15 @@ class HiCacheController:
                 # vs at the later release asserts bisects the corruption
                 # window. Cold-gated (hot=False): once per operation, no extra
                 # sync on top of the one above.
+                full_host_pool_size = (
+                    self.mem_pool_host.full_pool_host.size
+                    if self.is_hybrid_swa
+                    else self.mem_pool_host.size
+                )
                 assert_indices_in_bounds(
                     operation.host_indices,
                     self.page_size,
-                    self.mem_pool_host.full_pool_host.size + self.page_size,
+                    full_host_pool_size + self.page_size,
                     "prefetch_thread_func(host_indices)",
                     hot=False,
                 )

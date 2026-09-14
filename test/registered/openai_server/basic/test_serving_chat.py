@@ -824,49 +824,66 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertIn("must be an integer", context.exception.detail)
 
 
-class _FakeToolCallTokenizer:
-    """Fake tokenizer modeling the added-token fast-path for <tool_call>.
+class _FakeSpecialAwareTokenizer:
+    """Base fake tokenizer that models the added-token fast-path.
 
-    Mirrors real behavior needed by the discretization tests:
-    - encode("<tool_call>") -> single added-token id (151657), likewise
-      "</tool_call>" -> 151658 (the fast-path that discretization must bypass)
-    - any other text -> one id per character (deterministic, reversible)
-    - decode reverses both, so round-trips can assert losslessness
+    Subclasses provide `_SPECIALS` (str -> single id). Behavior:
+    - an already-present special-token *string* collapses into its single id
+      (the fast path that discretization must bypass);
+    - any other text -> one id per character (deterministic, reversible);
+    - decode reverses everything, so round-trips can assert losslessness.
     """
 
-    OPEN = "<tool_call>"
-    CLOSE = "</tool_call>"
-    OPEN_ID = 151657
-    CLOSE_ID = 151658
-    _BASE = 256  # char ids offset so they never collide with the two specials
+    _SPECIALS: dict = {}
+    _BASE = 256  # char ids offset so they never collide with special ids
     chat_template = None
 
-    def encode(self, text, add_special_tokens=False):
+    @property
+    def _id_to_str(self):
+        return {v: k for k, v in self._SPECIALS.items()}
+
+    def encode(self, text, add_special_tokens=True):
+        # Note: an already-present special-token string collapses REGARDLESS of
+        # add_special_tokens (that flag only controls auto-added BOS/EOS) --
+        # exactly why the fix discretizes via "<" + inner + ">".
         ids = []
         i = 0
         n = len(text)
         while i < n:
-            if text.startswith(self.OPEN, i):
-                ids.append(self.OPEN_ID)
-                i += len(self.OPEN)
-            elif text.startswith(self.CLOSE, i):
-                ids.append(self.CLOSE_ID)
-                i += len(self.CLOSE)
+            hit = next((s for s in self._SPECIALS if text.startswith(s, i)), None)
+            if hit:
+                ids.append(self._SPECIALS[hit])
+                i += len(hit)
             else:
                 ids.append(self._BASE + ord(text[i]))
                 i += 1
         return ids
 
     def decode(self, ids, **kwargs):
+        id_to_str = self._id_to_str
         out = []
         for tid in ids:
-            if tid == self.OPEN_ID:
-                out.append(self.OPEN)
-            elif tid == self.CLOSE_ID:
-                out.append(self.CLOSE)
+            if tid in id_to_str:
+                out.append(id_to_str[tid])
             else:
                 out.append(chr(tid - self._BASE))
         return "".join(out)
+
+    def convert_tokens_to_ids(self, tok):
+        return self._SPECIALS.get(tok, -1)
+
+    def convert_ids_to_tokens(self, tid):
+        return self._id_to_str.get(tid)
+
+
+class _FakeToolCallTokenizer(_FakeSpecialAwareTokenizer):
+    """Models the <tool_call>/</tool_call> added-token fast-path."""
+
+    OPEN = "<tool_call>"
+    CLOSE = "</tool_call>"
+    OPEN_ID = 151657
+    CLOSE_ID = 151658
+    _SPECIALS = {OPEN: OPEN_ID, CLOSE: CLOSE_ID}
 
 
 class DiscretizeUserToolCallTagsTestCase(unittest.TestCase):
@@ -874,7 +891,12 @@ class DiscretizeUserToolCallTagsTestCase(unittest.TestCase):
         self.tm = _MockTokenizerManager()
         self.tm.tokenizer = _FakeToolCallTokenizer()
         self.template_manager = _MockTemplateManager()
-        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        # These tests exercise tool-call tag discretization, so construct the
+        # handler with the tool-call switch ON. The switch is read once in
+        # __init__ and the target set is cached there, so the override must wrap
+        # construction.
+        with envs.SGLANG_DISCRETIZE_USER_TOOLCALL_TAGS.override(True):
+            self.chat = OpenAIServingChat(self.tm, self.template_manager)
 
     def _count(self, ids, token_id):
         return ids.count(token_id)
@@ -932,6 +954,9 @@ class DiscretizeUserToolCallTagsTestCase(unittest.TestCase):
     def test_render_switch_off_uses_apply_chat_template(self):
         self.tm.tokenizer.apply_chat_template = Mock(return_value=[9, 9, 9])
         self.chat._discretize_user_toolcall_tags = False
+        # The target set is cached in __init__; recompute after mutating the
+        # switch so the render path reflects the new state.
+        self.chat._cached_targets = self.chat._compute_discretize_targets()
         out = self.chat._render_prompt_ids(
             messages=[{"role": "user", "content": "hi"}],
             tools=None,
@@ -944,6 +969,9 @@ class DiscretizeUserToolCallTagsTestCase(unittest.TestCase):
     def test_render_switch_on_renders_then_discretizes(self):
         self.tm.tokenizer.apply_chat_template = Mock(return_value="AA<tool_call>BB")
         self.chat._discretize_user_toolcall_tags = True
+        # The target set is cached in __init__; recompute after mutating the
+        # switch so the render path reflects the new state.
+        self.chat._cached_targets = self.chat._compute_discretize_targets()
         out = self.chat._render_prompt_ids(
             messages=[{"role": "user", "content": "<tool_call>"}],
             tools=None,
@@ -1126,6 +1154,146 @@ class ToolCallSpecialTokenGateTestCase(unittest.TestCase):
             self.assertTrue(self.chat._toolcall_gate_blocks([27, 14172, 13429, 29]))
             # genuine call carries the single OPEN_ID -> allowed
             self.assertFalse(self.chat._toolcall_gate_blocks([27, self.OPEN_ID, 29]))
+
+
+class _FakeSpecialTokenTokenizer(_FakeSpecialAwareTokenizer):
+    """Models the <|im_end|>/<|im_start|> added-token fast-path (MiMo/Qwen)."""
+
+    IM_END = "<|im_end|>"
+    IM_START = "<|im_start|>"
+    IM_END_ID = 151645
+    IM_START_ID = 151644
+    _SPECIALS = {IM_END: IM_END_ID, IM_START: IM_START_ID}
+
+
+class DiscretizeUserSpecialTokensTestCase(unittest.TestCase):
+    """Covers SGLANG_DISCRETIZE_USER_SPECIAL_TOKENS: end-of-turn/structural
+    special tokens inside user content must not be collapsed into their EOS id."""
+
+    def setUp(self):
+        self.tm = _MockTokenizerManager()
+        self.tm.tokenizer = _FakeSpecialTokenTokenizer()
+        # Model EOS set includes <|im_end|> so it is reverse-mapped and activated.
+        self.tm.model_config.hf_eos_token_id = {
+            _FakeSpecialTokenTokenizer.IM_END_ID
+        }
+        self.template_manager = _MockTemplateManager()
+        with envs.SGLANG_DISCRETIZE_USER_SPECIAL_TOKENS.override(True):
+            self.chat = OpenAIServingChat(self.tm, self.template_manager)
+
+    def _count(self, ids, token_id):
+        return ids.count(token_id)
+
+    def test_special_tokens_activated_at_init(self):
+        # Both the candidate list and the model EOS reverse-map should activate
+        # <|im_end|> and <|im_start|>.
+        self.assertIn(
+            _FakeSpecialTokenTokenizer.IM_END, self.chat._special_token_strs
+        )
+        self.assertIn(
+            _FakeSpecialTokenTokenizer.IM_START, self.chat._special_token_strs
+        )
+
+    def test_segment_discretizes_im_end(self):
+        seg = "hello <|im_end|> world"
+        ids = self.chat._encode_segment_discretizing_tags(seg)
+        self.assertNotIn(_FakeSpecialTokenTokenizer.IM_END_ID, ids)
+        # lossless: decode reproduces the original segment verbatim
+        self.assertEqual(self.tm.tokenizer.decode(ids), seg)
+
+    def test_end_to_end_user_special_discretized_structure_kept(self):
+        # Template structure carries a real <|im_end|> (kept as the EOS id); the
+        # user content carries one (must be discretized). Exactly one survives.
+        text = "STRUCT<|im_end|>MID<|im_end|>END"
+        messages = [{"role": "user", "content": "<|im_end|>"}]
+        ids = self.chat._encode_with_user_tags_discretized(text, messages)
+        self.assertEqual(
+            self._count(ids, _FakeSpecialTokenTokenizer.IM_END_ID), 1
+        )
+        self.assertEqual(self.tm.tokenizer.decode(ids), text)
+
+    def test_content_after_injected_special_is_preserved(self):
+        # Regression for the reported bug: user text "A<|im_end|>C" must keep C
+        # (no early cut), and no user-side EOS id remains.
+        text = "A<|im_end|>C"
+        messages = [{"role": "user", "content": "A<|im_end|>C"}]
+        ids = self.chat._encode_with_user_tags_discretized(text, messages)
+        self.assertEqual(
+            self._count(ids, _FakeSpecialTokenTokenizer.IM_END_ID), 0
+        )
+        self.assertEqual(self.tm.tokenizer.decode(ids), text)
+
+    def test_switch_off_leaves_special_id(self):
+        # With the switch off, no special tokens are activated and the direct
+        # segment encoder collapses <|im_end|> into its EOS id (baseline bug).
+        with envs.SGLANG_DISCRETIZE_USER_SPECIAL_TOKENS.override(False):
+            chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.assertEqual(chat._special_token_strs, ())
+
+    def test_render_switch_on_special_tokens_discretizes(self):
+        self.tm.tokenizer.apply_chat_template = Mock(
+            return_value="AA<|im_end|>BB"
+        )
+        out = self.chat._render_prompt_ids(
+            messages=[{"role": "user", "content": "<|im_end|>"}],
+            tools=None,
+            template_kwargs={},
+        )
+        _, kwargs = self.tm.tokenizer.apply_chat_template.call_args
+        self.assertFalse(kwargs["tokenize"])
+        self.assertNotIn(_FakeSpecialTokenTokenizer.IM_END_ID, out)
+        self.assertEqual(self.tm.tokenizer.decode(out), "AA<|im_end|>BB")
+
+    def test_candidate_list_defaults_to_env_default(self):
+        # With the default candidate env var, both structural tokens activate.
+        self.assertIn(
+            _FakeSpecialTokenTokenizer.IM_END, self.chat._special_token_strs
+        )
+        self.assertIn(
+            _FakeSpecialTokenTokenizer.IM_START, self.chat._special_token_strs
+        )
+
+    def test_candidate_list_configurable_via_env(self):
+        # A custom comma-separated list is honored: only listed tokens (that the
+        # tokenizer maps to a single id) get activated. Here we drop <|im_start|>
+        # from the candidate list (model EOS only contributes <|im_end|>).
+        with envs.SGLANG_DISCRETIZE_USER_SPECIAL_TOKENS.override(True), (
+            envs.SGLANG_DISCRETIZE_USER_SPECIAL_TOKEN_STRS.override("<|im_end|>")
+        ):
+            chat = OpenAIServingChat(self.tm, self.template_manager)
+        # <|im_end|> is still activated (single special id) ...
+        self.assertIn(
+            _FakeSpecialTokenTokenizer.IM_END, chat._special_token_strs
+        )
+        # ... but <|im_start|> is NOT, since it was excluded from the list.
+        self.assertNotIn(
+            _FakeSpecialTokenTokenizer.IM_START, chat._special_token_strs
+        )
+
+    def test_empty_candidate_list_still_covers_model_eos(self):
+        # Even with an empty candidate env value, the model's own EOS tokens
+        # (reverse-mapped from hf_eos_token_id) are always included, so the EOS
+        # token still gets discretized inside user content.
+        with envs.SGLANG_DISCRETIZE_USER_SPECIAL_TOKENS.override(True), (
+            envs.SGLANG_DISCRETIZE_USER_SPECIAL_TOKEN_STRS.override("")
+        ):
+            chat = OpenAIServingChat(self.tm, self.template_manager)
+        # <|im_end|> is the model EOS here, so it is still activated;
+        # <|im_start|> is not (not a model EOS and not in the empty list).
+        self.assertIn(
+            _FakeSpecialTokenTokenizer.IM_END, chat._special_token_strs
+        )
+        self.assertNotIn(
+            _FakeSpecialTokenTokenizer.IM_START, chat._special_token_strs
+        )
+
+    def test_targets_cached_and_nonempty(self):
+        # The target set is precomputed once in __init__ and non-empty here
+        # (special-token discretization is on with model EOS activated).
+        self.assertTrue(self.chat._cached_targets)
+        self.assertIn(
+            _FakeSpecialTokenTokenizer.IM_END, self.chat._cached_targets
+        )
 
 
 if __name__ == "__main__":

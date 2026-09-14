@@ -143,16 +143,16 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             self._tokenizer_auto_adds_specials = True
 
+        # Cached "<" / ">" sub-token ids, computed once and reused for all tags.
+        self._open_ids: Optional[List[int]] = None
+        self._close_ids: Optional[List[int]] = None
         # Precompute the discretized "<" + inner + ">" id list for each fixed tag.
         self._discretized_tag_ids: Dict[str, List[int]] = {}
         try:
-            tokenizer = self.tokenizer_manager.tokenizer
-            if tokenizer is not None:
-                open_ids = tokenizer.encode("<", add_special_tokens=False)
-                close_ids = tokenizer.encode(">", add_special_tokens=False)
-                for tag in self._TOOLCALL_TAGS:
-                    inner_ids = tokenizer.encode(tag[1:-1], add_special_tokens=False)
-                    self._discretized_tag_ids[tag] = open_ids + inner_ids + close_ids
+            for tag in self._TOOLCALL_TAGS:
+                ids = self._precompute_discretized_ids(tag)
+                if ids is not None:
+                    self._discretized_tag_ids[tag] = ids
         except Exception as e:
             logger.warning(
                 f"Failed to precompute discretized tool-call tag ids; "
@@ -182,6 +182,122 @@ class OpenAIServingChat(OpenAIServingBase):
         self._require_special_toolcall_token = (
             envs.SGLANG_REQUIRE_SPECIAL_TOOLCALL_TOKEN.get()
         )
+        self._discretize_user_special_tokens = (
+            envs.SGLANG_DISCRETIZE_USER_SPECIAL_TOKENS.get()
+        )
+
+        # Build the set of end-of-turn / structural special-token strings that
+        # must be discretized when they appear inside untrusted user content, and
+        # precompute their discretized ("<" + inner + ">") id lists. A string is
+        # only activated if the tokenizer maps it to a single added-token id
+        # (otherwise it is already treated as ordinary text and needs no fix).
+        self._special_token_strs: tuple = ()
+        if self._discretize_user_special_tokens:
+            self._build_discretized_special_tokens()
+
+        # All discretization switches/lists are fixed after __init__, so compute
+        # the target tag/special-token set once and reuse it per request.
+        self._cached_targets = self._compute_discretize_targets()
+
+    def _precompute_discretized_ids(self, tag: str) -> Optional[List[int]]:
+        """Return the discretized id list for a bracketed tag, i.e.
+        encode("<") + encode(inner) + encode(">"), all with add_special_tokens
+        =False so the single added-token fast path is bypassed. decode() of the
+        result reconstructs the identical string. Returns None if the tokenizer
+        is unavailable. "<" / ">" ids are cached across calls.
+        """
+        tokenizer = self.tokenizer_manager.tokenizer
+        if tokenizer is None:
+            return None
+        if self._open_ids is None:
+            self._open_ids = tokenizer.encode("<", add_special_tokens=False)
+        if self._close_ids is None:
+            self._close_ids = tokenizer.encode(">", add_special_tokens=False)
+        inner_ids = tokenizer.encode(tag[1:-1], add_special_tokens=False)
+        return self._open_ids + inner_ids + self._close_ids
+
+    def _build_discretized_special_tokens(self) -> None:
+        """Resolve which special-token strings must be discretized inside user
+        content, and precompute each one's "<" + inner + ">" id list.
+
+        Candidates come from two sources:
+          1. env var SGLANG_DISCRETIZE_USER_SPECIAL_TOKEN_STRS (comma-separated).
+          2. Model EOS tokens (model_config.hf_eos_token_id), reverse-mapped to
+             their token strings so any model-specific end token is covered.
+
+        A candidate is activated only if the tokenizer maps it to a *single*
+        added-token id; otherwise it is already plain text and needs no fix.
+        """
+        tokenizer = self.tokenizer_manager.tokenizer
+        if tokenizer is None:
+            self._special_token_strs = ()
+            return
+
+        # Configurable candidate list (comma-separated env var); this env var's
+        # default is the single source of truth for the built-in candidates.
+        candidates: List[str] = list(
+            envs.SGLANG_DISCRETIZE_USER_SPECIAL_TOKEN_STRS.get()
+        )
+
+        # Add model EOS token strings (reverse-mapped from ids) so we catch
+        # model-specific end tokens like "<EOS>" / "<|I_am_end|>".
+        try:
+            eos_ids = getattr(
+                self.tokenizer_manager.model_config, "hf_eos_token_id", None
+            )
+            if eos_ids:
+                for eos_id in eos_ids:
+                    try:
+                        tok_str = tokenizer.convert_ids_to_tokens(eos_id)
+                    except Exception:
+                        tok_str = None
+                    if isinstance(tok_str, str) and tok_str:
+                        candidates.append(tok_str)
+        except Exception as e:
+            logger.warning(f"Failed to collect model EOS token strings: {e}")
+
+        activated: List[str] = []
+        for tok in dict.fromkeys(candidates):  # dedup, preserve order
+            # Only discretize strings that (a) look like a bracketed tag and
+            # (b) the tokenizer collapses into a single added-token id.
+            if not (len(tok) >= 2 and tok.startswith("<") and tok.endswith(">")):
+                continue
+            try:
+                ids = tokenizer.encode(tok, add_special_tokens=False)
+            except Exception:
+                continue
+            if len(ids) != 1:
+                # Already tokenized as ordinary sub-tokens; no injection risk.
+                continue
+            try:
+                discretized = self._precompute_discretized_ids(tok)
+            except Exception:
+                continue
+            if discretized is None:
+                continue
+            self._discretized_tag_ids[tok] = discretized
+            activated.append(tok)
+
+        self._special_token_strs = tuple(activated)
+        if activated:
+            logger.info(
+                f"User-content special-token discretization active for: "
+                f"{activated}"
+            )
+
+    def _compute_discretize_targets(self) -> tuple:
+        """Compute all tag/special-token strings to discretize inside user
+        content. Called once in __init__ since the inputs are fixed afterwards.
+
+        Longest-first so that overlapping prefixes (e.g. "<tool_call>" vs "<")
+        match the most specific tag first.
+        """
+        targets = set()
+        if self._discretize_user_toolcall_tags:
+            targets.update(self._TOOLCALL_TAGS)
+        if self._discretize_user_special_tokens:
+            targets.update(self._special_token_strs)
+        return tuple(sorted(targets, key=len, reverse=True))
 
     def _handle_last_assistant_message(
         self,
@@ -460,8 +576,12 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> List[int]:
         # Non-discretize path keeps the branch's normal single-pass encoding
         # (apply_chat_template tokenize=True), so default behavior is unchanged.
+        # A non-empty target set is the single source of truth for whether any
+        # discretization applies (it already encodes both switches and whether
+        # any special tokens were actually activated).
         tokenizer = self.tokenizer_manager.tokenizer
-        if not self._discretize_user_toolcall_tags:
+        discretize_enabled = bool(self._cached_targets)
+        if not discretize_enabled:
             return tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
@@ -472,16 +592,10 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
         # The discretize path renders to a string first, then encodes segment by
-        # segment so that <tool_call>/</tool_call> appearing inside USER and TOOL
-        # content are split into ordinary BPE tokens (e.g. '<','tool','_call','>')
-        # instead of the single added-token id, while template structure and tool
-        # definitions keep their normal encoding.
-        #
-        # For multimodal models, skip discretize and use plain tokenizer.encode()
-        # to match the inference path: _convert_to_internal_request sets `text`
-        # (prompt string) when is_multimodal=True, and the inference engine
-        # re-tokenizes via _tokenize_texts → tokenizer.encode().  The discretize
-        # encoding differs from plain encoding, causing token-count mismatches.
+        # segment so that targeted tags/special tokens (e.g. <tool_call>,
+        # <|im_end|>) appearing inside USER and TOOL content are split into
+        # ordinary sub-tokens instead of the single added-token/EOS id, while
+        # template structure and tool definitions keep their normal encoding.
         rendered = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -555,16 +669,23 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _encode_segment_discretizing_tags(self, seg: str) -> List[int]:
         tokenizer = self.tokenizer_manager.tokenizer
+        # Targets are the precomputed union of tool-call tags and end-of-turn/
+        # structural special tokens (whichever discretization switches are on),
+        # ordered longest-first so the most specific tag wins on overlapping
+        # prefixes. If empty, the loop below encodes the segment verbatim -- no
+        # implicit fallback, so nothing is discretized unless explicitly enabled.
+        targets = self._cached_targets
         ids: List[int] = []
         i = 0
         n = len(seg)
         while i < n:
-            hit = next((t for t in self._TOOLCALL_TAGS if seg.startswith(t, i)), None)
+            hit = next((t for t in targets if seg.startswith(t, i)), None)
             if hit:
-                # Encode "<tool_call>" as "<" + "tool_call" + ">" (and likewise
-                # "</tool_call>" as "<" + "/tool_call" + ">") so the added-token
+                # Encode e.g. "<tool_call>" as "<" + "tool_call" + ">" and
+                # "<|im_end|>" as "<" + "|im_end|" + ">" so the added-token
                 # fast-path is bypassed. decode() reconstructs the identical
-                # string, so the model sees the same text.
+                # string, so the model sees the same text (but as ordinary
+                # sub-tokens rather than a single special/EOS id).
                 hit_ids = self._discretized_tag_ids.get(hit)
                 if hit_ids is None:
                     inner = hit[1:-1]
@@ -578,9 +699,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 i += len(hit)
                 continue
             next_positions = [
-                pos
-                for pos in (seg.find(t, i) for t in self._TOOLCALL_TAGS)
-                if pos != -1
+                pos for pos in (seg.find(t, i) for t in targets) if pos != -1
             ]
             nxt = min(next_positions) if next_positions else n
             ids += tokenizer.encode(seg[i:nxt], add_special_tokens=False)

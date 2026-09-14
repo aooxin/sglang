@@ -13,8 +13,8 @@ RUN if [ -n "${PIP_DEFAULT_INDEX}" ]; then \
 fi
 
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
-      sed -i "s|http://.*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
-      sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
+      sed -i "s|http://[^ ]*archive.ubuntu.com\S*|$UBUNTU_MIRROR|g" /etc/apt/sources.list.d/ubuntu.sources && \
+      sed -i "s|http://[^ ]*security.ubuntu.com\S*|$UBUNTU_MIRROR|g" /etc/apt/sources.list.d/ubuntu.sources; \
     fi && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -104,7 +104,9 @@ RUN python3 -m pip install https://artifactory.d.xiaomi.net/artifactory/mimo-cor
 RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/* \
+    && npm config set registry https://registry.npmmirror.com \
     && npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force \
     && echo '{"hasCompletedOnboarding": true}' > /root/.claude.json \
     && claude --version
 
@@ -123,6 +125,19 @@ RUN if [ -n "${GITLAB_API_TOKEN}" ]; then \
     && claude plugin install cloudml-mimo-analyze@cloudml-claude-plugins --yes \
     && grep -q 'cloudml-mimo-analyze@cloudml-claude-plugins' /root/.claude/plugins/installed_plugins.json
 
+# --- opencode + oh-my-opencode --------------------------------------------
+# opencode ships as the npm package `opencode-ai`; oh-my-opencode is a plugin
+# installed via its own CLI (npx), which registers into opencode's config.
+# The npm registry is configured once above (npm config set registry).
+RUN npm install -g opencode-ai \
+    && opencode --version \
+    && npx --yes oh-my-opencode install \
+        --no-tui --skip-auth \
+        --claude=no --openai=no --gemini=no --copilot=no \
+    && npm cache clean --force \
+    && rm -rf /root/.npm/_npx
+
+# Keep this at the end of the Dockerfile to avoid cache invalidation for previous layers
 COPY . .
 
 # Set workspace directory

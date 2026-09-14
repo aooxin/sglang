@@ -679,6 +679,7 @@ class SimpleSWARadixCache(RadixCache):
         already-freed entries (mapping == 0), so double-free is safe.
         """
         all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        all_token_len = min(all_token_len, req.kv_committed_len)
         actual_kv_len = (
             max(0, all_token_len - self.speculative_num_steps)
             if self.is_eagle

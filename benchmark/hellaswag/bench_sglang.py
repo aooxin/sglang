@@ -33,7 +33,7 @@ def main(args):
 
     # Read data
     data_path = args.data_path
-    url = "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl"
+    url = "https://cnbj1-fds.api.xiaomi.net/aie-shared-objects/gitlab_ci/hellaswag_val.jsonl"
     if not os.path.isfile(data_path):
         data_path = download_and_cache_file(url)
     lines = list(read_jsonl(data_path))

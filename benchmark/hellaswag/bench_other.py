@@ -30,7 +30,7 @@ def main(args):
     call_select = get_call_select(args)
 
     # Read data
-    url = "https://raw.githubusercontent.com/rowanz/hellaswag/master/data/hellaswag_val.jsonl"
+    url = "https://cnbj1-fds.api.xiaomi.net/aie-shared-objects/gitlab_ci/hellaswag_val.jsonl"
     filename = download_and_cache_file(url)
     lines = list(read_jsonl(filename))
 

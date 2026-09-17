@@ -3,11 +3,15 @@
 #include <c10/util/irange.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
+#include <utility>
 #include <vector>
 
 #ifndef USE_ROCM
+#include <ATen/cuda/CachingHostAllocator.h>
 #include <dlfcn.h>
 #define WARP_SIZE 32
 // TODO(yingchun): when build separately, pytorch_extension_utils.h is not visible, use torch/extension.h instead
@@ -1064,6 +1068,155 @@ inline void transfer_page_direct(
           /* non_blocking= */ true);
 }
 
+#if !defined(USE_ROCM) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+// CUDA headers may provide C++ overloads of cudaMemcpyBatchAsync, so taking
+// its address with decltype is ambiguous. Describe the runtime symbol's ABI
+// explicitly, including CUDA 13's const pointer arrays and removed failIdx.
+#if CUDART_VERSION >= 13000
+using MemcpyBatchPointer = const void*;
+using MemcpyBatchAsyncFn = cudaError_t(CUDARTAPI*)(
+    const void**, const void**, const size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, cudaStream_t);
+#else
+using MemcpyBatchPointer = void*;
+using MemcpyBatchAsyncFn = cudaError_t(CUDARTAPI*)(
+    void**, void**, size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, size_t*, cudaStream_t);
+#endif
+
+inline cudaError_t invoke_memcpy_batch(
+    MemcpyBatchAsyncFn fn,
+    MemcpyBatchPointer* dsts,
+    MemcpyBatchPointer* srcs,
+    size_t* sizes,
+    size_t count,
+    cudaMemcpyAttributes* attrs,
+    size_t* attrs_idxs,
+    size_t* fail_idx,
+    cudaStream_t stream) {
+#if CUDART_VERSION >= 13000
+  (void)fail_idx;
+  return fn(dsts, srcs, sizes, count, attrs, attrs_idxs, 1, stream);
+#else
+  return fn(dsts, srcs, sizes, count, attrs, attrs_idxs, 1, fail_idx, stream);
+#endif
+}
+
+// Same-layout contiguous H2D only: both LF layers and PF all-layer raw
+// buffers fit this contract. Other directions/layouts retain ATen copy_.
+bool try_transfer_kv_batch_h2d(
+    const std::vector<at::Tensor>& src_layers,
+    const std::vector<at::Tensor>& dst_layers,
+    const at::Tensor& src_indices_cpu,
+    const at::Tensor& dst_indices_cpu) {
+  if (src_layers.empty() || src_indices_cpu.numel() == 0) {
+    return true;
+  }
+
+  static const int driver_version = []() {
+    int version = 0;
+    return cudaDriverGetVersion(&version) == cudaSuccess ? version : 0;
+  }();
+  static const auto memcpy_batch = reinterpret_cast<MemcpyBatchAsyncFn>(dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync"));
+  static const int runtime_version = []() {
+    int version = 0;
+    return cudaRuntimeGetVersion(&version) == cudaSuccess ? version : 0;
+  }();
+  if (driver_version < 12080 || runtime_version < 12080 || runtime_version / 1000 != CUDART_VERSION / 1000 ||
+      memcpy_batch == nullptr) {
+    return false;
+  }
+
+  const int device_id = at::cuda::current_device();
+  std::vector<size_t> row_bytes;
+  row_bytes.reserve(src_layers.size());
+  for (size_t j = 0; j < src_layers.size(); ++j) {
+    const auto& src = src_layers[j];
+    const auto& dst = dst_layers[j];
+    if (!src.is_cpu() || !dst.is_cuda() || dst.get_device() != device_id || !src.is_pinned() || !src.is_contiguous() ||
+        !dst.is_contiguous() || src.scalar_type() != dst.scalar_type() || src.dim() == 0 || dst.dim() == 0 ||
+        src.sizes().slice(1) != dst.sizes().slice(1) || src.size(0) == 0 || dst.size(0) == 0) {
+      return false;
+    }
+    const auto bytes = src.numel() / src.size(0) * src.element_size();
+    if (bytes == 0) {
+      return false;
+    }
+    row_bytes.push_back(bytes);
+  }
+
+  const auto* src_indices = src_indices_cpu.data_ptr<int64_t>();
+  const auto* dst_indices = dst_indices_cpu.data_ptr<int64_t>();
+  const auto count = src_indices_cpu.numel();
+  // Merge runs contiguous on BOTH sides before building the CUDA batch.
+  std::vector<std::array<int64_t, 3>> runs;
+  for (int64_t begin = 0; begin < count;) {
+    int64_t end = begin + 1;
+    while (end < count && src_indices[end] == src_indices[end - 1] + 1 &&
+           dst_indices[end] == dst_indices[end - 1] + 1) {
+      ++end;
+    }
+    runs.push_back({src_indices[begin], dst_indices[begin], end - begin});
+    begin = end;
+  }
+
+  std::vector<MemcpyBatchPointer> srcs, dsts;
+  std::vector<size_t> sizes;
+  std::vector<std::pair<uintptr_t, uintptr_t>> dst_ranges;
+  const auto num_copies = runs.size() * src_layers.size();
+  srcs.reserve(num_copies);
+  dsts.reserve(num_copies);
+  sizes.reserve(num_copies);
+  dst_ranges.reserve(num_copies);
+  for (const auto& run : runs) {
+    const auto [src_index, dst_index, length] = run;
+    for (size_t j = 0; j < src_layers.size(); ++j) {
+      if (src_index < 0 || dst_index < 0 || length > src_layers[j].size(0) || length > dst_layers[j].size(0) ||
+          src_index > src_layers[j].size(0) - length || dst_index > dst_layers[j].size(0) - length) {
+        return false;
+      }
+      auto* src = static_cast<char*>(src_layers[j].data_ptr()) + src_index * row_bytes[j];
+      auto* dst = static_cast<char*>(dst_layers[j].data_ptr()) + dst_index * row_bytes[j];
+      const auto bytes = length * row_bytes[j];
+      srcs.push_back(src);
+      dsts.push_back(dst);
+      sizes.push_back(bytes);
+      const auto address = reinterpret_cast<uintptr_t>(dst);
+      dst_ranges.emplace_back(address, address + bytes);
+    }
+  }
+  // Batch copies are unordered. Preserve copy_'s sequential semantics for
+  // repeated destination indices or aliasing destination tensors.
+  std::sort(dst_ranges.begin(), dst_ranges.end());
+  for (size_t i = 1; i < dst_ranges.size(); ++i) {
+    if (dst_ranges[i].first < dst_ranges[i - 1].second) {
+      return false;
+    }
+  }
+
+  const auto stream = at::cuda::getCurrentCUDAStream(device_id);
+  cudaMemcpyAttributes attrs{};
+  attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+  attrs.srcLocHint.type = cudaMemLocationTypeHost;
+  attrs.dstLocHint.type = cudaMemLocationTypeDevice;
+  attrs.dstLocHint.id = device_id;
+  size_t attrs_idx = 0;
+  size_t fail_idx = std::numeric_limits<size_t>::max();
+
+  // Match copy_'s protection for PyTorch-owned pinned allocations. Custom
+  // registered host pools remain owned by the caller until its H2D event.
+  for (const auto& src : src_layers) {
+    at::cuda::CachingHostAllocator_recordEvent(src.data_ptr(), src.storage().data_ptr().get_context(), stream);
+  }
+  const auto err = invoke_memcpy_batch(
+      memcpy_batch, dsts.data(), srcs.data(), sizes.data(), sizes.size(), &attrs, &attrs_idx, &fail_idx, stream);
+  if (err == cudaErrorNotSupported || err == cudaErrorCallRequiresNewerDriver) {
+    return false;
+  }
+  TORCH_CHECK(
+      err == cudaSuccess, "cudaMemcpyBatchAsync H2D failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
+  return true;
+}
+#endif
+
 void transfer_kv_direct(
     const std::vector<at::Tensor>& src_layers,
     std::vector<at::Tensor> dst_layers,
@@ -1076,8 +1229,14 @@ void transfer_kv_direct(
   TORCH_CHECK(page_size > 0, "Page size must be positive");
   TORCH_CHECK(src_indices.numel() % page_size == 0, "Source indices size must be divisible by page size");
 
-  auto src_indices_cpu = src_indices.cpu();
-  auto dst_indices_cpu = dst_indices.cpu();
+  auto src_indices_cpu = src_indices.cpu().contiguous();
+  auto dst_indices_cpu = dst_indices.cpu().contiguous();
+
+#if !defined(USE_ROCM) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+  if (try_transfer_kv_batch_h2d(src_layers, dst_layers, src_indices_cpu, dst_indices_cpu)) {
+    return;
+  }
+#endif
 
   const auto num_indices = src_indices_cpu.numel();
   const int64_t num_layers = src_layers.size();

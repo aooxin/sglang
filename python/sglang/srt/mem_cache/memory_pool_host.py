@@ -3998,6 +3998,18 @@ class SWATokenToKVPoolHost:
     def _backup_full_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if isinstance(device_pool.full_kv_pool, MHAPageFirstTokenToKVPool):
+            if device_pool.full_layer_nums == 0:
+                return
+            # PF token stride spans all layers; the LF kernel cannot read it.
+            self.full_pool_host.backup_from_device_all_layer(
+                device_pool.full_kv_pool,
+                host_indices,
+                device_indices,
+                io_backend,
+            )
+            return
+
         transfer_kv_all_layer_fuse_lf_pf(
             src_k_layers=device_pool.full_kv_pool.k_data_ptrs,
             dst_k=self.full_pool_host.k_buffer,
@@ -4016,6 +4028,16 @@ class SWATokenToKVPoolHost:
     def _backup_swa_from_device_all_layer(
         self, device_pool, swa_host_indices, swa_device_indices, io_backend
     ):
+        if isinstance(device_pool.swa_kv_pool, MHAPageFirstTokenToKVPool):
+            # PF token stride spans all layers; the LF kernel cannot read it.
+            self.swa_pool_host.backup_from_device_all_layer(
+                device_pool.swa_kv_pool,
+                swa_host_indices,
+                swa_device_indices,
+                io_backend,
+            )
+            return
+
         transfer_kv_all_layer_fuse_lf_pf(
             src_k_layers=device_pool.swa_kv_pool.k_data_ptrs,
             dst_k=self.swa_pool_host.k_buffer,

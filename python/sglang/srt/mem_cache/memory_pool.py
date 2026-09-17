@@ -736,6 +736,13 @@ class KVCache(abc.ABC):
     def maybe_get_custom_mem_pool(self):
         return self.custom_mem_pool
 
+    @property
+    def kv_transfer_layout(self) -> str:
+        """Default KV transfer layout. Subclasses that lay out KV in a
+        page-major (rather than layer-major) way override this (e.g.
+        ``MHAPageFirstTokenToKVPool`` returns ``"page_first"``)."""
+        return "layer_first"
+
 
 class MHATokenToKVPool(KVCache):
 

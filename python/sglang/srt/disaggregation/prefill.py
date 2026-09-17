@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    collect_kv_transfer_infos,
     get_kv_class,
     get_kv_transfer_buf_infos,
     is_mla_backend,
@@ -145,37 +146,13 @@ class PrefillBootstrapQueue:
             get_kv_transfer_buf_infos(self.token_to_kv_pool)
         )
 
-        if len(self.draft_token_to_kv_pool_list):
-            for draft_kv_pool in self.draft_token_to_kv_pool_list:
-                (
-                    draft_kv_data_ptrs,
-                    draft_kv_data_lens,
-                    draft_kv_item_lens,
-                    draft_kv_layout,
-                ) = get_kv_transfer_buf_infos(draft_kv_pool)
-                assert draft_kv_layout == kv_transfer_layout, (
-                    f"draft KV layout ({draft_kv_layout}) must match "
-                    f"target KV layout ({kv_transfer_layout})"
-                )
-                kv_data_ptrs += draft_kv_data_ptrs
-                kv_data_lens += draft_kv_data_lens
-                kv_item_lens += draft_kv_item_lens
-        elif self.draft_token_to_kv_pool is not None:
-            # We should also transfer draft model kv cache. The indices are
-            # always shared with a target model.
-            (
-                draft_kv_data_ptrs,
-                draft_kv_data_lens,
-                draft_kv_item_lens,
-                draft_kv_layout,
-            ) = get_kv_transfer_buf_infos(self.draft_token_to_kv_pool)
-            assert draft_kv_layout == kv_transfer_layout, (
-                f"draft KV layout ({draft_kv_layout}) must match "
-                f"target KV layout ({kv_transfer_layout})"
+        kv_data_ptrs, kv_data_lens, kv_item_lens, kv_transfer_layout = (
+            collect_kv_transfer_infos(
+                (kv_data_ptrs, kv_data_lens, kv_item_lens, kv_transfer_layout),
+                self.draft_token_to_kv_pool_list,
+                self.draft_token_to_kv_pool,
             )
-            kv_data_ptrs += draft_kv_data_ptrs
-            kv_data_lens += draft_kv_data_lens
-            kv_item_lens += draft_kv_item_lens
+        )
 
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens

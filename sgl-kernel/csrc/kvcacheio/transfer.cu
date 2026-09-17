@@ -1073,19 +1073,19 @@ inline void transfer_page_direct(
 // its address with decltype is ambiguous. Describe the runtime symbol's ABI
 // explicitly, including CUDA 13's const pointer arrays and removed failIdx.
 #if CUDART_VERSION >= 13000
-using MemcpyBatchPointer = const void*;
+using MemcpyBatchSrcPointer = const void*;
 using MemcpyBatchAsyncFn = cudaError_t(CUDARTAPI*)(
-    const void**, const void**, const size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, cudaStream_t);
+    void* const*, const void* const*, const size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, cudaStream_t);
 #else
-using MemcpyBatchPointer = void*;
+using MemcpyBatchSrcPointer = void*;
 using MemcpyBatchAsyncFn = cudaError_t(CUDARTAPI*)(
     void**, void**, size_t*, size_t, cudaMemcpyAttributes*, size_t*, size_t, size_t*, cudaStream_t);
 #endif
 
 inline cudaError_t invoke_memcpy_batch(
     MemcpyBatchAsyncFn fn,
-    MemcpyBatchPointer* dsts,
-    MemcpyBatchPointer* srcs,
+    void** dsts,
+    MemcpyBatchSrcPointer* srcs,
     size_t* sizes,
     size_t count,
     cudaMemcpyAttributes* attrs,
@@ -1126,6 +1126,11 @@ bool try_transfer_kv_batch_h2d(
   }
 
   const int device_id = at::cuda::current_device();
+  const auto stream = at::cuda::getCurrentCUDAStream(device_id);
+  // cudaMemcpyBatchAsync does not accept the legacy NULL stream.
+  if (stream == at::cuda::getDefaultCUDAStream(device_id)) {
+    return false;
+  }
   std::vector<size_t> row_bytes;
   row_bytes.reserve(src_layers.size());
   for (size_t j = 0; j < src_layers.size(); ++j) {
@@ -1158,7 +1163,8 @@ bool try_transfer_kv_batch_h2d(
     begin = end;
   }
 
-  std::vector<MemcpyBatchPointer> srcs, dsts;
+  std::vector<MemcpyBatchSrcPointer> srcs;
+  std::vector<void*> dsts;
   std::vector<size_t> sizes;
   std::vector<std::pair<uintptr_t, uintptr_t>> dst_ranges;
   const auto num_copies = runs.size() * src_layers.size();
@@ -1192,7 +1198,6 @@ bool try_transfer_kv_batch_h2d(
     }
   }
 
-  const auto stream = at::cuda::getCurrentCUDAStream(device_id);
   cudaMemcpyAttributes attrs{};
   attrs.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
   attrs.srcLocHint.type = cudaMemLocationTypeHost;

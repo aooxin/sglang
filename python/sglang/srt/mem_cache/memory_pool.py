@@ -1151,6 +1151,14 @@ class MHAPageFirstTokenToKVPool(MHATokenToKVPool):
                 self.k_buffer = [self._k_raw[:, :, i] for i in range(self.layer_num)]
                 self.v_buffer = [self._v_raw[:, :, i] for i in range(self.layer_num)]
 
+        # Views share the raw storage and are rebuilt whenever buffers are created.
+        self._k_flat_views = [self._flat_view(buf) for buf in self.k_buffer]
+        self._v_flat_views = [self._flat_view(buf) for buf in self.v_buffer]
+        self._page_first_raw_buffers = (
+            self._k_raw.flatten(0, 1),
+            self._v_raw.flatten(0, 1),
+        )
+
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
             dtype=torch.uint64,
@@ -1172,6 +1180,9 @@ class MHAPageFirstTokenToKVPool(MHATokenToKVPool):
         )
 
     def _clear_buffers(self):
+        del self._k_flat_views
+        del self._v_flat_views
+        del self._page_first_raw_buffers
         del self.k_buffer
         del self.v_buffer
         del self._k_raw
@@ -1182,10 +1193,7 @@ class MHAPageFirstTokenToKVPool(MHATokenToKVPool):
         return "page_first"
 
     def get_page_first_raw_buffers(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return (
-            self._k_raw.flatten(0, 1),
-            self._v_raw.flatten(0, 1),
-        )
+        return self._page_first_raw_buffers
 
     def get_page_level_buf_infos(self):
         k_buffer, v_buffer = self.get_page_first_raw_buffers()
@@ -1254,8 +1262,8 @@ class MHAPageFirstTokenToKVPool(MHATokenToKVPool):
         _set_kv_buffer_impl(
             cache_k,
             cache_v,
-            self._flat_view(self.k_buffer[layer_id - self.start_layer]),
-            self._flat_view(self.v_buffer[layer_id - self.start_layer]),
+            self._k_flat_views[layer_id - self.start_layer],
+            self._v_flat_views[layer_id - self.start_layer],
             loc,
             row_dim=self.row_dim,
             store_dtype=self.store_dtype,
@@ -1268,9 +1276,7 @@ class MHAPageFirstTokenToKVPool(MHATokenToKVPool):
         # TODO: Extend copy_all_layer_kv_cache_tiled to accept separate token-stride
         # and item-size arguments. In page-first layout, the per-layer token stride
         # spans all layers while only one layer's [head, dim] payload should be copied.
-        k_flat = [self._flat_view(b) for b in self.k_buffer]
-        v_flat = [self._flat_view(b) for b in self.v_buffer]
-        move_kv_cache_native(k_flat, v_flat, tgt_loc, src_loc)
+        move_kv_cache_native(self._k_flat_views, self._v_flat_views, tgt_loc, src_loc)
 
     def get_cpu_copy(self, indices):
         self.device_module.synchronize()
@@ -1278,8 +1284,8 @@ class MHAPageFirstTokenToKVPool(MHATokenToKVPool):
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
-            k_flat = self._flat_view(self.k_buffer[layer_id])
-            v_flat = self._flat_view(self.v_buffer[layer_id])
+            k_flat = self._k_flat_views[layer_id]
+            v_flat = self._v_flat_views[layer_id]
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 k_cpu = k_flat[chunk_indices].to("cpu", non_blocking=True)
@@ -1292,8 +1298,8 @@ class MHAPageFirstTokenToKVPool(MHATokenToKVPool):
         self.device_module.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
-            k_flat = self._flat_view(self.k_buffer[layer_id])
-            v_flat = self._flat_view(self.v_buffer[layer_id])
+            k_flat = self._k_flat_views[layer_id]
+            v_flat = self._v_flat_views[layer_id]
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 k_cpu, v_cpu = (

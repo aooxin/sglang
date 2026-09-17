@@ -338,7 +338,7 @@ class PDDirect2HostManager:
                 page_size=self.page_size,
                 layout="layer_first",
             )
-        layout = getattr(device_pool, "kv_transfer_layout", "layer_first")
+        layout = device_pool.kv_transfer_layout
         if isinstance(device_pool, MHATokenToKVPool):
             return MHATokenToKVPoolHost(
                 device_pool=device_pool,

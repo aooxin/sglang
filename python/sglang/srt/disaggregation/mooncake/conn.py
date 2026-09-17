@@ -168,6 +168,7 @@ class KVArgsRegisterInfo:
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
+        # Field 14 is layout in new messages, staging in legacy messages.
         has_layout = len(msg) > 14 and msg[14] in (
             b"layer_first",
             b"page_first",
@@ -892,7 +893,7 @@ class MooncakeKVManager(CommonKVManager):
             prefill_data_indices=prefill_kv_indices,
             dst_data_indices=dst_kv_indices,
             executor=executor,
-            layout=getattr(self.kv_args, "kv_transfer_layout", "layer_first"),
+            layout=self.kv_args.kv_transfer_layout,
         )
 
     def send_kvcache_hisparse(
@@ -1428,6 +1429,23 @@ class MooncakeKVManager(CommonKVManager):
                 )
             self._sched_notified.add(bootstrap_room)
 
+    def _fail_transfer_and_sync(
+        self,
+        transfer_room: int,
+        transfer_info: TransferInfo,
+        reason: str,
+        prefill_unique_rank: int,
+    ):
+        self.record_failure(transfer_room, reason)
+        self.update_status(transfer_room, KVPoll.Failed)
+        self.sync_status_to_decode_endpoint(
+            transfer_info.endpoint,
+            transfer_info.dst_port,
+            transfer_info.room,
+            KVPoll.Failed,
+            prefill_unique_rank,
+        )
+
     def _clear_transfer_room(self, bootstrap_room: int):
         with self._decode_send_lock:
             with self._transfer_infos_lock:
@@ -1618,21 +1636,13 @@ class MooncakeKVManager(CommonKVManager):
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
                         _t_send_start = time.monotonic()
-                        src_kv_layout = getattr(
-                            self.kv_args, "kv_transfer_layout", "layer_first"
-                        )
+                        src_kv_layout = self.kv_args.kv_transfer_layout
                         if src_kv_layout != target_rank_registration_info.dst_kv_layout:
-                            self.record_failure(
+                            self._fail_transfer_and_sync(
                                 kv_chunk.room,
+                                req,
                                 f"KV layout mismatch: prefill={src_kv_layout} "
                                 f"decode={target_rank_registration_info.dst_kv_layout}",
-                            )
-                            self.update_status(kv_chunk.room, KVPoll.Failed)
-                            self.sync_status_to_decode_endpoint(
-                                req.endpoint,
-                                req.dst_port,
-                                req.room,
-                                KVPoll.Failed,
                                 prefill_unique_rank,
                             )
                             break
@@ -1643,17 +1653,11 @@ class MooncakeKVManager(CommonKVManager):
                             or self.kv_args.kv_item_lens[0]
                             != target_rank_registration_info.dst_kv_item_len
                         ):
-                            self.record_failure(
+                            self._fail_transfer_and_sync(
                                 kv_chunk.room,
+                                req,
                                 "page-first KV transfer requires matching page "
                                 "geometry and attention TP size",
-                            )
-                            self.update_status(kv_chunk.room, KVPoll.Failed)
-                            self.sync_status_to_decode_endpoint(
-                                req.endpoint,
-                                req.dst_port,
-                                req.room,
-                                KVPoll.Failed,
                                 prefill_unique_rank,
                             )
                             break
@@ -2502,11 +2506,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     packed_state_dim_per_tensor,
                     enable_hisparse,
                     enable_pd_direct2host,
-                    getattr(
-                        self.kv_mgr.kv_args,
-                        "kv_transfer_layout",
-                        "layer_first",
-                    ).encode("ascii"),
+                    self.kv_mgr.kv_args.kv_transfer_layout.encode("ascii"),
                     packed_staging_base_ptr,
                     staging_total_size_str,
                     packed_draft_state_data_ptrs,

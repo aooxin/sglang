@@ -17,6 +17,21 @@ from sgl_kernel.kvcacheio import (
 from sglang.srt.utils import is_hip
 
 
+@pytest.mark.parametrize("use_default_stream", [True, False])
+def test_transfer_kv_direct_h2d_stream(use_default_stream):
+    stream = torch.cuda.default_stream() if use_default_stream else torch.cuda.Stream()
+    src = torch.arange(24 * 8, dtype=torch.float32).reshape(24, 8).pin_memory()
+    src_indices = torch.tensor([0, 1, 2, 3, 8, 9, 10, 11])
+    dst_indices = torch.tensor([12, 13, 14, 15, 4, 5, 6, 7])
+    expected = torch.zeros_like(src)
+    expected[dst_indices] = src[src_indices]
+    with torch.cuda.stream(stream):
+        dst = torch.zeros_like(src, device="cuda")
+        transfer_kv_direct([src], [dst], src_indices, dst_indices, page_size=4)
+    stream.synchronize()
+    torch.testing.assert_close(dst.cpu(), expected, rtol=0, atol=0)
+
+
 def ref_copy_with_indices(src_pool, dst_pool, src_indices, dst_indices):
     dst_pool[dst_indices] = src_pool[src_indices].to(dst_pool.device)
 

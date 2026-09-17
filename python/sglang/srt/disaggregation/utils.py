@@ -23,6 +23,7 @@ if TYPE_CHECKING:
         CommonKVSender,
     )
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.memory_pool import KVCache
 
 #########################
 # Constants & Enums
@@ -492,11 +493,42 @@ def get_kv_class(
 #########################
 
 
-def get_kv_transfer_buf_infos(kv_pool):
-    layout = getattr(kv_pool, "kv_transfer_layout", "layer_first")
+KVTransferDescriptors = tuple[list[int], list[int], list[int], str]
+
+
+def get_kv_transfer_buf_infos(kv_pool: KVCache) -> KVTransferDescriptors:
+    layout = kv_pool.kv_transfer_layout
     if layout == "page_first":
         return (*kv_pool.get_page_level_buf_infos(), layout)
     return (*kv_pool.get_contiguous_buf_infos(), layout)
+
+
+def collect_kv_transfer_infos(
+    base_descriptors: KVTransferDescriptors,
+    draft_pool_list: list[KVCache],
+    fallback_draft_pool: Optional[KVCache],
+) -> KVTransferDescriptors:
+    """Append draft descriptors to already selected device or host descriptors.
+
+    Copy the lists so callers and pools retain ownership of their descriptors.
+    A nonempty draft list takes precedence over the single draft pool.
+    """
+    base_ptrs, base_lens, base_item_lens, layout = base_descriptors
+    ptrs, lens, item_lens = list(base_ptrs), list(base_lens), list(base_item_lens)
+    draft_pools = draft_pool_list or (
+        [fallback_draft_pool] if fallback_draft_pool is not None else []
+    )
+    for pool in draft_pools:
+        draft_ptrs, draft_lens, draft_item_lens, draft_layout = (
+            get_kv_transfer_buf_infos(pool)
+        )
+        assert (
+            draft_layout == layout
+        ), f"draft KV layout ({draft_layout}) must match target KV layout ({layout})"
+        ptrs.extend(draft_ptrs)
+        lens.extend(draft_lens)
+        item_lens.extend(draft_item_lens)
+    return ptrs, lens, item_lens, layout
 
 
 def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):

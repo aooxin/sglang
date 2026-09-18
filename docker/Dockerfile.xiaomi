@@ -76,9 +76,7 @@ RUN python3 -m pip install https://cnbj1-fds.api.xiaomi.net/git-assert/workspace
     python3 -m pip install https://cnbj1-fds.api.xiaomi.net/aie-shared-objects/20260901/transfer_kernel-0.4.1-cp310-abi3-linux_x86_64.whl \
     --no-cache-dir --no-deps --force-reinstall
 
-# DeepGEMM with sm90 megamoe kernel (cloudml-aie/DeepGEMM branch sm90-megamoe-coop-nsplit-per128 @b23a8a0).
-RUN python3 -m pip install "https://cnbj1-fds.api.xiaomi.net/git-assets/test/0510/deep_gemm-2.5.0+local-cp312-cp312-linux_x86_64.whl" \
-    --no-cache-dir --no-dependencies --force-reinstall
+# sm90 megamoe kernel is now bundled in the combined DeepGEMM wheel installed below.
 
 # gcache
 COPY docker/gcache.flags /sgl-workspace/
@@ -93,6 +91,18 @@ RUN python3 -m pip install https://git-assert.cnbj1.mi-fds.com/git-assert/mimo/m
     --no-cache-dir --no-dependencies --force-reinstall
 RUN python3 -m pip install https://git-assert.cnbj1.mi-fds.com/git-assert/pro/mimo_pro_moe_fused_gate-1.0.0-cp312-cp312-linux_x86_64.whl\
     --no-cache-dir --no-dependencies --force-reinstall
+
+# DeepGEMM with W4A8 + sm90 megamoe kernels (branch combine_earlier_w4a8_mega_moe_sm90 @de9009a)
+RUN cd /tmp && \
+    wget -q -O deep_gemm-2.5.0+de9009a-cp312-cp312-linux_x86_64.whl 'https://cnbj1-fds.api.xiaomi.net/deepgemm/deep_gemm-2.5.0+de9009a-cp312-cp312-linux_x86_64.whl?GalaxyAccessKeyId=5151729087601&Expires=9223372036854775807&Signature=2g79y9cot4XI3Kql%2BfbQwQAfqYU%3D' && \
+    python3 -m pip install /tmp/deep_gemm-2.5.0+de9009a-cp312-cp312-linux_x86_64.whl --no-cache-dir --no-dependencies --force-reinstall && \
+    rm -f /tmp/deep_gemm-2.5.0+de9009a-cp312-cp312-linux_x86_64.whl
+
+# Humming MXFP4 W4A8 kernels (MiMoV2 decode path)
+RUN cd /tmp && \
+    wget -q -O humming_kernels-0.1.10.post2+g766964975-py3-none-any.whl 'https://cnbj1-fds.api.xiaomi.net/deepgemm/humming_kernels-0.1.10.post2+g766964975-py3-none-any.whl?GalaxyAccessKeyId=5151729087601&Expires=9223372036854775807&Signature=%2FkAWDHHbM%2BvzP3oh5aeUrw1Nde4%3D' && \
+    python3 -m pip install /tmp/humming_kernels-0.1.10.post2+g766964975-py3-none-any.whl --no-cache-dir && \
+    rm -f /tmp/humming_kernels-0.1.10.post2+g766964975-py3-none-any.whl
 
 # ez_kernel_kit: CUDA decode kernel for MiMo FP8 KV cache
 RUN python3 -m pip install https://artifactory.d.xiaomi.net/artifactory/mimo-core-pypi-local/ez-kernel-kit/0.3.0.dev89+fp8kv.g57e0e0e/ez_kernel_kit-0.3.0.dev89+fp8kv.g57e0e0e-cp312-cp312-linux_x86_64.whl \

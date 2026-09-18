@@ -215,10 +215,19 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
-            + self.num_experts
-        ) // self.num_experts
+        # Ceil division floored at 1. Must stay in sync with
+        # _compute_deepep_expected_m in deepep.py; the old (X + num_experts) form
+        # over-rounded expected_m by 1 whenever X divided evenly, and the floor
+        # keeps 0-token (DP-attention idle) forwards at expected_m=1.
+        expected_m = max(
+            1,
+            (
+                hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
+                + self.num_experts
+                - 1
+            )
+            // self.num_experts,
+        )
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,

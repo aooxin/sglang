@@ -76,6 +76,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
+    MXFP4_W4A8 = "mxfp4_w4a8"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
@@ -106,6 +107,9 @@ class MoeRunnerBackend(Enum):
 
     def is_flashinfer_mxfp4(self):
         return self == MoeRunnerBackend.FLASHINFER_MXFP4
+
+    def is_mxfp4_w4a8(self):
+        return self == MoeRunnerBackend.MXFP4_W4A8
 
     def is_cutlass(self):
         return self == MoeRunnerBackend.CUTLASS

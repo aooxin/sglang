@@ -26,7 +26,12 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    get_deepep_mode,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,
@@ -84,6 +89,7 @@ from sglang.srt.utils import (
     is_sm100_supported,
     is_sm120_supported,
     log_info_on_rank0,
+    print_info_once,
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -167,6 +173,9 @@ class Fp8Config(QuantizationConfig):
             )
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
+        # MiMoV2 MXFP4 W4A8 routed experts flag; populated from
+        # ModelConfig.is_fp4_experts by the model loader before weight creation.
+        self.is_fp4_experts = False
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized and weight_block_size != [128, 128]:
                 raise ValueError(
@@ -261,7 +270,17 @@ class Fp8Config(QuantizationConfig):
                 return UnquantizedFusedMoEMethod(
                     layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
                 )
-            return Fp8MoEMethod(self)
+            fp8_method = Fp8MoEMethod(self)
+            # MiMoV2 MXFP4 W4A8 Humming backend: wrap the fp8 method. Mutually
+            # exclusive with the DeepGEMM W4A8 path (which dispatches inside
+            # Fp8MoEMethod.apply) — selected by --moe-runner-backend mxfp4_w4a8.
+            if self.is_fp4_experts and get_moe_runner_backend().is_mxfp4_w4a8():
+                from sglang.srt.layers.quantization.mxfp4_w4a8_moe import (
+                    Mxfp4W4A8MoEMethod,
+                )
+
+                return Mxfp4W4A8MoEMethod(fp8_method, prefix=prefix)
+            return fp8_method
         elif isinstance(layer, RadixAttention):
             return Fp8KVCacheMethod(self)
         return None
@@ -816,6 +835,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
+        # MiMoV2 MXFP4 W4A8 routed experts: uint8 E8M0 per-32 weight scales +
+        # f8fp4bf16 DeepGEMM kernels. Set from ModelConfig.is_fp4_experts.
+        self.is_fp4_expert = getattr(self.quant_config, "is_fp4_experts", False)
+        if self.is_fp4_expert:
+            # The per-32 MXFP4 weight scales are registered as [E, N, K/32] and
+            # need FusedMoE's BLOCK scale loader. create_weights only tags them
+            # BLOCK when block_quant is set, so a checkpoint that declares
+            # quant_method=fp8 + store_dtype=mxfp4 but omits weight_block_size
+            # would route a 3-D scale through the per-tensor loader instead.
+            assert self.block_quant, (
+                "MXFP4 W4A8 routed experts require a block-quantized fp8 config "
+                "(quantization_config.weight_block_size must be set) so the per-32 "
+                "weight scales load through the BLOCK scale loader"
+            )
         self.with_bias = False
         if get_moe_runner_backend().is_cutlass():
             assert (
@@ -895,7 +928,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
 
         # WEIGHTS
-        if _is_hip and _use_hip_int4:
+        if self.is_fp4_expert:
+            # MiMoV2 MXFP4 W4A8: two fp4 nibbles packed per int8, so the
+            # contraction dims are halved (K/2 for w13, intermediate/2 for w2).
+            w13_weight = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size // 2,
+                    dtype=torch.int8,
+                ),
+                requires_grad=False,
+            )
+            w2_weight = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // 2,
+                    dtype=torch.int8,
+                ),
+                requires_grad=False,
+            )
+        elif _is_hip and _use_hip_int4:
             # INT4 MoE weight - INT32 packed
             w13_weight = torch.nn.Parameter(
                 torch.empty(
@@ -963,7 +1017,39 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
         # WEIGHT_SCALES
-        if self.block_quant:
+        if self.is_fp4_expert:
+            fp4_block_k = 32
+            # The MiMoV2 MXFP4 checkpoint stores per-32 weight scales as raw E8M0
+            # exponents (uint8). Keep that native uint8 layout as the primary scale
+            # so the loader copies it through unchanged and the SM90 DeepGEMM
+            # contiguous (prefill) kernel can consume the E8M0 SFB fast path
+            # directly (gran_k_b=32 asserts uint8 SFB). The masked (decode) kernel
+            # uses the MN-major uint8 E8M0 SFB directly when expected_m<=96 and the
+            # fp32 companion only for the expected_m>96 fallback; both are prepared
+            # in process_weights_after_loading. The Humming backend views the same
+            # uint8 tensor as float8_e8m0fnu at repack time.
+            fp4_scale_dtype = torch.uint8
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size // fp4_block_k,
+                    dtype=fp4_scale_dtype,
+                ),
+                requires_grad=False,
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // fp4_block_k,
+                    dtype=fp4_scale_dtype,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+            layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+        elif self.block_quant:
             scale_dtype = torch.uint8 if self.use_mxfp8 else torch.float32
             scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.ones
             w13_weight_scale = torch.nn.Parameter(
@@ -1140,6 +1226,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
+            from sglang.srt.layers import deep_gemm_wrapper
             from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
             from sglang.srt.model_loader.utils import (
                 should_deepgemm_weight_requant_ue8m0,
@@ -1147,6 +1234,96 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             # Check if MoE will actually use DeepGEMM runner
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
+
+            if self.is_fp4_expert:
+                # MiMoV2 MXFP4 packs two fp4 nibbles per int8; the parameter is
+                # already registered as int8 in create_weights. (Upstream's marlin /
+                # aiter fp4 branches are not present on this xm base: Fp8MoEMethod
+                # .apply has no marlin path, so an early return here would only
+                # defer the failure to the first forward.)
+
+                # SM90 DeepGEMM W4A8: the primary weight scale is native per-32
+                # E8M0 (uint8), shape [E, N, K/32]. Two consumers, two layouts:
+                #   * contiguous (prefill) kernel reads the uint8 E8M0 SFB *raw*
+                #     (no host transform) and requires it MN-major (stride(-1)!=1).
+                #     The checkpoint stores it K-major, so we transpose in place.
+                #   * masked (decode) kernel also consumes the MN-major uint8 E8M0
+                #     SFB directly when expected_m<=96 (shared with prefill), and
+                #     falls back to a natural K-major fp32 companion for
+                #     expected_m>96. Decode E8M0 exponent -> 2**(e-127) losslessly,
+                #     once, at load time.
+                if (
+                    will_use_deepgemm
+                    and not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                    and layer.w13_weight_scale_inv.dtype == torch.uint8
+                ):
+                    # The fp32 companion is read only by _run_masked_gemm (the
+                    # decode path) at expected_m > 96, and it costs 4x the uint8
+                    # scale == 25% of the packed MXFP4 weight bytes. Skip building
+                    # it when the masked runner input is provably unreachable: a
+                    # DeepEP dispatcher that cannot resolve to low-latency only
+                    # ever produces the contiguous (normal) runner input. Every
+                    # other combination -- deepep auto/low_latency, or a standard
+                    # dispatcher, whose pre_permute sets use_masked_gemm=True --
+                    # keeps the companion.
+                    masked_unreachable = (
+                        get_moe_a2a_backend().is_deepep()
+                        and not get_deepep_mode().enable_low_latency()
+                    )
+                    if masked_unreachable:
+                        print_info_once(
+                            "MXFP4 W4A8: skipping fp32 weight-scale companions "
+                            f"(a2a={get_moe_a2a_backend().value}, "
+                            f"deepep_mode={get_deepep_mode().value}); the DeepGEMM "
+                            "masked path is unreachable so they would never be read."
+                        )
+                    else:
+                        e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+                        assert e8m0_dtype is not None, (
+                            "torch.float8_e8m0fnu is required to decode MXFP4 E8M0 "
+                            "weight scales for the DeepGEMM masked path"
+                        )
+                    for u8_name, fp32_name in [
+                        ("w13_weight_scale_inv", "w13_weight_scale_inv_fp32"),
+                        ("w2_weight_scale_inv", "w2_weight_scale_inv_fp32"),
+                    ]:
+                        u8_param = getattr(layer, u8_name)
+                        if not masked_unreachable:
+                            # fp32 companion (K-major natural) for the masked path.
+                            fp32_scale = (
+                                u8_param.data.contiguous()
+                                .view(e8m0_dtype)
+                                .to(torch.float32)
+                            )
+                            layer.register_parameter(
+                                fp32_name,
+                                torch.nn.Parameter(fp32_scale, requires_grad=False),
+                            )
+                        # MN-major uint8 E8M0 for the contiguous path: keep the
+                        # logical [E, N, K/32] indexing but make N the contiguous
+                        # dim (transpose K<->N, contiguous, transpose back).
+                        mn_major = (
+                            u8_param.data.transpose(-1, -2)
+                            .contiguous()
+                            .transpose(-1, -2)
+                        )
+                        u8_param.data = mn_major
+
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
+                    # Blackwell (DEEPGEMM_SCALE_UE8M0 == DEEPGEMM_BLACKWELL) is not
+                    # supported on this path and never has been: it is unreachable on
+                    # SM90, and the transform it used to attempt was wrong in two
+                    # ways. transform_sf_into_required_layout expects an fp32 scale
+                    # but the MXFP4 checkpoint stores uint8 E8M0, and the branch
+                    # skipped the fp32 companion that _run_masked_gemm requires above
+                    # expected_m 96, so decode would have host-asserted. Fail loudly
+                    # instead of silently producing a wrongly laid out scale.
+                    raise NotImplementedError(
+                        "MXFP4 W4A8 routed experts are only implemented for the SM90 "
+                        "DeepGEMM path; the Blackwell UE8M0 scale layout needs an "
+                        "fp32 scale input and an expected_m > 96 companion that this "
+                        "path does not build."
+                    )
 
             if (
                 should_deepgemm_weight_requant_ue8m0(
@@ -1171,8 +1348,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale_inv.format_ue8m0 = True
 
         # SM90 fused MegaMoE: build the transformed expert weights the kernel reads.
-        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-
         if get_moe_a2a_backend().is_megamoe():
             from sglang.srt.layers.moe.mega_moe import (
                 build_mega_moe_experts_weights,
@@ -1703,13 +1878,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     .unsqueeze(2)
                     .repeat_interleave(w2_scale_k, dim=2)
                 )
+            # FP4 W4A8: contiguous (prefill) consumes the native uint8 E8M0 scale
+            # (w13/w2_scale above); masked (decode) uses the same uint8 scale when
+            # expected_m<=96 and the fp32 companion only above that. Pass both; the
+            # runner picks per path/expected_m. Non-fp4 leaves these None.
+            w13_scale_fp32 = getattr(layer, "w13_weight_scale_inv_fp32", None)
+            w2_scale_fp32 = getattr(layer, "w2_weight_scale_inv_fp32", None)
             quant_info = DeepGemmMoeQuantInfo(
                 w13_weight=w13_weight,
                 w2_weight=w2_weight,
                 use_fp8=True,
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
+                w13_scale_fp32=w13_scale_fp32,
+                w2_scale_fp32=w2_scale_fp32,
                 block_shape=block_shape,
+                is_fp4_experts=self.is_fp4_expert,
             )
         elif (
             self.runner.runner_backend.is_flashinfer_trtllm()

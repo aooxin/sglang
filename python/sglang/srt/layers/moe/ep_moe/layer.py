@@ -110,6 +110,11 @@ class DeepEPMoE(FusedMoE):
             quant_config, Fp8Config
         ):
             self.deprecate_flag = True
+        elif (
+            get_moe_runner_backend().is_mxfp4_w4a8()
+            and get_moe_a2a_backend().is_deepep()
+        ):
+            self.deprecate_flag = True
         else:
             self.deprecate_flag = False
 

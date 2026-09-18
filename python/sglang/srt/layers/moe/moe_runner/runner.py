@@ -54,6 +54,8 @@ class MoeRunner:
             or runner_backend.is_flashinfer_trtllm_routed()
         ):
             self.runner_core = None  # FlashInfer TRT-LLM only supports fused path
+        elif runner_backend.is_mxfp4_w4a8():
+            self.runner_core = None  # MXFP4 W4A8 only supports fused path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 

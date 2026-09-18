@@ -97,6 +97,21 @@ class DeepEPLLDispatchOutput(NamedTuple):
         return DispatchOutputFormat.DEEPEP_LL
 
 
+def _compute_deepep_expected_m(
+    num_tokens: int,
+    group_size: int,
+    top_k: int,
+    num_experts: int,
+) -> int:
+    # Ceil division, floored at 1. num_tokens == 0 is a real input: under DP
+    # attention an idle rank still runs the MoE (empty topk output) so the DeepEP
+    # collective stays matched, and outside CUDA graph replay (which pads idle
+    # ranks to the peer batch size) that forward has 0 tokens. The masked GEMMs
+    # downstream treat expected_m as a positive tile hint (Humming rejects 0), so
+    # keep the old formula's behaviour of returning 1 there.
+    return max(1, (num_tokens * group_size * top_k + num_experts - 1) // num_experts)
+
+
 assert isinstance(DeepEPNormalDispatchOutput, DispatchOutput)
 assert isinstance(DeepEPLLDispatchOutput, DispatchOutput)
 
@@ -386,8 +401,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
+        use_mxfp4_w4a8 = get_moe_runner_backend().is_mxfp4_w4a8()
         if (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            (deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or use_mxfp4_w4a8)
             and not get_moe_runner_backend().is_cutlass()
             and not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
         ):
@@ -432,6 +448,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
         previous_event,
     ):
+        use_mxfp4_w4a8 = get_moe_runner_backend().is_mxfp4_w4a8()
         buffer = self._get_buffer()
         (
             num_tokens_per_rank,
@@ -468,7 +485,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            expert_alignment=(
+                128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or use_mxfp4_w4a8 else 1
+            ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
@@ -553,10 +572,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
-            + self.num_experts
-        ) // self.num_experts
+        expected_m = _compute_deepep_expected_m(
+            hidden_states.shape[0],
+            buffer.group_size,
+            topk_ids.shape[1],
+            self.num_experts,
+        )
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,

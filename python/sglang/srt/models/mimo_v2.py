@@ -194,10 +194,6 @@ class MoEGate(nn.Module):
         is_nextn: bool = False,
     ):
         super().__init__()
-        # Local import: the module-level `envs` import in this file was
-        # introduced by the disagg stress-test bench commit (SGLANG_FAKE_TOPK_IDS)
-        # and disappears when that commit is reverted; keep this feature
-        # self-contained.
         from sglang.srt.environ import envs
 
         self.is_nextn = is_nextn
@@ -1379,6 +1375,17 @@ class MiMoV2ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         skipped_mtp_weights = False
 
+        def _resolve_expert_param_name(name: str) -> Optional[str]:
+            if name in params_dict:
+                return name
+
+            if name.endswith("_weight_scale"):
+                scale_inv_name = f"{name}_inv"
+                if scale_inv_name in params_dict:
+                    return scale_inv_name
+
+            return None
+
         def _is_vision_audio_weight(name):
             return (
                 name.startswith(self._VISION_AUDIO_WEIGHT_PREFIXES)
@@ -1562,13 +1569,29 @@ class MiMoV2ForCausalLM(nn.Module):
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
-                    name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
+                    # Map on a local var so `name` stays the original checkpoint
+                    # tensor name if this mapping does not resolve (avoids a
+                    # polluted name leaking into later iterations / the for-else
+                    # fallback warning below).
+                    mapped_name = name.replace(weight_name, param_name)
+                    resolved_name = _resolve_expert_param_name(mapped_name)
+                    if resolved_name is None:
+                        # A matched expert mapping means this IS a routed-expert
+                        # tensor that must load; a missing param is fatal (silently
+                        # skipping leaves the expert at its create_weights init and
+                        # produces garbage output with no error). Fail fast instead.
+                        raise KeyError(
+                            f"routed-expert weight {name!r} mapped to "
+                            f"{mapped_name!r}, which is not a model parameter -- the "
+                            f"checkpoint's per-expert tensor naming does not match "
+                            f"what create_weights registered"
+                        )
+                    param = params_dict[resolved_name]
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
                         loaded_weight,
-                        name,
+                        resolved_name,
                         shard_id=shard_id,
                         expert_id=expert_id,
                     )

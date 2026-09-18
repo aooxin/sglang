@@ -24,6 +24,21 @@ if ENABLE_JIT_DEEPGEMM:
 
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
 _ENABLE_JIT_DEEPGEMM_PRECOMPILE = envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.get()
+
+# FP4 W4A8 masked decode: max expected_m for which the DeepGEMM kernel's uint8
+# E8M0 SFB fast path (scale_b_direct_load) is valid. At/below this the runner
+# feeds the MN-major uint8 weight scale; above it the kernel host-asserts on a
+# uint8 SFB, so the runner switches to the fp32 companion. The two SFB dtypes are
+# different kernel instantiations, so the masked warmup executor below must
+# exercise the same dtype the runner will pick for each m -- otherwise the decode
+# cubin is not precompiled here and its first (lazy) compile lands inside CUDA
+# graph capture's warmup forward.
+# MUST match the kernel gate `expected_m <= kW4MaxDecodeM` in
+# sm90_fp8_fp4_gemm_1d2d.hpp (DeepGEMM guanwenfei @026bcf7, kW4MaxDecodeM=96).
+# Deploying a wheel whose gate is lower than this value would host-assert on the
+# uint8 SFB; keep this constant and the wheel version in lockstep (see
+# docker/Dockerfile.xiaomi, which must point at the 026bcf7 wheel).
+FP4_MASKED_UINT8_SFB_MAX_EXPECTED_M = 96
 _DO_COMPILE_ALL = True
 _IS_FIRST_RANK_ON_NODE = envs.SGLANG_IS_FIRST_RANK_ON_NODE.get()
 _IN_PRECOMPILE_STAGE = envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get()
@@ -83,6 +98,38 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
         m_max = min(1024 * 128, m_max)
         _BUILTIN_M_LIST += list(range(1, m_max + 1))
 
+    # A PD-disaggregation *decode* node never runs prefill: its per-forward token
+    # count M is bounded by the decode batch, not chunked_prefill_size. Compiling
+    # (and, worse, running the warmup executor) up to a prefill-scale m_max makes
+    # the warmup allocate an `out = (max_m, n)` buffer of several GB for the large
+    # lm_head/dense GEMMs (e.g. m_max=32768, n=32768 -> 2 GB in bf16). Because the
+    # first DeepGEMM call happens inside CUDA graph capture's warmup forward, that
+    # transient scratch collides with the graph memory pool and OOMs at the same
+    # --mem-fraction-static that fits the graphs otherwise. Bound m_max to the
+    # decode ceiling so the warmup only touches the M values decode will ever see.
+    # This is memory-neutral (KV cache untouched) and only skips compiling M values
+    # this node can never hit (they would JIT lazily and cheaply if ever needed).
+    if getattr(server_args, "disaggregation_mode", "null") == "decode":
+        num_draft_tokens = getattr(server_args, "speculative_num_draft_tokens", None) or 1
+        max_running = server_args.max_running_requests or 0
+        cuda_graph_max_bs = server_args.cuda_graph_max_bs or 0
+        decode_bs_ceiling = max(max_running, cuda_graph_max_bs)
+        if decode_bs_ceiling > 0:
+            # +1 page of headroom; covers spec draft-token expansion.
+            decode_m_max = (decode_bs_ceiling + 1) * num_draft_tokens
+            prev_max = _BUILTIN_M_LIST[-1] if _BUILTIN_M_LIST else 0
+            if decode_m_max < prev_max:
+                _BUILTIN_M_LIST = [m for m in _BUILTIN_M_LIST if m <= decode_m_max]
+                if not _BUILTIN_M_LIST or _BUILTIN_M_LIST[-1] != decode_m_max:
+                    _BUILTIN_M_LIST.append(decode_m_max)
+                logger.info(
+                    f"Decode disaggregation node: capping DeepGEMM warmup m_max "
+                    f"from {prev_max} to {decode_m_max} "
+                    f"(decode_bs_ceiling={decode_bs_ceiling}, "
+                    f"num_draft_tokens={num_draft_tokens}) to avoid oversized "
+                    f"warmup scratch during CUDA graph capture."
+                )
+
     _IS_FIRST_RANK_ON_NODE = server_args.base_gpu_id == gpu_id
 
     # Check if is the first rank on node.
@@ -94,7 +141,9 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
 
 class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
+    GROUPED_GEMM_NT_F8FP4BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
+    GROUPED_GEMM_NT_F8FP4BF16_CONTIG = auto()
     GEMM_NT_F8F8BF16 = auto()
     GEMM_NT_BF16BF16F32 = auto()
 
@@ -159,7 +208,10 @@ def _compile_deep_gemm_one_type_all(
     # Temporary disable symmetric memory during compilation since it only runs on the first rank.
     saved_context = disable_symmetric_memory_context()
     try:
-        if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
+        if kernel_type in (
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_CONTIG,
+        ):
             m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
@@ -195,16 +247,16 @@ def _compile_deep_gemm_one_type_all(
         )
 
         # Newer DeepGEMM removed get/set_compile_mode.
-        has_compile_mode_api = hasattr(deep_gemm, "get_compile_mode") and hasattr(
+        has_compile_mode = hasattr(deep_gemm, "get_compile_mode") and hasattr(
             deep_gemm, "set_compile_mode"
         )
-        if has_compile_mode_api:
-            old_compile_mode = deep_gemm.get_compile_mode()
+        old_compile_mode = deep_gemm.get_compile_mode() if has_compile_mode else None
+        if has_compile_mode:
             deep_gemm.set_compile_mode(1)
         # TODO can use multi thread
         for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
             executor.execute(m=m)
-        if has_compile_mode_api:
+        if has_compile_mode:
             deep_gemm.set_compile_mode(old_compile_mode)
 
         # clean up input buffers
@@ -222,7 +274,9 @@ class _BaseWarmupExecutor:
         return {
             DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_CONTIG: _GroupedContFp8Fp4WarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_MASKED: _GroupedMaskedFp8Fp4WarmupExecutor,
             DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
         }[kernel_type](**kwargs)
 
@@ -236,10 +290,28 @@ class _BaseWarmupExecutor:
             return (max_m * k + n * k + max_m * n * 2) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
             return (max_m * k + num_groups * n * k + max_m * 4 + max_m * n * 2) / _GB
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_CONTIG:
+            return (
+                max_m * k
+                + num_groups * n * ceil_div(k, 2)
+                # contiguous SFB is uint8 E8M0 (1 byte), not fp32
+                + num_groups * n * ceil_div(k, 32) * 1
+                + max_m * 4
+                + max_m * n * 2
+            ) / _GB
         elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED:
             return (
                 num_groups * max_m * k
                 + num_groups * n * k
+                + num_groups * 4
+                + num_groups * max_m * n * 2
+            ) / _GB
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_MASKED:
+            return (
+                num_groups * max_m * k
+                + num_groups * n * ceil_div(k, 2)
+                # both SFB variants are allocated: uint8 E8M0 + fp32 companion
+                + num_groups * n * ceil_div(k, 32) * (1 + 4)
                 + num_groups * 4
                 + num_groups * max_m * n * 2
             ) / _GB
@@ -309,6 +381,32 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
         )
 
 
+class _GroupedContFp8Fp4WarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
+        self.rhs_q = torch.empty(
+            (num_groups, n, ceil_div(k, 2)), device="cuda", dtype=torch.int8
+        )
+        # gran_k_b=32 contiguous path consumes uint8 E8M0 SFB that must be
+        # MN-major (stride(-1) != 1): allocate [G, K/32, N] then transpose so the
+        # logical shape is [G, N, K/32] with N as the contiguous dim.
+        self.rhs_s = torch.empty(
+            (num_groups, ceil_div(k, 32), n), device="cuda", dtype=torch.uint8
+        ).transpose(-1, -2)
+        self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
+
+    def execute(self, m):
+        deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma(
+            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.rhs_q, self.rhs_s),
+            self.out[:m],
+            self.m_indices[:m],
+            gran_k_b=32,
+            compiled_dims="nk",
+        )
+
+
 class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs_q, self.lhs_s = _empty_token_fp8((num_groups, max_m, k))
@@ -326,6 +424,49 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             masked_m=self.masked_m,
             # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
             expected_m=m,
+        )
+
+
+class _GroupedMaskedFp8Fp4WarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_fp8((num_groups, max_m, k))
+        self.rhs_q = torch.empty(
+            (num_groups, n, ceil_div(k, 2)), device="cuda", dtype=torch.int8
+        )
+        # Two SFB variants, matching the runner's per-expected_m selection in
+        # DeepGemmRunnerCore._run_masked_gemm:
+        #   * expected_m <= FP4_MASKED_UINT8_SFB_MAX_EXPECTED_M: MN-major uint8
+        #     E8M0 (the same tensor the contiguous path reads), i.e. logical
+        #     [G, N, K/32] with N as the contiguous dim.
+        #   * expected_m >  FP4_MASKED_UINT8_SFB_MAX_EXPECTED_M: K-major fp32
+        #     companion.
+        # They are distinct kernel instantiations, so both must be warmed here.
+        self.rhs_s_u8 = torch.empty(
+            (num_groups, ceil_div(k, 32), n), device="cuda", dtype=torch.uint8
+        ).transpose(-1, -2)
+        self.rhs_s_fp32 = torch.empty(
+            (num_groups, n, ceil_div(k, 32)), device="cuda", dtype=torch.float32
+        )
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+    def execute(self, m):
+        rhs_s = (
+            self.rhs_s_u8
+            if m <= FP4_MASKED_UINT8_SFB_MAX_EXPECTED_M
+            else self.rhs_s_fp32
+        )
+        deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma(
+            (self.lhs_q, self.lhs_s),
+            (self.rhs_q, rhs_s),
+            self.out,
+            masked_m=self.masked_m,
+            expected_m=m,
+            gran_k=128,
+            gran_k_a=128,
+            gran_k_b=32,
         )
 
 

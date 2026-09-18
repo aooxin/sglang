@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import gc
+import contextlib
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,11 +14,29 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 from sglang.srt.layers.moe.moe_runner.mxfp4_w4a8_tuning import (
     HUMMING_FINE_TUNING_RANGES,
 )
+from sglang.srt.utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
 _HUMMING_EXPERT_LAYOUT_CACHE = {}
 _HUMMING_WARNED_REASONS = set()
+
+
+@contextlib.contextmanager
+def _stage_timer(timings: dict[str, float], key: str, device: torch.device):
+    """Accumulate wall time for one repack stage into ``timings[key]``.
+
+    Synchronizes the device on both sides so the number reflects GPU
+    completion rather than kernel-launch overhead. Load-time one-shot
+    profiling only; the sync overhead is negligible here.
+    """
+    torch.cuda.synchronize(device)
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        torch.cuda.synchronize(device)
+        timings[key] = time.perf_counter() - start
 
 
 @dataclass
@@ -779,7 +798,9 @@ def _warmup_humming_masked_entry(entry: HummingMxfp4W4A8Weight) -> None:
     torch.cuda.synchronize(device)
 
 
-def replace_mxfp4_w4a8_weights_with_humming(layer: torch.nn.Module) -> None:
+def replace_mxfp4_w4a8_weights_with_humming(
+    layer: torch.nn.Module, prefix: str = ""
+) -> None:
     gateup_size = layer.w13_weight.shape[1]
     hidden_size = layer.w13_weight.shape[2] * 2
     intermediate_size = gateup_size // 2
@@ -795,41 +816,59 @@ def replace_mxfp4_w4a8_weights_with_humming(layer: torch.nn.Module) -> None:
             f"{hidden_size=}, {intermediate_size=}"
         )
 
-    w13_entry = _build_humming_weight_entry(
-        layer.w13_weight,
-        layer.w13_weight_scale_inv,
-        n=gateup_size,
-        k=hidden_size,
-        expert_major_input_scale=True,
-        ep_size=getattr(layer, "mxfp4_w4a8_ep_size", None),
-    )
+    device = layer.w13_weight.device
+    timings: dict[str, float] = {}
+
+    with _stage_timer(timings, "w13_build", device):
+        w13_entry = _build_humming_weight_entry(
+            layer.w13_weight,
+            layer.w13_weight_scale_inv,
+            n=gateup_size,
+            k=hidden_size,
+            expert_major_input_scale=True,
+            ep_size=getattr(layer, "mxfp4_w4a8_ep_size", None),
+        )
     # The entries are plain dataclasses, so register the Humming layers explicitly
     # to keep their parameters visible to PyTorch module traversal and state handling.
-    layer.add_module("w13_humming_layer", w13_entry.layer)
-    layer.w13_humming_weight = w13_entry
-    delattr(layer, "w13_weight")
-    delattr(layer, "w13_weight_scale_inv")
-    gc.collect()
-    torch.cuda.empty_cache()
+    # NOTE: deliberately no gc.collect()/empty_cache() here. Per-layer, they
+    # dominated the repack cost (~0.27s of ~0.6s): a full GC
+    # pass over the whole module graph plus cudaFree of the freed weight
+    # blocks back to the driver, which defeats the caching allocator and
+    # forces a fresh cudaMalloc for the next layer's identical-size
+    # allocations. The allocator reuses the freed blocks for the next layer
+    # instead, keeping the memory peak flat at one extra layer.
+    with _stage_timer(timings, "w13_install", device):
+        layer.add_module("w13_humming_layer", w13_entry.layer)
+        layer.w13_humming_weight = w13_entry
+        delattr(layer, "w13_weight")
+        delattr(layer, "w13_weight_scale_inv")
 
-    w2_entry = _build_humming_weight_entry(
-        layer.w2_weight,
-        layer.w2_weight_scale_inv,
-        n=hidden_size,
-        k=intermediate_size,
-        ep_size=getattr(layer, "mxfp4_w4a8_ep_size", None),
-    )
-    layer.add_module("w2_humming_layer", w2_entry.layer)
-    layer.w2_humming_weight = w2_entry
-    delattr(layer, "w2_weight")
-    delattr(layer, "w2_weight_scale_inv")
-    gc.collect()
-    torch.cuda.empty_cache()
+    with _stage_timer(timings, "w2_build", device):
+        w2_entry = _build_humming_weight_entry(
+            layer.w2_weight,
+            layer.w2_weight_scale_inv,
+            n=hidden_size,
+            k=intermediate_size,
+            ep_size=getattr(layer, "mxfp4_w4a8_ep_size", None),
+        )
+    with _stage_timer(timings, "w2_install", device):
+        layer.add_module("w2_humming_layer", w2_entry.layer)
+        layer.w2_humming_weight = w2_entry
+        delattr(layer, "w2_weight")
+        delattr(layer, "w2_weight_scale_inv")
 
     # Load the masked-GEMM cubins now (outside CUDA graph capture) to avoid a
     # lazy cuModuleLoad deadlock during capture on multi-rank decode servers.
-    _warmup_humming_masked_entry(w13_entry)
-    _warmup_humming_masked_entry(w2_entry)
+    with _stage_timer(timings, "warmup", device):
+        _warmup_humming_masked_entry(w13_entry)
+        _warmup_humming_masked_entry(w2_entry)
+
+    breakdown = " ".join(f"{k}={v:.3f}s" for k, v in timings.items())
+    log_info_on_rank0(
+        logger,
+        f"Humming repack for MoE layer {prefix}: {breakdown} "
+        f"total={sum(timings.values()):.3f}s",
+    )
 
 
 def mxfp4_w4a8_deepep_ll_humming(

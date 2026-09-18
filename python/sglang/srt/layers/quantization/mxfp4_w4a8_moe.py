@@ -8,6 +8,7 @@ from torch.nn import Module
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.quantization.base_config import QuantizeMethodBase
 from sglang.srt.utils import is_cuda, log_info_on_rank0
 from sglang.srt.utils.common import is_sm90_supported
 
@@ -17,12 +18,34 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class Mxfp4W4A8MoEMethod:
+class Mxfp4W4A8MoEMethod(QuantizeMethodBase):
     """Humming MXFP4 W4A8 expert method for DeepEP dispatch."""
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
+
+    @classmethod
+    def supports_remote_byte_image_preprocess(cls) -> bool:
+        """The combined post-processing only transforms LAYOUT and leaves
+        every tensor the forward reads as a registered parameter. See
+        QuantizeMethodBase.supports_remote_byte_image_preprocess.
+
+        The fp8 delegate pass rebinds/requantizes parameters in place
+        (Fp8MoEMethod already declares this contract). The Humming
+        replacement then reinterprets the original w13/w2 weight storage as
+        the Humming layer's int32 weight Parameter (a view, zero-copy),
+        swizzles it in place via layer.transform(), registers the Humming
+        layer as a submodule and deletes the original params — so the final
+        parameter set is config-derived (n/k/num_experts) and identical on
+        seed and client, and the seed's registered bytes are exactly the
+        transformed layout. The non-parameter state the forward touches is
+        runtime-only: zero-initialized lock buffers and heuristic-table
+        tuning configs keyed by SM count, none derived from weight values.
+        Precondition: seed and client run the same humming build and device
+        class, so layer.transform() produces the same swizzle layout.
+        """
+        return True
 
     def create_weights(
         self,

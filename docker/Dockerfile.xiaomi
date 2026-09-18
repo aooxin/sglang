@@ -99,10 +99,9 @@ RUN cd /tmp && \
     rm -f /tmp/deep_gemm-2.5.0+de9009a-cp312-cp312-linux_x86_64.whl
 
 # Humming MXFP4 W4A8 kernels (MiMoV2 decode path)
-RUN cd /tmp && \
-    wget -q -O humming_kernels-0.1.10.post2+g766964975-py3-none-any.whl 'https://cnbj1-fds.api.xiaomi.net/deepgemm/humming_kernels-0.1.10.post2+g766964975-py3-none-any.whl?GalaxyAccessKeyId=5151729087601&Expires=9223372036854775807&Signature=%2FkAWDHHbM%2BvzP3oh5aeUrw1Nde4%3D' && \
-    python3 -m pip install /tmp/humming_kernels-0.1.10.post2+g766964975-py3-none-any.whl --no-cache-dir && \
-    rm -f /tmp/humming_kernels-0.1.10.post2+g766964975-py3-none-any.whl
+RUN pip install -i https://pkgs.d.xiaomi.net/artifactory/api/pypi/pypi-virtual/simple \
+    --no-cache-dir --no-deps pyelftools &&\
+    pip install -i https://pkgs.d.xiaomi.net/artifactory/api/pypi/pypi-virtual/simple humming-kernels==0.1.10.post3+g6cca15f37 --no-cache-dir --no-deps
 
 # ez_kernel_kit: CUDA decode kernel for MiMo FP8 KV cache
 RUN python3 -m pip install https://artifactory.d.xiaomi.net/artifactory/mimo-core-pypi-local/ez-kernel-kit/0.3.0.dev89+fp8kv.g57e0e0e/ez_kernel_kit-0.3.0.dev89+fp8kv.g57e0e0e-cp312-cp312-linux_x86_64.whl \

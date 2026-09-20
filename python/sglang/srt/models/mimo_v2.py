@@ -552,7 +552,7 @@ class MiMoV2Attention(nn.Module):
             self.total_num_heads * self.v_head_dim,
             hidden_size,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
             reduce_results=False,

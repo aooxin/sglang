@@ -655,7 +655,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-                num_sms=self.deepep_ll_num_sms,
+                # Upstream DeepEP does not accept num_sms, even when it is 0.
+                **(
+                    dict(num_sms=self.deepep_ll_num_sms)
+                    if self.deepep_ll_num_sms
+                    else dict()
+                ),
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
@@ -717,7 +722,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 )
         else:
             overlap_args_dict = {}
-        if "num_sms" not in overlap_args_dict:
+        if self.deepep_ll_num_sms and "num_sms" not in overlap_args_dict:
             overlap_args_dict["num_sms"] = self.deepep_ll_num_sms
 
         with ctx:

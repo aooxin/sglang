@@ -5469,7 +5469,7 @@ class ServerArgs:
             "--deepep-ll-num-sms",
             type=int,
             default=ServerArgs.deepep_ll_num_sms,
-            help="Number of SMs to use for DeepEP low-latency kernels. Set 0 to use DeepEP's default.",
+            help="Number of SMs to use for DeepEP low-latency kernels. Set 0 to use DeepEP's default. Nonzero values require a DeepEP build with LL num_sms support.",
         )
         parser.add_argument(
             "--ep-num-redundant-experts",

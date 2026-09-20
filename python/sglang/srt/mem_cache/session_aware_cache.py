@@ -169,6 +169,9 @@ class SessionAwareCache(BasePrefixCache):
         self.slots.clear()
         self.inner.reset()
 
+    def defer_writes(self):
+        return self.inner.defer_writes()
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         req = params.req
         if not _is_streaming(req):

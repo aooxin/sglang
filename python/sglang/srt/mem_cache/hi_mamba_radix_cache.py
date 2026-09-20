@@ -258,6 +258,9 @@ class HiMambaRadixCache(MambaRadixCache):
 
         super().__init__(params=params)
 
+    def defer_writes(self):
+        return self.cache_controller.defer_writes()
+
     def reset(self) -> None:
         TreeNode.counter = 0
         self._flush_pending_storage_backups_before_reset()

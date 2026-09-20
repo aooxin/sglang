@@ -4,6 +4,7 @@ import dataclasses
 import enum
 import time
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -204,6 +205,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
         self.metrics_collector = RadixCacheMetricsCollector(labels=labels)
+
+    def defer_writes(self):
+        return nullcontext()
 
     def update_eviction_metrics(self, num_evicted: int, start_time: float):
         if self.metrics_collector is not None and num_evicted > 0:

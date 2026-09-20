@@ -818,83 +818,86 @@ class SchedulerDisaggregationPrefillMixin:
 
         undone_reqs: List[Req] = []
         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
-        for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+        with self.tree_cache.defer_writes():
+            for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
 
-            if rids_to_check is not None:
-                if req.rid not in rids_to_check:
+                if rids_to_check is not None:
+                    if req.rid not in rids_to_check:
+                        undone_reqs.append(req)
+                        continue
+
+                    # In PP mode, the previous rank may have reached a terminal
+                    # state (Success/Failed) while this rank's local poll is still
+                    # in a transient state due to clock skew or propagation delay.
+                    # Treat non-terminal states as undone instead of crashing.
+                    if poll not in (
+                        KVPoll.Success,
+                        KVPoll.Failed,
+                    ):
+                        logger.warning(
+                            f"PP rank {self.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
+                            f"from consensus; treating as undone"
+                        )
+                        undone_reqs.append(req)
+                        continue
+
+                if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
+                    _inflight_age = time.perf_counter() - getattr(
+                        req.time_stats,
+                        "prefill_transfer_queue_entry_time",
+                        time.perf_counter(),
+                    )
+                    if _inflight_age > envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get():
+                        _sender = req.disagg_kv_sender
+                        if _sender.conclude_state is None:
+                            _sender.kv_mgr.record_failure(
+                                req.bootstrap_room,
+                                f"KV transfer timed out after {_inflight_age:.1f}s in inflight_queue",
+                            )
+                            _sender.conclude_state = KVPoll.Failed
+                            logger.error(
+                                f"[PD-Trace] rid={req.rid} room={req.bootstrap_room} "
+                                f"timed out in inflight_queue after {_inflight_age:.1f}s, poll={poll}, "
+                                f"has_sent={getattr(_sender, 'has_sent', '?')}, "
+                                f"curr_idx={getattr(_sender, 'curr_idx', '?')}/{getattr(_sender, 'num_kv_indices', '?')}, "
+                                f"aborting request"
+                            )
                     undone_reqs.append(req)
-                    continue
-
-                # In PP mode, the previous rank may have reached a terminal
-                # state (Success/Failed) while this rank's local poll is still
-                # in a transient state due to clock skew or propagation delay.
-                # Treat non-terminal states as undone instead of crashing.
-                if poll not in (
-                    KVPoll.Success,
-                    KVPoll.Failed,
-                ):
+                elif poll == KVPoll.Success:  # transfer done
+                    release_kv_cache(req, self.tree_cache)  # unlock the tree
+                    req.finished_reason = FINISH_LENGTH(length=0)
+                    if hasattr(req.disagg_kv_sender, "transfer_elapsed_s"):
+                        req.time_stats.transfer_elapsed_s = (
+                            req.disagg_kv_sender.transfer_elapsed_s
+                        )
+                    # FIXME: clean up req's data in transfer engine
+                    if hasattr(req.disagg_kv_sender, "clear"):
+                        req.disagg_kv_sender.clear()
+                    done_reqs.append(req)
+                    req.time_stats.set_prefill_kv_transfer_finish_time()
+                elif poll == KVPoll.Failed:
+                    error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
+                    try:
+                        req.disagg_kv_sender.failure_exception()
+                    except Exception as e:
+                        error_message += f" with exception {e}"
+                    logger.warning(error_message)
+                    req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+                    release_kv_cache(req, self.tree_cache)  # unlock the tree
+                    prepare_abort(
+                        req,
+                        error_message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    done_reqs.append(req)
+                    if self.enable_metrics:
+                        self.metrics_collector.increment_transfer_failed_reqs()
+                else:
                     logger.warning(
-                        f"PP rank {self.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
-                        f"from consensus; treating as undone"
+                        f"Unexpected polling state {poll} for rid {req.rid} in inflight queue; "
+                        f"treating as undone"
                     )
                     undone_reqs.append(req)
-                    continue
-
-            if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
-                _inflight_age = time.perf_counter() - getattr(
-                    req.time_stats,
-                    "prefill_transfer_queue_entry_time",
-                    time.perf_counter(),
-                )
-                if _inflight_age > envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get():
-                    _sender = req.disagg_kv_sender
-                    if _sender.conclude_state is None:
-                        _sender.kv_mgr.record_failure(
-                            req.bootstrap_room,
-                            f"KV transfer timed out after {_inflight_age:.1f}s in inflight_queue",
-                        )
-                        _sender.conclude_state = KVPoll.Failed
-                        logger.error(
-                            f"[PD-Trace] rid={req.rid} room={req.bootstrap_room} "
-                            f"timed out in inflight_queue after {_inflight_age:.1f}s, poll={poll}, "
-                            f"has_sent={getattr(_sender, 'has_sent', '?')}, "
-                            f"curr_idx={getattr(_sender, 'curr_idx', '?')}/{getattr(_sender, 'num_kv_indices', '?')}, "
-                            f"aborting request"
-                        )
-                undone_reqs.append(req)
-            elif poll == KVPoll.Success:  # transfer done
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
-                req.finished_reason = FINISH_LENGTH(length=0)
-                if hasattr(req.disagg_kv_sender, "transfer_elapsed_s"):
-                    req.time_stats.transfer_elapsed_s = (
-                        req.disagg_kv_sender.transfer_elapsed_s
-                    )
-                # FIXME: clean up req's data in transfer engine
-                if hasattr(req.disagg_kv_sender, "clear"):
-                    req.disagg_kv_sender.clear()
-                done_reqs.append(req)
-                req.time_stats.set_prefill_kv_transfer_finish_time()
-            elif poll == KVPoll.Failed:
-                error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
-                try:
-                    req.disagg_kv_sender.failure_exception()
-                except Exception as e:
-                    error_message += f" with exception {e}"
-                logger.warning(error_message)
-                req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-                release_kv_cache(req, self.tree_cache)  # unlock the tree
-                prepare_abort(
-                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-                )
-                done_reqs.append(req)
-                if self.enable_metrics:
-                    self.metrics_collector.increment_transfer_failed_reqs()
-            else:
-                logger.warning(
-                    f"Unexpected polling state {poll} for rid {req.rid} in inflight queue; "
-                    f"treating as undone"
-                )
-                undone_reqs.append(req)
 
         for req in done_reqs:
             req.time_stats.set_completion_time()

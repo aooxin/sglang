@@ -19,6 +19,7 @@ import random
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from queue import Empty, Full, Queue
 from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple
 
@@ -116,11 +117,17 @@ class CacheOperation:
         node_id: int,
         priority: Optional[int] = None,
         swa_only: bool = False,
+        swa_host_indices: Optional[torch.Tensor] = None,
+        swa_device_indices: Optional[torch.Tensor] = None,
+        is_full_node_write: bool = False,
     ):
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
         self.data = None
+        self.swa_host_indices = swa_host_indices
+        self.swa_device_indices = swa_device_indices
+        self.is_full_node_write = is_full_node_write
         # TODO(yingchun): 建议 swa_only=False 时用 None 延迟初始化，merge_ops 跳过构造函数的分配。
         self.swa_only_mask = torch.full(
             (len(host_indices),), swa_only, dtype=torch.bool, device=host_indices.device
@@ -147,6 +154,17 @@ class CacheOperation:
         merged_op = CacheOperation(host_indices, device_indices, -1, priority)
         merged_op.node_ids = node_ids
         merged_op.swa_only_mask = swa_only_mask
+        # All-or-nothing: either every op carries precomputed SWA indices or
+        # none does. A mix must fail loudly on both directions: ops[0]=None
+        # would otherwise silently fall back to flush-time recomputation,
+        # discarding the later ops' preset snapshots.
+        if any(op.swa_host_indices is not None for op in ops):
+            assert all(op.swa_host_indices is not None for op in ops)
+            assert all(op.swa_device_indices is not None for op in ops)
+            merged_op.swa_host_indices = torch.cat([op.swa_host_indices for op in ops])
+            merged_op.swa_device_indices = torch.cat(
+                [op.swa_device_indices for op in ops]
+            )
         return merged_op
 
     def __lt__(self, other: CacheOperation):
@@ -697,6 +715,7 @@ class HiCacheController:
         # self.write_queue = PriorityQueue[CacheOperation]()
         self.load_queue: List[CacheOperation] = []
         self.write_queue: List[CacheOperation] = []
+        self._defer_write_depth = 0
         self.ack_load_queue: List[HiCacheAck] = []
         self.ack_write_queue: List[HiCacheAck] = []
 
@@ -1167,15 +1186,98 @@ class HiCacheController:
         host_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
+        is_full_node_write: bool = False,
     ):
         """
         Back up KV caches from device memory to host memory.
         """
         assert host_indices is not None
+
         self.write_queue.append(
-            CacheOperation(host_indices, device_indices, node_id, priority)
+            CacheOperation(
+                host_indices,
+                device_indices,
+                node_id,
+                priority,
+                is_full_node_write=is_full_node_write,
+            )
         )
-        self.start_writing()
+        if self._defer_write_depth == 0:
+            self.start_writing()
+
+    def has_pending_full_write(self, node_id: int) -> bool:
+        return any(
+            op.is_full_node_write
+            and node_id in op.node_ids
+            and op.swa_host_indices is None
+            and op.swa_device_indices is None
+            for op in self.write_queue
+        )
+
+    @contextmanager
+    def defer_writes(self):
+        if self.io_backend != "kernel":
+            yield
+            return
+
+        self._defer_write_depth += 1
+        try:
+            yield
+        finally:
+            self._defer_write_depth -= 1
+            if self._defer_write_depth == 0:
+                self.start_writing()
+
+    def _write_swa_args(
+        self,
+        op: CacheOperation,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+    ) -> dict:
+        """Compute the SWA copy arguments for a device->host backup.
+
+        Returns {} for non-hybrid-SWA pools.
+        """
+        if not self.is_hybrid_swa:
+            return {}
+
+        if op.swa_host_indices is None:
+            (
+                swa_host_indices,
+                swa_device_indices,
+            ) = self._compute_swa_indices(
+                host_indices,
+                device_indices,
+                # write_back may legally leave device-only SWA until eviction.
+                # write_through should repair it within the defer window; if a
+                # residual mismatch reaches flush, warn and skip it so reuse
+                # falls back to a shorter SWA-safe prefix instead of exiting.
+                warn_on_mismatch=self.write_policy != "write_back",
+            )
+            op.swa_host_indices = swa_host_indices
+            op.swa_device_indices = swa_device_indices
+        assert op.swa_device_indices is not None
+        swa_host_indices = op.swa_host_indices
+        if self.io_backend == "kernel" and not swa_host_indices.is_cuda:
+            swa_host_indices = swa_host_indices.to(self.device, non_blocking=True)
+        # Use the device∩host intersection instead of device-nonzero:
+        # - snapshot path (op.swa_host_indices preset): snapshots always satisfy
+        #   device⊆host, so the intersection equals device-nonzero (no change);
+        # - flush-computed path: skip device-only positions, which would
+        #   otherwise write into host swa slot 0 (0 is the "no SWA" sentinel,
+        #   not a valid slot). write_back repairs them before eviction;
+        #   write_through logs the residual mismatch and later reuse falls back
+        #   to a shorter SWA-safe prefix.
+        # Compute the mask from the post-.to() local tensor so both operands
+        # always share a device: on the flush-computed path it IS
+        # op.swa_host_indices (same GPU object); on a preset snapshot path it
+        # is the GPU copy of the CPU snapshot, keeping the mask off the CPU.
+        valid_swa_mask = (op.swa_device_indices != 0) & (swa_host_indices != 0)
+        valid_swa_device_indices = valid_swa_mask.nonzero().flatten()
+        return {
+            "swa_host_indices": swa_host_indices[valid_swa_device_indices],
+            "swa_device_indices": op.swa_device_indices[valid_swa_device_indices],
+        }
 
     @staticmethod
     def _draft_swa_args(draft_host_pool, swa_args: dict) -> dict:
@@ -1193,32 +1295,7 @@ class HiCacheController:
         host_indices, device_indices, _ = self.move_indices(op)
         self.write_queue.clear()
 
-        # 在 default stream 上预计算 SWA indices（此时 stream 为空）
-        # TODO(yingchun): 可与 start_loading 中的逻辑重构复用
-        swa_args = {}
-        if self.is_hybrid_swa:
-            swa_host_indices = self.mem_pool_host.gather_swa_mapping(host_indices)
-            swa_device_indices = self.mem_pool_device.full_to_swa_index_mapping[
-                device_indices
-            ]
-            # Invariant: device.nonzero ⊆ host.nonzero. alloc_host() sets
-            # host SWA per the device mask at that moment, and device SWA
-            # never gains slots after that. Host SWA, however, can grow
-            # later (e.g. splice_swa_mapping in check_prefetch_progress
-            # filling positions whose SWA was previously absent). D2H
-            # copies only the device-nonzero positions; host-only extras
-            # already hold valid SWA data placed there by the source
-            # (splice / mapping_full_and_swa_indices / etc.) and must not
-            # be overwritten with stale device data.
-            # TODO(yingchun): check it in debug mode
-            assert not torch.any(
-                (swa_device_indices != 0) & (swa_host_indices == 0)
-            ), "device has SWA at positions where host does not — violates alloc_host invariant"
-            valid_swa_device_indices = swa_device_indices.nonzero().flatten()
-            swa_args = {
-                "swa_host_indices": swa_host_indices[valid_swa_device_indices],
-                "swa_device_indices": swa_device_indices[valid_swa_device_indices],
-            }
+        swa_args = self._write_swa_args(op, host_indices, device_indices)
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -1444,6 +1521,45 @@ class HiCacheController:
         else:
             raise ValueError(f"Unsupported io backend")
 
+    def _compute_swa_indices(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        *,
+        raise_on_mismatch: bool = False,
+        warn_on_mismatch: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gather host/device SWA mappings and handle device-only entries.
+
+        ``device-only`` is a legal transient for deferred write-back, while
+        the load path treats it as a broken host/device mapping invariant.
+        Callers must explicitly choose whether to raise or warn.
+        """
+        assert not (
+            raise_on_mismatch and warn_on_mismatch
+        ), "SWA mismatch cannot both raise and warn"
+        swa_host_indices = self.mem_pool_host.gather_swa_mapping(host_indices)
+        swa_device_indices = self.mem_pool_device.full_to_swa_index_mapping[
+            device_indices
+        ]
+        device_only_count = int(
+            ((swa_device_indices != 0) & (swa_host_indices == 0)).count_nonzero()
+        )
+        if device_only_count > 0:
+            message = (
+                "SWA mapping mismatch: "
+                f"{device_only_count} device-only positions; host mapping is missing"
+            )
+            if raise_on_mismatch:
+                raise AssertionError(message)
+            if warn_on_mismatch:
+                logger.warning(
+                    "SWA backup skipped %d device-only positions: host mapping "
+                    "is missing; later reuse will use a shorter safe prefix.",
+                    device_only_count,
+                )
+        return swa_host_indices, swa_device_indices
+
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
             return -1
@@ -1456,10 +1572,6 @@ class HiCacheController:
         # 在 default stream 上预计算 SWA indices
         swa_args = {}
         if self.is_hybrid_swa:
-            swa_host_indices = self.mem_pool_host.gather_swa_mapping(host_indices)
-            swa_device_indices = self.mem_pool_device.full_to_swa_index_mapping[
-                device_indices
-            ]
             # Invariant: device.nonzero ⊆ host.nonzero. alloc_device() sets
             # device SWA per the host mask at that moment, and device SWA
             # never gains slots after that. Host SWA, however, can grow
@@ -1467,10 +1579,11 @@ class HiCacheController:
             # filling positions whose SWA was previously absent). H2D copies
             # only the device-nonzero positions; any host-only extras are
             # already populated by whoever extended the host mapping.
-            # TODO(yingchun): check it in debug mode
-            assert not torch.any(
-                (swa_device_indices != 0) & (swa_host_indices == 0)
-            ), "device has SWA at positions where host does not — violates alloc_device invariant"
+            swa_host_indices, swa_device_indices = self._compute_swa_indices(
+                host_indices,
+                device_indices,
+                raise_on_mismatch=True,
+            )
             valid_swa_device_indices = swa_device_indices.nonzero().flatten()
             swa_args = {
                 "swa_host_indices": swa_host_indices[valid_swa_device_indices],

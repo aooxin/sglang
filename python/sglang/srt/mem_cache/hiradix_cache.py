@@ -291,6 +291,9 @@ class BaseHiRadixCache(abc.ABC):
 
         super().__init__(params=params)
 
+    def defer_writes(self):
+        return self.cache_controller.defer_writes()
+
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown.
 
@@ -851,6 +854,7 @@ class BaseHiRadixCache(abc.ABC):
             device_indices=node.value,
             host_indices=full_host_indices,
             node_id=node.id,
+            is_full_node_write=True,
         )
         node.host_value = full_host_indices
         assert len(node.host_value) > 0
@@ -859,6 +863,7 @@ class BaseHiRadixCache(abc.ABC):
             "key": RadixKey(token_ids=node.key.token_ids),
             "hash_value": list(node.hash_value) if node.hash_value else None,
             "host_value": full_host_indices,
+            "pending_write_count": 1,
         }
         if not write_back:
             # no need to lock nodes if write back
@@ -913,10 +918,6 @@ class BaseHiRadixCache(abc.ABC):
             )
         )
 
-        if node.id in self.ongoing_write_through:
-            # TODO: how to rewrite with ongoing_write_through?
-            return 0, 0
-
         full_host_indices = node.host_value
 
         # allocate and amp new_swa_host_indices
@@ -969,20 +970,35 @@ class BaseHiRadixCache(abc.ABC):
             extra=f"reason={reason}",
         )
 
+        ongoing_write = self.ongoing_write_through.get(node.id)
+        if ongoing_write is not None and self.cache_controller.has_pending_full_write(
+            node.id
+        ):
+            # The original full-node write is still waiting in write_queue. It
+            # computes SWA indices at flush time, so the host mapping added above
+            # is enough for that write to include the newly spliced SWA slots.
+            return 0, 0
+
         # write to host
         # TODO: optimize to avoid rewrite full attn
+        if ongoing_write is not None:
+            ongoing_write["pending_write_count"] = (
+                ongoing_write.get("pending_write_count", 1) + 1
+            )
         self.cache_controller.write(
             device_indices=node.value[new_swa_mask],
             host_indices=full_host_indices[new_swa_mask_host],
             node_id=node.id,
         )
-        self.ongoing_write_through[node.id] = {
-            "node": node,
-            "key": RadixKey(token_ids=node.key.token_ids),
-            "hash_value": list(node.hash_value) if node.hash_value else None,
-            "host_value": full_host_indices,
-        }
-        if not write_back:
+        if ongoing_write is None:
+            self.ongoing_write_through[node.id] = {
+                "node": node,
+                "key": RadixKey(token_ids=node.key.token_ids),
+                "hash_value": list(node.hash_value) if node.hash_value else None,
+                "host_value": full_host_indices,
+                "pending_write_count": 1,
+            }
+        if ongoing_write is None and not write_back:
             # no need to lock nodes if write back
             self.inc_lock_ref(node)
 
@@ -1059,7 +1075,9 @@ class BaseHiRadixCache(abc.ABC):
                 for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
-                        snapshot = self.ongoing_write_through.pop(ack_id)
+                        snapshot = self._consume_write_ack(ack_id)
+                        if snapshot is None:
+                            continue
                         backuped_node = snapshot["node"]
                         # TODO(yingchun): 注意 write_back 时，存储的不是之前的快照值。
                         #  split node 之后的新节点会延迟到它自己触发 write_back 时再存储。
@@ -1114,7 +1132,9 @@ class BaseHiRadixCache(abc.ABC):
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                snapshot = self.ongoing_write_through.pop(ack_id)
+                snapshot = self._consume_write_ack(ack_id)
+                if snapshot is None:
+                    continue
                 backuped_node = snapshot["node"]
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
@@ -1134,6 +1154,16 @@ class BaseHiRadixCache(abc.ABC):
                         backuped_node.hash_value = current_hash_value
                         backuped_node.host_value = current_host_value
             finish_count -= 1
+
+    def _consume_write_ack(self, node_id: int):
+        snapshot = self.ongoing_write_through[node_id]
+        pending_write_count = snapshot["pending_write_count"]
+        assert pending_write_count > 0
+        pending_write_count -= 1
+        if pending_write_count > 0:
+            snapshot["pending_write_count"] = pending_write_count
+            return None
+        return self.ongoing_write_through.pop(node_id)
 
     def loading_check(self):
         finish_count = 0

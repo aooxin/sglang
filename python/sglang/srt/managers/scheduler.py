@@ -3132,15 +3132,18 @@ class Scheduler(
                     )
 
             req.init_next_round_input(self.tree_cache)
-            req.time_stats.trace_ctx.trace_slice_add_attr(
-                {
-                    "prefill_match_result.prefix_cached_tokens": len(
-                        req.prefix_indices
-                    ),
-                    "prefill_match_result.host_hit_tokens": req.host_hit_length,
-                    "prefill_match_result.extend_input_len": req.extend_input_len,
-                },
-            )
+            match_trace_attrs = {
+                "prefill_match_result.prefix_cached_tokens": len(
+                    req.prefix_indices
+                ),
+                "prefill_match_result.host_hit_tokens": req.host_hit_length,
+                "prefill_match_result.extend_input_len": req.extend_input_len,
+            }
+            if self.enable_hicache_storage:
+                match_trace_attrs.update(
+                    self.tree_cache.pop_prefetch_insert_match_diagnostics(req.rid)
+                )
+            req.time_stats.trace_ctx.trace_slice_add_attr(match_trace_attrs)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

@@ -274,6 +274,10 @@ class BaseHiRadixCache(abc.ABC):
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.prefetch_trace_attrs_by_reqid: dict[str, dict[str, Any]] = {}
+        # Diagnostics: prefetch host-node insert timestamp, and eviction age (ms)
+        # if that node is evicted before match_prefix runs.
+        self._prefetch_insert_ts_by_reqid: dict[str, float] = {}
+        self._prefetch_evicted_age_ms_by_reqid: dict[str, float] = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
@@ -767,6 +771,8 @@ class BaseHiRadixCache(abc.ABC):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.prefetch_trace_attrs_by_reqid.clear()
+        self._prefetch_insert_ts_by_reqid.clear()
+        self._prefetch_evicted_age_ms_by_reqid.clear()
         self.evictable_host_leaves.clear()
         super().reset()
 
@@ -1412,6 +1418,21 @@ class BaseHiRadixCache(abc.ABC):
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit BlockRemoved so the router removes this block from its index.
             self._record_remove_event(x)
+            evicted_prefetch_req_id = getattr(x, "prefetch_req_id", None)
+            if evicted_prefetch_req_id is not None:
+                insert_ts = self._prefetch_insert_ts_by_reqid.get(
+                    evicted_prefetch_req_id
+                )
+                if insert_ts is not None:
+                    self._prefetch_evicted_age_ms_by_reqid[evicted_prefetch_req_id] = (
+                        time.monotonic() - insert_ts
+                    ) * 1000
+                    logger.warning(
+                        "hicache prefetch node evicted before match: "
+                        f"req={evicted_prefetch_req_id}, "
+                        f"age_ms={self._prefetch_evicted_age_ms_by_reqid[evicted_prefetch_req_id]:.1f}, "
+                        f"host_tokens={len(x.host_value)}"
+                    )
             freed_full, freed_swa = self.cache_controller.evict_host(x.host_value)
             full_evicted += freed_full
             swa_evicted += freed_swa
@@ -1825,19 +1846,21 @@ class BaseHiRadixCache(abc.ABC):
             fetched_key,
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
+            req_id=req_id,
         )
+        self._prefetch_insert_ts_by_reqid[req_id] = time.monotonic()
 
         # Before freeing the overlapping prefetch indices, transfer any SWA
         # slots that the prefetch brought back but the existing tree nodes lack.
         # This closes the SWA gap that would otherwise persist across sessions.
         #
-        # TODO(yingchun): only the host-side SWA gap is closed here.
-        #  Tree nodes whose device value exists but has no SWA mapping
-        #  (full-only device) are still unfixed — match_prefix will still
-        #  trim at the device-swa boundary until those nodes are evicted and
-        #  reloaded (load-back rebuilds device SWA from host). Consider also
-        #  doing a device-side splice (or forced H2D SWA copy) so prefetched
-        #  SWA benefits the first request hitting this prefix.
+        # Scope: this splice closes only the host-side SWA gap. Full-only device
+        #  nodes (device value present, no device SWA mapping) are left as-is
+        #  here on purpose; match_prefix() trims them at the device-swa boundary
+        #  and hands off swa_refill_node/swa_refill_len, and init_swa_refill()
+        #  (invoked from schedule_policy) allocates the device SWA slots and
+        #  enqueues the SWA-only H2D load. Do not add a device-side splice here
+        #  or the same range gets SWA-allocated twice.
         if (
             self.is_hybrid_swa
             and matched_length > 0
@@ -1878,6 +1901,13 @@ class BaseHiRadixCache(abc.ABC):
                 "hicache_prefetch_done.io_duration_ms": round(
                     (io_duration or 0) * 1000, 2
                 ),
+                "hicache_prefetch_done.matched_length": matched_length,
+                "hicache_prefetch_done.last_host_node_is_root": last_host_node
+                is self.root_node,
+                "hicache_prefetch_done.insert_extra_key_present": fetched_key.extra_key
+                is not None,
+                "hicache_prefetch_done.prefetch_key_extra_key_present": key.extra_key
+                is not None,
             }
 
         # Track tokens actually loaded from storage for this request (L3 hits)
@@ -1914,6 +1944,26 @@ class BaseHiRadixCache(abc.ABC):
 
     def pop_prefetch_trace_attrs(self, req_id: str) -> dict[str, Any]:
         return self.prefetch_trace_attrs_by_reqid.pop(req_id, {})
+
+    def pop_prefetch_insert_match_diagnostics(
+        self, req_id: str
+    ) -> dict[str, Any]:
+        insert_ts = self._prefetch_insert_ts_by_reqid.pop(req_id, None)
+        evicted_age_ms = self._prefetch_evicted_age_ms_by_reqid.pop(req_id, None)
+        if insert_ts is None:
+            return {}
+        attrs: dict[str, Any] = {
+            "prefill_match_result.insert_to_match_ms": round(
+                (time.monotonic() - insert_ts) * 1000, 2
+            ),
+            "prefill_match_result.prefetch_node_evicted_before_match": evicted_age_ms
+            is not None,
+        }
+        if evicted_age_ms is not None:
+            attrs["prefill_match_result.prefetch_node_evicted_age_ms"] = round(
+                evicted_age_ms, 2
+            )
+        return attrs
 
     def pop_storage_full_hit(self, req_id: str) -> int:
         return self.storage_full_hit_by_reqid.pop(req_id, 0)
@@ -2050,7 +2100,7 @@ class BaseHiRadixCache(abc.ABC):
         return PrefetchStatus.STARTED
 
     def _insert_helper_host(
-        self, node: TreeNode, key: RadixKey, host_value, hash_value
+        self, node: TreeNode, key: RadixKey, host_value, hash_value, req_id: Optional[str] = None
     ) -> tuple[int, Optional[torch.Tensor]]:
         """
         Insert prefetched host data into the radix tree.
@@ -2106,6 +2156,7 @@ class BaseHiRadixCache(abc.ABC):
             new_node.value = None
             new_node.host_value = host_value.clone()
             new_node.hash_value = hash_value
+            new_node.prefetch_req_id = req_id
             node.children[child_key] = new_node
             self._update_host_leaf_status(new_node)
             self._update_leaf_status(node)
@@ -2421,6 +2472,8 @@ class BaseHiRadixCache(abc.ABC):
         self.storage_swa_hit_by_reqid.pop(rid, None)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self.prefetch_trace_attrs_by_reqid.pop(rid, None)
+        self._prefetch_insert_ts_by_reqid.pop(rid, None)
+        self._prefetch_evicted_age_ms_by_reqid.pop(rid, None)
 
         if rid not in self.ongoing_prefetch:
             return
@@ -2764,6 +2817,18 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
         full_matched_host_len = full_matched_result.host_hit_length
         self._last_raw_match_len = full_matched_device_len + full_matched_host_len
 
+        if params.req is not None and params.req.time_stats.trace_ctx.tracing_enable:
+            params.req.time_stats.trace_ctx.trace_slice_add_attr(
+                {
+                    "match_prefix.full_matched_device_len": full_matched_device_len,
+                    "match_prefix.full_matched_host_len": full_matched_host_len,
+                    "match_prefix.full_matched_total_len": self._last_raw_match_len,
+                    "match_prefix.match_key_extra_key_present": params.key.extra_key
+                    is not None,
+                    "match_prefix.last_host_node_is_root": full_matched_result.last_host_node
+                    is self.root_node,
+                },
+            )
         if full_matched_device_len + full_matched_host_len == 0:
             assert (
                 full_matched_device_len == 0 and full_matched_host_len == 0
@@ -2802,6 +2867,15 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
         logger.debug(
             f"{full_matched_device_len=}, {full_matched_host_len=}, {swa_matched_device_len=}, {swa_matched_host_len=}"
         )
+
+        if params.req is not None and params.req.time_stats.trace_ctx.tracing_enable:
+            params.req.time_stats.trace_ctx.trace_slice_add_attr(
+                {
+                    "match_prefix.swa_matched_device_len": swa_matched_device_len,
+                    "match_prefix.swa_matched_host_len": swa_matched_host_len,
+                    "match_prefix.swa_refill_len": swa_refill_len,
+                },
+            )
 
         # Trim device_indices if needed.
         if swa_matched_device_len < full_matched_device_len:
@@ -2876,6 +2950,15 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
                     swa_rematched_result.host_hit_length,
                 )
 
+        if params.req is not None and params.req.time_stats.trace_ctx.tracing_enable:
+            params.req.time_stats.trace_ctx.trace_slice_add_attr(
+                {
+                    "match_prefix.swa_rematched_device_len": len(
+                        swa_rematched_result.device_indices
+                    ),
+                    "match_prefix.swa_rematched_host_len": swa_rematched_result.host_hit_length,
+                },
+            )
         # Preserve the final SWA-safe match result while carrying the optional
         # refill metadata to schedule_policy; match_prefix itself remains
         # read-only and does not allocate or enqueue loads.

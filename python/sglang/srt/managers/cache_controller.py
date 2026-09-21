@@ -2209,8 +2209,7 @@ class HiCacheController:
         swa_valid_pages = []
         backend_queried_keys = 0
         backend_hit_keys = 0
-        first_gcache_miss_page = -1
-        first_miss_component = "none"
+        first_full_miss_component = "none"
 
         logical_len = len(key)
 
@@ -2250,16 +2249,12 @@ class HiCacheController:
                 backend_hit_keys += int(
                     backend_diagnostics.get("gcache_hit_keys", 0)
                 )
-                batch_first_miss_page = int(
-                    backend_diagnostics.get("first_miss_page", -1)
-                )
-                if first_gcache_miss_page < 0 and batch_first_miss_page >= 0:
-                    first_gcache_miss_page = (
-                        start // self.page_size + batch_first_miss_page
+                if first_full_miss_component == "none":
+                    batch_full_miss_component = backend_diagnostics.get(
+                        "first_full_miss_component", "none"
                     )
-                    first_miss_component = str(
-                        backend_diagnostics.get("first_miss_component", "unknown")
-                    )
+                    if batch_full_miss_component != "none":
+                        first_full_miss_component = str(batch_full_miss_component)
             if self.metrics_collector is not None:
                 self.metrics_collector.log_storage_query_latency(
                     time.perf_counter() - t0_query
@@ -2299,8 +2294,7 @@ class HiCacheController:
                         "hicache_prefetch_query.gcache_key_hit_ratio": round(
                             backend_hit_keys / backend_queried_keys, 6
                         ),
-                        "hicache_prefetch_query.first_gcache_miss_page": first_gcache_miss_page,
-                        "hicache_prefetch_query.first_miss_component": first_miss_component,
+                        "hicache_prefetch_query.first_full_miss_component": first_full_miss_component,
                     }
                 )
         if self._fault_injector.enabled:

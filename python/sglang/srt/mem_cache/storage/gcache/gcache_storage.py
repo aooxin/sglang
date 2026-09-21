@@ -38,21 +38,26 @@ class GcacheStorage(HiCacheStorage):
         if extra_info is None or extra_info.extra_info is None:
             return
 
-        first_miss_index = next(
-            (index for index, exists in enumerate(exist_mask) if not exists), -1
-        )
+        # Need the full_k/full_v pair (offsets 0, 1) per page, else base+1 reads
+        # into the next page.
+        assert key_multiplier >= 2, f"{key_multiplier=} must be >= 2"
+
+        num_pages = len(exist_mask) // key_multiplier
+        first_full_miss_component = "none"
+        for page in range(num_pages):
+            base = page * key_multiplier
+            for offset in (0, 1):
+                if not exist_mask[base + offset]:
+                    first_full_miss_component = cls._EXISTS_COMPONENTS[offset]
+                    break
+            if first_full_miss_component != "none":
+                break
+
         extra_info.extra_info.update(
             {
                 "gcache_queried_keys": len(exist_mask),
                 "gcache_hit_keys": sum(bool(exists) for exists in exist_mask),
-                "first_miss_page": first_miss_index // key_multiplier
-                if first_miss_index >= 0
-                else -1,
-                "first_miss_component": cls._EXISTS_COMPONENTS[
-                    first_miss_index % key_multiplier
-                ]
-                if first_miss_index >= 0
-                else "none",
+                "first_full_miss_component": first_full_miss_component,
             }
         )
 

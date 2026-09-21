@@ -507,11 +507,11 @@ class ModelRunnerKVCacheMixin:
             and chunked_prefill_size is not None
             and chunked_prefill_size > 0
         ):
-            min_swa_tokens = chunked_prefill_size * 3
+            min_swa_tokens = chunked_prefill_size + self.sliding_window_size
             if swa_tokens < min_swa_tokens:
                 raise RuntimeError(
                     f"SWA pool size ({swa_tokens}) is too small for chunked prefill "
-                    f"(requires >= chunked_prefill_size * 3 = {min_swa_tokens}). "
+                    f"(requires >= chunked_prefill_size + sliding_window_size = {min_swa_tokens}). "
                     f"Please increase --swa-full-tokens-ratio "
                     f"(current: {swa_full_tokens_ratio}) or increase "
                     f"--mem-fraction-static to enlarge the SWA pool capacity."

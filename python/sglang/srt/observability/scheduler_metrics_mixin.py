@@ -146,6 +146,7 @@ class SchedulerMetricsMixin:
         self.last_swa_active_freed_tokens: int = 0
         self.last_swa_evicted_from_tree: int = 0
         self.last_full_evicted_from_tree: int = 0
+        self.last_swa_dynamic_anchor_protected_tokens: int = 0
         self.last_tree_cache_info_time: float = 0.0
 
         self.stats = SchedulerStats()
@@ -577,6 +578,19 @@ class SchedulerMetricsMixin:
                     self.last_swa_active_freed_tokens = cur_swa_freed
                     self.last_swa_evicted_from_tree = cur_swa_evicted
                     self.last_full_evicted_from_tree = cur_full_evicted
+                    # Per-request SWA branch-window protection is SWA-cache-only;
+                    # use getattr so the non-SWA HiRadixCache (which lacks the
+                    # counter) is a no-op.
+                    cur_swa_anchor_protected = getattr(
+                        self.tree_cache, "swa_dynamic_anchor_protected_tokens", 0
+                    )
+                    self.stats.swa_dynamic_anchor_protected_tokens_delta = (
+                        cur_swa_anchor_protected
+                        - self.last_swa_dynamic_anchor_protected_tokens
+                    )
+                    self.last_swa_dynamic_anchor_protected_tokens = (
+                        cur_swa_anchor_protected
+                    )
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
 

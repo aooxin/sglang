@@ -2578,6 +2578,13 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
         # are initialized by BaseHiRadixCache.__init__ above.)
         self.sliding_window_size = params.sliding_window_size
         self._last_raw_match_len: int = 0
+        # HiSimpleSWARadixCache inherits evict_swa / _filter_swa_free_slots_before_free
+        # from SimpleSWARadixCache, which read swa_reserved_points / swa_reserved_chunk
+        # / swa_reserved_max_point. Since we do not chain through
+        # SimpleSWARadixCache.__init__, initialize that state (static reserved
+        # points + per-request branch-window protection) here so the inherited
+        # eviction path works.
+        self._init_swa_reserved_and_anchor_state(params.page_size)
 
         # Force load_back_threshold to 0 for SWA mode: any host-resident hit
         # must be loaded back to device before it can be safely reused, since
@@ -2815,7 +2822,8 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
         full_matched_result = BaseHiRadixCache.match_prefix(self, params)
         full_matched_device_len = len(full_matched_result.device_indices)
         full_matched_host_len = full_matched_result.host_hit_length
-        self._last_raw_match_len = full_matched_device_len + full_matched_host_len
+        raw_match_len = full_matched_device_len + full_matched_host_len
+        self._last_raw_match_len = raw_match_len
 
         if params.req is not None and params.req.time_stats.trace_ctx.tracing_enable:
             params.req.time_stats.trace_ctx.trace_slice_add_attr(
@@ -2829,7 +2837,7 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
                     is self.root_node,
                 },
             )
-        if full_matched_device_len + full_matched_host_len == 0:
+        if raw_match_len == 0:
             assert (
                 full_matched_device_len == 0 and full_matched_host_len == 0
             ), f"{full_matched_device_len=}, {full_matched_host_len=}"
@@ -2894,6 +2902,9 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
                     host_hit_length=0,
                     swa_refill_node=swa_refill_node,
                     swa_refill_len=swa_refill_len,
+                    swa_branching_seqlen=self._report_swa_branching_seqlen(
+                        raw_match_len, 0
+                    ),
                 )
         else:
             assert (
@@ -2969,4 +2980,8 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
             host_hit_length=swa_rematched_result.host_hit_length,
             swa_refill_node=swa_refill_node,
             swa_refill_len=swa_refill_len,
+            swa_branching_seqlen=self._report_swa_branching_seqlen(
+                raw_match_len,
+                swa_matched_device_len + swa_matched_host_len,
+            ),
         )

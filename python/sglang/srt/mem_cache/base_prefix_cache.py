@@ -178,6 +178,11 @@ class MatchResult(NamedTuple):
                                 exists a mamba state.
         swa_refill_node :   Device-resident node whose SWA can be refilled from host.
         swa_refill_len  :   Target prefix length after SWA refill.
+        swa_branching_seqlen: The SWA reuse branching point, i.e. the longest page-aligned
+                                full-KV hit length that the SWA tail failed to cover
+                                (full_matched_len > swa_matched_len). Used to protect the
+                                SWA window ending at the branch so a later request sharing
+                                this prefix stays SWA-safe. None when there is no SWA truncation.
     """
 
     device_indices: torch.Tensor
@@ -188,6 +193,7 @@ class MatchResult(NamedTuple):
     cache_protected_len: Optional[int] = None
     swa_refill_node: Any = None
     swa_refill_len: int = 0
+    swa_branching_seqlen: Optional[int] = None
 
 
 class BasePrefixCache(ABC, PrefixCacheTrait):

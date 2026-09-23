@@ -568,6 +568,15 @@ class Envs:
     SGLANG_SIMPLE_SWA_RESERVED_CHUNK = EnvInt(14 * 1024)
     SGLANG_SIMPLE_SWA_RESERVED_MAX_POINT = EnvInt(128 * 1024)
 
+    # Per-request SWA branch-window protection at Full-KV branch points.
+    # Default off; gate rollout. When enabled,
+    # each request's evict_swa() protects the SWA window ending at its own
+    # page-aligned full-KV branching seqlen in addition to the static reserved
+    # points, so a later request reusing that prefix stays SWA-safe at the
+    # branch. Protection is per-request (no global anchor set), so the surviving
+    # SWA is bounded naturally and reclaimed by evict()'s memory-pressure LRU.
+    SGLANG_SIMPLE_SWA_DYNAMIC_ANCHORS = EnvBool(False)
+
     # Gate for SWA host-pool diagnostic invariant checks ([SWA-DIAG]). These
     # run per alloc/free on the hot path; keep disabled in production and enable
     # only when investigating SWA partial-page corruption.

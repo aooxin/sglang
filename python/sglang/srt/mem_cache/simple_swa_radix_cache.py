@@ -28,6 +28,7 @@ Safety:
       out-of-window KV entries.
 """
 
+import bisect
 import heapq
 import logging
 import time
@@ -173,6 +174,102 @@ class SimpleSWARadixCache(RadixCache):
 
         return reserved_points, reserved_chunk, reserved_max_point
 
+    def _init_swa_reserved_and_anchor_state(self, page_size: int) -> None:
+        """Initialize SWA reserved-point config and per-request branch-window state.
+
+        Called from both ``SimpleSWARadixCache.__init__`` and
+        ``HiSimpleSWARadixCache.__init__`` (which does not chain through the
+        base ``__init__``) so the inherited ``evict_swa`` /
+        ``_filter_swa_free_slots_before_free`` find these attributes on both
+        caches.
+        """
+        (
+            self.swa_reserved_points,
+            self.swa_reserved_chunk,
+            self.swa_reserved_max_point,
+        ) = self._load_swa_reserved_config(self.sliding_window_size, page_size)
+
+        # Per-request Full-KV-guided SWA branch-window protection. Off by
+        # default; when enabled, each request's evict_swa()
+        # protects the SWA window ending at *its own* page-aligned full-KV
+        # branch point on top of the static reserved points, so the branch KV
+        # survives into the tree (and host/L3 backup) for later reuse. Protection
+        # is per-request, so there is no global anchor set to bound: whatever
+        # survives into the tree is reclaimed by evict()'s memory-pressure LRU.
+        self.swa_dynamic_anchors_enabled = envs.SGLANG_SIMPLE_SWA_DYNAMIC_ANCHORS.get()
+        # Cumulative count of SWA tokens withheld from freeing because they fell
+        # inside a request's branch window. Read by the scheduler for a Prometheus
+        # delta counter (mirrors swa_active_freed_tokens).
+        self.swa_dynamic_anchor_protected_tokens: int = 0
+
+    def _build_swa_protected_points(self, branch_seqlen: Optional[int]) -> List[int]:
+        """Ascending list of SWA window-end positions to protect for one request.
+
+        Always includes the static reserved points. When per-request protection
+        is enabled and ``branch_seqlen`` is an eligible full-KV branch point,
+        adds that page-aligned position too. A point is eligible only if it lies
+        past the sliding window (else there is no window to protect) and below
+        ``swa_reserved_max_point`` (else it would exceed the reserve budget);
+        duplicates of a static point are absorbed by the set union.
+        """
+        aligned = (
+            floor_align(branch_seqlen, self.page_size)
+            if branch_seqlen is not None
+            else None
+        )
+        eligible = (
+            self.swa_dynamic_anchors_enabled
+            and aligned is not None
+            and aligned > self.sliding_window_size
+            and (not self.swa_reserved_max_point or aligned < self.swa_reserved_max_point)
+        )
+        if not eligible:
+            # Reuse the static list without allocating; callers only read it.
+            return self.swa_reserved_points
+        # Insert a unique branch point while preserving the existing sort order.
+        points = list(self.swa_reserved_points)
+        if aligned not in self.swa_reserved_points:
+            bisect.insort(points, aligned)
+        return points
+
+    def _compute_swa_branching_seqlen(
+        self, full_matched_len: int, swa_matched_len: int
+    ) -> Optional[int]:
+        """Page-aligned full-KV branch point for a dynamic SWA anchor, or None.
+
+        Returns the page-aligned full-KV hit length when the SWA tail failed to
+        cover it (``full_matched_len > swa_matched_len``) and the hit spans more
+        than one sliding window; otherwise None. Always None when dynamic anchors
+        are disabled, so producers add no overhead in the default configuration.
+        """
+        if not self.swa_dynamic_anchors_enabled:
+            return None
+        if (
+            full_matched_len > swa_matched_len
+            and full_matched_len > self.sliding_window_size
+        ):
+            return floor_align(full_matched_len, self.page_size)
+        return None
+
+    def _report_swa_branching_seqlen(
+        self, full_matched_len: int, swa_matched_len: int
+    ) -> Optional[int]:
+        """Compute the branch point and, when there is one, report its metrics.
+
+        Shared by every ``match_prefix`` return path that plants a dynamic anchor
+        (SimpleSWARadixCache and both branches of HiSimpleSWARadixCache), so the
+        counter and position histogram are recorded consistently regardless of
+        cache backend. Increments the created-total and observes the branch
+        position, feeding sglang:swa_dynamic_anchor_created_total and
+        sglang:swa_dynamic_anchor_position. ``metrics_collector`` is None when
+        metrics are disabled, so this adds no overhead in that configuration.
+        """
+        branch = self._compute_swa_branching_seqlen(full_matched_len, swa_matched_len)
+        if branch is not None and self.metrics_collector is not None:
+            self.metrics_collector.increment_swa_dynamic_anchor_created()
+            self.metrics_collector.observe_swa_dynamic_anchor_position(branch)
+        return branch
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -187,11 +284,7 @@ class SimpleSWARadixCache(RadixCache):
 
         super().__init__(params)
         self.sliding_window_size = params.sliding_window_size
-        (
-            self.swa_reserved_points,
-            self.swa_reserved_chunk,
-            self.swa_reserved_max_point,
-        ) = self._load_swa_reserved_config(self.sliding_window_size, params.page_size)
+        self._init_swa_reserved_and_anchor_state(params.page_size)
 
         # Cumulative counters for metrics.
         # Updated in evict_swa() and evict(); read by the scheduler to compute
@@ -242,15 +335,77 @@ class SimpleSWARadixCache(RadixCache):
             f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
         )
 
+    def _segment_free_slots(
+        self,
+        free_slots: torch.Tensor,  # read-only here
+        effective_start: int,
+        swa_free_end: int,
+        points: List[int],
+    ) -> List[torch.Tensor]:
+        """Split ``free_slots`` so SWA windows ending at each protected ``point``
+        are withheld from freeing.
+
+        ``points`` is an ascending list of absolute seqlen positions (static
+        reserved points and/or dynamic anchors). Each point ``wend`` protects the
+        window ``[wend - sliding_window_size, wend)``.
+        """
+        # 如果和 points 没有交集
+        if (
+            not points
+            or effective_start >= points[-1]
+            or swa_free_end <= points[0] - self.sliding_window_size
+        ):
+            return [free_slots]
+
+        result = []
+        last_wend = effective_start
+        # 遍历每个保护窗口，以窗口起点 wbegin 为分割点：把 [last_wend, wbegin)
+        # 这段窗口之前的空隙加入可 free 列表，再把游标推进到窗口末尾 wend，从而
+        # 保护窗口尾部 [wbegin, wend)。
+        # 特殊情况：若 swa_free_end 落在某个窗口内部（wbegin < swa_free_end < wend），
+        # 则该窗口内 [wbegin, swa_free_end) 这段被保护（游标已推进到 wend，末尾
+        # 的 `last_wend < swa_free_end` 不再成立），而不是像旧实现那样整体 free。
+        for wend in points:
+            wbegin = wend - self.sliding_window_size
+            # Skip this protected window whenever it extends past the current
+            # cursor (last_wend < wend), even if its start lies at/before the
+            # cursor (a window straddling effective_start). Only emit a freeable
+            # segment for the gap before the window when that gap is non-empty
+            # (last_wend < wbegin); otherwise just advance the cursor past the
+            # window so its in-region tail [last_wend, wend) stays protected.
+            if wbegin <= swa_free_end and last_wend < wend:
+                if last_wend < wbegin:
+                    result.append(
+                        free_slots[
+                            last_wend - effective_start : wbegin - effective_start
+                        ]
+                    )
+                last_wend = wend
+        # 添加最后剩下的片段
+        if last_wend < swa_free_end:
+            result.append(free_slots[last_wend - effective_start :])
+
+        return result
+
     def _filter_swa_free_slots_before_free(
         self,
         free_slots: torch.Tensor,  # read-only here
         effective_start: int,
         swa_free_end: int,
         tree_prefix_len: int,
+        points: List[int],
+        branch_seqlen: Optional[int],
     ) -> List[torch.Tensor]:
         """
-        Filter out SWA pages to free that are explicit reserved
+        Filter out SWA pages to free that are explicit reserved (static reserved
+        points) or protected at this request's own full-KV branch point.
+
+        ``points`` is the ascending list built by ``_build_swa_protected_points``
+        for the current request (static reserved points, plus the request's own
+        eligible branch window when per-request protection is enabled).
+        ``branch_seqlen`` is this request's ``req.swa_branching_seqlen`` — the raw
+        (pre-alignment) branch length used only to attribute the withheld window
+        without re-scanning ``points``.
         """
 
         # 如果 swa_free_end>>effective_start 且 effective_start>>tree_prefix_len，则保留effective_start附近的swa
@@ -262,30 +417,50 @@ class SimpleSWARadixCache(RadixCache):
             effective_start += self.sliding_window_size
             free_slots = free_slots[self.sliding_window_size :]
 
-        if not self.swa_reserved_points:
-            return [free_slots]
+        # Protect windows at the static reserved points plus this request's own
+        # branch point. When per-request protection is disabled (or the branch
+        # point is ineligible) ``points`` equals the static reserved points, so
+        # behavior is byte-for-byte identical.
+        result = self._segment_free_slots(
+            free_slots, effective_start, swa_free_end, points
+        )
 
-        # 如果和 reserved points 没有交集
-        if (
-            effective_start >= self.swa_reserved_points[-1]
-            or swa_free_end <= self.swa_reserved_points[0] - self.sliding_window_size
+        # Attribute the extra SWA tokens withheld by the request's branch window
+        # for observability. Only runs when a branch point was actually added
+        # (points has one more element than the static reserved set); the extra
+        # element is that branch point.
+        #
+        # Derive the attribution from the already-computed ``result`` in a single
+        # cheap pass over the tiny ``points`` list, instead of running a second
+        # full segmentation on the hot evict_swa path:
+        #   total_protected = free_slots length - tokens actually freed
+        #   branch_window   = |[branch - W, branch) ∩ [effective_start, swa_free_end)|
+        # and take the smaller of the two — the branch window can never withhold
+        # more than its own in-region length, nor more than what was protected in
+        # total. This is exact when the branch window is disjoint from (or merely
+        # adjacent to) the static reserved windows, which covers every deployed
+        # configuration (static reserved points are empty or far from a request's
+        # own branch point). It can slightly over-attribute only if a static
+        # window partially overlaps the branch window — a case the removed second
+        # pass computed exactly but that does not arise in practice.
+        if self.swa_dynamic_anchors_enabled and len(points) > len(
+            self.swa_reserved_points
         ):
-            return [free_slots]
-
-        result = []
-        last_wend = effective_start
-        # 如果一个point的起点和free_slots有交集，则以它为分割点，添加last_wend到point起点之前的片段
-        # 特殊情况：如果swa_free_end在第一个point的窗口内，则不满足任何条件，全部可free
-        for wend in self.swa_reserved_points:
-            wbegin = wend - self.sliding_window_size
-            if wbegin <= swa_free_end and last_wend < wbegin:
-                result.append(
-                    free_slots[last_wend - effective_start : wbegin - effective_start]
-                )
-                last_wend = wend
-        # 添加最后剩下的片段
-        if last_wend < swa_free_end:
-            result.append(free_slots[last_wend - effective_start :])
+            freed_effective = sum(int(seg.shape[0]) for seg in result)
+            total_protected = int(free_slots.shape[0]) - freed_effective
+            # ``points`` is longer than the static set only when
+            # _build_swa_protected_points added this request's branch point, which
+            # is exactly floor_align(branch_seqlen). Derive it directly from the
+            # seqlen instead of re-scanning ``points``.
+            branch_point = floor_align(branch_seqlen, self.page_size)
+            window_start = max(
+                effective_start, branch_point - self.sliding_window_size
+            )
+            window_end = min(swa_free_end, branch_point)
+            branch_window = max(0, window_end - window_start)
+            self.swa_dynamic_anchor_protected_tokens += min(
+                total_protected, branch_window
+            )
 
         return result
 
@@ -317,6 +492,11 @@ class SimpleSWARadixCache(RadixCache):
             "req_to_token row and should only run after a prefill chunk has "
             "completed."
         )
+        # Protect this request's own full-KV branch window during its active SWA
+        # shrink (see _init_swa_reserved_and_anchor_state). Yields just the static
+        # reserved points unless the feature is enabled and match_prefix observed
+        # an eligible SWA truncation for this request.
+        points = self._build_swa_protected_points(req.swa_branching_seqlen)
         # Keep SWA eviction page-aligned to avoid freeing a partial page.
         # PagedTokenToKVPoolAllocator.free() converts token indices to page
         # indices and frees *entire* pages.  If the free range slices through
@@ -348,7 +528,12 @@ class SimpleSWARadixCache(RadixCache):
             # freed_swa_size = self.token_to_kv_pool_allocator.free_swa(free_slots)
             freed_swa_size = 0
             filtered_free_slots = self._filter_swa_free_slots_before_free(
-                free_slots, effective_start, swa_free_end, tree_prefix_len
+                free_slots,
+                effective_start,
+                swa_free_end,
+                tree_prefix_len,
+                points,
+                req.swa_branching_seqlen,
             )
             # TODO(yingchun): 先 torch.cat 合并再统一释放
             for one_free_slots in filtered_free_slots:
@@ -596,7 +781,13 @@ class SimpleSWARadixCache(RadixCache):
             key=RadixKey(list(key.token_ids)[:safe_token_len], key.extra_key),
             req=params.req,
         )
-        return super().match_prefix(safe_params)
+        result = super().match_prefix(safe_params)
+        # Expose the full-KV branch point (raw match len before SWA trim) so the
+        # scheduler can plant a dynamic reuse anchor in evict_swa().
+        branch = self._report_swa_branching_seqlen(full_matched_len, swa_matched_len)
+        if branch is not None:
+            result = result._replace(swa_branching_seqlen=branch)
+        return result
 
     @nvtx_annotated_method("swa_radix.cache_unfinished_req")
     def cache_unfinished_req(self, req: Req, chunked=False):

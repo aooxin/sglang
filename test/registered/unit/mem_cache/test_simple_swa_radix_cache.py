@@ -1,4 +1,5 @@
 import os
+import types
 import unittest
 
 import torch
@@ -133,8 +134,9 @@ class _SWACacheTestBase:
             self.fail("cache is not initialized")
         return self.cache
 
-    def _alloc_req_slot(self) -> int:
-        pool = self._require_pool()
+    def _alloc_req_slot(self, pool: ReqToTokenPool | None = None) -> int:
+        if pool is None:
+            pool = self._require_pool()
         placeholder = Req(
             rid="placeholder",
             origin_input_text="",
@@ -885,6 +887,51 @@ class TestSimpleSWARadixCacheIncrementalCounters(_SWACacheTestBase, CustomTestCa
 
         cache.dec_lock_ref(result_a.last_device_node)
         self._assert_counters_match_recount()
+
+
+class TestSegmentFreeSlots(CustomTestCase):
+    """Unit tests for SimpleSWARadixCache._segment_free_slots.
+
+    _segment_free_slots is a pure helper (reads only self.sliding_window_size and
+    slices a CPU tensor), so we drive it through a lightweight stub without a GPU
+    allocator. free_slots values are set equal to their seqlen positions, so the
+    concatenation of the returned (freeable) segments IS the set of freed
+    positions; whatever is missing was protected.
+    """
+
+    def _freed_positions(self, sliding_window_size, effective_start, swa_free_end, points):
+        stub = types.SimpleNamespace(sliding_window_size=sliding_window_size)
+        free_slots = torch.arange(effective_start, swa_free_end, dtype=torch.int64)
+        segments = SimpleSWARadixCache._segment_free_slots(
+            stub, free_slots, effective_start, swa_free_end, points
+        )
+        if segments:
+            return set(int(v) for v in torch.cat(segments).tolist())
+        return set()
+
+    def test_protects_window_when_region_starts_inside_window(self):
+        # effective_start=6 falls inside the anchor window [4, 8) of point 8.
+        # The in-region part of that window, [6, 8), must be protected, so only
+        # [8, 12) is freeable.
+        freed = self._freed_positions(
+            sliding_window_size=4, effective_start=6, swa_free_end=12, points=[8]
+        )
+        self.assertEqual(freed, {8, 9, 10, 11})
+
+    def test_protects_window_fully_inside_region(self):
+        # Regression guard: anchor window [4, 8) sits fully inside [0, 12);
+        # positions before ([0, 4)) and after ([8, 12)) the window are freeable.
+        freed = self._freed_positions(
+            sliding_window_size=4, effective_start=0, swa_free_end=12, points=[8]
+        )
+        self.assertEqual(freed, {0, 1, 2, 3, 8, 9, 10, 11})
+
+    def test_protects_multiple_ascending_points(self):
+        freed = self._freed_positions(
+            sliding_window_size=4, effective_start=0, swa_free_end=20, points=[8, 16]
+        )
+        # Protected windows [4, 8) and [12, 16).
+        self.assertEqual(freed, {0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19})
 
 
 if __name__ == "__main__":

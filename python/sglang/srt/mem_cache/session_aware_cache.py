@@ -58,6 +58,9 @@ class SessionSlot:
     mamba_last_track_seqlen: Any = None
     mamba_branching_seqlen: Any = None
 
+    # SWA reuse branching point (per-request branch-window protection)
+    swa_branching_seqlen: Optional[int] = None
+
     @property
     def is_holding_kv(self) -> bool:
         """Whether this slot currently holds KV pool resources."""
@@ -80,6 +83,7 @@ class SessionSlot:
         self.mamba_next_track_idx = req.mamba_next_track_idx
         self.mamba_last_track_seqlen = req.mamba_last_track_seqlen
         self.mamba_branching_seqlen = req.mamba_branching_seqlen
+        self.swa_branching_seqlen = req.swa_branching_seqlen
 
         req.req_pool_idx = None
         req.mamba_pool_idx = None
@@ -97,6 +101,7 @@ class SessionSlot:
         req.mamba_next_track_idx = self.mamba_next_track_idx
         req.mamba_last_track_seqlen = self.mamba_last_track_seqlen
         req.mamba_branching_seqlen = self.mamba_branching_seqlen
+        req.swa_branching_seqlen = self.swa_branching_seqlen
 
         # NOTE: req_pool_idx and mamba_pool_idx are intentionally NOT cleared
         # from the slot. During chunked prefill, a request may be rejected by

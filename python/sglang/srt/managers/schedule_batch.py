@@ -691,6 +691,10 @@ class Req(ReqDllmMixin):
         # the branching point seqlen to track mamba state. If set, given by prefix match,
         # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        # the SWA reuse branching point seqlen. If set (given by prefix match when
+        # the full-KV hit outran the SWA tail), evict_swa() protects the SWA window
+        # ending here so later requests reusing this prefix stay SWA-safe.
+        self.swa_branching_seqlen: Optional[int] = None
 
         # Check finish
         self.tokenizer = None
@@ -1130,6 +1134,7 @@ class Req(ReqDllmMixin):
                 )
                 self.swa_refill_node = match_result.swa_refill_node
                 self.swa_refill_len = match_result.swa_refill_len
+                self.swa_branching_seqlen = match_result.swa_branching_seqlen
                 if match_result.cache_protected_len is not None:
                     self.cache_protected_len = match_result.cache_protected_len
                 else:
@@ -1362,6 +1367,7 @@ class Req(ReqDllmMixin):
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
+        self.swa_branching_seqlen = None
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0

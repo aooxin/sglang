@@ -198,6 +198,7 @@ class SchedulerStats:
     swa_active_freed_tokens_delta: int = 0
     swa_evicted_from_tree_delta: int = 0
     full_evicted_from_tree_delta: int = 0
+    swa_dynamic_anchor_protected_tokens_delta: int = 0
 
 
 ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 3, 5, 7, 10, 20, 50, 100, 200]
@@ -1126,6 +1127,11 @@ class SchedulerMetricsCollector:
             documentation="Cumulative SWA KV tokens evicted from the radix tree by cache pressure.",
             labelnames=labels.keys(),
         )
+        self.swa_dynamic_anchor_protected_tokens_total = Counter(
+            name="sglang:swa_dynamic_anchor_protected_tokens_total",
+            documentation="Cumulative SWA KV tokens withheld from freeing by per-request Full-KV-guided branch-window protection.",
+            labelnames=labels.keys(),
+        )
 
     def _log_gauge(self, gauge: Gauge, data: Union[int, float]) -> None:
         # Convenience function for logging a scalar to gauge.
@@ -1465,6 +1471,10 @@ class SchedulerMetricsCollector:
         if stats.swa_evicted_from_tree_delta > 0:
             self.swa_evicted_from_tree_total.labels(**self.labels).inc(
                 stats.swa_evicted_from_tree_delta
+            )
+        if stats.swa_dynamic_anchor_protected_tokens_delta > 0:
+            self.swa_dynamic_anchor_protected_tokens_total.labels(**self.labels).inc(
+                stats.swa_dynamic_anchor_protected_tokens_delta
             )
 
         self.last_log_time = time.perf_counter()
@@ -2366,6 +2376,41 @@ class RadixCacheMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        # Per-request SWA dynamic-anchor observability. Only exercised when
+        # SGLANG_SIMPLE_SWA_DYNAMIC_ANCHORS is on; observed once per branch point
+        # detected at match_prefix (see SimpleSWARadixCache.match_prefix).
+        bucket_swa_anchor_position = get_histogram_conf_from_env(
+            "SGLANG_BUCKET_SWA_ANCHOR_POSITION"
+        )
+        if bucket_swa_anchor_position is None:
+            bucket_swa_anchor_position = [
+                1024,
+                2048,
+                4096,
+                8192,
+                16384,
+                32768,
+                65536,
+                131072,
+            ]
+        self.swa_dynamic_anchor_created = Counter(
+            name="sglang:swa_dynamic_anchor_created_total",
+            documentation=(
+                "Cumulative count of per-request SWA full-KV branch points detected "
+                "at match_prefix (full match longer than the SWA tail)."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.swa_dynamic_anchor_position = Histogram(
+            name="sglang:swa_dynamic_anchor_position",
+            documentation=(
+                "Distribution of SWA branch-point positions (page-aligned full-KV hit "
+                "length, in tokens) at which a per-request reuse anchor is planted."
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_swa_anchor_position,
+        )
+
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
 
@@ -2377,6 +2422,12 @@ class RadixCacheMetricsCollector:
 
     def observe_load_back_duration(self, duration_seconds: float) -> None:
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def increment_swa_dynamic_anchor_created(self, count: int = 1) -> None:
+        self.swa_dynamic_anchor_created.labels(**self.labels).inc(count)
+
+    def observe_swa_dynamic_anchor_position(self, position: int) -> None:
+        self.swa_dynamic_anchor_position.labels(**self.labels).observe(position)
 
 
 class LogitProcessorCollector:

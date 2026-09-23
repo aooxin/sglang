@@ -6,6 +6,7 @@ from typing import Any, List, Optional
 import torch
 from gcache_sdk import GCacheClient
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_dp_rank
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
@@ -74,6 +75,14 @@ class GcacheStorage(HiCacheStorage):
         # concatenates the variable middle part instead of formatting a full
         # f-string for every key.
         self._key_prefix = f"{self.model_name}_"
+        # Draft keys use an independent prefix so they can be decoupled from the
+        # main model. Set SGLANG_HICACHE_DRAFT_MODEL_NAME to give the draft model its own
+        # namespace; otherwise fall back to the legacy behavior of binding draft
+        # keys to the main model prefix with a "d:" marker.
+        draft_model_name = envs.SGLANG_HICACHE_DRAFT_MODEL_NAME.get()
+        self._draft_key_prefix = (
+            f"{draft_model_name}_" if draft_model_name else "d:" + self._key_prefix
+        )
         self._key_suffix_full_k = f"_{self.tp_rank}_full_k"
         self._key_suffix_full_v = f"_{self.tp_rank}_full_v"
         self._key_suffix_swa_k = f"_{self.tp_rank}_swa_k"
@@ -634,7 +643,7 @@ class GcacheStorage(HiCacheStorage):
     ):
         if swa_valid_list is not None:
             assert len(keys) == len(swa_valid_list)
-        prefix = ("d:" if draft else "") + self._key_prefix
+        prefix = self._draft_key_prefix if draft else self._key_prefix
         suffix_full_k = self._key_suffix_full_k
         suffix_full_v = self._key_suffix_full_v
         suffix_swa_k = self._key_suffix_swa_k

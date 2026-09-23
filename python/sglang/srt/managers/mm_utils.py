@@ -1840,3 +1840,45 @@ def unwrap_shm_features(obj):
                     item.precomputed_embeddings
                 )
     return obj
+
+
+# ── Padding pattern resolution ──────────────────────────────────────────────
+
+# Architectures that use MultiModalityDataPaddingPatternTokenPairs.
+# All other multimodal models use MultiModalityDataPaddingPatternMultimodalTokens.
+_TOKEN_PAIRS_HF_ARCHS: set = {
+    "InternVLChatModel",
+    "Gemma3ForConditionalGeneration",
+    "InternS1ForConditionalGeneration",
+    "MiniCPMO",
+    "MiniCPMV",
+    "NemotronH_Nano_VL_V2",
+    "MultiModalityCausalLM",  # Janus Pro
+}
+
+
+def get_padding_pattern(mm_inputs: "MultimodalInputs", hf_config=None):
+    """Return the correct padding-pattern instance for the current model.
+
+    Uses ``hf_config.architectures[0]`` when available to pick between
+    :class:`MultiModalityDataPaddingPatternMultimodalTokens` (default) and
+    :class:`MultiModalityDataPaddingPatternTokenPairs`.  Falls back to
+    *mm_inputs* field heuristics when *hf_config* is *None*.
+    """
+    arch = hf_config.architectures[0] if hf_config is not None else None
+    if arch is not None and arch in _TOKEN_PAIRS_HF_ARCHS:
+        data_token_pairs = _collect_data_token_pairs(mm_inputs)
+        return MultiModalityDataPaddingPatternTokenPairs(data_token_pairs)
+    return MultiModalityDataPaddingPatternMultimodalTokens()
+
+
+def _collect_data_token_pairs(mm_inputs):
+    """Collect (start_id, end_id) pairs from the mm_inputs fields."""
+    pairs = []
+    if mm_inputs.im_start_id is not None:
+        pairs.append((mm_inputs.im_start_id, mm_inputs.im_end_id))
+    if mm_inputs.slice_start_id is not None:
+        pairs.append((mm_inputs.slice_start_id, mm_inputs.slice_end_id))
+    if mm_inputs.audio_start_id is not None:
+        pairs.append((mm_inputs.audio_start_id, mm_inputs.audio_end_id))
+    return pairs or None

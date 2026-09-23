@@ -293,9 +293,7 @@ class MultimodalDataItem:
         return len([item for item in flatten_nested_list(l) if item is not None]) == 0
 
     def set_pad_value(self):
-        """
-        Set the pad value after first hashing the data
-        """
+        """Set the pad value after first hashing the data."""
         if self.pad_value is not None:
             return
 

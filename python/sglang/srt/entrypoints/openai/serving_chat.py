@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import logging
@@ -446,9 +447,24 @@ class OpenAIServingChat(OpenAIServingBase):
         # NOTE: only handles text requests for now; multimodal inputs (image_data,
         # video_data, audio_data) are passed in the normal path below (GenerateReqInput at ~line 363).
         if request.return_tokens_only:
-            adapted_request = GenerateReqInput(
-                input_ids=processed_messages.prompt_ids,
+            has_mm_data = (
+                processed_messages.image_data
+                or processed_messages.video_data
+                or processed_messages.audio_data
             )
+            if has_mm_data and is_multimodal:
+                adapted_request = GenerateReqInput(
+                    text=processed_messages.prompt,
+                    image_data=processed_messages.image_data,
+                    video_data=processed_messages.video_data,
+                    audio_data=processed_messages.audio_data,
+                    modalities=processed_messages.modalities,
+                    return_tokens_only=True,
+                )
+            else:
+                adapted_request = GenerateReqInput(
+                    input_ids=processed_messages.prompt_ids,
+                )
             return adapted_request, request
 
         # Build sampling parameters
@@ -955,8 +971,15 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_tokens_only:
             from sglang.srt.entrypoints.openai.utils import _truncate_tokens
 
-            prompt_ids = adapted_request.input_ids
             tm = self.tokenizer_manager
+            if adapted_request.contains_mm_input():
+                async with contextlib.aclosing(
+                    tm.generate_request(adapted_request, raw_request)
+                ) as gen:
+                    ret = await gen.__anext__()
+                prompt_ids = ret["input_ids"]
+            else:
+                prompt_ids = adapted_request.input_ids
             if tm.server_args.allow_auto_truncate and tm.max_req_input_len is not None:
                 prompt_ids = _truncate_tokens(prompt_ids, tm.max_req_input_len)
             return {"tokens": prompt_ids, "count": len(prompt_ids)}
@@ -1409,16 +1432,26 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.return_tokens_only:
             from sglang.srt.entrypoints.openai.utils import _truncate_tokens
 
-            prompt_ids = adapted_request.input_ids
             tm = self.tokenizer_manager
+            if adapted_request.contains_mm_input():
+                async with contextlib.aclosing(
+                    tm.generate_request(adapted_request, raw_request)
+                ) as gen:
+                    ret = await gen.__anext__()
+                prompt_ids = ret["input_ids"]
+            else:
+                prompt_ids = adapted_request.input_ids
             if tm.server_args.allow_auto_truncate and tm.max_req_input_len is not None:
                 prompt_ids = _truncate_tokens(prompt_ids, tm.max_req_input_len)
             return {"tokens": prompt_ids, "count": len(prompt_ids)}
 
         try:
-            ret = await self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ).__anext__()
+            async with contextlib.aclosing(
+                self.tokenizer_manager.generate_request(
+                    adapted_request, raw_request
+                )
+            ) as gen:
+                ret = await gen.__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
 

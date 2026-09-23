@@ -569,6 +569,29 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
+
+                if obj.return_tokens_only and obj.contains_mm_input():
+                    input_ids = tokenized_obj.input_ids
+                    mm_inputs = tokenized_obj.mm_inputs
+                    if mm_inputs and getattr(mm_inputs, "mm_items", None):
+                        from sglang.srt.managers.mm_utils import (
+                            get_padding_pattern,
+                        )
+                        from sglang.srt.managers.schedule_batch import (
+                            MultimodalDataItem,
+                        )
+
+                        for item in mm_inputs.mm_items:
+                            if isinstance(item, MultimodalDataItem):
+                                item.set_pad_value()
+                        pattern = get_padding_pattern(
+                            mm_inputs, self.model_config.hf_config
+                        )
+                        input_ids = pattern.pad_input_tokens(input_ids, mm_inputs)
+                    self.rid_to_state.pop(obj.rid, None)
+                    yield {"input_ids": input_ids}
+                    return
+
                 state = self.rid_to_state[obj.rid]
                 self._send_one_request(tokenized_obj)
                 async for response in self._wait_one_response(obj, state, request):

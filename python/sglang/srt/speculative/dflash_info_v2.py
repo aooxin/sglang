@@ -6,6 +6,10 @@ from typing import List, Optional, Tuple
 
 import torch
 
+try:
+    from sglang.jit_kernel.fill_from_pinned import fill_from_pinned
+except Exception:  # jit_kernel unavailable (e.g. non-CUDA build)
+    fill_from_pinned = None
 from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -108,6 +112,14 @@ class DFlashDraftInputV2(SpecInput):
             self._prepare_nxt_kv_lens_cpu_buf = torch.empty(
                 (capacity,), dtype=torch.int32, device="cpu", pin_memory=pin_memory
             )
+            if fill_from_pinned is not None and not (
+                self._prepare_cur_kv_lens_cpu_buf.is_pinned()
+                and self._prepare_nxt_kv_lens_cpu_buf.is_pinned()
+            ):
+                raise RuntimeError(
+                    "DFLASH kv-len buffers must be pinned for fill_from_pinned; "
+                    "pinned host memory is unavailable on this device."
+                )
 
         if needs_gpu_alloc(self._prepare_cur_kv_lens_gpu_buf):
             capacity = grown_capacity(self._prepare_cur_kv_lens_gpu_buf)
@@ -244,8 +256,12 @@ class DFlashDraftInputV2(SpecInput):
 
             cur_kv_lens = self._prepare_cur_kv_lens_gpu_buf[:bs]
             nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
-            cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
-            nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
+            if fill_from_pinned is not None:
+                fill_from_pinned(cur_kv_lens, cur_kv_lens_cpu_t)
+                fill_from_pinned(nxt_kv_lens, nxt_kv_lens_cpu_t)
+            else:
+                cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
+                nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
 
             if num_needed_tokens > 0:
                 if page_size == 1:

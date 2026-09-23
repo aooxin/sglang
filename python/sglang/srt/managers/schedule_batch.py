@@ -111,6 +111,12 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 logger = logging.getLogger(__name__)
 
 
+try:
+    from sglang.jit_kernel.fill_from_pinned import fill_from_pinned
+except Exception:  # jit_kernel unavailable (e.g. non-CUDA build)
+    fill_from_pinned = None
+
+
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
     if vocab_size > MM_PAD_SHIFT_VALUE:
@@ -2380,11 +2386,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # No need to filter
             return
 
-        keep_indices_device = torch.tensor(
-            keep_indices,
-            dtype=torch.int64,
-            pin_memory=is_pin_memory_available(self.device),
-        ).to(self.device, non_blocking=True)
+        if fill_from_pinned is not None and is_pin_memory_available(self.device):
+            keep_indices_cpu = torch.tensor(
+                keep_indices, dtype=torch.int64, pin_memory=True
+            )
+            keep_indices_device = torch.empty(
+                len(keep_indices), dtype=torch.int64, device=self.device
+            )
+            fill_from_pinned(keep_indices_device, keep_indices_cpu)
+        else:
+            keep_indices_device = torch.tensor(
+                keep_indices,
+                dtype=torch.int64,
+                pin_memory=is_pin_memory_available(self.device),
+            ).to(self.device, non_blocking=True)
 
         if self.model_config.is_encoder_decoder:
             self.encoder_lens = self.encoder_lens[keep_indices_device]

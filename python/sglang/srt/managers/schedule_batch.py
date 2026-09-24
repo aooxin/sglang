@@ -663,15 +663,16 @@ class Req(ReqDllmMixin):
         self._is_reasoning_over = False
         self.reasoning_tokens = 0
 
-        # Sampling info
+        # Keep request parameters independent, but do not store a reference to
+        # this Req in them: Req -> SamplingParams -> custom_params -> Req would
+        # retain completed requests (including long token lists) until cyclic GC.
+        # SamplingBatchInfo binds __req__ in its batch-owned processor params.
         if isinstance(sampling_params.custom_params, dict):
             sampling_params = copy.copy(sampling_params)
-            sampling_params.custom_params = sampling_params.custom_params | {
-                "__req__": self
-            }
+            sampling_params.custom_params = sampling_params.custom_params.copy()
         elif custom_logit_processor is not None:
             sampling_params = copy.copy(sampling_params)
-            sampling_params.custom_params = {"__req__": self}
+            sampling_params.custom_params = {}
         self.sampling_params = sampling_params
         self.custom_logit_processor = custom_logit_processor
         self.return_hidden_states = return_hidden_states
@@ -2380,6 +2381,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if keep_indices is None or len(keep_indices) == 0:
             # Filter out all requests
             self.reqs = []
+            # Release batch-owned processor references without mutating params
+            # that an in-flight forward snapshot may still be using.
+            self.sampling_info = None
             return
 
         if len(keep_indices) == len(self.reqs):

@@ -594,7 +594,10 @@ class TestFromScheduleBatch(CustomTestCase):
         self.assertFalse(mask[1].item())
         # custom_params should be collected for all reqs
         self.assertEqual(len(info.custom_params), 2)
-        self.assertEqual(info.custom_logit_processor_params[key], [{"token_ids": [1]}])
+        self.assertEqual(
+            info.custom_logit_processor_params[key],
+            [{"token_ids": [1], "__req__": req1}],
+        )
         self.assertEqual(info.custom_logit_processor_indices[key], [0])
         self.assertTrue(
             torch.equal(

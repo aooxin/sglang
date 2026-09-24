@@ -143,7 +143,16 @@ class SamplingBatchInfo:
                     processor_dict[processor_str] = []
                 processor_dict[processor_str].append(i)
 
-            custom_params = [r.sampling_params.custom_params for r in reqs]
+            # Only the batch owns these references to Req. Never write the
+            # bound dict back to r.sampling_params, which would create a cycle.
+            custom_params = []
+            for r in reqs:
+                params = r.sampling_params.custom_params
+                if r.custom_logit_processor is not None:
+                    params = (params if isinstance(params, dict) else {}) | {
+                        "__req__": r
+                    }
+                custom_params.append(params)
             merged_custom_logit_processor = {}
             custom_logit_processor_params = {}
             custom_logit_processor_indices = {}
@@ -487,9 +496,8 @@ class SamplingBatchInfo:
                     self_custom_params[i] for i in left_indices
                 ] + [other_custom_params[i] for i in right_indices]
 
-            # Merge the custom params lists
-            self.custom_params = self_custom_params
-            self.custom_params.extend(other_custom_params)
+            # Do not extend a list shared with an in-flight forward snapshot.
+            self.custom_params = self_custom_params + other_custom_params
 
             # Set the flag to True if any of the two has custom logit processor
             self.has_custom_logit_processor = True

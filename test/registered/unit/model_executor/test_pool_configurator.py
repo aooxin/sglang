@@ -1008,6 +1008,65 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
         self.assertLess(_tokens(10240), _tokens(None))
 
+    def test_chunk_cap_budget_includes_draft_pool(self):
+        """Fixed SWA capacity must leave room for both full and DFLASH pools."""
+        available = 16_000_000
+        page_size = 64
+        for mode in ("prefill", "decode"):
+            for draft_kv_per_token in (5120, 10240):
+                with self.subTest(mode=mode, draft_kv_per_token=draft_kv_per_token):
+                    mr = _make_model_runner(
+                        self,
+                        num_layers=2,
+                        is_hybrid_swa=True,
+                        full_attention_layer_ids=[0],
+                        swa_attention_layer_ids=[1],
+                        swa_num_kv_heads=8,
+                        disable_radix_cache=True,
+                        chunked_prefill_size=256,
+                        sliding_window_size=128,
+                        page_size=page_size,
+                        max_running_requests=2,
+                        speculative_algorithm="DFLASH",
+                        speculative_num_steps=1,
+                        speculative_eagle_topk=1,
+                        speculative_num_draft_tokens=8,
+                        disaggregation_mode=mode,
+                        disaggregation_decode_extra_slots=2,
+                    )
+                    mr.spec_algorithm.is_dflash_family.return_value = True
+                    mr.spec_algorithm.is_none.return_value = False
+                    mr.spec_aux_config.dflash_draft_num_layers = 5
+                    mr.spec_aux_config.dflash_draft_cell_size_per_token = (
+                        draft_kv_per_token
+                    )
+
+                    with (
+                        get_memory().override(enable_unified_memory=False),
+                        mock_cpu_env(),
+                    ):
+                        from sglang.srt.model_executor.pool_configurator import (
+                            SWAChunkCapPoolConfigurator,
+                            create_memory_pool_configurator,
+                        )
+
+                        cfg = create_memory_pool_configurator(mr)
+                        config = cfg.calculate_pool_sizes(available, page_size)
+
+                    self.assertIsInstance(cfg, SWAChunkCapPoolConfigurator)
+                    full_tokens = config.full_max_total_num_tokens
+                    self.assertEqual(config.max_total_num_tokens, full_tokens)
+                    self.assertEqual(full_tokens % page_size, 0)
+                    used = (
+                        _actual_memory_used(mr, config)
+                        + full_tokens * draft_kv_per_token
+                    )
+                    self.assertLessEqual(used, available)
+                    # One target full layer: 4 heads * (64 + 64) dims * 2 bytes.
+                    # Another shared page must not fit after sizing both pools.
+                    next_page_bytes = page_size * (1024 + draft_kv_per_token)
+                    self.assertGreater(used + next_page_bytes, available)
+
 
 class TestSWAPoolFloor(CustomTestCase):
     """An SWA pool below the prefill admission floor must fail here, not livelock

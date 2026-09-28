@@ -1,3 +1,5 @@
+rm -f ./sglang_server.log
+
 python3 -m sglang.launch_server \
               --model-path /preset-models/ \
               --served-model-name mimo-v2-pro-0520 \
@@ -47,4 +49,5 @@ python3 -m sglang.launch_server \
               --disable-tokenizer-batch-decode \
               --context-length 1048576 \
               --load-balance-method round_robin \
-              --tokenizer-worker-num 64 --swa-full-tokens-ratio 0.3
+              --tokenizer-worker-num 64 --swa-full-tokens-ratio 0.3 \
+              2>&1 | tee ./sglang_server.log

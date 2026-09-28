@@ -1,3 +1,8 @@
+rm -f ./sglang_server.log
+
+unset NCCL_DEBUG_SUBSYS && unset NCCL_DEBUG && unset NVSHMEM_DEBUG_SUBSYS && unset NVSHMEM_DEBUG
+export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
+
 python3 -m sglang.launch_server \
               --model-path /preset-models/ \
               --served-model-name mimo-v2-pro-0520 \
@@ -43,4 +48,5 @@ python3 -m sglang.launch_server \
               --disable-tokenizer-batch-decode \
               --context-length 1048576 \
               --numa-node 0 0 0 0 1 1 1 1 \
-              --tokenizer-worker-num 64 --swa-full-tokens-ratio 0.3
+              --tokenizer-worker-num 64 --swa-full-tokens-ratio 0.3 \
+              2>&1 | tee ./sglang_server.log

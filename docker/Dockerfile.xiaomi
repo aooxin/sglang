@@ -15,6 +15,16 @@ RUN python3 -c "from importlib import metadata, util; from pathlib import Path; 
     assert spec is not None and spec.origin and Path(spec.origin).resolve() == expected, \
         f'Expected an editable SGLang installation at {expected}, got {spec}'"
 
+# Enable CUDA 13.0 forward compatibility on H20 hosts with an R570 driver.
+# The official CUDA base normally includes this package; install it if missing.
+RUN if [ ! -r /usr/local/cuda-13.0/compat/libcuda.so.1 ]; then \
+        apt-get update \
+        && apt-get install -y --no-install-recommends cuda-compat-13-0 \
+        && rm -rf /var/lib/apt/lists/*; \
+    fi \
+    && test -r /usr/local/cuda-13.0/compat/libcuda.so.1
+ENV LD_LIBRARY_PATH="/usr/local/cuda-13.0/compat:${LD_LIBRARY_PATH}"
+
 # GCache is optional for the Python package; the internal image includes the
 # same Python 3.12 SDK wheel as the legacy deployment.
 ARG GCACHE_SDK_WHEEL_URL=https://cnbj1-fds.api.xiaomi.net/juicefs/gcache/release/2.1/20260917-5978d0b2/gcache_sdk-2.1.0+g5978d0b2.py312.release.2.1-py3-none-any.whl

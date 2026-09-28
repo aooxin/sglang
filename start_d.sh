@@ -2,6 +2,8 @@ rm -f ./sglang_server.log
 
 unset NCCL_DEBUG_SUBSYS && unset NCCL_DEBUG && unset NVSHMEM_DEBUG_SUBSYS && unset NVSHMEM_DEBUG
 export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
+# DFLASH verify: 96 requests * 8 tokens / (TP 8 / DP 2) = 192 tokens per rank.
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
 
 python3 -m sglang.launch_server \
               --model-path /preset-models/ \

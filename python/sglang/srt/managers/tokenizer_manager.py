@@ -129,6 +129,8 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 _MM_CONTEXT_FETCH_TIMEOUT_S = envs.SGLANG_MM_CONTEXT_FORWARD_TIMEOUT.get()
+# Retained for compatibility: a node on --enable-mm-context-forward has no local
+# tower to fall back to, so a miss is always fatal and this is no longer consulted.
 _MM_CONTEXT_FORWARD_FALLBACK = envs.SGLANG_MM_CONTEXT_FORWARD_FALLBACK.get()
 
 logger = logging.getLogger(__name__)
@@ -428,6 +430,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             )
 
         self._enable_mm_context_forward = self.server_args.enable_mm_context_forward
+        # A decode node that takes the expanded multimodal length from prefill has
+        # no tower to preprocess with, so it can never do the work locally: the
+        # length has to arrive via mm-context forwarding, and a miss is fatal.
+        self._no_local_vision_tower = (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and not self.server_args.has_local_vision_tower
+        )
         self._mm_context_session: Optional[aiohttp.ClientSession] = None
         self._mm_context_tasks: set = set()
 
@@ -739,11 +748,22 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
             logger.debug(
                 f"mm_context hit for rid={obj.rid}, expanded_len={expanded_len}"
             )
-        elif attempted_mm_context and not _MM_CONTEXT_FORWARD_FALLBACK:
+        elif attempted_mm_context:
+            # Reaching here means the node is on --enable-mm-context-forward and
+            # is a decode node, so it has no local vision tower to preprocess
+            # with: the forwarded length is the only way it can serve the
+            # request. Name the checks that make the forward land.
             raise ValueError(
                 f"mm_context forward miss for rid={obj.rid}, "
                 f"room={obj.bootstrap_room}: no payload within the wait "
-                f"window and local fallback is disabled."
+                f"window. A decode node on --enable-mm-context-forward has no "
+                f"local vision tower, so the expanded length must be forwarded "
+                f"from prefill. Check that prefill runs with "
+                f"--enable-mm-context-forward, that prefill can reach this node "
+                f"at the bootstrap_host/port the request was routed with, and "
+                f"that its multimodal preprocess finished within "
+                f"SGLANG_MM_CONTEXT_FORWARD_TIMEOUT "
+                f"({envs.SGLANG_MM_CONTEXT_FORWARD_TIMEOUT.get()}s)."
             )
         elif obj.input_embeds is not None:
             if not self.server_args.disable_radix_cache:
@@ -774,6 +794,24 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 )
 
         if is_mm_request:
+            # Guard the remaining paths into local multimodal preprocessing: a
+            # decode node on --enable-mm-context-forward has no tower to run them
+            # on, so anything short of an mm-context hit is a request we cannot
+            # serve. Failing here keeps a broken request from silently producing
+            # a text-only input_ids of the wrong length.
+            if self._no_local_vision_tower and not mm_context_hit:
+                raise ValueError(
+                    f"decode node on --enable-mm-context-forward cannot serve "
+                    f"multimodal request rid={obj.rid}: it has no local vision "
+                    f"tower and no expanded input length was forwarded from prefill "
+                    f"(bootstrap_host={obj.bootstrap_host}, "
+                    f"bootstrap_room={obj.bootstrap_room}, "
+                    f"input_embeds={'set' if obj.input_embeds is not None else 'unset'}). "
+                    f"A request reaching this node needs either bootstrap routing "
+                    f"so prefill can forward the length, or input_embeds already "
+                    f"set. Check that the router is in PD mode and that prefill "
+                    f"runs with --enable-mm-context-forward."
+                )
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
             if obj.video_data is not None and not isinstance(obj.video_data, list):

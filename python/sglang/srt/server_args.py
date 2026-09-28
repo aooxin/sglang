@@ -1374,7 +1374,7 @@ class ServerArgs:
             # Multimodal models need more memory for the image processing,
             # so we adjust the mem_fraction_static accordingly.
             model_config = self.get_model_config()
-            if model_config.is_multimodal and not self.language_only:
+            if model_config.is_multimodal and self.has_local_vision_tower:
                 self.adjust_mem_fraction_for_vlm(model_config)
 
         # If symm mem is enabled and prealloc size is not set, set it to 4GB
@@ -3633,6 +3633,36 @@ class ServerArgs:
         if self.language_only and len(self.encoder_urls) == 0:
             raise ValueError(
                 "requires at least one encoder urls to be set via --encoder-urls"
+            )
+
+        # On a decode node the tower-free shape is expressed by the forwarding flag
+        # instead: it already means "the length comes from prefill", so it drops the
+        # tower without also making this node an encoder client that redundantly
+        # re-encodes every request.
+        if self.language_only and self.disaggregation_mode == "decode":
+            raise ValueError(
+                "--language-only is not accepted on a decode node: it would make the "
+                "node an encoder client and re-encode every request. Use "
+                "--enable-mm-context-forward instead, which drops the vision tower "
+                "and takes the expanded input length from the prefill node."
+            )
+
+        # mm-context forwarding is published by whichever node computes the expanded
+        # length. With zmq_to_scheduler the encoder embeddings land in the scheduler,
+        # so the tokenizer never sees them and cannot publish; only the
+        # tokenizer-side backends can.
+        if (
+            self.language_only
+            and self.disaggregation_mode == "prefill"
+            and self.enable_mm_context_forward
+            and self.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
+            raise ValueError(
+                "--enable-mm-context-forward with --language-only cannot publish the "
+                "expanded input length when --encoder-transfer-backend is "
+                "zmq_to_scheduler on a prefill node: the encoder embeddings are "
+                "received in the scheduler, not the tokenizer. Use zmq_to_tokenizer "
+                "or mooncake, or drop --enable-mm-context-forward."
             )
 
         if (
@@ -6648,6 +6678,21 @@ class ServerArgs:
         # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE and page_size.
         # It is used to determine the caching point in a sequence during prefill.
         return max(FLA_CHUNK_SIZE, self.page_size)
+
+    @property
+    def has_local_vision_tower(self) -> bool:
+        """Whether this node builds the vision/audio tower.
+
+        False in two cases: --language-only (this node serves the language half of
+        a split model), or a decode node on --enable-mm-context-forward, which
+        takes the expanded multimodal length from the prefill node and so has
+        nothing to preprocess locally.
+        """
+        if self.language_only:
+            return False
+        return not (
+            self.enable_mm_context_forward and self.disaggregation_mode == "decode"
+        )
 
     def check_server_args(self):
         # Check parallel size constraints

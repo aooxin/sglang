@@ -366,7 +366,10 @@ class ModelConfig:
             quantize_and_serve=server_args.quantize_and_serve,
             override_config_file=override_config_file,
             is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
-            language_only=server_args.language_only,
+            # Drives the tower-skip checks in the model implementations, so it also
+            # covers a decode node on --enable-mm-context-forward: it has no tower
+            # to build either.
+            language_only=not server_args.has_local_vision_tower,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,

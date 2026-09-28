@@ -461,5 +461,116 @@ class TestEncoderSha1RoutingArgs(unittest.TestCase):
         self.assertFalse(args.enable_encoder_url_sha1_header)
 
 
+class TestLanguageOnlyArgs(unittest.TestCase):
+    """--language-only, and the tower-free decode node.
+
+    --language-only keeps its original meaning and its --encoder-urls
+    requirement. A decode node gets the tower-free shape from
+    --enable-mm-context-forward instead: that drops the tower without also
+    making the node an encoder client that re-encodes every request.
+
+    A language-only prefill node is the publisher of the expanded length, which
+    only works on the tokenizer-side encoder backends.
+    """
+
+    # Must be in _handle_encoder_disaggregation's supported-architecture list.
+    arch = "Qwen2VLForConditionalGeneration"
+
+    def _make_args(self, **overrides) -> ServerArgs:
+        args = ServerArgs(model_path="dummy")
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def _run_handler(self, args: ServerArgs) -> None:
+        """Run the handler with the model-config lookup stubbed out."""
+        fake_cfg = MagicMock()
+        fake_cfg.hf_config.architectures = [self.arch]
+        with patch.object(args, "get_model_config", return_value=fake_cfg):
+            args._handle_encoder_disaggregation()
+
+    # --- --language-only is unchanged, and not accepted on decode ---
+
+    def test_decode_rejects_language_only(self):
+        args = self._make_args(
+            language_only=True,
+            disaggregation_mode="decode",
+            encoder_urls=["http://encoder:30000"],
+        )
+        with self.assertRaisesRegex(ValueError, "not accepted on a decode node"):
+            self._run_handler(args)
+
+    def test_language_only_still_requires_encoder_urls(self):
+        for mode in ("prefill", "null"):
+            with self.subTest(disaggregation_mode=mode):
+                args = self._make_args(language_only=True, disaggregation_mode=mode)
+                with self.assertRaisesRegex(ValueError, "encoder urls"):
+                    self._run_handler(args)
+
+    # --- the tower-free decode node ---
+
+    def test_decode_on_forwarding_needs_no_encoder_urls(self):
+        self._run_handler(
+            self._make_args(
+                disaggregation_mode="decode", enable_mm_context_forward=True
+            )
+        )
+
+    def test_has_local_vision_tower(self):
+        """The single value the whole feature hangs on."""
+        cases = [
+            # plain decode keeps its tower and preprocesses locally
+            (dict(disaggregation_mode="decode"), True),
+            # a decode node on forwarding has nothing to preprocess with
+            (dict(disaggregation_mode="decode", enable_mm_context_forward=True), False),
+            # forwarding on a prefill node changes nothing about the tower
+            (dict(disaggregation_mode="prefill", enable_mm_context_forward=True), True),
+            # --language-only serves the language half, so no tower
+            (dict(language_only=True, disaggregation_mode="prefill"), False),
+        ]
+        for overrides, expected in cases:
+            with self.subTest(**overrides):
+                args = self._make_args(**overrides)
+                self.assertIs(args.has_local_vision_tower, expected)
+
+    # --- the prefill node is the publisher of the expanded length ---
+
+    def _prefill(self, **overrides) -> ServerArgs:
+        return self._make_args(
+            language_only=True,
+            disaggregation_mode="prefill",
+            encoder_urls=["http://encoder:30000"],
+            **overrides,
+        )
+
+    def test_prefill_cannot_publish_with_zmq_to_scheduler(self):
+        """The embeddings land in the scheduler, so the tokenizer cannot publish."""
+        args = self._prefill(
+            enable_mm_context_forward=True,
+            encoder_transfer_backend="zmq_to_scheduler",
+        )
+        with self.assertRaisesRegex(ValueError, "zmq_to_tokenizer or mooncake"):
+            self._run_handler(args)
+
+    def test_prefill_publishes_on_tokenizer_side_backends(self):
+        for backend in ("zmq_to_tokenizer", "mooncake"):
+            with self.subTest(backend=backend):
+                self._run_handler(
+                    self._prefill(
+                        enable_mm_context_forward=True,
+                        encoder_transfer_backend=backend,
+                    )
+                )
+
+    def test_prefill_with_zmq_to_scheduler_is_fine_without_forwarding(self):
+        """Plain EPD keeps working: no forwarding, so nothing needs publishing."""
+        self._run_handler(
+            self._prefill(
+                enable_mm_context_forward=False,
+                encoder_transfer_backend="zmq_to_scheduler",
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

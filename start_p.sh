@@ -2,6 +2,8 @@ rm -f ./sglang_server.log
 
 unset NCCL_DEBUG_SUBSYS && unset NCCL_DEBUG && unset NVSHMEM_DEBUG_SUBSYS && unset NVSHMEM_DEBUG
 export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
+# Compile actual shapes on demand instead of sweeping all M values in a request.
+export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
 
 python3 -m sglang.launch_server \
               --model-path /preset-models/ \
@@ -22,6 +24,7 @@ python3 -m sglang.launch_server \
               --port 9001 \
               --trust-remote-code \
               --watchdog-timeout 1000000 \
+              --dist-timeout 1800 \
               --mem-fraction-static 0.80 \
               --chunked-prefill-size 32768 \
               --reasoning-parser mimo \
@@ -37,11 +40,18 @@ python3 -m sglang.launch_server \
               --skip-server-warmup \
               --moe-dense-tp-size 1 \
               --enable-dp-lm-head \
+              --enable-hierarchical-cache \
               --speculative-algorithm EAGLE \
               --speculative-num-steps 3 \
               --speculative-eagle-topk 1 \
               --speculative-num-draft-tokens 4 \
               --enable-multi-layer-eagle \
+              --hicache-ratio 2.5 \
+              --hicache-mem-layout page_first \
+              --hicache-write-policy write_through \
+              --hicache-storage-prefetch-policy wait_complete \
+              --hicache-storage-backend gcache \
+              --hicache-storage-backend-extra-config '{"prefetch_threshold": 16}' \
               --dist-init-addr ${LWS_LEADER_IP}:20000 \
               --node-rank ${LWS_WORKER_INDEX} \
               --nnodes ${LWS_GROUP_SIZE} \

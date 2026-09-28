@@ -1,5 +1,8 @@
 rm -f ./sglang_server.log
 
+unset NCCL_DEBUG_SUBSYS && unset NCCL_DEBUG && unset NVSHMEM_DEBUG_SUBSYS && unset NVSHMEM_DEBUG
+export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
+
 python3 -m sglang.launch_server \
               --model-path /preset-models/ \
               --served-model-name mimo-v2-pro-0520 \
@@ -21,6 +24,7 @@ python3 -m sglang.launch_server \
               --port 9001 \
               --trust-remote-code \
               --watchdog-timeout 1000000 \
+              --dist-timeout 1800 \
               --mem-fraction-static 0.7 \
               --max-running-requests 192 \
               --cuda-graph-max-bs-decode 96 \

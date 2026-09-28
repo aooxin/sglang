@@ -40,11 +40,10 @@ python3 -m sglang.launch_server \
               --allow-auto-truncate \
               --disable-radix-cache \
               --enable-metrics-for-all-schedulers \
-              --speculative-algorithm EAGLE \
-              --speculative-num-steps 3 \
-              --speculative-eagle-topk 1 \
-              --speculative-num-draft-tokens 4 \
-              --enable-multi-layer-eagle \
+              --speculative-algorithm DFLASH \
+              --speculative-draft-model-path /preset-models/dflash/ \
+              --speculative-num-draft-tokens 8 \
+              --speculative-draft-attention-backend fa3 \
               --moe-dense-tp-size 1 \
               --enable-dp-lm-head \
               --dist-init-addr ${LWS_LEADER_IP}:20000 \

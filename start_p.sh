@@ -1,5 +1,8 @@
 rm -f ./sglang_server.log
 
+export GCACHE_MASTER_ADDR="${GCACHE_MASTER_ADDR:-bj9-cloudml.juicefs.srv}"
+export GCACHE_CACHE_GROUP="${GCACHE_CACHE_GROUP:-gcache-bj9-bcecn-dev-test}"
+
 unset NCCL_DEBUG_SUBSYS && unset NCCL_DEBUG && unset NVSHMEM_DEBUG_SUBSYS && unset NVSHMEM_DEBUG
 export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
 # Compile actual shapes on demand instead of sweeping all M values in a request.
@@ -41,11 +44,10 @@ python3 -m sglang.launch_server \
               --moe-dense-tp-size 1 \
               --enable-dp-lm-head \
               --enable-hierarchical-cache \
-              --speculative-algorithm EAGLE \
-              --speculative-num-steps 3 \
-              --speculative-eagle-topk 1 \
-              --speculative-num-draft-tokens 4 \
-              --enable-multi-layer-eagle \
+              --speculative-algorithm DFLASH \
+              --speculative-draft-model-path /preset-models/dflash/ \
+              --speculative-num-draft-tokens 8 \
+              --speculative-draft-attention-backend fa3 \
               --hicache-ratio 2.5 \
               --hicache-mem-layout page_first \
               --hicache-write-policy write_through \

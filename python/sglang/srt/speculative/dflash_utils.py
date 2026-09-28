@@ -394,8 +394,45 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
     ]
 
 
+def get_dflash_legacy_swa_window(config: Any) -> Optional[int]:
+    """Legacy window_left, -1 for explicit full attention, or None for modern configs.
+
+    Legacy DFlash checkpoints store the FA window directly in dflash_config;
+    unlike HF sliding_window it does not include the current token. The explicit
+    marker also takes precedence over Qwen3's generated full_attention layers.
+    """
+    dflash_config = _get_dflash_config(config)
+    if "use_swa" not in dflash_config:
+        return None
+    use_swa = dflash_config["use_swa"]
+    if not isinstance(use_swa, bool):
+        raise ValueError("DFLASH dflash_config.use_swa must be a bool.")
+    if not use_swa:
+        return -1
+    window = dflash_config.get("swa_window_size")
+    if window is None:
+        window = _cfg_get(
+            _get_text_config(config),
+            "sliding_window",
+            _cfg_get(config, "sliding_window"),
+        )
+    if not isinstance(window, Integral) or isinstance(window, bool) or window <= 0:
+        raise ValueError(
+            "DFLASH dflash_config.swa_window_size must be a positive integer "
+            "when use_swa=true (or provide config.sliding_window)."
+        )
+    return int(window)
+
+
 def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
     text_config = _get_text_config(config)
+    legacy_window = get_dflash_legacy_swa_window(config)
+    if legacy_window is not None:
+        num_layers = _cfg_get(text_config, "num_hidden_layers")
+        if not isinstance(num_layers, Integral) or num_layers <= 0:
+            raise ValueError("DFLASH config.num_hidden_layers must be positive.")
+        layer_type = "sliding_attention" if legacy_window > 0 else "full_attention"
+        return [layer_type] * int(num_layers)
     layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
     if layer_types is None:
         return None
@@ -407,6 +444,9 @@ def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
 
 
 def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
+    legacy_window = get_dflash_legacy_swa_window(config)
+    if legacy_window is not None:
+        return legacy_window if legacy_window > 0 else None
     layer_types = get_dflash_layer_types(config)
     if layer_types is None or "sliding_attention" not in layer_types:
         return None
@@ -546,6 +586,8 @@ class DFlashDraftConfig:
     emb_dim: Optional[int]
     attention_sink_bias: bool = False
     attention_value_scale: Optional[float] = None
+    use_swa: Optional[bool] = None
+    swa_window_size: Optional[int] = None
 
     @property
     def is_domino(self) -> bool:
@@ -598,6 +640,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     """Parse and validate DFLASH draft config fields from HF config/dict."""
     dflash_cfg = _get_dflash_config(draft_hf_config)
     draft_text_config = _get_text_config(draft_hf_config)
+    legacy_window = get_dflash_legacy_swa_window(draft_hf_config)
 
     num_hidden_layers = _parse_optional_int(
         _cfg_get(draft_text_config, "num_hidden_layers", None),
@@ -819,6 +862,10 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         emb_dim=emb_dim,
         attention_sink_bias=attention_sink_bias,
         attention_value_scale=attention_value_scale,
+        use_swa=None if legacy_window is None else legacy_window > 0,
+        swa_window_size=legacy_window
+        if legacy_window is not None and legacy_window > 0
+        else None,
     )
 
 

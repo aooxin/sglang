@@ -1253,22 +1253,30 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not get_parallel().enable_dp_attention:
             return
 
-        tp_group = get_tp_group()
-        tp_size = int(tp_group.world_size)
-        if tp_size <= 1:
-            return
-
         target_model = self._target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
         local_w = embed_module.weight.data
-        shard = getattr(embed_module, "shard_indices", None)
-        num_org = int(shard.num_org_elements) if shard else local_w.shape[0]
         vocab_size = int(self._target_worker.model_runner.model_config.vocab_size)
-
-        shard_t = local_w[:num_org].contiguous()
-        parts = [torch.empty_like(shard_t) for _ in range(tp_size)]
-        dist.all_gather(parts, shard_t, group=tp_group.device_group)
-        self._full_embed_gpu = torch.cat(parts, dim=0)[:vocab_size]
+        if int(getattr(embed_module, "tp_size", 1)) > 1:
+            tp_group = (
+                get_parallel().attn_tp_group
+                if getattr(embed_module, "use_attn_tp_group", False)
+                else get_tp_group()
+            )
+            # Gather equally sized *padded* shards. The last shard can contain
+            # fewer real tokens, so gathering only num_org_elements can hang
+            # NCCL. Use the embedding's own group and mapping, including added
+            # vocabulary, instead of concatenating duplicate DP replicas.
+            parts = [torch.empty_like(local_w) for _ in range(tp_group.world_size)]
+            dist.all_gather(parts, local_w.contiguous(), group=tp_group.device_group)
+            full_w = torch.cat(parts, dim=0)
+            mapping = embed_module.get_sharded_to_full_mapping()
+            if mapping is not None:
+                indices = torch.tensor(mapping[:vocab_size], device=local_w.device)
+                full_w = full_w.index_select(0, indices)
+        else:
+            full_w = local_w
+        self._full_embed_gpu = full_w[:vocab_size].contiguous()
         if self.ps.tp_rank == 0:
             logger.info(
                 "DFLASH cached full embed on GPU for dp attention: shape=%s",

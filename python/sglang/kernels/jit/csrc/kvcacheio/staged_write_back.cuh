@@ -35,7 +35,19 @@ using CudaMemcpyBatchAsyncFn = cudaError_t (*)(
 #endif
 
 inline auto get_cuda_memcpy_batch_async() -> CudaMemcpyBatchAsyncFn {
-  static CudaMemcpyBatchAsyncFn cuda_memcpy_batch_async = []() {
+  static CudaMemcpyBatchAsyncFn cuda_memcpy_batch_async = []() -> CudaMemcpyBatchAsyncFn {
+    // PyTorch and JIT extensions may load different libcudart majors. The
+    // RTLD_DEFAULT symbol can come from CUDA 12 even with CUDA 13 headers (or
+    // vice versa); the fail_idx argument was removed in CUDA 13. Do not call
+    // that symbol through an incompatible function pointer. The ordinary
+    // cudaMemcpyAsync fallback below has a stable signature across both.
+    using RuntimeVersionFn = cudaError_t (*)(int*);
+    auto get_runtime_version = reinterpret_cast<RuntimeVersionFn>(dlsym(RTLD_DEFAULT, "cudaRuntimeGetVersion"));
+    int runtime_version = 0;
+    if (get_runtime_version == nullptr || get_runtime_version(&runtime_version) != cudaSuccess ||
+        runtime_version < 12080 || runtime_version / 1000 != CUDA_VERSION / 1000) {
+      return nullptr;
+    }
     void* symbol = dlsym(RTLD_DEFAULT, "cudaMemcpyBatchAsync");
     return reinterpret_cast<CudaMemcpyBatchAsyncFn>(symbol);
   }();

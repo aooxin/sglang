@@ -88,23 +88,66 @@ def test_all_swa_draft_never_requires_a_full_draft_object(backend_factory):
     assert len(backend.gcache_client.registrations) == 2
 
 
+@pytest.mark.parametrize("component", ["k", "v"])
+@pytest.mark.parametrize("page_size,draft_layers", [(2, 1), (64, 5)])
 def test_missing_draft_component_limits_prefix_and_reports_read_failure(
-    backend_factory,
+    backend_factory, component, page_size, draft_layers
 ):
-    backend = backend_factory()
-    draft = make_mha_pool(layers=1)
+    backend = backend_factory(make_mha_pool(size=4 * page_size, page_size=page_size))
+    draft = make_mha_pool(size=4 * page_size, page_size=page_size, layers=draft_layers)
     backend.register_mem_host_pool_v2(draft, PoolName.DRAFT)
+    fill_pool(draft, seed=41)
+    expected = [page_bytes(draft, i * page_size) for i in range(3)]
     keys = ["h0", "h1", "h2"]
-    indices = torch.arange(6)
+    indices = torch.arange(3 * page_size)
     transfer = PoolTransfer(
         PoolName.DRAFT, indices, keys=keys, indices_from_pool=PoolName.KV
     )
     assert backend.batch_set_v1(keys, indices) == [True] * 3
     assert backend.batch_set_v2([transfer])[PoolName.DRAFT] == [True] * 3
-    backend_factory.server.delete("d:model_h1_1_full_v")
+    backend_factory.server.delete(f"d:model_h1_1_full_{component}")
     assert backend.batch_exists(keys) == 3
     assert backend.batch_exists_v2(keys, [transfer]).restorable_prefix_pages == [1]
+    draft.k_buffer.zero_()
+    draft.v_buffer.zero_()
     assert backend.batch_get_v2([transfer])[PoolName.DRAFT] == [True, False, True]
+    assert page_bytes(draft, 0) == expected[0]
+    assert page_bytes(draft, 2 * page_size) == expected[2]
+
+
+@pytest.mark.parametrize("component", ["k", "v"])
+def test_five_layer_draft_swa_requires_complete_1024_token_tail(
+    backend_factory, component
+):
+    page_size, pages = 64, 20
+    backend = backend_factory(
+        make_mha_pool(size=pages * page_size, page_size=page_size)
+    )
+    draft = make_mha_pool(size=pages * page_size, page_size=page_size, layers=5)
+    backend.register_mem_host_pool_v2(draft, PoolName.DRAFT_SWA)
+    keys = [f"h{i}" for i in range(pages)]
+    indices = torch.arange(pages * page_size)
+    assert backend.batch_set_v1(keys, indices) == [True] * pages
+    assert (
+        backend.batch_set_v2([PoolTransfer(PoolName.DRAFT_SWA, indices, keys=keys)])[
+            PoolName.DRAFT_SWA
+        ]
+        == [True] * pages
+    )
+    query = PoolTransfer(
+        PoolName.DRAFT_SWA,
+        keys=["window"] * 16,
+        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+    )
+    # An early missing page only disqualifies prefixes whose 1024-token
+    # draft tail still covers it. Longer prefixes can be restored again.
+    backend_factory.server.delete(f"d:model_h1_1_swa_{component}")
+    result = backend.batch_exists_v2(keys, [query])
+    assert result.kv_hit_pages == pages
+    assert result.restorable_prefix_pages == [1, 18, 19, 20]
+    # A missing page in the last 16 pages must not count as a complete hit.
+    backend_factory.server.delete(f"d:model_h18_1_swa_{component}")
+    assert backend.batch_exists_v2(keys, [query]).restorable_prefix_pages == [1, 18]
 
 
 if __name__ == "__main__":

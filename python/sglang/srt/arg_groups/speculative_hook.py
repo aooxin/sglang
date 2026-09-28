@@ -206,11 +206,23 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "DFLASH speculative decoding only supports CUDA, NPU and XPU devices."
         )
 
-    # DFLASH + dp attention is validated on NPU only.
-    if cfg.enable_dp_attention and not cfg.device == "npu":
+    # CUDA DFlash runs the draft within each attention-TP subgroup. Its
+    # borrowed vocabulary head must be sharded on that same group: idle peer
+    # DP ranks cannot join a global-TP draft sampling collective.
+    if cfg.enable_dp_attention and not (
+        cfg.device.startswith("cuda") or cfg.device == "npu"
+    ):
         raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp "
-            "attention on non-NPU devices."
+            "DFLASH dp attention currently supports CUDA and NPU devices only."
+        )
+    if (
+        cfg.enable_dp_attention
+        and cfg.device.startswith("cuda")
+        and not cfg.enable_dp_lm_head
+    ):
+        raise ValueError(
+            "DFLASH with CUDA dp attention requires --enable-dp-lm-head "
+            "so draft sampling covers the full vocabulary within each DP group."
         )
 
     if cfg.pp_size != 1:
@@ -739,7 +751,10 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     if draft_backend is None:
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
-        from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
+        from sglang.srt.speculative.dflash_utils import (
+            get_dflash_layer_types,
+            get_dflash_legacy_swa_window,
+        )
         from sglang.srt.utils.hf_transformers_utils import get_config
 
         draft_hf_config = get_config(
@@ -757,6 +772,9 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             layer_types
             and len(layer_types) == num_layers
             and set(layer_types) == {"sliding_attention"}
+            # The legacy sliding layers are bidirectional by default; the
+            # TRT-LLM SWA path assumes causal attention.
+            and get_dflash_legacy_swa_window(draft_hf_config) is None
         )
         all_causal = getattr(draft_text_config, "is_causal", False) is True
         if not (all_sliding or all_causal):

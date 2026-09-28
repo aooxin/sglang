@@ -15,6 +15,22 @@ RUN python3 -c "from importlib import metadata, util; from pathlib import Path; 
     assert spec is not None and spec.origin and Path(spec.origin).resolve() == expected, \
         f'Expected an editable SGLang installation at {expected}, got {spec}'"
 
+# GCache is optional for the Python package; the internal image includes the
+# same Python 3.12 SDK wheel as the legacy deployment.
+ARG GCACHE_SDK_WHEEL_URL=https://cnbj1-fds.api.xiaomi.net/juicefs/gcache/release/2.1/20260917-5978d0b2/gcache_sdk-2.1.0+g5978d0b2.py312.release.2.1-py3-none-any.whl
+ARG GCACHE_SDK_WHEEL_SHA256=33df5f536cf06b16fce597b1461e9a52755c0d29ef584850f68dc1e94a6daf8b
+# Despite its py3-none-any filename, this wheel contains a CPython 3.12
+# x86_64 native extension. Fail clearly before installing on a different ABI.
+RUN python3 -c "import platform, sys; \
+    assert sys.implementation.name == 'cpython' and sys.version_info[:2] == (3, 12) \
+        and platform.system() == 'Linux' and platform.machine() == 'x86_64', \
+        'The pinned GCache SDK requires CPython 3.12 on Linux x86_64'" \
+    && python3 -m pip install --no-cache-dir --no-deps "${GCACHE_SDK_WHEEL_URL}#sha256=${GCACHE_SDK_WHEEL_SHA256}" \
+    && python3 -c "from importlib.metadata import version; from gcache_sdk import GCacheClient; \
+        assert version('gcache-sdk') == '2.1.0+g5978d0b2.py312.release.2.1'"
+COPY docker/gcache.flags /sgl-workspace/gcache.flags
+COPY --chmod=755 docker/wait-gcache-server.sh /home/work/gcache/wait-gcache-server.sh
+
 # Overlay the checkout while retaining the base image's generated _version.py
 # and compiled .so files, which .dockerignore excludes from the build context.
 # Dependency or Rust source changes require a matching rebuilt base image.

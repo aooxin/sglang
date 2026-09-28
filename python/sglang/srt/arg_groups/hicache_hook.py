@@ -57,6 +57,19 @@ def handle_hicache(server_args: Any):
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
+    validate_gcache_compatibility(server_args)
+
+
+def validate_gcache_compatibility(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.hicache_storage_backend != "gcache":
+        return
+    if cfg.pp_size != 1 or cfg.attn_cp_size != 1:
+        raise NotImplementedError("GCache requires pp_size=1 and attn_cp_size=1.")
+    if cfg.hicache_mem_layout not in ("page_first", "page_first_direct"):
+        raise ValueError("GCache requires page_first or page_first_direct host layout.")
+    if cfg.hicache_io_backend not in ("kernel", "direct"):
+        raise ValueError("GCache supports kernel or direct host I/O.")
 
 
 def handle_hicache_ratio_default(server_args: Any):
@@ -153,7 +166,7 @@ def resolve_layout_io_compatibility(server_args: Any):
 def resolve_storage_layout_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     if (
-        cfg.hicache_storage_backend not in ("mooncake", "npu_memcache")
+        cfg.hicache_storage_backend not in ("mooncake", "npu_memcache", "gcache")
         or cfg.hicache_mem_layout != "layer_first"
     ):
         return
@@ -172,7 +185,7 @@ def resolve_storage_layout_compatibility(server_args: Any):
         hicache_mem_layout=new_layout,
     )
     logger.warning(
-        f"Mooncake/Ascend MemCache storage backend does not support layer_first layout, "
+        f"{cfg.hicache_storage_backend} storage backend does not support layer_first layout, "
         f"switching to {new_layout} layout for {cfg.hicache_io_backend} io backend"
     )
 

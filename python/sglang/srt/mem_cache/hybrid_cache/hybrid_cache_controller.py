@@ -180,17 +180,32 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
         )
 
-        for entry in host_pools or []:
-            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+        try:
+            for entry in host_pools or []:
+                self.storage_backend.register_mem_host_pool_v2(
+                    entry.host_pool, entry.name
+                )
+        except Exception:
+            # Base attach has started workers. A side-pool failure must unwind
+            # that attach as well, so runtime retries do not see a half-attached
+            # backend or leave workers touching incomplete pool registrations.
+            self.detach_storage_backend()
+            raise
 
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
+        if entry.name in self.mem_pool_host.entry_map:
+            raise ValueError(f"Host pool {entry.name} is already registered.")
+        if entry.is_primary_index_anchor:
+            raise ValueError("Cannot replace the anchor of an existing HostPoolGroup.")
+        # Publish the new pool only after its storage registration succeeds.
+        # Native registration failures can then be retried with the same entry.
+        if self.enable_storage and self.storage_backend is not None:
+            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
-        if self.enable_storage and self.storage_backend is not None:
-            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     @staticmethod
     def parse_storage_backend_extra_config(
@@ -603,6 +618,9 @@ class HybridCacheController(BaseHiCacheController):
             # are prefix-covered, so re-querying only adds a round trip.
             kv_hit_pages = len(hash_value)
             operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+            operation.pool_storage_result.restorable_prefix_pages = list(
+                range(1, kv_hit_pages + 1)
+            )
             return hash_value, kv_hit_pages * self.page_size
 
         extra_info = HiCacheStorageExtraInfo(
@@ -620,11 +638,44 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        operation.pool_storage_result.restorable_prefix_pages = (
+            hit_result.restorable_prefix_pages
+        )
 
         return (
             hash_value[:kv_hit_pages],
             kv_hit_pages * self.page_size,
         )
+
+    def _sync_storage_hit_count(self, operation, storage_hit_count: int) -> int:
+        has_trailing_pool = any(
+            transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
+            for transfer in operation.pool_transfers or []
+        )
+        if (
+            not has_trailing_pool
+            or getattr(self.storage_backend, "supports_restorable_prefixes", False)
+            is not True
+        ):
+            return super()._sync_storage_hit_count(operation, storage_hit_count)
+
+        # A trailing window can be present at 6 pages and absent at 4. MIN of
+        # per-rank maxima is therefore insufficient. Every rank, including one
+        # that cancelled before querying, reduces the same fixed-size bitmap.
+        num_pages = len(operation.token_ids) // self.page_size
+        valid = torch.zeros(num_pages + 1, dtype=torch.int)
+        valid[0] = 1
+        for pages in operation.pool_storage_result.restorable_prefix_pages or []:
+            if 0 < pages <= min(num_pages, storage_hit_count // self.page_size):
+                valid[pages] = 1
+        self._all_reduce(
+            valid,
+            torch.distributed.ReduceOp.MIN,
+            self.prefetch_hits_sync_groups,
+        )
+        hit_pages = int(valid.nonzero()[-1].item())
+        operation.pool_storage_result.kv_hit_pages = hit_pages
+        return hit_pages * self.page_size
 
     def move_hybrid_indices(
         self, operation: CacheOperation

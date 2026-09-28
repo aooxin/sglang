@@ -46,7 +46,7 @@ python3 -m sglang.launch_server \
               --node-rank ${LWS_WORKER_INDEX} \
               --nnodes ${LWS_GROUP_SIZE} \
               --disable-tokenizer-batch-decode \
-              --context-length 1048576 \
+              --context-length 262144 \
               --numa-node 0 0 0 0 1 1 1 1 \
               --tokenizer-worker-num 64 --swa-full-tokens-ratio 0.3 \
               2>&1 | tee ./sglang_server.log

@@ -25,7 +25,7 @@ exec python3 -m sglang.launch_server \
     --decode-log-interval 1 \
     --page-size 128 \
     --host 0.0.0.0 \
-    --port 30000 \
+    --port 9001 \
     --trust-remote-code \
     --watchdog-timeout 1000000 \
     --dist-timeout 1200 \

@@ -23,6 +23,9 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
+    FP4_MASKED_UINT8_SFB_MAX_EXPECTED_M,
+)
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import deep_gemm_sm120
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -39,6 +42,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_parallel,
+    get_platform,
 )
 from sglang.srt.utils import (
     ceil_div,
@@ -295,6 +299,8 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
     use_mxfp8: bool = False
+    w13_scale_fp32: Optional[torch.Tensor] = None
+    w2_scale_fp32: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         if self.use_mxfp8:
@@ -382,6 +388,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
         scale_block_size = quant_info.block_shape[1] if quant_info.use_mxfp8 else 128
+        use_sm90_fp4 = quant_info.is_fp4_experts and get_platform().is_sm90
 
         if all_tokens == 0:
             if trace_deepep_v2_contig:
@@ -413,10 +420,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if (
             deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
             and not runner_input.hidden_states_scale_tma_aligned
+            and not use_sm90_fp4
         ):
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+        grouped_gemm = (
+            deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_contig
+            if use_sm90_fp4
+            else deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig
+        )
+        grouped_gemm(
             (hidden_states, hidden_states_scale),
             w13_weight_fp8,
             gateup_output,
@@ -566,7 +579,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 device=hidden_states_device,
                 dtype=torch.bfloat16,
             )
-        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES and not use_sm90_fp4:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
         recipe_a_down = (
@@ -574,7 +587,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             if quant_info.use_mxfp8
             else recipe_a
         )
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+        grouped_gemm(
             (down_input_fp8, down_input_scale),
             w2_weight_fp8,
             down_output,
@@ -668,11 +681,26 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_scale = runner_input.hidden_states_scale
         masked_m = runner_input.masked_m
         expected_m = runner_input.expected_m
+        use_sm90_fp4 = quant_info.is_fp4_experts and get_platform().is_sm90
+        if use_sm90_fp4 and (
+            running_state.get("down_gemm_overlap_args") is not None
+            or running_state.get("meta_overlap_args") is not None
+        ):
+            raise NotImplementedError(
+                "SM90 FP8xFP4 masked DeepGEMM does not support single-batch overlap"
+            )
 
         w13_weight = quant_info.w13_weight
         w2_weight = quant_info.w2_weight
         w13_scale = quant_info.w13_scale
         w2_scale = quant_info.w2_scale
+        if use_sm90_fp4 and expected_m > FP4_MASKED_UINT8_SFB_MAX_EXPECTED_M:
+            if quant_info.w13_scale_fp32 is None or quant_info.w2_scale_fp32 is None:
+                raise ValueError(
+                    "SM90 FP8xFP4 masked expected_m > 96 requires fp32 companion scales"
+                )
+            w13_scale = quant_info.w13_scale_fp32
+            w2_scale = quant_info.w2_scale_fp32
 
         hidden_states_device = running_state["hidden_states_device"]
         trace_deepep_v2_masked = envs.SGLANG_DEEPEP_V2_TRACE_MASKED.get()
@@ -716,7 +744,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_a, recipe_b = None, None
 
         # GroupGemm-0
-        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and not use_sm90_fp4:
             if hidden_states_scale.dtype != torch.int:
                 b, s_mn, s_k = hidden_states_scale.shape
                 assert s_mn % 4 == 0 and s_k % 4 == 0, (
@@ -725,7 +753,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 hidden_states_scale = _cast_to_e8m0_with_rounding_up(
                     hidden_states_scale
                 )
-        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES and not use_sm90_fp4:
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
             )
@@ -746,7 +774,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 n,
             )
             raise
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+        grouped_gemm = (
+            deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked
+            if use_sm90_fp4
+            else deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked
+        )
+        grouped_gemm(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scale),
             gateup_output,
@@ -824,7 +857,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     down_input_scale
                 )
             )
-        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES and not use_sm90_fp4:
             down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 down_input_scale
             )
@@ -849,7 +882,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 "max_block_n": max_block_n,
             }
 
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+        deep_gemm_return_value = grouped_gemm(
             (down_input, down_input_scale),
             (w2_weight, w2_scale),
             down_output,

@@ -37,6 +37,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_padding_size,
     get_moe_runner_backend,
@@ -256,11 +257,13 @@ class Fp8Config(QuantizationConfig):
         is_fp4_experts: bool = False,
         kv_cache_quant_algo: Optional[str] = None,
         scale_fmt: Optional[str] = None,
+        fp4_scale_dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__()
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
         # model_loader from ModelConfig. Default False off the DSV4 path.
         self.is_fp4_experts = is_fp4_experts
+        self.fp4_scale_dtype = fp4_scale_dtype
         self.dequant_fp4_to_fp8 = False
         self.is_dsv4_fp4_experts = False
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
@@ -367,6 +370,13 @@ class Fp8Config(QuantizationConfig):
             use_mxfp8=use_mxfp8,
             kv_cache_quant_algo=kv_cache_quant_algo,
             scale_fmt=scale_fmt,
+            # MiMo stores MXFP4 scales as E8M0 exponent bytes. A numeric
+            # uint8 -> float32 copy would turn exponent 127 into 127.0, not 1.0.
+            fp4_scale_dtype=(
+                torch.uint8
+                if str(config.get("store_dtype", "")).lower() == "mxfp4"
+                else None
+            ),
         )
 
     def get_quant_method(
@@ -1362,6 +1372,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if is_fp4_expert:
             fp4_block_k = 32
             if fp4_scale_dtype is None:
+                fp4_scale_dtype = getattr(quant_config, "fp4_scale_dtype", None)
+            if fp4_scale_dtype is None:
                 fp4_scale_dtype = torch.float8_e8m0fnu if _use_aiter else torch.float32
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
@@ -1816,7 +1828,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     prepare_fp4_moe_weights_for_flashinfer_megamoe(layer)
                     return
 
-                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
+                if will_use_deepgemm and get_platform().is_sm90:
+                    self._prepare_sm90_fp4_scales(layer)
+                elif deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
                     from deep_gemm import transform_sf_into_required_layout
 
                     for scale_param, weight_param in [
@@ -2365,6 +2379,30 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight_scale.data.float() * layer.w2_input_scale.data.float()
             )
 
+    def _prepare_sm90_fp4_scales(self, layer: Module) -> None:
+        # SM90 W4A8 consumes MN-major E8M0 bytes directly. The masked kernel
+        # needs a K-major fp32 companion above expected_m=96. DeepEP normal
+        # cannot reach that kernel, so avoid the extra resident scale memory.
+        masked_unreachable = (
+            get_moe_a2a_backend().is_deepep()
+            and not get_deepep_mode().enable_low_latency()
+        )
+        for name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+            param = getattr(layer, name)
+            scale = param.data.contiguous()
+            if scale.dtype == torch.uint8:
+                scale = scale.view(torch.float8_e8m0fnu)
+            elif scale.dtype != torch.float8_e8m0fnu:
+                scale = scale.to(torch.float8_e8m0fnu)
+            if not masked_unreachable:
+                layer.register_parameter(
+                    name + "_fp32", Parameter(scale.float(), requires_grad=False)
+                )
+            param.data = (
+                scale.view(torch.uint8).transpose(-1, -2).contiguous().transpose(-1, -2)
+            )
+            param.format_ue8m0 = True
+
     def _get_hpc_ops_quant_info(self, layer: torch.nn.Module):
         from sglang.srt.layers.moe.moe_runner.hpc_ops import HpcOpsMoeQuantInfo
 
@@ -2808,6 +2846,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 block_shape=block_shape,
                 is_fp4_experts=self.is_fp4_expert,
                 use_mxfp8=self.use_mxfp8,
+                w13_scale_fp32=getattr(layer, "w13_weight_scale_inv_fp32", None),
+                w2_scale_fp32=getattr(layer, "w2_weight_scale_inv_fp32", None),
             )
         elif (
             self.runner.runner_backend.is_flashinfer_trtllm()

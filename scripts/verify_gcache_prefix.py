@@ -2,6 +2,8 @@
 """Verify prefix reuse through a live PD service, using only Python's stdlib.
 
 Sequence: 32K chat -> flush P's L1/L2 -> 42K chat with a 30K common prefix.
+Use --shared-tokens 32768 to retain the complete first prompt and append a
+10K conversation suffix, including chat-template tokens.
 K means 1024 tokens, including the chat template. Token IDs are measured with
 P's /v1/tokenize endpoint. /flush_cache does NOT clear the storage backend.
 Use --check-l1 for an additional identical 42K request without a flush.
@@ -155,12 +157,12 @@ class Verification:
         (self.out / f"{name}.prom").write_text(raw)
         return parse_metrics(raw)
 
-    def tokenize(self, content):
+    def tokenize(self, messages):
         result = self.control.json(
             self.p + "/v1/tokenize",
             {
                 "model": self.model,
-                "messages": [{"role": "user", "content": content}],
+                "messages": messages,
             },
         )
         ids = result["tokens"]
@@ -179,21 +181,53 @@ class Verification:
         def content(common, tail, branch):
             return header + " x" * common + branch * tail + suffix
 
-        small = [self.tokenize(content(16, 16, branch)) for branch in (" y", " z")]
-        prefix = common_prefix(*small)
-        common_count = self.args.shared_tokens - (prefix - 16)
-        tails = [
-            target - self.args.shared_tokens - (len(ids) - prefix - 16)
-            for target, ids in zip(
-                (self.args.first_tokens, self.args.second_tokens), small
-            )
-        ]
-        if min(common_count, *tails) <= 0:
-            raise RuntimeError("Token budgets are too small for the chat template")
-        prompts = [
-            content(common_count, tail, branch)
-            for tail, branch in zip(tails, (" y", " z"))
-        ]
+        def user_message(text):
+            return [{"role": "user", "content": text}]
+
+        if self.args.shared_tokens == self.args.first_tokens:
+            small = self.tokenize(user_message(content(16, 0, "")))
+            first_count = self.args.first_tokens - len(small) + 16
+            if first_count <= 0:
+                raise RuntimeError("Token budget is too small for the chat template")
+            first = user_message(content(first_count, 0, ""))
+
+            def extend(tail):
+                # Preserve the first prompt's user-end / assistant-start tokens.
+                # Appending to the user text alone would replace those tokens
+                # and can miss the final SWA checkpoint despite a shared body.
+                return first + [
+                    {"role": "assistant", "content": "OK"},
+                    {
+                        "role": "user",
+                        "content": "Additional data:" + " z" * tail + suffix,
+                    },
+                ]
+
+            tail_count = self.args.second_tokens - len(self.tokenize(extend(16))) + 16
+            if tail_count <= 0:
+                raise RuntimeError("Suffix budget is too small for the chat template")
+            prompts = [first, extend(tail_count)]
+            self.report["prompt_construction"] = "append_chat_turn"
+        else:
+            small = [
+                self.tokenize(user_message(content(16, 16, branch)))
+                for branch in (" y", " z")
+            ]
+            prefix = common_prefix(*small)
+            common_count = self.args.shared_tokens - (prefix - 16)
+            tails = [
+                target - self.args.shared_tokens - (len(ids) - prefix - 16)
+                for target, ids in zip(
+                    (self.args.first_tokens, self.args.second_tokens), small
+                )
+            ]
+            if min(common_count, *tails) <= 0:
+                raise RuntimeError("Token budgets are too small for the chat template")
+            prompts = [
+                user_message(content(common_count, tail, branch))
+                for tail, branch in zip(tails, (" y", " z"))
+            ]
+            self.report["prompt_construction"] = "divergent_suffixes"
         tokens = [self.tokenize(prompt) for prompt in prompts]
         actual = (len(tokens[0]), len(tokens[1]), common_prefix(*tokens))
         expected = (
@@ -205,8 +239,14 @@ class Verification:
             raise RuntimeError(
                 f"Tokenizer calibration failed: expected {expected}, got {actual}"
             )
-        for i, (prompt, ids) in enumerate(zip(prompts, tokens), 1):
-            (self.out / f"prompt_{i}.txt").write_text(prompt)
+        for i, (messages, ids) in enumerate(zip(prompts, tokens), 1):
+            save_json(self.out / f"messages_{i}.json", messages)
+            text = (
+                messages[0]["content"]
+                if len(messages) == 1
+                else "\n\n".join(f"{m['role']}:\n{m['content']}" for m in messages)
+            )
+            (self.out / f"prompt_{i}.txt").write_text(text)
             save_json(self.out / f"tokens_{i}.json", ids)
         self.report["tokens"] = dict(zip(("first", "second", "common_prefix"), actual))
         self.report["expected_storage_hit_tokens"] = (
@@ -220,10 +260,10 @@ class Verification:
         )
         return prompts
 
-    def request(self, name, content, expected_tokens):
+    def request(self, name, messages, expected_tokens):
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": content}],
+            "messages": messages,
             "max_tokens": self.args.max_tokens,
             "temperature": 0,
             "stream": True,
@@ -458,7 +498,12 @@ def main():
     parser.add_argument("--model", help="Defaults to P's served_model_name")
     parser.add_argument("--first-tokens", type=int, default=32 * 1024)
     parser.add_argument("--second-tokens", type=int, default=42 * 1024)
-    parser.add_argument("--shared-tokens", type=int, default=30 * 1024)
+    parser.add_argument(
+        "--shared-tokens",
+        type=int,
+        default=30 * 1024,
+        help="Set equal to first-tokens to append a chat turn after the complete first prompt",
+    )
     parser.add_argument("--max-tokens", type=int, default=16)
     parser.add_argument(
         "--dp-rank",
@@ -485,9 +530,12 @@ def main():
         default=f"/tmp/gcache-prefix-{dt.datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}",
     )
     args = parser.parse_args()
-    if not 0 < args.shared_tokens < min(args.first_tokens, args.second_tokens):
+    if not (
+        0 < args.shared_tokens <= args.first_tokens
+        and args.shared_tokens < args.second_tokens
+    ):
         parser.error(
-            "shared-tokens must be positive and smaller than both request lengths"
+            "shared-tokens must be positive, no greater than first-tokens, and smaller than second-tokens"
         )
     verification = Verification(args)
     try:

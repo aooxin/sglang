@@ -255,16 +255,9 @@ class DFlashAttention(nn.Module):
         elif draft_cfg.attention_sink_bias:
             # Per-head sink bias; each TP rank owns its slice of the
             # all-heads checkpoint tensor.
-            # Legacy MiMo DFlash used BF16 sinks, as required by its FA3
-            # kernel. Keep the FP32 contract for modern drafts and backends.
-            sink_dtype = (
-                torch.bfloat16
-                if draft_cfg.use_swa is not None
-                and get_spec().speculative_draft_attention_backend == "fa3"
-                else torch.float32
-            )
             self.attention_sink_bias = nn.Parameter(
-                torch.empty(self.num_heads, dtype=sink_dtype), requires_grad=False
+                torch.empty(self.num_heads, dtype=torch.float32 if _is_npu else None),
+                requires_grad=False,
             )
             set_weight_attrs(
                 self.attention_sink_bias,

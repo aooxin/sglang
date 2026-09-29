@@ -106,6 +106,79 @@ def _ensure_cuda(
     )
 
 
+def grouped_gemm_nt_f8fp4bf16_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    overlap_args: Optional[Any] = None,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
+):
+    if overlap_args is not None:
+        raise NotImplementedError("SM90 FP8xFP4 masked DeepGEMM does not support overlap")
+    kernel = getattr(
+        globals().get("deep_gemm"),
+        "m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma",
+        None,
+    )
+    if kernel is None:
+        raise RuntimeError(
+            "DeepGEMM is missing m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma; "
+            "install the SM90 FP8xFP4 build used by v0.5.10-xm."
+        )
+    num_groups, _, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    gran_k_a = recipe_a[1] if recipe_a is not None else 128
+    gran_k_b = recipe_b[1] if recipe_b is not None else 32
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups,
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_MASKED,
+    ):
+        return kernel(
+            lhs, rhs, out, masked_m, expected_m,
+            gran_k=gran_k_a, gran_k_a=gran_k_a, gran_k_b=gran_k_b,
+        )
+
+
+def grouped_gemm_nt_f8fp4bf16_contig(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    m_indices: torch.Tensor,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
+):
+    kernel = getattr(
+        globals().get("deep_gemm"),
+        "m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma",
+        None,
+    )
+    if kernel is None:
+        raise RuntimeError(
+            "DeepGEMM is missing m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma; "
+            "install the SM90 FP8xFP4 build used by v0.5.10-xm."
+        )
+    gran_k_a = recipe_a[1] if recipe_a is not None else 128
+    gran_k_b = recipe_b[1] if recipe_b is not None else 32
+    if gran_k_a != 128:
+        raise ValueError("SM90 FP8xFP4 contiguous requires activation group size 128")
+    m, k = lhs[0].shape
+    num_groups, n, _ = rhs[0].shape
+    if m == 0:
+        return
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+    with compile_utils.deep_gemm_execution_hook(
+        m, n, k, num_groups,
+        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_CONTIG,
+    ):
+        kernel(lhs, rhs, out, m_indices, gran_k_b=gran_k_b, compiled_dims="nk")
+
+
 def grouped_gemm_nt_bf16_masked(
     a: torch.Tensor,
     b: torch.Tensor,

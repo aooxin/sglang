@@ -716,10 +716,14 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
-            + self.num_experts
-        ) // self.num_experts
+        # Round up only a partial expert batch. Idle DP ranks still need a
+        # positive hint; an extra token on exact division can cross the SM90
+        # FP4 masked kernel's E8M0/fp32 scale boundary at expected_m=96.
+        expected_m = max(
+            1,
+            (hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
+             + self.num_experts - 1) // self.num_experts,
+        )
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,

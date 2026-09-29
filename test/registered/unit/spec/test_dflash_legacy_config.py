@@ -150,7 +150,8 @@ def test_legacy_swa_requires_a_window():
 
 @pytest.mark.parametrize("backend", ["fa3", "fa4"])
 @pytest.mark.parametrize("legacy_use_swa", [None, False, True])
-def test_sink_dtype_preserves_legacy_fa3_contract(backend, legacy_use_swa):
+@pytest.mark.parametrize("model_dtype", [torch.bfloat16, torch.float32])
+def test_sink_dtype_follows_model_dtype(backend, legacy_use_swa, model_dtype):
     fields = legacy_config(
         hidden_size=128,
         num_attention_heads=2,
@@ -167,17 +168,11 @@ def test_sink_dtype_preserves_legacy_fa3_contract(backend, legacy_use_swa):
             tp_size=1, speculative_draft_attention_backend=backend
         ),
         get_parallel().override(tp_rank=0, attn_tp_rank=0),
-        set_default_torch_dtype(torch.bfloat16),
+        set_default_torch_dtype(model_dtype),
     ):
         attn = DFlashAttention(Qwen3Config(**fields), layer_id=0)
-    # The legacy FA3 kernel consumes BF16 sinks. Preserve the existing FP32
-    # contract for modern checkpoints and other attention backends.
-    expected = (
-        torch.bfloat16
-        if legacy_use_swa is not None and backend == "fa3"
-        else torch.float32
-    )
-    assert attn.attention_sink_bias.dtype == expected
+    # Match the CUDA sink dtype used by the internal v0.5.10-xm DFlash model.
+    assert attn.attention_sink_bias.dtype == model_dtype
 
 
 @pytest.mark.parametrize("legacy", [True, False])

@@ -3,7 +3,7 @@ rm -f ./sglang_server.log
 unset NCCL_DEBUG_SUBSYS && unset NCCL_DEBUG && unset NVSHMEM_DEBUG_SUBSYS && unset NVSHMEM_DEBUG
 unset SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC
 export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
-# DFLASH verify: 96 requests * 8 tokens / (TP 8 / DP 2) = 192 tokens per rank.
+# DFLASH verify (1P2D): 96 requests * 8 tokens / (TP 16 / DP 2) = 96 tokens per rank.
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
 
 python3 -m sglang.launch_server \
@@ -14,7 +14,7 @@ python3 -m sglang.launch_server \
               --enable-cache-report \
               --pp-size 1 \
               --dp-size 2 \
-              --tp-size 8 \
+              --tp-size $((LWS_GROUP_SIZE * 8)) \
               --enable-dp-attention \
               --moe-a2a-backend deepep \
               --deepep-mode low_latency \
@@ -30,7 +30,7 @@ python3 -m sglang.launch_server \
               --trust-remote-code \
               --watchdog-timeout 1000000 \
               --dist-timeout 1800 \
-              --mem-fraction-static 0.7 \
+              --mem-fraction-static 0.8 \
               --max-running-requests 192 \
               --cuda-graph-max-bs-decode 96 \
               --cuda-graph-bs-decode 96 \

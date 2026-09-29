@@ -15,7 +15,7 @@ exec python3 -m sglang.launch_server \
     --log-level-http warning \
     --enable-cache-report \
     --pp-size 1 \
-    --dp-size 1 \
+    --dp-size 2 \
     --tp-size 8 \
     --ep-size 8 \
     --enable-dp-attention \

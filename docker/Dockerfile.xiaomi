@@ -47,6 +47,15 @@ RUN cd /tmp && \
     python3 -m pip install /tmp/deep_gemm-2.5.0+de9009a-cp312-cp312-linux_x86_64.whl --no-cache-dir --no-dependencies --force-reinstall && \
     rm -f /tmp/deep_gemm-2.5.0+de9009a-cp312-cp312-linux_x86_64.whl
 
+# Node.js (LTS) + Codex CLI, following the reference image's npm setup.
+RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm config set registry https://registry.npmmirror.com \
+    && npm install -g @openai/codex \
+    && npm cache clean --force \
+    && codex --version
+
 # Overlay the checkout while retaining the base image's generated _version.py
 # and compiled .so files, which .dockerignore excludes from the build context.
 # Dependency or Rust source changes require a matching rebuilt base image.

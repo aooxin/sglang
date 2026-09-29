@@ -29,7 +29,9 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
 # for tokenizer: fastokens
 # for debugging: py-spy, nvtx
 # for omni: torchcodec, joblib, accelerate, decord, apache-tvm-ffi
+# for constrained decoding: xgrammar
 RUN python3 -m pip install --no-cache-dir --break-system-packages --no-build-isolation --no-deps \
+    "xgrammar==0.2.1" \
     py-spy==0.4.1 \
     nvtx==0.2.13 \
     torchcodec==0.9.1 \

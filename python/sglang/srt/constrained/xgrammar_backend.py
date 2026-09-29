@@ -71,6 +71,8 @@ class XGrammarGrammar(BaseGrammarObject):
         self.grammar_stats = grammar_stats
 
     def accept_token(self, token: int):
+        # Speculative DFS may pass a CPU scalar tensor; XGrammar FFI requires int.
+        token = int(token)
         if not self.is_terminated():
             self.current_token = token
             accepted = self.matcher.accept_token(token)
@@ -97,7 +99,7 @@ class XGrammarGrammar(BaseGrammarObject):
         return allocate_token_bitmask(batch_size, vocab_size)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
-        self.matcher.fill_next_token_bitmask(vocab_mask, idx)
+        self.matcher.fill_next_token_bitmask(vocab_mask, int(idx))
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:

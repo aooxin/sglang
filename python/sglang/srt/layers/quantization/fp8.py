@@ -1837,10 +1837,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         (layer.w13_weight_scale_inv, layer.w13_weight),
                         (layer.w2_weight_scale_inv, layer.w2_weight),
                     ]:
-                        num_experts, n, _ = scale_param.data.shape
+                        scale = scale_param.data
+                        # Blackwell packs FP32 scale values into INT32 UE8M0.
+                        # MiMo stores exponent bytes: decode 127 as 1.0 first.
+                        if scale.dtype == torch.uint8:
+                            scale = scale.view(torch.float8_e8m0fnu)
+                        if scale.dtype == torch.float8_e8m0fnu:
+                            scale = scale.float()
+                        num_experts, n, _ = scale.shape
                         k = weight_param.shape[2] * 2
                         scale_param.data = transform_sf_into_required_layout(
-                            scale_param.data,
+                            scale,
                             mn=n,
                             k=k,
                             recipe=(1, 32),

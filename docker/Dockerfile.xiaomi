@@ -44,8 +44,7 @@ COPY --chmod=755 docker/wait-gcache-server.sh /home/work/gcache/wait-gcache-serv
 # DeepGEMM with W4A8 + sm90 megamoe kernels (branch combine_earlier_w4a8_mega_moe_sm90 @de9009a)
 # Built for the base image's PyTorch 2.13 and CUDA 13.0.
 COPY deep_gemm-2.5.0+de9009a-cp312-cp312-linux_x86_64.whl /tmp/
-RUN python3 -m pip install /tmp/deep_gemm-2.5.0+de9009a-cp312-cp312-linux_x86_64.whl --no-cache-dir --no-dependencies --force-reinstall \
-    && rm -f /tmp/deep_gemm-2.5.0+de9009a-cp312-cp312-linux_x86_64.whl
+RUN python3 -m pip install /tmp/deep_gemm-2.5.0+de9009a-cp312-cp312-linux_x86_64.whl --no-cache-dir --no-dependencies --force-reinstall
 
 # Node.js (LTS) + Codex CLI, following the reference image's npm setup.
 RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \

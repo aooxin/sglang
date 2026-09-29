@@ -41,6 +41,12 @@ RUN python3 -c "import platform, sys; \
 COPY docker/gcache.flags /sgl-workspace/gcache.flags
 COPY --chmod=755 docker/wait-gcache-server.sh /home/work/gcache/wait-gcache-server.sh
 
+# DeepGEMM with W4A8 + sm90 megamoe kernels (branch combine_earlier_w4a8_mega_moe_sm90 @de9009a)
+RUN cd /tmp && \
+    wget -q -O deep_gemm-2.5.0+de9009a-cp312-cp312-linux_x86_64.whl 'https://cnbj1-fds.api.xiaomi.net/deepgemm/deep_gemm-2.5.0+de9009a-cp312-cp312-linux_x86_64.whl?GalaxyAccessKeyId=5151729087601&Expires=9223372036854775807&Signature=2g79y9cot4XI3Kql%2BfbQwQAfqYU%3D' && \
+    python3 -m pip install /tmp/deep_gemm-2.5.0+de9009a-cp312-cp312-linux_x86_64.whl --no-cache-dir --no-dependencies --force-reinstall && \
+    rm -f /tmp/deep_gemm-2.5.0+de9009a-cp312-cp312-linux_x86_64.whl
+
 # Overlay the checkout while retaining the base image's generated _version.py
 # and compiled .so files, which .dockerignore excludes from the build context.
 # Dependency or Rust source changes require a matching rebuilt base image.

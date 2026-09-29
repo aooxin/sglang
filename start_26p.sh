@@ -4,6 +4,7 @@ export GCACHE_MASTER_ADDR="${GCACHE_MASTER_ADDR:-bj9-cloudml.juicefs.srv}"
 export GCACHE_CACHE_GROUP="${GCACHE_CACHE_GROUP:-gcache-bj9-bcecn-dev-test}"
 
 unset NCCL_DEBUG_SUBSYS && unset NCCL_DEBUG && unset NVSHMEM_DEBUG_SUBSYS && unset NVSHMEM_DEBUG
+unset SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC
 export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
 # Compile actual shapes on demand instead of sweeping all M values in a request.
 export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0

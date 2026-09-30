@@ -513,8 +513,7 @@ class Envs:
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
     SGLANG_MM_CACHE_SHM = EnvBool(False)
-    # Key the local SHM mm_cache only on the URL-basename SHA1; non-SHA1 items skip the cache (no fallback).
-    SGLANG_MM_CACHE_URL_SHA1_ONLY = EnvBool(False)
+    SGLANG_MM_CACHE_URL_SHA1_SKIP_LOAD = EnvBool(False)
 
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
@@ -633,6 +632,7 @@ class Envs:
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
     SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU = EnvBool(False)
+    SGLANG_ENCODER_PREPROCESS_USE_GPU = EnvStr(None)
     SGLANG_ENCODER_MAX_BATCH_SIZE = EnvInt(8)
     SGLANG_ENCODER_REQ_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_DP_WORKER_MAX_INFLIGHT = EnvInt(64)

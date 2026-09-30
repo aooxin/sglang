@@ -1271,6 +1271,17 @@ def tensor_hash(tensor_list) -> int:
     return int.from_bytes(hash_bytes, byteorder="big", signed=False)
 
 
+def hash_decoded_content(modality: str, *values) -> int:
+    hasher = hashlib.sha1(modality.encode())
+    for value in values:
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        array = np.ascontiguousarray(value)
+        hasher.update(str((array.dtype.str, array.shape)).encode())
+        hasher.update(memoryview(array).cast("B"))
+    return int.from_bytes(hasher.digest(), "big")
+
+
 def hash_feature(f):
     if isinstance(f, list):
         if len(f) > 0 and isinstance(f[0], ShmPointerMMData):
@@ -1842,10 +1853,6 @@ def unwrap_shm_features(obj):
     return obj
 
 
-# ── Padding pattern resolution ──────────────────────────────────────────────
-
-# Architectures that use MultiModalityDataPaddingPatternTokenPairs.
-# All other multimodal models use MultiModalityDataPaddingPatternMultimodalTokens.
 _TOKEN_PAIRS_HF_ARCHS: set = {
     "InternVLChatModel",
     "Gemma3ForConditionalGeneration",
@@ -1858,13 +1865,6 @@ _TOKEN_PAIRS_HF_ARCHS: set = {
 
 
 def get_padding_pattern(mm_inputs: "MultimodalInputs", hf_config=None):
-    """Return the correct padding-pattern instance for the current model.
-
-    Uses ``hf_config.architectures[0]`` when available to pick between
-    :class:`MultiModalityDataPaddingPatternMultimodalTokens` (default) and
-    :class:`MultiModalityDataPaddingPatternTokenPairs`.  Falls back to
-    *mm_inputs* field heuristics when *hf_config* is *None*.
-    """
     arch = hf_config.architectures[0] if hf_config is not None else None
     if arch is not None and arch in _TOKEN_PAIRS_HF_ARCHS:
         data_token_pairs = _collect_data_token_pairs(mm_inputs)
@@ -1873,7 +1873,6 @@ def get_padding_pattern(mm_inputs: "MultimodalInputs", hf_config=None):
 
 
 def _collect_data_token_pairs(mm_inputs):
-    """Collect (start_id, end_id) pairs from the mm_inputs fields."""
     pairs = []
     if mm_inputs.im_start_id is not None:
         pairs.append((mm_inputs.im_start_id, mm_inputs.im_end_id))

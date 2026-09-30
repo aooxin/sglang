@@ -46,6 +46,7 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqInput, ProfileReqType
+from sglang.srt.managers.mm_utils import hash_decoded_content, hash_feature
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_loader import get_model
@@ -248,7 +249,10 @@ def _get_mm_feature(mm_inputs, modality):
 
 def _build_mm_aux_data(mm_inputs, model_type=None):
     # Video aux metadata, scoped to model_type's video-meta attrs.
-    return {attr: mm_inputs.get(attr) for attr in video_meta_attrs_for(model_type)}
+    attrs = video_meta_attrs_for(model_type)
+    if "file_hashes" in mm_inputs:
+        attrs = (*attrs, "file_hashes")
+    return {attr: mm_inputs.get(attr) for attr in attrs}
 
 
 _image_grid_attrs = ["image_grid_thw", "image_grid_hws"]
@@ -379,36 +383,6 @@ def _compute_tokens_per_image(
     return tokens_per_image
 
 
-def _describe_mm_source(mm_items, max_len: int = 96) -> str:
-    def _one(item) -> str:
-        if isinstance(item, str):
-            # data URI: keep the scheme/mime prefix, drop the base64 payload.
-            if item.startswith("data:"):
-                return f"{item.split(',', 1)[0]},<{len(item)}B>"
-            if len(item) > max_len:
-                return f"{item[:max_len]}...(<{len(item)}B>)"
-            return item
-        if isinstance(item, dict):
-            for k in ("url", "image_url", "video_url", "audio_url", "path", "name"):
-                v = item.get(k)
-                if isinstance(v, dict):
-                    v = v.get("url") or v.get("path")
-                if isinstance(v, str) and v:
-                    return _one(v)
-            return f"<dict keys={list(item.keys())[:5]}>"
-        return f"<{type(item).__name__}>"
-
-    if isinstance(mm_items, (list, tuple)):
-        flat = []
-        for it in mm_items:
-            flat.extend(it if isinstance(it, (list, tuple)) else [it])
-        descs = [_one(x) for x in flat[:4]]
-        if len(flat) > 4:
-            descs.append(f"...(+{len(flat) - 4})")
-        return "[" + ", ".join(descs) + "]"
-    return _one(mm_items)
-
-
 _SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -437,7 +411,6 @@ def _extract_url_sha1_key(
     include_preprocess_kwargs: bool = False,
     preprocess_kwargs: Optional[dict] = None,
 ) -> Optional[int]:
-    # None => no 40-hex SHA1 in the URL basename => skip the cache (no fallback).
     url_str = _item_to_url(item)
     if not url_str:
         return None
@@ -458,6 +431,16 @@ def _extract_url_sha1_key(
     )
     pp_str = str(sorted(pp.items())) if pp else ""
     return int(hashlib.sha1(f"{url_hash}:{pp_str}".encode()).hexdigest(), 16)
+
+
+def _record_input_file_metrics(request: dict, modality: str) -> None:
+    if encoder_metrics_collector is None or not request.get("log_metrics", True):
+        return
+    items = MMEncoder._flatten_nested_items(request.get("mm_items", []))
+    sha1_count = sum(_extract_url_sha1_key(item) is not None for item in items)
+    encoder_metrics_collector.record_input_files(
+        sha1_count, len(items) - sha1_count, modality
+    )
 
 
 class MMEncoder:
@@ -514,7 +497,7 @@ class MMEncoder:
             world_size=server_args.tp_size,
             rank=rank,
             distributed_init_method=dist_init_method,
-            local_rank=rank,
+            local_rank=self.gpu_id,
         )
         initialize_model_parallel(tensor_model_parallel_size=server_args.tp_size)
         initialize_dp_attention(server_args, self.model_config)
@@ -838,6 +821,30 @@ class MMEncoder:
                         }:
                             self.vision_config["audio"]["truncation"] = False
 
+        preprocess_devices = envs.SGLANG_ENCODER_PREPROCESS_USE_GPU.get()
+        self.vision_config["video"]["device"] = "cpu"
+        if preprocess_devices is not None:
+            flags = preprocess_devices.split()
+            if len(flags) != 3 or any(flag not in ("0", "1") for flag in flags):
+                raise ValueError(
+                    "SGLANG_ENCODER_PREPROCESS_USE_GPU requires three 0/1 flags "
+                    "in image audio video order, e.g. '1 1 0'"
+                )
+            for modality, flag in zip(("image", "video"), (flags[0], flags[2])):
+                self.vision_config[modality]["device"] = (
+                    f"{self.device}:{self.gpu_id}" if flag == "1" else "cpu"
+                )
+            logger.warning(
+                "SGLANG_ENCODER_PREPROCESS_USE_GPU audio=%s is not implemented; "
+                "audio Mel preprocessing remains on CPU and model encoding is unchanged",
+                flags[1],
+            )
+        logger.info(
+            "Encoder visual preprocessing devices: image=%s, video=%s",
+            self.vision_config["image"].get("device") or "cpu",
+            self.vision_config["video"]["device"],
+        )
+
     def _load_mm_processor(self, server_args: ServerArgs):
         """
         Load image/video/audio processor separately,
@@ -1094,25 +1101,32 @@ class MMEncoder:
         return slices
 
     def _calculate_hashes_from_features(
-        self, mm_feature, grid_thw: List, modality: Modality
-    ) -> List[str]:
+        self, mm_feature, grid_thw: List, modality: Modality, indices=None
+    ) -> Dict[int, int]:
         """CPU Task: Compute hashes based on processed feature patches."""
-        hashes = []
-        if modality == Modality.AUDIO and isinstance(mm_feature, list):
-            for feature in mm_feature:
+        if indices is None:
+            indices = range(len(grid_thw))
+        hashes: Dict[int, int] = {}
+        if modality == Modality.AUDIO:
+            for i in indices:
+                feature = (
+                    mm_feature[i]
+                    if isinstance(mm_feature, list)
+                    else mm_feature[i : i + 1]
+                )
                 tmp_item = MultimodalDataItem(modality=modality, feature=feature)
                 tmp_item.set_pad_value()
-                hashes.append(tmp_item.hash)
+                hashes[i] = tmp_item.hash
             return hashes
 
-        offset = 0
+        offsets = [0]
         for grid in grid_thw:
-            num_patches = self.get_num_patches(grid, modality)
-            feature_slice = mm_feature[offset : offset + num_patches]
+            offsets.append(offsets[-1] + self.get_num_patches(grid, modality))
+        for i in indices:
+            feature_slice = mm_feature[offsets[i] : offsets[i + 1]]
             tmp_item = MultimodalDataItem(modality=modality, feature=feature_slice)
             tmp_item.set_pad_value()
-            hashes.append(tmp_item.hash)
-            offset += num_patches
+            hashes[i] = tmp_item.hash
         return hashes
 
     async def _encode_missing(
@@ -1162,7 +1176,7 @@ class MMEncoder:
         )
 
         for k, v in mm_inputs.items():
-            if k in _mm_feature_attrs.get(modality, []):
+            if k == "file_hashes" or k in _mm_feature_attrs.get(modality, []):
                 continue
             val = _convert(v)
             if k in _mm_grid_attrs.get(modality, []):
@@ -1222,8 +1236,8 @@ class MMEncoder:
 
         _t0 = time.perf_counter()
         async with self.mm_cache_lock:
-            for i, k in enumerate(keys):
-                hit = self.mm_cache.get_single(k)
+            for i in range(total):
+                hit = self.mm_cache.get_single(keys[i])
                 if hit is not None:
                     final_slices[i] = hit.embedding
                 else:
@@ -1544,7 +1558,13 @@ class MMEncoder:
     ):
         if not (self.image_processor or model_preprocessor):
             raise ValueError("No image processor available")
+        mm_items = self._flatten_nested_items(mm_items)
         images = await self._flatten_and_load_images(mm_items, timings=load_timings)
+        file_hashes = [
+            key if key is not None else hash_decoded_content("image", np.asarray(image))
+            for item, image in zip(mm_items, images)
+            for key in [_extract_url_sha1_key(item)]
+        ]
         _pp_start = time.perf_counter()
         if pp_timing is not None:
             pp_timing.setdefault("preprocess_start_ts", _pp_start)
@@ -1553,6 +1573,7 @@ class MMEncoder:
         else:
             image_config = self.vision_config.get("image", {})
             result = self.image_processor(images=images, **image_config)
+        result["file_hashes"] = file_hashes
         if pp_timing is not None:
             pp_timing["preprocess"] += time.perf_counter() - _pp_start
         return result
@@ -1566,6 +1587,7 @@ class MMEncoder:
         pp_timing=None,
     ):
         if model_preprocessor:
+            mm_items = self._flatten_nested_items(mm_items)
             _pp_start = time.perf_counter()
             if pp_timing is not None:
                 pp_timing.setdefault("preprocess_start_ts", _pp_start)
@@ -1576,6 +1598,10 @@ class MMEncoder:
                 self.vision_config,
                 mm_items_preprocess_kwargs,
                 load_timings=load_timings,
+                file_hashes=[
+                    _extract_url_sha1_key(item)
+                    for item in self._flatten_nested_items(mm_items)
+                ],
             )
             if pp_timing is not None:
                 elapsed = time.perf_counter() - _pp_start
@@ -1648,13 +1674,24 @@ class MMEncoder:
     ):
         # Await off the event loop so EncoderScheduler can accumulate
         # cross-request batches during download.
+        mm_items = self._flatten_nested_items(mm_items)
         audios = await self._flatten_and_load_audios(mm_items, timings=load_timings)
 
         _pp_start = time.perf_counter()
         if pp_timing is not None:
             pp_timing.setdefault("preprocess_start_ts", _pp_start)
         if model_preprocessor:
+            file_hashes = [
+                (
+                    key
+                    if key is not None
+                    else hash_decoded_content("audio", self.model_audio_sr, audio)
+                )
+                for item, audio in zip(mm_items, audios)
+                for key in [_extract_url_sha1_key(item)]
+            ]
             result = model_preprocessor(audios, Modality.AUDIO, self.vision_config)
+            result["file_hashes"] = file_hashes
             if pp_timing is not None:
                 pp_timing["preprocess"] += time.perf_counter() - _pp_start
             return result
@@ -1684,6 +1721,7 @@ class MMEncoder:
         content_hash_lookup: bool = True,
         mm_items_preprocess_kwargs=None,
         log_metrics: bool = True,
+        content_hash_fallback: bool = False,
     ) -> Tuple[object, torch.Tensor, dict, Optional[int], bool]:
         # Shared encode core (download+preprocess+ViT). Does NOT store.
         # Returns (grid, embedding, aux, content_mm_hash, cache_hit); in content
@@ -1710,7 +1748,7 @@ class MMEncoder:
         cache_hit = False
         content_mm_hash = None
         cache_enabled = self.server_args.enable_prefix_mm_cache
-        url_sha1_only = envs.SGLANG_MM_CACHE_URL_SHA1_ONLY.get()
+        url_sha1_skip_load = envs.SGLANG_MM_CACHE_URL_SHA1_SKIP_LOAD.get()
 
         mm_item = MultimodalDataItem.from_dict(
             {
@@ -1719,20 +1757,32 @@ class MMEncoder:
             }
         )
         for k, v in mm_inputs.items():
-            if k in _mm_feature_attrs[modality]:
+            if k == "file_hashes" or k in _mm_feature_attrs[modality]:
                 continue
             mm_item.set(k, _convert(v))
 
+        cached_grid = None
+        cached_aux = None
         # Content-hash lookup needs the preprocessed feature, so it happens here (SHA1 mode looks up earlier).
-        if content_hash_lookup and cache_enabled and not url_sha1_only:
+        if (
+            content_hash_lookup
+            and cache_enabled
+            and (not url_sha1_skip_load or content_hash_fallback)
+        ):
             mm_item.set_pad_value()
-            content_mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
+            item_hashes = [mm_item.hash]
+            if modality == Modality.VIDEO and mm_inputs.get("video_audio_features"):
+                item_hashes.append(hash_feature(mm_inputs["video_audio_features"]))
+            content_mm_hash = MultiModalStaticCache.combine_hashes(item_hashes)
             _t0 = time.perf_counter()
             async with self.mm_cache_lock:
                 mm_cache = self.mm_cache.get_single(content_mm_hash)
                 if mm_cache is not None:
                     mm_embedding = mm_cache.embedding
                     cache_hit = True
+                    if mm_cache.grid is not None:
+                        cached_grid = mm_cache.grid
+                        cached_aux = mm_cache.aux
             if mc is not None:
                 mc.observe_cache_read(time.perf_counter() - _t0, modality=modality_str)
 
@@ -1752,32 +1802,38 @@ class MMEncoder:
                     forward_end - forward_start, modality=modality_str
                 )
 
-        aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
+        if cached_grid is not None:
+            grid_dim = cached_grid
+            aux_data = dict(cached_aux) if cached_aux else {}
+        else:
+            aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
 
-        if modality == Modality.VIDEO and mm_inputs.get("video_audio_features"):
-            target = (
-                self.model.thinker if hasattr(self.model, "thinker") else self.model
-            )
-            encode_video_audio_fn = getattr(target, "encode_video_audio", None)
-            if encode_video_audio_fn is not None:
-                audio_forward_start = time.perf_counter()
-                audio_embedding = encode_video_audio_fn(mm_inputs)
-                if stage_timing is not None:
-                    stage_timing.setdefault("forward_start_ts", audio_forward_start)
-                    stage_timing["forward_end_ts"] = time.perf_counter()
-                if mc is not None:
-                    mc.observe_model_forward(
-                        time.perf_counter() - audio_forward_start, modality="audio"
-                    )
-                if audio_embedding is not None:
-                    aux_data["video_audio_embedding"] = audio_embedding
-            else:
-                logger.warning(
-                    "Videos carry audio tracks but model has no "
-                    "encode_video_audio; dropping audio for EPD encoding."
+            if modality == Modality.VIDEO and mm_inputs.get("video_audio_features"):
+                target = (
+                    self.model.thinker if hasattr(self.model, "thinker") else self.model
                 )
+                encode_video_audio_fn = getattr(target, "encode_video_audio", None)
+                if encode_video_audio_fn is not None:
+                    audio_forward_start = time.perf_counter()
+                    audio_embedding = encode_video_audio_fn(mm_inputs)
+                    if stage_timing is not None:
+                        stage_timing.setdefault("forward_start_ts", audio_forward_start)
+                        stage_timing["forward_end_ts"] = time.perf_counter()
+                    if mc is not None:
+                        mc.observe_model_forward(
+                            time.perf_counter() - audio_forward_start, modality="audio"
+                        )
+                    if audio_embedding is not None:
+                        aux_data["video_audio_embedding"] = audio_embedding
+                else:
+                    logger.warning(
+                        "Videos carry audio tracks but model has no "
+                        "encode_video_audio; dropping audio for EPD encoding."
+                    )
 
-        grid_dim = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+            grid_dim = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+        if "file_hashes" in mm_inputs:
+            aux_data["file_hashes"] = mm_inputs["file_hashes"]
         _merge_batch_timing(stage_timing, num_items=len(grid_dim))
         return grid_dim, mm_embedding, aux_data, content_mm_hash, cache_hit
 
@@ -1798,6 +1854,14 @@ class MMEncoder:
 
         aux_data: dict = {}
         for k in aux_keys:
+            if k == "video_audio_per_video_num_units":
+                if any(a.get(k) is not None for _, _, a in per_video):
+                    units: list = []
+                    for _, _, a in per_video:
+                        v = a.get(k)
+                        units.extend(list(v) if v is not None else [0])
+                    aux_data[k] = units
+                continue
             parts = [a[k] for _, _, a in per_video if a.get(k) is not None]
             if not parts:
                 continue
@@ -1816,31 +1880,37 @@ class MMEncoder:
     async def _encode_video_per_item(
         self,
         leaves: List,
-        sha1_keys: List[int],
+        sha1_keys: List[Optional[int]],
         mm_items_preprocess_kwargs=None,
     ) -> Tuple[object, torch.Tensor, dict]:
         # Per-video URL-SHA1 cache: hits skip download+preprocess+ViT, only misses are encoded.
         mc = encoder_metrics_collector
         n = len(leaves)
         per_video: List[Optional[Tuple]] = [None] * n  # (grid, embedding, aux)
-        miss_pos: List[int] = []
+        to_encode: List[Tuple[int, str]] = []
+        sha1_hits = 0
+        content_hits = 0
 
         _t0 = time.perf_counter()
         async with self.mm_cache_lock:
             for i, k in enumerate(sha1_keys):
+                if k is None:
+                    to_encode.append((i, "content"))
+                    continue
                 hit = self.mm_cache.get_single(k)
                 # Require grid; legacy entries without it are re-encoded.
                 if hit is not None and hit.grid is not None:
-                    per_video[i] = (hit.grid, hit.embedding, hit.aux or {})
+                    aux = dict(hit.aux or {})
+                    aux["file_hashes"] = [_extract_url_sha1_key(leaves[i])]
+                    per_video[i] = (hit.grid, hit.embedding, aux)
+                    sha1_hits += 1
                 else:
-                    miss_pos.append(i)
+                    to_encode.append((i, "sha1"))
         if mc is not None:
             mc.observe_cache_read(time.perf_counter() - _t0, modality="video")
-            hits = n - len(miss_pos)
-            mc.record_cache_files(hits, n, modality="video")
 
         # Encode each miss video on its own so its cache entry is a genuine single-video result.
-        for pos in miss_pos:
+        for pos, mode in to_encode:
             # preprocess_kwargs is index-aligned with leaves; pass this video's
             # entry as a single-element list so its sampling params still apply.
             pk = (
@@ -1849,20 +1919,49 @@ class MMEncoder:
                 and pos < len(mm_items_preprocess_kwargs)
                 else None
             )
-            grid_dim, mm_embedding, aux_data, _, _ = await self._encode_group(
-                [leaves[pos]],
-                Modality.VIDEO,
-                content_hash_lookup=False,
-                mm_items_preprocess_kwargs=pk,
-            )
-            per_video[pos] = (grid_dim, mm_embedding, aux_data)
-            async with self.mm_cache_lock:
-                self.mm_cache.set(
-                    sha1_keys[pos],
-                    EmbeddingResult(
-                        embedding=mm_embedding, grid=grid_dim, aux=aux_data
-                    ),
+            if mode == "content":
+                (
+                    grid_dim,
+                    mm_embedding,
+                    aux_data,
+                    content_hash,
+                    cache_hit,
+                ) = await self._encode_group(
+                    [leaves[pos]],
+                    Modality.VIDEO,
+                    content_hash_lookup=True,
+                    mm_items_preprocess_kwargs=pk,
+                    content_hash_fallback=True,
                 )
+                per_video[pos] = (grid_dim, mm_embedding, aux_data)
+                if cache_hit:
+                    content_hits += 1
+                elif content_hash is not None:
+                    async with self.mm_cache_lock:
+                        self.mm_cache.set(
+                            content_hash,
+                            EmbeddingResult(
+                                embedding=mm_embedding, grid=grid_dim, aux=aux_data
+                            ),
+                        )
+            else:
+                grid_dim, mm_embedding, aux_data, _, _ = await self._encode_group(
+                    [leaves[pos]],
+                    Modality.VIDEO,
+                    content_hash_lookup=False,
+                    mm_items_preprocess_kwargs=pk,
+                )
+                per_video[pos] = (grid_dim, mm_embedding, aux_data)
+                async with self.mm_cache_lock:
+                    self.mm_cache.set(
+                        sha1_keys[pos],
+                        EmbeddingResult(
+                            embedding=mm_embedding, grid=grid_dim, aux=aux_data
+                        ),
+                    )
+
+        if mc is not None:
+            mc.record_cache_files(sha1_hits + content_hits, n, modality="video")
 
         if self.profiler is not None:
             self.profiler.step()
@@ -1879,14 +1978,12 @@ class MMEncoder:
         mc = encoder_metrics_collector if log_metrics else None
 
         cache_enabled = self.server_args.enable_prefix_mm_cache
-        url_sha1_only = envs.SGLANG_MM_CACHE_URL_SHA1_ONLY.get()
-        mm_source = _describe_mm_source(mm_items) if cache_enabled else None
+        url_sha1_skip_load = envs.SGLANG_MM_CACHE_URL_SHA1_SKIP_LOAD.get()
 
-        # SHA1-only mode keys the whole request on URL SHA1s (known pre-download); any non-SHA1 item skips the cache.
         sha1_skip = False
         sha1_keys = None
         mm_hash = None
-        if cache_enabled and url_sha1_only:
+        if cache_enabled and url_sha1_skip_load:
             leaves = MMEncoder._flatten_nested_items(mm_items)
             # VIDEO folds per-video sampling params into the key so they don't
             # collide; params come from the leaf-aligned parallel list.
@@ -1900,17 +1997,13 @@ class MMEncoder:
                 )
                 for i, it in enumerate(leaves)
             ]
-            if not leaves or any(k is None for k in sha1_keys):
-                sha1_skip = True
-                logger.info(
-                    f"[mm_cache] SKIP (no url-sha1) modality={modality.name} "
-                    f"url={mm_source} mode=sha1"
-                )
             # VIDEO multi-leaf: cache per-video so a request can reuse one cached video. TP-safe.
-            elif modality == Modality.VIDEO and len(leaves) > 1:
+            if modality == Modality.VIDEO and len(leaves) > 1:
                 return await self._encode_video_per_item(
                     leaves, sha1_keys, mm_items_preprocess_kwargs
                 )
+            if not leaves or any(k is None for k in sha1_keys):
+                sha1_skip = True
             else:
                 _t0 = time.perf_counter()
                 async with self.mm_cache_lock:
@@ -1925,7 +2018,9 @@ class MMEncoder:
                 if hit is not None and hit.grid is not None:
                     if self.profiler is not None:
                         self.profiler.step()
-                    return (hit.grid, hit.embedding, hit.aux or {})
+                    aux = dict(hit.aux or {})
+                    aux["file_hashes"] = [_extract_url_sha1_key(it) for it in leaves]
+                    return (hit.grid, hit.embedding, aux)
 
         try:
             grid_dim, mm_embedding, aux_data, content_mm_hash, cache_hit = (
@@ -1933,6 +2028,7 @@ class MMEncoder:
                     mm_items,
                     modality,
                     mm_items_preprocess_kwargs=mm_items_preprocess_kwargs,
+                    content_hash_fallback=sha1_skip,
                 )
             )
             if mm_hash is None:
@@ -1945,7 +2041,7 @@ class MMEncoder:
                 mc.record_cache_files(1 if cache_hit else 0, 1, modality=modality_str)
 
             # Store grid + aux so a later pre-download hit can rebuild EmbeddingData without preprocess.
-            if cache_enabled and not sha1_skip:
+            if cache_enabled and mm_hash is not None and not cache_hit:
                 _t0 = time.perf_counter()
                 async with self.mm_cache_lock:
                     entries_before = len(self.mm_cache)
@@ -1995,6 +2091,11 @@ class MMEncoder:
         embedding_port=None,
         url=None,
     ):
+        if (
+            mm_data.tokenize_only
+            and self.server_args.encoder_transfer_backend != "zmq_to_tokenizer"
+        ):
+            raise ValueError("tokenize_only requires zmq_to_tokenizer")
         if self.server_args.encoder_transfer_backend == "mooncake":
             self.engine.register(embedding.data_ptr(), embedding.nbytes)
             self.engine.transfer_sync(
@@ -2012,7 +2113,13 @@ class MMEncoder:
         logger.info(f"{endpoint = }")
 
         # Serialize data
-        if self.server_args.encoder_transfer_backend == "mooncake":
+        if mm_data.tokenize_only:
+            metadata = mm_data.copy_without_embedding()
+            metadata.__dict__.pop("video_audio_embedding", None)
+            metadata.send_time = time.time()
+            serialized_data = pickle.dumps(metadata)
+            buffer = None
+        elif self.server_args.encoder_transfer_backend == "mooncake":
             mm_data.send_time = time.time()
             serialized_data = pickle.dumps(mm_data)
             buffer = None
@@ -2047,6 +2154,7 @@ class MMEncoder:
         if (
             encoder_metrics_collector is not None
             and embedding is not None
+            and not mm_data.tokenize_only
             and mm_data.error_msg is None
         ):
             modality_str = (
@@ -2220,7 +2328,7 @@ class MMEncoder:
         # IMAGE/AUDIO cross-request fusion. URL-SHA1 mode → _batch_encode_sha1, else _legacy_batch_encode.
         fast = (
             self.server_args.enable_prefix_mm_cache
-            and envs.SGLANG_MM_CACHE_URL_SHA1_ONLY.get()
+            and envs.SGLANG_MM_CACHE_URL_SHA1_SKIP_LOAD.get()
         )
         if fast:
             return await self._batch_encode_sha1(
@@ -2248,10 +2356,12 @@ class MMEncoder:
                 mc.observe_mm_items_per_request(n, modality=modality_str)
             mc.observe_mm_items_per_batch(total, modality=modality_str)
         keys = [_extract_url_sha1_key(it) for it in flat_items]
+        file_hashes = list(keys)
         cached_emb: List[Optional[torch.Tensor]] = [None] * total
         cached_grid: List[Optional[torch.Tensor]] = [None] * total
+        cache_hits = [False] * total
         miss_indices: List[int] = []
-        skip_indices: List[int] = []  # no url-sha1: encode but never store
+        skip_indices: List[int] = []
 
         _t0 = time.perf_counter()
         async with self.mm_cache_lock:
@@ -2264,13 +2374,11 @@ class MMEncoder:
                 # Require grid; legacy entries without it are recomputed and re-stored.
                 if hit is not None and hit.grid is not None:
                     cached_emb[i], cached_grid[i] = hit.embedding, hit.grid
+                    cache_hits[i] = True
                 else:
                     miss_indices.append(i)
         if mc is not None:
             mc.observe_cache_read(time.perf_counter() - _t0, modality=modality_str)
-            hits = total - len(miss_indices)
-            mc.record_cache_tokens(hits, total, modality=modality_str)
-            mc.record_cache_files(hits, total, modality=modality_str)
 
         # Download + preprocess + ViT only for the misses.
         stage_timing = {} if (mc is not None or get_global_tracing_enabled()) else None
@@ -2306,33 +2414,83 @@ class MMEncoder:
                     )
                     return await self._legacy_batch_encode(requests, modality)
 
-                miss_slices = await self._encode_missing(
-                    mm_feature,
-                    mm_inputs,
-                    list(range(len(miss_items))),
-                    modality,
-                    get_feat,
-                    forward_timing=forward_timing,
-                    log_metrics=log_metrics,
+                for j, gidx in enumerate(miss_indices):
+                    file_hashes[gidx] = mm_inputs["file_hashes"][j]
+                skip_set = set(skip_indices)
+                content_keys = (
+                    self._calculate_hashes_from_features(
+                        mm_feature,
+                        miss_grid,
+                        modality,
+                        indices=[
+                            j
+                            for j, gidx in enumerate(miss_indices)
+                            if gidx in skip_set
+                        ],
+                    )
+                    if skip_set
+                    else None
                 )
 
-                skip_set = set(skip_indices)
-                _t0 = time.perf_counter()
-                async with self.mm_cache_lock:
-                    for j, gidx in enumerate(miss_indices):
-                        emb = miss_slices[j]
-                        g = miss_grid[j : j + 1]
-                        cached_emb[gidx], cached_grid[gidx] = emb, g
-                        if gidx in skip_set:
-                            continue
-                        self.mm_cache.set(
-                            keys[gidx], EmbeddingResult(embedding=emb, grid=g)
+                vit_positions: List[int] = []  # miss-space indices needing ViT
+                store_keys: Dict[int, int] = {}  # miss-space index -> cache key
+                if content_keys is not None:
+                    _t0 = time.perf_counter()
+                    async with self.mm_cache_lock:
+                        for j, gidx in enumerate(miss_indices):
+                            if gidx in skip_set:
+                                ck = content_keys[j]
+                                hit = self.mm_cache.get_single(ck)
+                                if hit is not None:
+                                    cached_emb[gidx] = hit.embedding
+                                    cached_grid[gidx] = miss_grid[j : j + 1]
+                                    cache_hits[gidx] = True
+                                    continue
+                                store_keys[j] = ck
+                            else:
+                                store_keys[j] = keys[gidx]
+                            vit_positions.append(j)
+                    if mc is not None:
+                        mc.observe_cache_read(
+                            time.perf_counter() - _t0, modality=modality_str
                         )
-                if mc is not None:
-                    mc.observe_cache_write(
-                        time.perf_counter() - _t0, modality=modality_str
+                else:
+                    vit_positions = list(range(len(miss_items)))
+                    store_keys = {
+                        j: keys[gidx]
+                        for j, gidx in enumerate(miss_indices)
+                        if gidx not in skip_set
+                    }
+
+                if vit_positions:
+                    miss_slices = await self._encode_missing(
+                        mm_feature,
+                        mm_inputs,
+                        vit_positions,
+                        modality,
+                        get_feat,
+                        forward_timing=forward_timing,
+                        log_metrics=log_metrics,
                     )
-                    mc.set_cache_state(self.mm_cache.current_size, len(self.mm_cache))
+
+                    _t0 = time.perf_counter()
+                    async with self.mm_cache_lock:
+                        for pos, emb in zip(vit_positions, miss_slices):
+                            gidx = miss_indices[pos]
+                            g = miss_grid[pos : pos + 1]
+                            cached_emb[gidx], cached_grid[gidx] = emb, g
+                            key = store_keys.get(pos)
+                            if key is not None:
+                                self.mm_cache.set(
+                                    key, EmbeddingResult(embedding=emb, grid=g)
+                                )
+                    if mc is not None:
+                        mc.observe_cache_write(
+                            time.perf_counter() - _t0, modality=modality_str
+                        )
+                        mc.set_cache_state(
+                            self.mm_cache.current_size, len(self.mm_cache)
+                        )
             except Exception as e:
                 return self._batch_set_error(
                     requests, modality, InternalError(f"Internal encoding error: {e}")
@@ -2363,6 +2521,13 @@ class MMEncoder:
             gs = cached_grid[offset : offset + n]
             emb = es[0] if n == 1 else torch.cat(es, dim=0)
             grid = gs[0] if n == 1 else torch.cat(gs, dim=0)
+            if mc is not None:
+                hits = cache_hits[offset : offset + n]
+                hit_tokens = sum(e.shape[0] for e, hit in zip(es, hits) if hit)
+                mc.record_cache_files(sum(hits), n, modality=modality_str)
+                mc.record_cache_tokens(
+                    hit_tokens, emb.shape[0], modality=modality_str
+                )
             if self.rank == 0:
                 self.embedding_to_send[req["req_id"]] = EmbeddingData(
                     req["req_id"],
@@ -2371,6 +2536,7 @@ class MMEncoder:
                     grid,
                     modality,
                     emb,
+                    file_hashes=file_hashes[offset : offset + n],
                 )
             results.append((emb.nbytes, emb.shape[0], emb.shape[1], None, None))
             offset += n
@@ -2454,6 +2620,11 @@ class MMEncoder:
                         grid_dim[offset : offset + n],
                         modality,
                         emb,
+                        file_hashes=(
+                            mm_inputs["file_hashes"][offset : offset + n]
+                            if "file_hashes" in mm_inputs
+                            else None
+                        ),
                     )
                 results.append((emb.nbytes, emb.shape[0], emb.shape[1], None, None))
                 offset += n
@@ -3039,6 +3210,7 @@ def _emit_encode_trace(
 def _stamp_encoder_e2e(enc: MMEncoder, request: dict) -> None:
     mm_data = enc.embedding_to_send.get(request["req_id"])
     if mm_data is not None:
+        mm_data.tokenize_only = request.get("tokenize_only", False)
         mm_data.encoder_e2e_latency = time.time() - request["enter_time"]
 
 
@@ -3711,6 +3883,7 @@ async def _dp_worker_handle_request(
         encoder_metrics_collector.inc_requests_received(
             dp_rank=dp_rank, modality=modality_str
         )
+        _record_input_file_metrics(request, modality_str)
     try:
         if dp_type in ("start_profile", "stop_profile"):
             content = await _dp_worker_handle_profile(enc, dp_rank, dp_type, request)
@@ -4230,6 +4403,7 @@ async def handle_encode_request(request: dict):
             encoder_metrics_collector.inc_requests_received(
                 dp_rank=0, modality=modality_str
             )
+            _record_input_file_metrics(request, modality_str)
         if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
             try:
                 nbytes, embedding_len, embedding_dim, error_msg, error_code = (

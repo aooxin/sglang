@@ -2550,6 +2550,12 @@ class EncoderMetricsCollector:
             labelnames=list(labels.keys()) + ["dp_rank", "modality"],
         )
 
+        self.input_files_total = Counter(
+            name="sglang:encoder_input_files_total",
+            documentation="Total multimodal files received by encoder, by modality and URL filename SHA1 type.",
+            labelnames=list(labels.keys()) + ["modality", "sha1_type"],
+        )
+
         # Multimodal items per batch histogram
         self.mm_items_per_batch = Histogram(
             name="sglang:encoder_mm_items_per_batch",
@@ -2743,6 +2749,16 @@ class EncoderMetricsCollector:
         self.requests_total.labels(
             **self.labels, modality=modality, status=status
         ).inc()
+
+    def record_input_files(
+        self, sha1_count: int, non_sha1_count: int, modality: str
+    ) -> None:
+        self.input_files_total.labels(
+            **self.labels, modality=modality, sha1_type="sha1"
+        ).inc(sha1_count)
+        self.input_files_total.labels(
+            **self.labels, modality=modality, sha1_type="non_sha1"
+        ).inc(non_sha1_count)
 
     def inc_requests_received(self, dp_rank: int = 0, modality: str = "image") -> None:
         """Increment the received-requests counter at request-arrival time."""

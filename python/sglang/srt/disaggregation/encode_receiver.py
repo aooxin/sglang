@@ -141,8 +141,12 @@ class EmbeddingData:
         embedding_shape=None,
         error_msg=None,
         error_code=None,
+        file_hashes=None,
+        tokenize_only=False,
         **kwargs,
     ):
+        self.tokenize_only = tokenize_only
+        self.file_hashes = file_hashes
         self.req_id = req_id
         self.num_parts = num_parts
         self.part_idx = part_idx
@@ -269,6 +273,8 @@ class MultiModalEmbeddingData(EmbeddingData):
             embedding_shape,
             **kwargs,
         )
+        self.file_hashes_list = [None] * num_parts
+        self.file_hashes_list[part_idx] = self.file_hashes
         self.video_meta_attrs = video_meta_attrs_for(model_type)
         self.img_grid_thw = [None] * num_parts
         self.video_grid_thw = [None] * num_parts
@@ -318,7 +324,10 @@ class MultiModalEmbeddingData(EmbeddingData):
     ):
         """Create MultiModalEmbeddingData from an EmbeddingData instance."""
         # Only forward known optional attrs (e.g. video metadata) so they land on the instance
-        extra = {}
+        extra = {
+            "file_hashes": embedding_data.file_hashes,
+            "tokenize_only": embedding_data.tokenize_only,
+        }
         for attr in video_meta_attrs_for(model_type):
             val = getattr(embedding_data, attr, None)
             if val is not None:
@@ -362,6 +371,16 @@ class MultiModalEmbeddingData(EmbeddingData):
                 self.audio_feature_lens, flatten_items=True
             ),
         }
+        if any(h is not None for h in self.file_hashes_list):
+            file_hashes = defaultdict(list)
+            for pid, hashes in enumerate(self.file_hashes_list):
+                mod = self.modality_list[pid]
+                grid_attr, _ = _MODALITY_GRID_ATTRS[mod]
+                grid = getattr(self, grid_attr)[pid]
+                if hashes is None or len(hashes) != len(grid):
+                    raise ValueError(f"File hashes do not match grid for part {pid}")
+                file_hashes[mod].extend(hashes)
+            kwargs["file_hashes"] = dict(file_hashes)
         for attr in self.video_meta_attrs:
             lst = getattr(self, attr, None)
             if not lst:
@@ -382,12 +401,15 @@ class MultiModalEmbeddingData(EmbeddingData):
                 f"expected {self.req_id}, got {embedding_data.req_id}"
             )
             return False
+        if self.tokenize_only != embedding_data.tokenize_only:
+            raise ValueError("Inconsistent tokenize_only mode across encoder parts")
         assert not self.ready_list[embedding_data.part_idx]
         pid = embedding_data.part_idx
         self.ready_list[pid] = True
         self.modality_list[pid] = embedding_data.modality
         self.embedding_list[pid] = embedding_data.get_embedding()
         self.embedding_shape_list[pid] = embedding_data.shape
+        self.file_hashes_list[pid] = embedding_data.file_hashes
         self._set_part_grid(pid, embedding_data.modality, embedding_data.get_grid())
         if embedding_data.modality == Modality.VIDEO:
             self._set_video_meta_for_part(pid, embedding_data)
@@ -789,6 +811,14 @@ class MMReceiverBase(ABC):
         need_wait_for_mm_inputs=True,
         trace_context=None,
     ):
+        tokenize_only = getattr(request_obj, "return_tokens_only", False)
+        if tokenize_only and (
+            self.encoder_transfer_backend != "zmq_to_tokenizer"
+            or not isinstance(self, MMReceiverHTTP)
+        ):
+            raise ValueError(
+                "tokenize_only requires HTTP encoder requests with zmq_to_tokenizer"
+            )
         req_id = None
         try:
             if len(self.encode_urls) == 0 or not need_wait_for_mm_inputs:
@@ -808,7 +838,7 @@ class MMReceiverBase(ABC):
                 f"modalities={modalities}, num_items={len(mm_data)}"
             )
             send_time = time.monotonic()
-            asyncio.create_task(
+            send_task = asyncio.create_task(
                 self.encode(
                     req_id,
                     mm_data,
@@ -816,12 +846,30 @@ class MMReceiverBase(ABC):
                     "encode",
                     "send",
                     trace_context=trace_context,
+                    **({"tokenize_only": True} if tokenize_only else {}),
                 )
             )
-            result = await asyncio.wait_for(
-                self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
-                timeout=self.recv_timeout,
-            )
+            if tokenize_only:
+                recv_task = asyncio.create_task(
+                    self._recv_mm_data(
+                        req_id, recv_socket, mm_processor, prompt, tokenize_only=True
+                    )
+                )
+                try:
+                    _, result = await asyncio.wait_for(
+                        asyncio.gather(send_task, recv_task), timeout=self.recv_timeout
+                    )
+                finally:
+                    for task in (send_task, recv_task):
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(send_task, recv_task, return_exceptions=True)
+                    recv_socket.close()
+            else:
+                result = await asyncio.wait_for(
+                    self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
+                    timeout=self.recv_timeout,
+                )
             elapsed = time.monotonic() - send_time
             logger.info(f"[{req_id}] Received embedding from E in {elapsed:.3f}s")
             if self.metrics_collector is not None and result is not None:
@@ -865,14 +913,14 @@ class MMReceiverBase(ABC):
         for key in [k for k in self._part_send_ts if k[0] == req_id]:
             self._part_send_ts.pop(key, None)
 
-    def _observe_part_metrics(self, recv_obj: EmbeddingData):
+    def _observe_part_metrics(self, recv_obj: EmbeddingData, received_at=None):
         if self.metrics_collector is None:
             return
         modality = recv_obj.modality
         modality_str = (
             modality.name.lower() if hasattr(modality, "name") else str(modality)
         )
-        now = time.time()
+        now = received_at if received_at is not None else time.time()
         send_time = getattr(recv_obj, "send_time", None)
         if send_time is not None:
             self.metrics_collector.observe_encoder_transfer_seconds(
@@ -887,7 +935,9 @@ class MMReceiverBase(ABC):
         if encoder_e2e is not None:
             self.metrics_collector.observe_encoder_e2e_request_latency(encoder_e2e)
 
-    async def _recv_mm_data(self, req_id, recv_socket, mm_processor, prompt):
+    async def _recv_mm_data(
+        self, req_id, recv_socket, mm_processor, prompt, tokenize_only=False
+    ):
         if req_id is None:
             return None
 
@@ -900,6 +950,7 @@ class MMReceiverBase(ABC):
                 parts = await recv_socket.recv_multipart(copy=False)
                 if not parts:
                     continue
+                received_at = time.time()
                 recv_obj: EmbeddingData = pickle.loads(parts[0])
                 if getattr(recv_obj, "error_msg", None) is not None:
                     logger.warning(
@@ -908,14 +959,21 @@ class MMReceiverBase(ABC):
                     )
                     self._cleanup_mooncake_buffer(req_id)
                     return None
+                if recv_obj.tokenize_only != tokenize_only:
+                    raise ValueError(
+                        "Encoder response tokenize_only mode does not match request"
+                    )
                 logger.debug("recv_obj=%s", recv_obj)
                 # Extract original req_id from part_req_id
                 part_req_id = recv_obj.req_id
                 original_req_id = extract_original_req_id(part_req_id)
                 # Update recv_obj.req_id to original for aggregation
                 recv_obj.req_id = original_req_id
-                self._observe_part_metrics(recv_obj)
-                if self.encoder_transfer_backend == "zmq_to_tokenizer":
+                self._observe_part_metrics(recv_obj, received_at=received_at)
+                if (
+                    self.encoder_transfer_backend == "zmq_to_tokenizer"
+                    and not tokenize_only
+                ):
                     if len(parts) < 2:
                         logger.error(
                             "zmq_to_tokenizer expected 2-part message, got %d parts",
@@ -969,6 +1027,7 @@ class MMReceiverBase(ABC):
                 prompt,
                 recv_embedding,
                 **recv_embedding_data.get_mm_extra_meta(),
+                **({"tokenize_only": True} if tokenize_only else {}),
             )
             return mm_inputs
         finally:
@@ -1427,6 +1486,7 @@ class MMReceiverHTTP(MMReceiverBase):
         endpoint_send,
         num_items_assigned=None,
         trace_context=None,
+        tokenize_only=False,
     ):
         if len(mm_data) == 0:
             return
@@ -1471,6 +1531,9 @@ class MMReceiverHTTP(MMReceiverBase):
                 else {}
             )
 
+        if tokenize_only:
+            for er in encode_requests:
+                er["tokenize_only"] = True
         if trace_context:
             for er in encode_requests:
                 er["trace_context"] = trace_context
@@ -1513,6 +1576,10 @@ class MMReceiverHTTP(MMReceiverBase):
                         msg = await response.text()
 
                     logger.error(f"Encoder returned error {response.status}: {msg}")
+                    if tokenize_only:
+                        raise ValueError(
+                            f"Encoder returned error {response.status}: {msg}"
+                        )
                     return
             response_json_list_unsort = [
                 await response.json() for response in responses

@@ -166,6 +166,7 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
     add_prometheus_track_response_middleware,
+    configure_logger,
     delete_directory,
     get_bool_env_var,
     kill_process_tree,
@@ -222,6 +223,8 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
     server_args: ServerArgs
     port_args: PortArgs
+
+    configure_logger(server_args, prefix=f" TokenizerWorker PID{os.getpid()}")
 
     # API key authentication is not supported in multi-tokenizer mode
     assert (

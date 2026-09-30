@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import copy
+import hashlib
 import io
 import json
 import math
@@ -27,11 +28,13 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
 )
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.mm_utils import hash_decoded_content
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -51,6 +54,16 @@ except ImportError:
     )
     torchaudio = None
     MelSpectrogram = None
+
+
+def _derive_audio_hash(video_hash):
+    if video_hash is None:
+        return None
+    return int.from_bytes(
+        hashlib.sha256(f"audio:{video_hash}".encode()).digest()[:8],
+        byteorder="big",
+        signed=False,
+    )
 
 
 @dataclass
@@ -388,11 +401,13 @@ class MiMoProcessor:
         video_process_num_threads=16,
         video_decode_num_threads=0,
         device=None,
+        encoder_video_device="cpu",
         **kwargs,
     ):
         self.tokenizer = tokenizer
         self.video_process_num_threads = video_process_num_threads
         self.video_decode_num_threads = video_decode_num_threads
+        self.encoder_video_device = torch.device(encoder_video_device)
 
         if device is None:
             self.device = None
@@ -660,7 +675,12 @@ class MiMoProcessor:
         return video_blob, video_tuple
 
     def preprocess_for_encoder(
-        self, mm_data, modality, preprocess_kwargs_list=None, load_timings=None
+        self,
+        mm_data,
+        modality,
+        preprocess_kwargs_list=None,
+        load_timings=None,
+        file_hashes=None,
     ):
         # EPD encoder-side features. video_audio_* fields appear when any
         # video has audio; the D side uses them to rebuild input_ids.
@@ -708,13 +728,17 @@ class MiMoProcessor:
                 video_blob, video_tuple = self._load_video_for_encoder(
                     video_data, pk, timing=item_timing
                 )
+                decoded_hashes = None
+                if file_hashes is not None and file_hashes[i] is None:
+                    decoded_hashes = [hash_decoded_content("video", *video_tuple)]
                 video_input_overrides = {
                     k: pk[k]
                     for k in self.default_video_processor_kwargs
                     if pk.get(k) is not None
                 }
                 patches, grid, aligned_ts, video_meta = self.process_video(
-                    VideoInput(video=video_tuple, **video_input_overrides)
+                    VideoInput(video=video_tuple, **video_input_overrides),
+                    device=self.encoder_video_device,
                 )
                 all_patches.append(patches)
                 all_grids.append(grid)
@@ -723,7 +747,9 @@ class MiMoProcessor:
 
                 if self.has_audio_track(video_blob):
                     try:
-                        audio_spec, audio_token_len = self.preprocess_audio(video_blob)
+                        audio_spec, audio_token_len = self.preprocess_audio(
+                            video_blob, decoded_hashes=decoded_hashes
+                        )
                     except ValueError as e:
                         # The blob is already downloaded, so preprocess_audio only
                         # sees bytes and cannot name the source. Log the original
@@ -756,12 +782,18 @@ class MiMoProcessor:
                     per_video_num_units.append(len(units))
                 else:
                     per_video_num_units.append(0)
+                if decoded_hashes is not None:
+                    file_hashes[i] = MultiModalStaticCache.combine_hashes(
+                        decoded_hashes
+                    )
 
             result = {
                 "pixel_values_videos": torch.cat(all_patches, dim=0),
                 "video_grid_thw": torch.stack(all_grids),
                 "video_timestamps": all_timestamps,
             }
+            if file_hashes is not None:
+                result["file_hashes"] = file_hashes
             if audio_features:
                 result["video_audio_features"] = audio_features
                 result["video_audio_feature_lens"] = torch.tensor(
@@ -846,7 +878,7 @@ class MiMoProcessor:
             raise ValueError("Video sampling strategy not specified")
         return kwargs
 
-    def preprocess_audio(self, audio: str | bytes):
+    def preprocess_audio(self, audio: str | bytes, decoded_hashes=None):
         self._ensure_audio_dependencies()
         """
         - Input: audio filename string, bytes, or tuple of (waveform, original_sr)
@@ -915,6 +947,10 @@ class MiMoProcessor:
             waveform = self._resamplers[original_sr](waveform)
         if waveform.ndim == 2:
             waveform = waveform.mean(dim=0)
+        if decoded_hashes is not None:
+            decoded_hashes.append(
+                hash_decoded_content("audio", self.audio_sampling_rate, waveform)
+            )
         spec = self.mel_spectrogram(waveform[None, :])
         spec = torch.log(torch.clip(spec, min=1e-7)).squeeze()
         spec = spec.transpose(0, 1)
@@ -945,7 +981,10 @@ class MiMoProcessor:
         return image_transformed_tensor
 
     def process_video(
-        self, video_input: VideoInput | VideoAudioInput, temporal_padding_factor=None
+        self,
+        video_input: VideoInput | VideoAudioInput,
+        temporal_padding_factor=None,
+        device: Optional[torch.device] = None,
     ):
 
         def smart_resize_video(
@@ -1099,7 +1138,7 @@ class MiMoProcessor:
             factor=self.patch_size * self.merge_size,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
-            device=self.device,
+            device=self.device if device is None else device,
         )
 
         visual_patches, thw_grid = self._flatten_visual_inputs(
@@ -2441,6 +2480,22 @@ class MiMoV2Processor(BaseMultimodalProcessor):
         video_audio_segment_lens_flat = kwargs.get("video_audio_segment_lens_flat")
         video_audio_per_video_num_units = kwargs.get("video_audio_per_video_num_units")
         video_audio_embedding = kwargs.get("video_audio_embedding")
+        file_hashes = kwargs.get("file_hashes")
+        tokenize_only = kwargs.get("tokenize_only", False)
+        if tokenize_only and file_hashes is None:
+            raise ValueError("tokenize_only requires encoder file hashes")
+        if file_hashes is not None:
+            for mod, grid in (
+                (Modality.IMAGE, img_grid_thw),
+                (Modality.VIDEO, video_grid_thw),
+                (Modality.AUDIO, audio_feature_lens),
+            ):
+                expected = len(grid) if grid is not None else 0
+                hashes = file_hashes.get(mod, [])
+                if len(hashes) != expected or any(
+                    not isinstance(h, int) for h in hashes
+                ):
+                    raise ValueError(f"File hashes do not match {mod.name} inputs")
 
         if not isinstance(prompt, str):
             prompt = self._tokenizer.decode(prompt)
@@ -2463,6 +2518,12 @@ class MiMoV2Processor(BaseMultimodalProcessor):
         num_videos = len(video_grid_thw) if video_grid_thw is not None else 0
         per_video_audio_info = [None] * num_videos
         if video_audio_per_video_num_units and video_audio_segment_lens_flat:
+            if len(video_audio_per_video_num_units) != num_videos:
+                raise ValueError(
+                    f"video_audio_per_video_num_units has "
+                    f"{len(video_audio_per_video_num_units)} entries but there are "
+                    f"{num_videos} videos; encoder aux is misaligned"
+                )
             off, av_idx = 0, 0
             for i, nu in enumerate(video_audio_per_video_num_units):
                 if nu <= 0:
@@ -2512,9 +2573,21 @@ class MiMoV2Processor(BaseMultimodalProcessor):
 
         merge_size = self.spatial_merge_size
         input_ids = []
+        file_spans = {
+            mod: [] for mod in (Modality.IMAGE, Modality.VIDEO, Modality.AUDIO)
+        }
         img_idx = video_idx = audio_idx = 0
         for part in text_parts:
             mod = self.mm_tokens.get_modality_of_token(part)
+            span_start = len(input_ids)
+            file_hash = None
+            if file_hashes is not None and mod in file_spans:
+                item_index = {
+                    Modality.IMAGE: img_idx,
+                    Modality.VIDEO: video_idx,
+                    Modality.AUDIO: audio_idx,
+                }[mod]
+                file_hash = file_hashes[mod][item_index]
             if mod == Modality.IMAGE:
                 grid = img_grid_thw[img_idx]
                 n = int(grid.prod().item()) // (merge_size**2)
@@ -2576,6 +2649,13 @@ class MiMoV2Processor(BaseMultimodalProcessor):
                 audio_idx += 1
             elif part:
                 input_ids += mp.tokenizer.encode(part)
+            if file_hash is not None:
+                span = (span_start, len(input_ids), file_hash)
+                file_spans[mod].append(span)
+                if mod == Modality.VIDEO:
+                    file_spans[Modality.AUDIO].append(
+                        (span_start, len(input_ids), _derive_audio_hash(file_hash))
+                    )
 
         input_ids_tensor = torch.tensor(input_ids)
 
@@ -2591,20 +2671,40 @@ class MiMoV2Processor(BaseMultimodalProcessor):
             (Modality.VIDEO, mp.video_token_id),
             (Modality.AUDIO, mp.audio_token_id),
         ]:
-            if mod not in embeddings:
+            if not tokenize_only and mod not in embeddings:
                 continue
             offsets = self.get_mm_items_offset(input_ids_tensor, token_id)
-            validate_offsets_match_embedding(
-                mod, offsets, embeddings[mod].shape[0], context=mismatch_context
-            )
+            if not tokenize_only:
+                validate_offsets_match_embedding(
+                    mod, offsets, embeddings[mod].shape[0], context=mismatch_context
+                )
+            span_idx = 0
             for offset in offsets:
                 n = offset[1] - offset[0] + 1
                 s = consumed.get(mod, 0)
+                file_hash = None
+                if file_hashes is not None:
+                    spans = file_spans[mod]
+                    while span_idx < len(spans) and spans[span_idx][1] <= offset[0]:
+                        span_idx += 1
+                    if span_idx == len(spans) or not (
+                        spans[span_idx][0]
+                        <= offset[0]
+                        <= offset[1]
+                        < spans[span_idx][1]
+                    ):
+                        raise ValueError(
+                            f"No source file hash for {mod.name} offset {offset}"
+                        )
+                    file_hash = spans[span_idx][2]
                 mm_items.append(
                     MultimodalDataItem(
                         modality=mod,
                         offsets=[offset],
-                        precomputed_embeddings=embeddings[mod][s : s + n],
+                        hash=file_hash,
+                        precomputed_embeddings=(
+                            None if tokenize_only else embeddings[mod][s : s + n]
+                        ),
                     )
                 )
                 consumed[mod] = s + n

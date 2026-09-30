@@ -1193,16 +1193,28 @@ class MiMoV2ForCausalLM(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def preprocess_mm_for_encoder(
-        self, mm_data, modality, config, preprocess_kwargs_list=None, load_timings=None
+        self,
+        mm_data,
+        modality,
+        config,
+        preprocess_kwargs_list=None,
+        load_timings=None,
+        file_hashes=None,
     ):
         if self._encoder_processor is None:
             from sglang.srt.multimodal.processors.mimo_v2 import MiMoProcessor
 
             self._encoder_processor = MiMoProcessor.from_hf_config(
-                self.config, mm_config=config
+                self.config,
+                mm_config=config,
+                encoder_video_device=config.get("video", {}).get("device", "cpu"),
             )
         return self._encoder_processor.preprocess_for_encoder(
-            mm_data, modality, preprocess_kwargs_list, load_timings=load_timings
+            mm_data,
+            modality,
+            preprocess_kwargs_list,
+            load_timings=load_timings,
+            file_hashes=file_hashes,
         )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:

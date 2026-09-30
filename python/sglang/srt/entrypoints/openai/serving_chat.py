@@ -443,9 +443,6 @@ class OpenAIServingChat(OpenAIServingBase):
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
 
-        # Fast path: return_tokens_only directly returns prompt_ids from _process_messages.
-        # NOTE: only handles text requests for now; multimodal inputs (image_data,
-        # video_data, audio_data) are passed in the normal path below (GenerateReqInput at ~line 363).
         if request.return_tokens_only:
             has_mm_data = (
                 processed_messages.image_data

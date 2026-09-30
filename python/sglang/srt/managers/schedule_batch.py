@@ -293,13 +293,15 @@ class MultimodalDataItem:
         return len([item for item in flatten_nested_list(l) if item is not None]) == 0
 
     def set_pad_value(self):
-        """Set the pad value after first hashing the data."""
+        """
+        Set the pad value after first hashing the data
+        """
         if self.pad_value is not None:
             return
 
         from sglang.srt.managers.mm_utils import hash_feature
 
-        if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+        if self.hash is None and envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
             import uuid
 
             self.hash = uuid.uuid4().int

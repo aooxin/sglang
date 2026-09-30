@@ -3,6 +3,7 @@
 # MiMo Pro on 8 x GM504; Prefill benchmark based on document A's v2 settings.
 # Reference: docs/504/MiMo-V2.5-Pro-FP4-DFlash  504测试.md (v2, commit 2dd80321).
 # Mount the target checkpoint at /preset-models/ and DFLASH at /extra-models/.
+# Keep DP2: TP8 / DP2 gives attention TP4 for this fused-QKV Pro checkpoint.
 # Keep draft window 1024 for this run. The legacy BF16-router and
 # pre-generated fake-top-k patches are deferred, so this differs from v2 + fake.
 export SGLANG_DG_CACHE_DIR=/model/cache/deep_gemm
@@ -19,7 +20,7 @@ exec python3 -m sglang.launch_server \
     --log-level-http warning \
     --enable-cache-report \
     --pp-size 1 \
-    --dp-size 1 \
+    --dp-size 2 \
     --tp-size 8 \
     --ep-size 8 \
     --enable-dp-attention \

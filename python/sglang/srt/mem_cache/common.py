@@ -156,6 +156,13 @@ def free_kv_row_segments(
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
+        if kwargs.get("chunked", False):
+            # Skipping shared-cache insertion must not discard chunk progress.
+            # These slots remain request-owned: keep cache_protected_len unchanged.
+            kv_indices = tree_cache.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, : req.extend_range.end
+            ]
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)

@@ -48,7 +48,6 @@ from sglang.benchmark.utils import (
     remove_prefix,
     set_ulimit,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.utils.network import resolve_base_url, resolve_host_port
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
@@ -1996,6 +1995,9 @@ def run_benchmark(args_: argparse.Namespace):
 
     # Inject bootstrap fields for fake decode benchmarking
     if getattr(args, "fake_prefill", False):
+        # Normal serving benchmarks do not need the server-side GPU backends.
+        from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+
         extra_request_body["bootstrap_host"] = FAKE_BOOTSTRAP_HOST
         extra_request_body["bootstrap_room"] = 0
 

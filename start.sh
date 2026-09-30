@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 
-# MiMo-V2.6 Pro on 8 x B300; one server handles prefill and decode.
+# MiMo Pro on 8 x GM504; Prefill benchmark based on document A's v2 settings.
+# Reference: docs/504/MiMo-V2.5-Pro-FP4-DFlash  504测试.md (v2, commit 2dd80321).
 # Mount the target checkpoint at /preset-models/ and DFLASH at /extra-models/.
+# Keep draft window 1024 for this run. The legacy BF16-router and
+# pre-generated fake-top-k patches are deferred, so this differs from v2 + fake.
 export SGLANG_DG_CACHE_DIR=/model/cache/deep_gemm
 export SGLANG_CACHE_DIR=/model/cache/sglang
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 export SGLANG_FORWARD_UNKNOWN_TOOLS=1
+export NCCL_TIMEOUT=1200
 export SGLANG_WARMUP_TIMEOUT=1200
 export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
 
@@ -15,7 +19,7 @@ exec python3 -m sglang.launch_server \
     --log-level-http warning \
     --enable-cache-report \
     --pp-size 1 \
-    --dp-size 2 \
+    --dp-size 1 \
     --tp-size 8 \
     --ep-size 8 \
     --enable-dp-attention \
@@ -23,17 +27,16 @@ exec python3 -m sglang.launch_server \
     --moe-a2a-backend deepep \
     --deepep-mode normal \
     --decode-log-interval 1 \
-    --page-size 128 \
+    --page-size 64 \
     --host 0.0.0.0 \
     --port 9001 \
     --trust-remote-code \
     --watchdog-timeout 1000000 \
-    --dist-timeout 1200 \
     --mem-fraction-static 0.7 \
-    --swa-full-tokens-ratio 0.13 \
+    --swa-full-tokens-ratio 0.08 \
     --chunked-prefill-size 49152 \
     --max-prefill-tokens 65536 \
-    --reasoning-parser mimo \
+    --reasoning-parser qwen3 \
     --tool-call-parser mimo \
     --enable-metrics \
     --quantization fp8 \
@@ -46,10 +49,8 @@ exec python3 -m sglang.launch_server \
     --enable-dp-lm-head \
     --speculative-algorithm DFLASH \
     --speculative-draft-model-path /extra-models/ \
-    --speculative-draft-model-quantization fp8 \
     --speculative-num-draft-tokens 8 \
     --speculative-draft-window-size 1024 \
-    --speculative-draft-attention-backend fa4 \
     --disable-tokenizer-batch-decode \
     --context-length 1048576 \
     --numa-node 0 0 0 0 1 1 1 1 \

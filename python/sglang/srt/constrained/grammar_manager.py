@@ -3,11 +3,14 @@ from __future__ import annotations
 import logging
 import time
 from concurrent import futures
+from dataclasses import replace
 from typing import TYPE_CHECKING, List
 
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import (
+    BaseGrammarObject,
+    GrammarStats,
     InvalidGrammarObject,
     create_grammar_backend,
 )
@@ -56,6 +59,32 @@ class GrammarManager:
     def has_waiting_grammars(self) -> bool:
         return len(self.grammar_queue) > 0
 
+    def _record_grammar_stats(
+        self,
+        req: Req,
+        *,
+        cache_hit: bool = False,
+        aborted: bool = False,
+        timed_out: bool = False,
+    ) -> None:
+        if not self.scheduler.current_scheduler_metrics_enabled:
+            return
+
+        # Keep request outcomes separate from cached (possibly shared) grammars.
+        stats = (
+            req.grammar.grammar_stats
+            if isinstance(req.grammar, BaseGrammarObject)
+            else None
+        )
+        stats = replace(stats) if stats is not None else GrammarStats()
+        stats.is_cache_hit = cache_hit
+        stats.is_grammar_aborted = aborted
+        stats.num_timeout = int(timed_out)
+        if cache_hit:
+            # A cache hit did not compile again.
+            stats.compilation_time = None
+        self.scheduler.metrics_collector.log_grammar_stats(stats)
+
     def abort_requests(self, recv_req: AbortReq):
         for req in self.grammar_queue:
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
@@ -75,6 +104,7 @@ class GrammarManager:
         ):
             if self.grammar_backend is None:
                 error_msg = "Grammar-based generation (json_schema, regex, ebnf, structural_tag) is not supported when the server is launched with --grammar-backend none"
+                self._record_grammar_stats(req, aborted=True)
                 req.set_finish_with_abort(error_msg)
             else:
                 if req.sampling_params.json_schema is not None:
@@ -95,6 +125,11 @@ class GrammarManager:
                     req.grammar_key = key
                     add_to_grammar_queue = True
                 else:
+                    self._record_grammar_stats(
+                        req,
+                        cache_hit=True,
+                        aborted=isinstance(value, InvalidGrammarObject),
+                    )
                     if isinstance(
                         value, InvalidGrammarObject
                     ):  # We hit a cached invalid grammar.
@@ -173,11 +208,15 @@ class GrammarManager:
             req = self.grammar_queue[i]
             return_reqs.append(req)
             if req.finished() or req.grammar is None:  # It is aborted by AbortReq
+                self._record_grammar_stats(req, aborted=True)
                 continue
 
             assert isinstance(req.grammar, futures.Future) and req.grammar_key
             req.grammar = req.grammar.result()
             self.grammar_backend.set_cache(req.grammar_key, req.grammar.copy())
+            self._record_grammar_stats(
+                req, aborted=isinstance(req.grammar, InvalidGrammarObject)
+            )
             if isinstance(req.grammar, InvalidGrammarObject):
                 error_msg = f"Failed to compile {req.grammar_key[0]} grammar: {req.grammar.error_message}"
                 req.set_finish_with_abort(error_msg)
@@ -193,6 +232,7 @@ class GrammarManager:
                 req.grammar_key, InvalidGrammarObject("Grammar preprocessing timed out")
             )
             error_msg = f"Grammar preprocessing timed out: {req.grammar_key=}"
+            self._record_grammar_stats(req, aborted=True, timed_out=True)
             req.set_finish_with_abort(error_msg)
 
         # Remove finished requests from grammar_queue

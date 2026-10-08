@@ -32,6 +32,7 @@ register_cpu_ci(2.0, "stage-a-test-cpu")
 def _make_scheduler(grammar_backend_name="none", skip_tokenizer=False):
     """Create a mock scheduler with necessary attributes."""
     scheduler = MagicMock()
+    scheduler.current_scheduler_metrics_enabled = False
     scheduler.server_args.grammar_backend = grammar_backend_name
     scheduler.server_args.skip_tokenizer_init = skip_tokenizer
     scheduler.server_args.reasoning_parser = None

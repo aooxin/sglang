@@ -28,6 +28,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
     def __init__(self, grammar: BaseGrammarObject, think_end_id: int):
         super().__init__()
         self.grammar = grammar
+        self.grammar_stats = grammar.grammar_stats
         self.think_end_id = think_end_id
         # -1    means thinking has not ended yet
         # 0     means just ended thinking in the last token

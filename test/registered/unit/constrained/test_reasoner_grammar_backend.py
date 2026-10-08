@@ -35,7 +35,7 @@ class TestReasonerGrammarObjectStateTransitions(unittest.TestCase):
     """Test thinking state machine in ReasonerGrammarObject."""
 
     def _make(self):
-        grammar = MagicMock(spec=BaseGrammarObject)
+        grammar = MagicMock(spec=BaseGrammarObject())
         return ReasonerGrammarObject(grammar, THINK_END_ID), grammar
 
     def test_initial_state_thinking(self):
@@ -94,7 +94,7 @@ class TestReasonerGrammarObjectAcceptToken(unittest.TestCase):
     """Test accept_token behavior with thinking/post-thinking states."""
 
     def _make(self):
-        grammar = MagicMock(spec=BaseGrammarObject)
+        grammar = MagicMock(spec=BaseGrammarObject())
         return ReasonerGrammarObject(grammar, THINK_END_ID), grammar
 
     def test_accept_during_thinking_skips_grammar(self):
@@ -147,7 +147,7 @@ class TestReasonerGrammarObjectRollback(unittest.TestCase):
     """Test rollback across thinking boundary."""
 
     def _make(self):
-        grammar = MagicMock(spec=BaseGrammarObject)
+        grammar = MagicMock(spec=BaseGrammarObject())
         return ReasonerGrammarObject(grammar, THINK_END_ID), grammar
 
     def test_rollback_within_generation(self):
@@ -222,7 +222,7 @@ class TestReasonerGrammarObjectVocabMask(unittest.TestCase):
     """Test vocab mask gating based on thinking state."""
 
     def _make(self):
-        grammar = MagicMock(spec=BaseGrammarObject)
+        grammar = MagicMock(spec=BaseGrammarObject())
         return ReasonerGrammarObject(grammar, THINK_END_ID), grammar
 
     def test_fill_during_thinking_skips(self):
@@ -266,7 +266,7 @@ class TestReasonerGrammarObjectDelegation(unittest.TestCase):
     """Test that non-state methods delegate to inner grammar."""
 
     def _make(self):
-        grammar = MagicMock(spec=BaseGrammarObject)
+        grammar = MagicMock(spec=BaseGrammarObject())
         return ReasonerGrammarObject(grammar, THINK_END_ID), grammar
 
     def test_is_terminated_delegates(self):
@@ -309,7 +309,7 @@ class TestReasonerGrammarObjectDelegation(unittest.TestCase):
 
     def test_copy_creates_new_wrapper(self):
         obj, grammar = self._make()
-        grammar_copy = MagicMock(spec=BaseGrammarObject)
+        grammar_copy = MagicMock(spec=BaseGrammarObject())
         grammar.copy.return_value = grammar_copy
 
         copied = obj.copy()
@@ -321,7 +321,7 @@ class TestReasonerGrammarObjectDelegation(unittest.TestCase):
     def test_copy_does_not_share_state(self):
         """Modifying copy's state should not affect the original."""
         obj, grammar = self._make()
-        grammar_copy = MagicMock(spec=BaseGrammarObject)
+        grammar_copy = MagicMock(spec=BaseGrammarObject())
         grammar.copy.return_value = grammar_copy
 
         copied = obj.copy()
@@ -333,20 +333,20 @@ class TestReasonerGrammarObjectMaybeInitReasoning(unittest.TestCase):
     """Test maybe_init_reasoning state initialization."""
 
     def test_reasoning_true_sets_thinking(self):
-        grammar = MagicMock(spec=BaseGrammarObject)
+        grammar = MagicMock(spec=BaseGrammarObject())
         obj = ReasonerGrammarObject(grammar, THINK_END_ID)
         obj.maybe_init_reasoning(True)
         self.assertEqual(obj.tokens_after_think_end, -1)
 
     def test_reasoning_false_skips_thinking(self):
-        grammar = MagicMock(spec=BaseGrammarObject)
+        grammar = MagicMock(spec=BaseGrammarObject())
         obj = ReasonerGrammarObject(grammar, THINK_END_ID)
         obj.maybe_init_reasoning(False)
         self.assertEqual(obj.tokens_after_think_end, 0)
 
     def test_reasoning_toggle(self):
         """Toggling reasoning resets state regardless of current position."""
-        grammar = MagicMock(spec=BaseGrammarObject)
+        grammar = MagicMock(spec=BaseGrammarObject())
         obj = ReasonerGrammarObject(grammar, THINK_END_ID)
         obj.tokens_after_think_end = 5  # Deep into generation
 
@@ -367,7 +367,7 @@ class TestReasonerGrammarBackend(unittest.TestCase):
 
     def test_wraps_valid_grammar(self):
         backend, inner = self._make()
-        mock_grammar = MagicMock(spec=BaseGrammarObject)
+        mock_grammar = MagicMock(spec=BaseGrammarObject())
         inner._init_value_dispatch.return_value = mock_grammar
 
         result = backend._init_value_dispatch(("json", "schema"), True)
@@ -393,7 +393,7 @@ class TestReasonerGrammarBackend(unittest.TestCase):
 
     def test_inits_reasoning_on_wrapped(self):
         backend, inner = self._make()
-        mock_grammar = MagicMock(spec=BaseGrammarObject)
+        mock_grammar = MagicMock(spec=BaseGrammarObject())
         inner._init_value_dispatch.return_value = mock_grammar
 
         result = backend._init_value_dispatch(("json", "schema"), True)
@@ -402,7 +402,7 @@ class TestReasonerGrammarBackend(unittest.TestCase):
 
     def test_inits_no_reasoning_on_wrapped(self):
         backend, inner = self._make()
-        mock_grammar = MagicMock(spec=BaseGrammarObject)
+        mock_grammar = MagicMock(spec=BaseGrammarObject())
         inner._init_value_dispatch.return_value = mock_grammar
 
         result = backend._init_value_dispatch(("json", "schema"), False)

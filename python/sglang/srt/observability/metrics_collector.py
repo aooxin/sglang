@@ -673,7 +673,7 @@ class SchedulerMetricsCollector:
         )
         self.num_grammar_aborted = Counter(
             name="sglang:num_grammar_aborted_total",
-            documentation="Number of grammar aborted requests.",
+            documentation="Number of requests aborted during grammar preprocessing.",
             labelnames=labels.keys(),
         )
         self.num_grammar_timeout = Counter(
@@ -683,9 +683,17 @@ class SchedulerMetricsCollector:
         )
         self.num_grammar_total = Counter(
             name="sglang:num_grammar_total",
-            documentation="Number of the total grammar requests.",
+            documentation="Number of completed grammar preprocessing requests, including cache hits and aborts.",
             labelnames=labels.keys(),
         )
+        # Export zero-valued counters before the first grammar request or error.
+        for counter in (
+            self.num_grammar_total,
+            self.num_grammar_cache_hit,
+            self.num_grammar_aborted,
+            self.num_grammar_timeout,
+        ):
+            counter.labels(**self.labels)
         self.grammar_schema_count = Histogram(
             name="sglang:grammar_schema_count",
             documentation="Histogram of grammar schema count.",

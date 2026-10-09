@@ -54,7 +54,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         raise ValueError(
             "--disaggregation-decode-host-receive-threshold must be between 0 and 1"
         )
-    if cfg.disaggregation_decode_host_receive_threshold > 0:
+    if cfg.disaggregation_decode_host_receive_threshold < 1:
         if cfg.enable_hisparse or cfg.enable_pd_role_switch:
             raise ValueError(
                 "Decode host receive does not yet support HiSparse or role switching"

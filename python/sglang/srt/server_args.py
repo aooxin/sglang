@@ -4884,7 +4884,7 @@ class ServerArgs:
             "--collect-tokens-histogram",
             action="store_true",
             default=ServerArgs.collect_tokens_histogram,
-            help="Collect prompt/generation tokens histogram.",
+            help="Collect prompt/generation/reasoning tokens histograms.",
         )
         bucket_rule = (
             "Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' "
@@ -4904,7 +4904,7 @@ class ServerArgs:
             type=str,
             nargs="+",
             default=ServerArgs.generation_tokens_buckets,
-            help=f"The buckets rule for generation tokens histogram. {bucket_rule}",
+            help=f"The buckets rule for generation and reasoning tokens histograms. {bucket_rule}",
         )
         parser.add_argument(
             "--gc-warning-threshold-secs",

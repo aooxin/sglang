@@ -1600,6 +1600,15 @@ class TokenizerMetricsCollector:
                     default_bucket_prompt_tokens,
                 ),
             )
+            self.reasoning_tokens_histogram = Histogram(
+                name="sglang:reasoning_tokens_histogram",
+                documentation="Histogram of reasoning token length per reasoning request.",
+                labelnames=labels.keys(),
+                buckets=generate_buckets(
+                    server_args.generation_tokens_buckets,
+                    default_bucket_prompt_tokens,
+                ),
+            )
             self.uncached_tokens = Histogram(
                 name="sglang:uncached_tokens_per_request",
                 documentation="Histogram of uncached prompt token length per request.",
@@ -1883,6 +1892,8 @@ class TokenizerMetricsCollector:
         retraction_count: int,
         cached_tokens_details: Optional[Dict[str, Any]] = None,
         is_abort: bool = False,
+        reasoning_tokens: int = 0,
+        require_reasoning: bool = False,
     ):
         self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
         uncached_tokens = max(prompt_tokens - cached_tokens, 0)
@@ -1939,6 +1950,10 @@ class TokenizerMetricsCollector:
             self.generation_tokens_histogram.labels(**labels).observe(
                 float(generation_tokens)
             )
+            if require_reasoning:
+                self.reasoning_tokens_histogram.labels(**labels).observe(
+                    float(reasoning_tokens)
+                )
             self.uncached_tokens.labels(**labels).observe(
                 float(uncached_tokens)
             )

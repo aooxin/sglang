@@ -10,6 +10,7 @@ import unittest
 
 import requests
 from openai import OpenAI
+from prometheus_client.parser import text_string_to_metric_families
 
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import kill_process_tree
@@ -28,6 +29,17 @@ register_cuda_ci(est_time=90, suite="stage-b-test-1-gpu-large")
 
 def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text
+
+
+def get_metric_value(metrics_text: str, metric_name: str, model_name: str) -> float:
+    for family in text_string_to_metric_families(metrics_text):
+        for sample in family.samples:
+            if (
+                sample.name == metric_name
+                and sample.labels.get("model_name") == model_name
+            ):
+                return sample.value
+    return 0
 
 
 class ReasoningTokenUsageMixin:
@@ -64,6 +76,8 @@ class ReasoningTokenUsageMixin:
             other_args=[
                 "--reasoning-parser",
                 cls.reasoning_parser_name,
+                "--enable-metrics",
+                "--collect-tokens-histogram",
             ]
             + cls.extra_server_args,
         )
@@ -76,6 +90,18 @@ class ReasoningTokenUsageMixin:
             kill_process_tree(cls.process.pid)
 
     def test_generate_api_non_streaming(self):
+        metrics_before = requests.get(f"{self.base_url}/metrics").text
+        count_before = get_metric_value(
+            metrics_before,
+            "sglang:reasoning_tokens_histogram_count",
+            self.model,
+        )
+        sum_before = get_metric_value(
+            metrics_before,
+            "sglang:reasoning_tokens_histogram_sum",
+            self.model,
+        )
+
         response = requests.post(
             url=f"{self.base_url}/generate",
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -97,6 +123,53 @@ class ReasoningTokenUsageMixin:
         assert (
             report_reasoning_tokens == actual_reasoning_tokens
         ), f"Expected {actual_reasoning_tokens}, got {report_reasoning_tokens}"
+
+        metrics_after_reasoning = requests.get(f"{self.base_url}/metrics").text
+        count_after_reasoning = get_metric_value(
+            metrics_after_reasoning,
+            "sglang:reasoning_tokens_histogram_count",
+            self.model,
+        )
+        sum_after_reasoning = get_metric_value(
+            metrics_after_reasoning,
+            "sglang:reasoning_tokens_histogram_sum",
+            self.model,
+        )
+        self.assertEqual(count_after_reasoning - count_before, 1)
+        self.assertEqual(
+            sum_after_reasoning - sum_before,
+            report_reasoning_tokens,
+        )
+
+        non_reasoning_response = requests.post(
+            url=f"{self.base_url}/generate",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "text": "Hello",
+                "model": self.model,
+                "require_reasoning": False,
+                "sampling_params": {"max_new_tokens": 1},
+            },
+        )
+        non_reasoning_response.raise_for_status()
+
+        metrics_after_non_reasoning = requests.get(f"{self.base_url}/metrics").text
+        self.assertEqual(
+            get_metric_value(
+                metrics_after_non_reasoning,
+                "sglang:reasoning_tokens_histogram_count",
+                self.model,
+            ),
+            count_after_reasoning,
+        )
+        self.assertEqual(
+            get_metric_value(
+                metrics_after_non_reasoning,
+                "sglang:reasoning_tokens_histogram_sum",
+                self.model,
+            ),
+            sum_after_reasoning,
+        )
 
     def test_generate_api_streaming(self):
         response = requests.post(

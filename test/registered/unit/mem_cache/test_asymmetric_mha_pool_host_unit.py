@@ -66,10 +66,12 @@ def _make_host(layout: str) -> AsymmetricMHATokenToKVPoolHost:
 def _make_device_pool(host: AsymmetricMHATokenToKVPoolHost) -> SimpleNamespace:
     size = 8
     k_buffer = [
-        torch.empty(size, host.head_num, host.head_dim) for _ in range(host.layer_num)
+        torch.empty(size, host.head_num, host.head_dim, dtype=host.dtype)
+        for _ in range(host.layer_num)
     ]
     v_buffer = [
-        torch.empty(size, host.head_num, host.v_head_dim) for _ in range(host.layer_num)
+        torch.empty(size, host.head_num, host.v_head_dim, dtype=host.dtype)
+        for _ in range(host.layer_num)
     ]
     return SimpleNamespace(
         k_buffer=k_buffer,

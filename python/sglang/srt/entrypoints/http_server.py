@@ -2185,7 +2185,10 @@ async def _send_disaggregation_warmup_requests(
                 "ignore_eos": True,
             },
             "bootstrap_host": FAKE_BOOTSTRAP_HOST,
-            "bootstrap_room": dp_rank,
+            # Every tokenizer worker runs this warmup. Room identity must be
+            # unique across workers, including fake transfers used by host
+            # transit's rank-wide admission protocol.
+            "bootstrap_room": uuid.uuid4().int & ((1 << 63) - 1),
             "input_ids": [10, 11, 12, 13],
             "routed_dp_rank": dp_rank,
         }

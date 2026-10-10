@@ -80,8 +80,20 @@ class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(args, ("http://localhost:30000/generate",))
             self.assertEqual(kwargs["json"]["input_ids"], [10, 11, 12, 13])
             self.assertEqual(kwargs["json"]["bootstrap_host"], FAKE_BOOTSTRAP_HOST)
-            self.assertEqual(kwargs["json"]["bootstrap_room"], dp_rank)
+            room = kwargs["json"]["bootstrap_room"]
+            self.assertIsInstance(room, int)
+            self.assertGreaterEqual(room, 0)
+            self.assertLess(room, 1 << 63)
             self.assertFalse(kwargs["ssl"])
+
+        # A second tokenizer's warmup must not reuse the first one's rooms.
+        with patch("sglang.srt.entrypoints.http_server.aiohttp.ClientSession", Session):
+            await _send_disaggregation_warmup_requests(
+                url="http://localhost:30000", headers={}, ssl_verify=False, timeout=123
+            )
+        rooms = [kwargs["json"]["bootstrap_room"] for _, kwargs in calls]
+        self.assertEqual(len(rooms), 2 * server_args.dp_size)
+        self.assertEqual(len(set(rooms)), len(rooms))
 
 
 if __name__ == "__main__":

@@ -1052,6 +1052,10 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     """
 
     def _init_write_back_staging_buffers(self):
+        if self.layout == "layer_first":
+            self.can_use_jit = self.can_use_jit and can_use_hicache_jit_kernel(
+                element_size=self._v_token_stride_size()
+            )
         self.staging_page_capacity = 0
         self.staging_token_capacity = 0
         self.staging_k_buffer = None
@@ -1111,8 +1115,22 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     def get_ksize_per_token(self):
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize
 
+    def get_contiguous_buf_infos(self):
+        if self.layout != "layer_first":
+            raise ValueError("KV transfer registration requires layout='layer_first'.")
+        buffers = self.k_data_refs + self.v_data_refs
+        return (
+            [buffer.data_ptr() for buffer in buffers],
+            [buffer.nbytes for buffer in buffers],
+            [self._k_token_stride_size() * self.page_size] * self.layer_num
+            + [self._v_token_stride_size() * self.page_size] * self.layer_num,
+        )
+
     def init_kv_buffer(self):
-        if self.layout == "page_first":
+        if self.layout == "layer_first":
+            k_dims = (self.layer_num, self.size, self.head_num, self.head_dim)
+            v_dims = (self.layer_num, self.size, self.head_num, self.v_head_dim)
+        elif self.layout == "page_first":
             k_dims = (self.size, self.layer_num, self.head_num, self.head_dim)
             v_dims = (self.size, self.layer_num, self.head_num, self.v_head_dim)
         elif self.layout == "page_first_direct":
@@ -1133,7 +1151,8 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
         else:
             raise ValueError(
                 f"Unsupported layout for models with head_dim != v_head_dim: "
-                f"{self.layout}; expected 'page_first' or 'page_first_direct'."
+                f"{self.layout}; expected 'layer_first', 'page_first' or "
+                "'page_first_direct'."
             )
 
         # token_stride_size / layout_dim are intentionally NOT set: K and V
@@ -1148,7 +1167,11 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
-            registration_granularity_bytes=self.page_size * self._k_layout_dim(),
+            registration_granularity_bytes=(
+                self.page_size * self._k_layout_dim()
+                if self.layout != "layer_first"
+                else None
+            ),
         )
         v_buffer = alloc_func(
             v_dims,
@@ -1156,7 +1179,11 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
-            registration_granularity_bytes=self.page_size * self._v_layout_dim(),
+            registration_granularity_bytes=(
+                self.page_size * self._v_layout_dim()
+                if self.layout != "layer_first"
+                else None
+            ),
         )
         return (k_buffer, v_buffer)
 
@@ -1179,6 +1206,37 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             "Use a backend that does not use this interface (e.g. mooncake, simm)."
         )
 
+    def _copy_layer_first(self, src, dst, src_indices, dst_indices, io_backend):
+        # Each call handles only K or V; neither kernels nor direct copies may
+        # infer V's record size from K's larger head dimension.
+        if io_backend == "kernel":
+            if self.can_use_jit:
+                jit_transfer_hicache_one_layer_mla(
+                    cache_src=src,
+                    cache_dst=dst,
+                    indices_src=src_indices,
+                    indices_dst=dst_indices,
+                    element_dim=src.shape[-2] * src.shape[-1],
+                )
+            else:
+                transfer_kv_per_layer_mla(
+                    src=src,
+                    dst=dst,
+                    src_indices=src_indices,
+                    dst_indices=dst_indices,
+                    item_size=src[0].nbytes,
+                )
+        elif io_backend == "direct":
+            transfer_kv_direct(
+                src_layers=[src],
+                dst_layers=[dst],
+                src_indices=src_indices,
+                dst_indices=dst_indices,
+                page_size=self.page_size,
+            )
+        else:
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -1197,6 +1255,20 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             device_layer_id = 0 if is_draft else layer_id
         else:
             host_layer_id = device_layer_id = layer_id
+
+        if self.layout == "layer_first":
+            for host_buffers, device_buffers in (
+                (self.k_buffer, device_pool.k_buffer),
+                (self.v_buffer, device_pool.v_buffer),
+            ):
+                self._copy_layer_first(
+                    host_buffers[host_layer_id],
+                    device_buffers[device_layer_id],
+                    host_indices,
+                    device_indices,
+                    io_backend,
+                )
+            return
 
         if io_backend == "kernel":
             if self.layout != "page_first":
@@ -1262,6 +1334,46 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
             device_k_buffers,
             device_v_buffers,
         ) = self._resolve_device_transfer_buffers(device_pool)
+        if self.layout == "layer_first":
+            for host_ptrs, device_ptrs, host_buffers, device_buffers, stride in (
+                (
+                    self.k_data_ptrs,
+                    device_k_data_ptrs,
+                    self.k_data_refs,
+                    device_k_buffers,
+                    self._k_token_stride_size(),
+                ),
+                (
+                    self.v_data_ptrs,
+                    device_v_data_ptrs,
+                    self.v_data_refs,
+                    device_v_buffers,
+                    self._v_token_stride_size(),
+                ),
+            ):
+                if io_backend == "kernel" and self.can_use_jit:
+                    jit_transfer_hicache_all_layer_mla(
+                        ptr_dst=host_ptrs,
+                        indices_dst=host_indices,
+                        ptr_src=device_ptrs,
+                        indices_src=device_indices,
+                        cache_src_stride_bytes=stride,
+                        cache_dst_stride_bytes=stride,
+                    )
+                elif io_backend == "direct":
+                    transfer_kv_direct(
+                        src_layers=device_buffers,
+                        dst_layers=host_buffers,
+                        src_indices=device_indices,
+                        dst_indices=host_indices,
+                        page_size=self.page_size,
+                    )
+                else:
+                    for src, dst in zip(device_buffers, host_buffers):
+                        self._copy_layer_first(
+                            src, dst, device_indices, host_indices, io_backend
+                        )
+            return
         if io_backend == "kernel":
             if self.layout != "page_first":
                 raise ValueError(

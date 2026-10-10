@@ -27,7 +27,10 @@ def _make_host(layout: str) -> AsymmetricMHATokenToKVPoolHost:
     host.v_head_dim = 6
     host.dtype = torch.float16
 
-    if layout == "page_first":
+    if layout == "layer_first":
+        k_dims = (host.layer_num, 8, host.head_num, host.head_dim)
+        v_dims = (host.layer_num, 8, host.head_num, host.v_head_dim)
+    elif layout == "page_first":
         k_dims = (8, host.layer_num, host.head_num, host.head_dim)
         v_dims = (8, host.layer_num, host.head_num, host.v_head_dim)
     elif layout == "page_first_direct":
@@ -49,7 +52,13 @@ def _make_host(layout: str) -> AsymmetricMHATokenToKVPoolHost:
     else:
         raise ValueError(f"Unsupported test layout: {layout}")
 
-    host.kv_buffer = (torch.empty(k_dims), torch.empty(v_dims))
+    host.kv_buffer = (
+        torch.empty(k_dims, dtype=host.dtype),
+        torch.empty(v_dims, dtype=host.dtype),
+    )
+    host.k_data_refs = list(host.k_buffer.unbind())
+    host.v_data_refs = list(host.v_buffer.unbind())
+    host.can_use_jit = False
     host.can_use_write_back_jit = False
     return host
 
@@ -71,6 +80,14 @@ def _make_device_pool(host: AsymmetricMHATokenToKVPoolHost) -> SimpleNamespace:
 
 
 class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
+    def test_layer_first_registration_preserves_native_kv_page_sizes(self):
+        host = _make_host("layer_first")
+        ptrs, lengths, items = host.get_contiguous_buf_infos()
+        buffers = host.k_data_refs + host.v_data_refs
+        self.assertEqual(ptrs, [buf.data_ptr() for buf in buffers])
+        self.assertEqual(lengths, [128] * 3 + [192] * 3)
+        self.assertEqual(items, [32] * 3 + [48] * 3)
+
     def test_factory_selects_asymmetric_pool_for_mismatched_kv_dims(self):
         symmetric_pool = SimpleNamespace(head_dim=4, v_head_dim=4)
         asymmetric_pool = SimpleNamespace(head_dim=4, v_head_dim=6)

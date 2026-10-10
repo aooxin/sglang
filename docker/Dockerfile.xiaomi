@@ -25,6 +25,28 @@ RUN if [ ! -r /usr/local/cuda-13.0/compat/libcuda.so.1 ]; then \
     && test -r /usr/local/cuda-13.0/compat/libcuda.so.1
 ENV LD_LIBRARY_PATH="/usr/local/cuda-13.0/compat:${LD_LIBRARY_PATH}"
 
+# The nvcc 12.9 FA3 replacement needs libcudart.so.12 alongside the base's
+# CUDA 13 runtime. Install it at build time in an isolated directory so startup
+# can reuse it without pip/network access or replacing Torch's CUDA packages.
+# An internal mirror may override the URL while retaining the pinned SHA256.
+ARG FA3_CUDART12_WHEEL_URL=https://files.pythonhosted.org/packages/bc/46/a92db19b8309581092a3add7e6fceb4c301a3fd233969856a8cbf042cd3c/nvidia_cuda_runtime_cu12-12.9.79-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+ARG FA3_CUDART12_WHEEL_SHA256=25bba2dfb01d48a9b59ca474a1ac43c6ebf7011f1b0b8cc44f54eb6ac48a96c3
+ENV FA3_CUDART12_DIR=/opt/sglang/fa3-cu129-runtime
+ENV FA3_CUDART12_LIB_DIR="${FA3_CUDART12_DIR}/nvidia/cuda_runtime/lib" \
+    LD_LIBRARY_PATH="${FA3_CUDART12_DIR}/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH}"
+RUN python3 -m pip install --no-cache-dir --no-deps --no-index --disable-pip-version-check \
+        --target "${FA3_CUDART12_DIR}" \
+        "${FA3_CUDART12_WHEEL_URL}#sha256=${FA3_CUDART12_WHEEL_SHA256}" \
+    && python3 -c "import ctypes, os; from pathlib import Path; \
+        path = Path(os.environ['FA3_CUDART12_LIB_DIR']) / 'libcudart.so.12'; \
+        runtime = ctypes.CDLL(str(path)); \
+        runtime.cudaRuntimeGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]; \
+        version = ctypes.c_int(); \
+        status = runtime.cudaRuntimeGetVersion(ctypes.byref(version)); \
+        assert status == 0 and version.value == 12090, \
+            f'Expected CUDA runtime 12.9, got status={status}, version={version.value}'; \
+        print(f'FA3 CUDA runtime ready: {path}')"
+
 # GCache is optional for the Python package; the internal image includes the
 # same Python 3.12 SDK wheel as the legacy deployment.
 ARG GCACHE_SDK_WHEEL_URL=https://cnbj1-fds.api.xiaomi.net/juicefs/gcache/release/2.1/20260917-5978d0b2/gcache_sdk-2.1.0+g5978d0b2.py312.release.2.1-py3-none-any.whl

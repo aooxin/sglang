@@ -31,6 +31,10 @@ from sglang.utils import logger
 
 _is_npu = is_npu()
 
+# Max placeholder/embedding gap tolerated by padding. Larger gaps are treated as
+# malformed input and rejected (fail fast).
+_MM_SCATTER_PAD_TOLERANCE = 8
+
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
 # propagation that can cause some log messages (like 'server is fired up') to not appear
@@ -732,9 +736,27 @@ def _adjust_embedding_length(
                 num_multimodal = num_mm_tokens_in_input_ids // embedding.shape[0]
                 embedding = embedding[-num_multimodal:, :]
         else:
-            raise RuntimeError(
-                f"Insufficient multimodal embedding length: {num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
+            # Insufficient embedding. A large gap means malformed input (e.g. stray
+            # literal <|image_pad|>): fail fast. A small gap is padded with the repeated
+            # last vector to keep masked_scatter_ from asserting and killing the node.
+            gap = num_mm_tokens_in_input_ids - num_mm_tokens_in_embedding
+            if gap > _MM_SCATTER_PAD_TOLERANCE:
+                logger.error(
+                    f"MM placeholder/embedding mismatch: {num_mm_tokens_in_input_ids} "
+                    f"slots vs {num_mm_tokens_in_embedding} rows; likely stray literal "
+                    f"<|image_pad|> in prompt"
+                )
+                raise ValueError(
+                    "Multimodal data corrupted: prompt contains literal placeholder "
+                    "tokens conflicting with the attached data; please remove them"
+                )
+            logger.warning(
+                f"Insufficient mm embedding, padding: "
+                f"{num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}"
             )
+            last_embedding = embedding[-1:, :]
+            padding = last_embedding.expand(gap, -1)
+            embedding = torch.cat([embedding, padding], dim=0)
     return embedding
 
 

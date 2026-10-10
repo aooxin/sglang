@@ -298,17 +298,6 @@ class Envs:
     SGLANG_FORWARD_UNKNOWN_TOOLS = EnvBool(False)
     SGLANG_DISCRETIZE_USER_TOOLCALL_TAGS = EnvBool(False)
     SGLANG_REQUIRE_SPECIAL_TOOLCALL_TOKEN = EnvBool(False)
-    # special-token
-    SGLANG_DISCRETIZE_USER_SPECIAL_TOKENS = EnvBool(False)
-    SGLANG_DISCRETIZE_USER_SPECIAL_TOKEN_STRS = EnvTuple(
-        (
-            "<|im_start|>",
-            "<|im_end|>",
-            "<|endoftext|>",
-            "<EOS>",
-            "<|I_am_end|>",
-        )
-    )
 
     # Hi-Cache
     SGLANG_HICACHE_DRAFT_MODEL_NAME = EnvStr(None)

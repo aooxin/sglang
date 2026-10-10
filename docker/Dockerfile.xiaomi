@@ -140,10 +140,12 @@ RUN if [ -n "${GITLAB_API_TOKEN}" ]; then \
 # opencode ships as the npm package `opencode-ai`; oh-my-opencode is a plugin
 # installed via its own CLI (npx), which registers into opencode's config.
 # The npm registry is configured once above (npm config set registry).
+# Pin the plugin and select its OpenCode entry point explicitly: npx's
+# automatic bin selection can otherwise invoke the lazycodex alias.
 RUN npm install -g opencode-ai \
     && opencode --version \
-    && npx --yes oh-my-opencode install \
-        --no-tui --skip-auth \
+    && npx --yes --package=oh-my-opencode@5.1.29 oh-my-opencode install \
+        --platform=opencode --no-tui --skip-auth \
         --claude=no --openai=no --gemini=no --copilot=no \
     && npm cache clean --force \
     && rm -rf /root/.npm/_npx

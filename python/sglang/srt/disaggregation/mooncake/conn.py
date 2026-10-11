@@ -2512,9 +2512,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 class MooncakeFailureExceptionMixin:
     """Shared `failure_exception` for the Mooncake sender and receiver.
 
-    Both sides conclude a failed room identically: latch Failed, clear local
-    state, then raise with the recorded reason -- or, when no reason was
-    recorded locally, report it as propagated from another rank. Expects the
+    Latch Failed and raise the recorded reason, or report a failure propagated
+    from another rank when no reason was recorded locally. Host receivers keep
+    their state until the transfer queue observes drain; other peers clear it
+    immediately. Expects the
     concrete class to provide ``conclude_state``, ``clear()``,
     ``bootstrap_room`` and ``kv_mgr``.
     """
@@ -2524,7 +2525,11 @@ class MooncakeFailureExceptionMixin:
         if self.conclude_state is None:
             self.conclude_state = KVPoll.Failed
 
-        self.clear()
+        # A Host receiver still owns RDMA destinations after failure. Its
+        # transfer queue clears it only after all drain ACKs arrive; clearing
+        # here would discard both early ACKs and the tracker for later ACKs.
+        if not getattr(self, "_host_destination_published", False):
+            self.clear()
 
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)

@@ -5,6 +5,7 @@ import os
 import tempfile
 import threading
 import unittest
+from collections import defaultdict
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -15,7 +16,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVTransferDestination
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import CommonKVManager, KVTransferError
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
@@ -229,6 +230,32 @@ class TestMooncakeHostReceive(CustomTestCase):
                 nprocs=2,
                 join=True,
             )
+
+    def test_failure_exception_keeps_early_and_late_host_drain_acks(self):
+        receiver = _receiver()
+        receiver._host_destination_published = True
+        receiver._host_drain_armed = True
+        receiver.conclude_state = None
+        receiver.bootstrap_addr = "prefill"
+        mgr = receiver.kv_mgr
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {17: "test transfer failure"}
+        mgr.request_status = {17: 0}
+        mgr.required_prefill_response_num_table = {}
+        mgr.prefill_response_tracker = {}
+        mgr.addr_to_rooms_tracker = defaultdict(set, {"prefill": {17}})
+        mgr.register_deferred_abort_room(17)
+        mgr.note_abort_ack(17, 0)
+        with self.assertRaisesRegex(KVTransferError, "test transfer failure"):
+            receiver.failure_exception()
+        self.assertEqual(mgr._deferred_abort_ack_tracker[17], {0})
+        self.assertFalse(receiver.is_abort_release_safe())
+        mgr.note_abort_ack(17, 1)
+        self.assertTrue(receiver.is_abort_release_safe())
+        # This is the queue's final clear, after all remote writes drained.
+        receiver.clear()
+        self.assertNotIn(17, mgr._deferred_abort_ack_tracker)
+        self.assertNotIn(17, mgr.request_status)
 
 
 if __name__ == "__main__":

@@ -122,13 +122,11 @@ class TestSenderDrainLifetime(CustomTestCase):
         self.mgr._deferred_ack_targets = {}
         self.mgr._deferred_ack_lock = threading.Lock()
         self.mgr._send_abort_ack = Mock()
-        self.sender = object.__new__(CommonKVSender)
-        self.sender.kv_mgr = self.mgr
-        self.sender.bootstrap_room = 17
+        self.sender = SimpleNamespace(kv_mgr=self.mgr, bootstrap_room=17)
 
     def test_clear_preserves_ack_until_inflight_write_drains(self):
         self.mgr.register_deferred_ack_target(17, "decode", 9000)
-        self.sender.clear()
+        CommonKVSender.clear(self.sender)
         self.mgr._send_abort_ack.assert_not_called()
         self.assertIn(17, self.mgr._deferred_ack_targets)
         self.mgr._staging_outstanding[17] = 0
@@ -137,7 +135,7 @@ class TestSenderDrainLifetime(CustomTestCase):
         self.assertNotIn(17, self.mgr._deferred_ack_targets)
 
     def test_abort_after_clear_still_drains_every_receiver(self):
-        self.sender.clear()
+        CommonKVSender.clear(self.sender)
         for port in (9000, 9001, 9000):
             self.mgr.register_deferred_ack_target(17, "decode", port)
             self.mgr._maybe_ack_drained_abort(17)
@@ -153,7 +151,7 @@ class TestSenderDrainLifetime(CustomTestCase):
     def test_clear_acknowledges_an_already_quiescent_room(self):
         self.mgr._staging_outstanding[17] = 0
         self.mgr.register_deferred_ack_target(17, "decode", 9000)
-        self.sender.clear()
+        CommonKVSender.clear(self.sender)
         self.mgr._send_abort_ack.assert_called_once_with("decode", 9000, 17)
         self.assertEqual(self.mgr._deferred_ack_targets, {})
 

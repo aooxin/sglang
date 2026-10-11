@@ -103,6 +103,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+    supports_host_destination: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -1064,6 +1065,10 @@ class CommonKVManager(BaseKVManager):
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
             "prefill_http_port": get_serving().port,
+            "supports_host_destination": (
+                self.supports_host_destination
+                and self.enable_deferred_decode_kv_release
+            ),
         }
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
@@ -1913,6 +1918,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
+        self.supports_host_destination: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
@@ -2010,6 +2016,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
             self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
 
+        supports_host = bool(data.get("supports_host_destination", False))
+        self.supports_host_destination = (
+            supports_host
+            if self.supports_host_destination is None
+            else self.supports_host_destination and supports_host
+        )
+
         if self.enable_dsa_cache_layer_split is None:
             self.enable_dsa_cache_layer_split = bool(
                 data.get("enable_dsa_cache_layer_split", False)
@@ -2080,6 +2093,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
+                supports_host_destination=bool(self.supports_host_destination),
             )
             return web.json_response(dataclasses.asdict(info), status=200)
 

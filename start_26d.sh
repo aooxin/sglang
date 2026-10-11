@@ -64,4 +64,5 @@ python3 -m sglang.launch_server \
               --load-balance-method round_robin \
               --tokenizer-worker-num 64 --swa-full-tokens-ratio 0.13 \
               --disable-prefill-cuda-graph \
+              "$@" \
               2>&1 | tee ./sglang_server.log

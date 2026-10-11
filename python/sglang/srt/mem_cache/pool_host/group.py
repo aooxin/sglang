@@ -83,9 +83,7 @@ class HostPoolGroup:
             pools = (entry.device_pool, *entry.packed_draft_device_pools)
             for pool in pools:
                 dense_mha = (
-                    isinstance(pool, MHATokenToKVPool)
-                    and pool.kv_cache_layout == "nhd"
-                    and pool.v_head_dim == pool.head_dim
+                    isinstance(pool, MHATokenToKVPool) and pool.kv_cache_layout == "nhd"
                 )
                 if (
                     not dense_mha
@@ -133,7 +131,7 @@ class HostPoolGroup:
                 host_by_device_ptr[device_buffer.data_ptr()] = (
                     host_buffer.data_ptr(),
                     host_buffer.nbytes,
-                    host.token_stride_size * self.page_size,
+                    host_buffer[0].nbytes * self.page_size,
                 )
         infos = [host_by_device_ptr[ptr] for ptr in device_infos[0]]
         host_infos = (

@@ -5335,6 +5335,7 @@ class Scheduler(
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     if decode_req.host_staged:
                         # Keep the host destination alive until prefill stops writing.
+                        decode_req.kv_receiver.abort()
                         prepare_abort(decode_req.req, "Aborted by AbortReq.")
                         continue
                     receiver = decode_req.kv_receiver

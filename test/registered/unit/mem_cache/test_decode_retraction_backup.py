@@ -87,6 +87,34 @@ class TestDecodeRetractionBackup(CustomTestCase):
             enable_memory_saver=False,
         )
 
+    def test_host_receive_asymmetric_target_and_draft(self):
+        def asymmetric_pool(layer_num, *, page_size=1):
+            return MHATokenToKVPool(
+                size=self.pool_size,
+                page_size=page_size,
+                head_num=2,
+                head_dim=64,
+                v_head_dim=32,
+                dtype=self.dtype,
+                layer_num=layer_num,
+                device=self.device,
+                enable_memory_saver=False,
+            )
+
+        # Replay the actual wire-write/admission/restore checks with different
+        # K/V byte strides, as used by MiMo. Exercise both transfer backends.
+        with (
+            patch.object(self, "_make_pool", side_effect=asymmetric_pool),
+            patch(
+                f"{__name__}.product",
+                return_value=[
+                    (HiCacheDraftMode.SIDECAR, "kernel"),
+                    (HiCacheDraftMode.SIDECAR, "direct"),
+                ],
+            ),
+        ):
+            self.test_host_receive_restores_target_and_draft_kv()
+
     def _seed_pool(
         self, pool: MHATokenToKVPool, indices: torch.Tensor, base: int
     ) -> None:

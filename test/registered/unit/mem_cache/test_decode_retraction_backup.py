@@ -1,4 +1,5 @@
 import ctypes
+import tempfile
 import unittest
 from array import array
 from itertools import product
@@ -56,6 +57,20 @@ class TestDecodeRetractionBackup(CustomTestCase):
     num_tokens = 8
     dtype = torch.bfloat16
     device = "cuda"
+
+    def setUp(self):
+        super().setUp()
+        # The 0520 handshake poll always performs its collective, including
+        # TP=1. Use a real single-rank group for these GPU integration tests.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        torch.distributed.init_process_group(
+            "gloo",
+            init_method="file://" + directory.name + "/rendezvous",
+            rank=0,
+            world_size=1,
+        )
+        self.addCleanup(torch.distributed.destroy_process_group)
 
     def test_host_receive_dense_subclass_checks_actual_buffer_geometry(self):
         class DensePool(MHATokenToKVPool):

@@ -255,9 +255,9 @@ class CommonKVManager(BaseKVManager):
             )
             self.register_to_bootstrap()
             self.transfer_infos = {}
-            # Deferred KV release: aborted room -> (decode_ip, decode_port);
-            # ack held until the transfer drains.
-            self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
+            # Keep every receiver until this room's writes have drained.
+            self._deferred_ack_targets: Dict[int, Set[Tuple[str, int]]] = {}
+            self._deferred_ack_lock = threading.Lock()
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
@@ -673,9 +673,10 @@ class CommonKVManager(BaseKVManager):
         (outstanding == 0). pop() makes it fire at most once."""
         if self._staging_outstanding.get(room, 0) > 0:
             return
-        target = self._deferred_ack_targets.pop(room, None)
-        if target is not None:
-            self._send_abort_ack(target[0], target[1], room)
+        with self._deferred_ack_lock:
+            targets = self._deferred_ack_targets.pop(room, ())
+        for decode_ip, decode_port in targets:
+            self._send_abort_ack(decode_ip, decode_port, room)
 
     def register_deferred_ack_target(
         self, room: int, decode_ip: str, decode_port: int
@@ -683,7 +684,10 @@ class CommonKVManager(BaseKVManager):
         """Hold this room's ack until its transfer drains. Callers must mark the
         room Failed FIRST -- registering while it still accepts chunks lets the
         worker ack, then a new chunk writes pages the decode already released."""
-        self._deferred_ack_targets[room] = (decode_ip, decode_port)
+        with self._deferred_ack_lock:
+            self._deferred_ack_targets.setdefault(room, set()).add(
+                (decode_ip, decode_port)
+            )
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:
@@ -1577,9 +1581,9 @@ class CommonKVSender(BaseKVSender):
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "_deferred_ack_targets"):
-            # Drop a held ack target if the room concluded without draining
-            # (e.g. aborted before any chunk enqueued); else it leaks on prefill.
-            self.kv_mgr._deferred_ack_targets.pop(self.bootstrap_room, None)
+            # clear() can race an in-flight write. Preserve its ACK target until
+            # the worker drains; a quiescent room can acknowledge immediately.
+            self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
 
     def abort(self):
         self.kv_mgr.record_failure(

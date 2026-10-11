@@ -2261,27 +2261,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         # first would let the worker drain+ack while the room is
                         # not yet Failed, so a newly enqueued chunk could still
                         # write to the freed pages. The worker (not this thread)
-                        # acks once its in-flight write drains; if nothing is in
-                        # flight, decode falls back to the release timeout.
+                        # acks once its in-flight write drains. A cleared room
+                        # can still have a write in flight, so retain its target too.
                         if room_active:
                             self.update_status(room_to_be_aborted, KVPoll.Failed)
-                            self.register_deferred_ack_target(
-                                room_to_be_aborted, decode_ip, decode_port
-                            )
-                            # Try once: the room may already be quiescent and
-                            # never revisited by the worker.
-                            self._maybe_ack_drained_abort(room_to_be_aborted)
-                            logger.debug(
-                                f"Received abort notification for room {room_to_be_aborted}, "
-                                f"marked as Failed; ACK deferred until transfer drains"
-                            )
-                        elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
-                            # Concluded/unknown AND quiescent: ack now. A cleared
-                            # room is not automatically quiescent -- clear() can
-                            # drop a room whose chunk is still transferring.
-                            self._send_abort_ack(
-                                decode_ip, decode_port, room_to_be_aborted
-                            )
+                        self.register_deferred_ack_target(
+                            room_to_be_aborted, decode_ip, decode_port
+                        )
+                        # Try once: a quiescent room may never be revisited.
+                        self._maybe_ack_drained_abort(room_to_be_aborted)
                         continue
                     # No need to abort the room if it has already succeeded
                     if room_active:

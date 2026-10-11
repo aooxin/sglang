@@ -8,12 +8,13 @@ that its transfer drained (CommonKVManager.is_abort_release_safe). Device
 destinations may also release on timeout; host destinations require the ack.
 """
 
+import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.srt.disaggregation import decode as decode_mod
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVSender
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -111,6 +112,50 @@ class TestAbortAckAggregation(CustomTestCase):
         # Re-registering (a later reuse) wipes the prior acks.
         mgr.register_deferred_abort_room(room)
         self.assertFalse(mgr.is_abort_release_safe(room, required_acks=2))
+
+
+class TestSenderDrainLifetime(CustomTestCase):
+    def setUp(self):
+        self.mgr = _make_manager()
+        self.mgr.request_status = {17: object()}
+        self.mgr._staging_outstanding = {17: 1}
+        self.mgr._deferred_ack_targets = {}
+        self.mgr._deferred_ack_lock = threading.Lock()
+        self.mgr._send_abort_ack = Mock()
+        self.sender = object.__new__(CommonKVSender)
+        self.sender.kv_mgr = self.mgr
+        self.sender.bootstrap_room = 17
+
+    def test_clear_preserves_ack_until_inflight_write_drains(self):
+        self.mgr.register_deferred_ack_target(17, "decode", 9000)
+        self.sender.clear()
+        self.mgr._send_abort_ack.assert_not_called()
+        self.assertIn(17, self.mgr._deferred_ack_targets)
+        self.mgr._staging_outstanding[17] = 0
+        self.mgr._maybe_ack_drained_abort(17)
+        self.mgr._send_abort_ack.assert_called_once_with("decode", 9000, 17)
+        self.assertNotIn(17, self.mgr._deferred_ack_targets)
+
+    def test_abort_after_clear_still_drains_every_receiver(self):
+        self.sender.clear()
+        for port in (9000, 9001, 9000):
+            self.mgr.register_deferred_ack_target(17, "decode", port)
+            self.mgr._maybe_ack_drained_abort(17)
+        self.mgr._send_abort_ack.assert_not_called()
+        self.mgr._staging_outstanding[17] = 0
+        self.mgr._maybe_ack_drained_abort(17)
+        self.assertEqual(
+            {call.args for call in self.mgr._send_abort_ack.call_args_list},
+            {("decode", 9000, 17), ("decode", 9001, 17)},
+        )
+        self.assertEqual(self.mgr._send_abort_ack.call_count, 2)
+
+    def test_clear_acknowledges_an_already_quiescent_room(self):
+        self.mgr._staging_outstanding[17] = 0
+        self.mgr.register_deferred_ack_target(17, "decode", 9000)
+        self.sender.clear()
+        self.mgr._send_abort_ack.assert_called_once_with("decode", 9000, 17)
+        self.assertEqual(self.mgr._deferred_ack_targets, {})
 
 
 class _FakeIdxAllocator:

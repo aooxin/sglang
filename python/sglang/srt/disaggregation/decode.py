@@ -2907,6 +2907,24 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Commit the survivors before releasing so a _do_release exception can't
         # leave a released entry in the list (double-free / None receiver on retry).
         self._deferred_releases = still_held
+        overdue_host = [
+            req
+            for req, deadline, _, _ in still_held
+            if self.enable_host_receive and req.host_staged and now >= deadline
+        ]
+        if overdue_host and now - getattr(self, "_last_host_drain_warning", 0) >= 30:
+            self._last_host_drain_warning = now
+            logger.warning(
+                "PD host receive waiting for drain: held=%s samples=%s",
+                len(overdue_host),
+                [
+                    {
+                        "room": req.req.bootstrap_room,
+                        "receiver_ready": req.kv_receiver.is_abort_release_safe(),
+                    }
+                    for req in overdue_host[:3]
+                ],
+            )
         for decode_req, idx, room, drained in to_release:
             if not drained:
                 logger.warning(

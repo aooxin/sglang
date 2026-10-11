@@ -3,6 +3,8 @@ rm -f ./sglang_server.log
 unset NCCL_DEBUG_SUBSYS && unset NCCL_DEBUG && unset NVSHMEM_DEBUG_SUBSYS && unset NVSHMEM_DEBUG
 unset SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC
 export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
+# Long-context requests can queue on Prefill before their first KV write.
+export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=${SGLANG_DISAGGREGATION_WAITING_TIMEOUT:-1200}
 # DFLASH verify (1P2D): 96 requests * 8 tokens / (TP 16 / DP 2) = 96 tokens per rank.
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
 

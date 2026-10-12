@@ -279,3 +279,5 @@ sgl-kernel/csrc/**/*_musa/
 
 # Claude Code worktrees
 .claude/worktrees/
+
+.teamai/

@@ -150,6 +150,65 @@ RUN npm install -g opencode-ai \
     && npm cache clean --force \
     && rm -rf /root/.npm/_npx
 
+# Xiaomi NCCL fixes CPU busy-waiting triggered by security scans.
+# Published artifacts target Ubuntu 24.04/amd64 and are built with CUDA 12.9.1.
+# Release directories use cuda12.9.1; deb filenames use +cuda12.9 by convention.
+# This is the artifact's CUDA version; revalidate CUDA/GPU compatibility when
+# changing the base image or these pinned artifacts.
+# Install after all package updates, and replace the wheel's library as PyTorch's
+# RPATH can prefer nvidia/nccl/lib over the system library. The cu12/cu13 wheels
+# share this relative path; require exactly one installed NCCL wheel.
+# The patched library has no shared libcudart dependency.
+# dpkg relies on the base image providing libc6 >= 2.38, libgcc-s1 >= 3.4 and
+# libstdc++6 >= 12; missing dependencies deliberately fail the build.
+# Keep libnccl-dev for pynccl_allocator's runtime JIT link with -lnccl.
+# Check the upstream version against the wheel pinned in docker/Dockerfile.
+# Validation below checks library loading/version without initializing a GPU communicator.
+# Version encoding uses NCCL >= 2.9's major*10000 + minor*100 + patch convention.
+# Update both SHA256 literals below when changing XIAOMI_NCCL_VERSION.
+# Limit both downloads, including retries and Retry-After waits, to ten minutes.
+ARG XIAOMI_NCCL_VERSION=2.28.3-xiaomi-0.1
+RUN . /etc/os-release && \
+    if [ "${ID}:${VERSION_ID}:$(dpkg --print-architecture)" != "ubuntu:24.04:amd64" ]; then \
+        echo "Xiaomi NCCL packages require Ubuntu 24.04 on amd64" >&2; exit 1; \
+    fi && \
+    NCCL_RELEASE_URL="https://cnbj1-fds.api.xiaomi.net/hpn/gitlab-ci/nccl/release/nccl-${XIAOMI_NCCL_VERSION}/ubuntu24.04/cuda12.9.1" && \
+    NCCL_DEB_VERSION="${XIAOMI_NCCL_VERSION}-1+cuda12.9" && \
+    NCCL_UPSTREAM_VERSION="${XIAOMI_NCCL_VERSION%%-*}" && \
+    timeout --signal=KILL 600s sh -c ' \
+        for package in libnccl2 libnccl-dev; do \
+            curl --retry 3 --retry-delay 2 --retry-connrefused \
+                --connect-timeout 10 --max-time 300 -fsSL \
+                "${1}/${package}_${2}_amd64.deb" \
+                -o "/tmp/${package}.deb" || exit 1; \
+        done' sh "${NCCL_RELEASE_URL}" "${NCCL_DEB_VERSION}" && \
+    printf '%s  %s\n' \
+        f0ecbe3e959f22699cffe23e1fe6b64ed84f2cb021dca31db5fd39ed9072a35a /tmp/libnccl2.deb \
+        2aa6986a66f084961bcb7e9f58f7eff7066f9d7d6e8322c5ec7a8963a2f8b107 /tmp/libnccl-dev.deb | sha256sum --strict -c - && \
+    dpkg -i /tmp/libnccl2.deb /tmp/libnccl-dev.deb && \
+    rm -f /tmp/libnccl2.deb /tmp/libnccl-dev.deb && \
+    NCCL_PYTHON_DIR=$(python3 -c "import sys; from importlib.metadata import distributions; \
+        wheels = [d for d in distributions() if d.metadata['Name'] in ('nvidia-nccl-cu12', 'nvidia-nccl-cu13')]; \
+        len(wheels) == 1 or sys.exit(f'Expected exactly one NCCL wheel, found {len(wheels)}'); \
+        wheels[0].version == sys.argv[1] or sys.exit(f'NCCL wheel {wheels[0].version} does not match patch {sys.argv[1]}'); \
+        print(wheels[0].locate_file('nvidia/nccl'))" "${NCCL_UPSTREAM_VERSION}") && \
+    if [ ! -f "${NCCL_PYTHON_DIR}/lib/libnccl.so.2" ]; then \
+        echo "NCCL library not found in wheel: ${NCCL_PYTHON_DIR}/lib/libnccl.so.2" >&2; exit 1; \
+    fi && \
+    ln -sf /usr/lib/x86_64-linux-gnu/libnccl.so.2 "${NCCL_PYTHON_DIR}/lib/libnccl.so.2" && \
+    python3 -c "import ctypes; import sys; from pathlib import Path; import torch; \
+        nccl = ctypes.CDLL('libnccl.so.2'); \
+        version = ctypes.c_int(); \
+        result = nccl.ncclGetVersion(ctypes.byref(version)); \
+        result == 0 or sys.exit(f'ncclGetVersion failed: {result}'); \
+        major, minor, patch = map(int, sys.argv[1].split('.')); \
+        expected_version = major * 10000 + minor * 100 + patch; \
+        version.value == expected_version or sys.exit(f'Unexpected NCCL version: {version.value}, expected {expected_version}'); \
+        expected = Path('/usr/lib/x86_64-linux-gnu/libnccl.so.2').resolve(); \
+        loaded = {Path(line.split()[-1]).resolve() for line in Path('/proc/self/maps').read_text().splitlines() if '/libnccl.so' in line}; \
+        loaded == {expected} or sys.exit(f'Unexpected NCCL libraries: {loaded}'); \
+        print('NCCL library load/version check passed:', expected, version.value)" "${NCCL_UPSTREAM_VERSION}"
+
 # Keep this at the end of the Dockerfile to avoid cache invalidation for previous layers
 COPY . .
 

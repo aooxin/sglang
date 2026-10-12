@@ -41,8 +41,8 @@ def token_indices_for_pages(pages, page_size=PAGE_SIZE, device=None):
 
 
 def fill_with_offset(tensor, offset):
-    data = torch.arange(tensor.numel(), device=tensor.device, dtype=tensor.dtype)
-    tensor.copy_((data + offset).view_as(tensor))
+    data = torch.arange(tensor.numel(), device=tensor.device, dtype=torch.float32)
+    tensor.copy_(((data + offset) % 251).view_as(tensor))
 
 
 def make_host_pool(dtype, layout="page_first"):
@@ -56,7 +56,10 @@ def make_host_pool(dtype, layout="page_first"):
     host.v_head_dim = V_HEAD_DIM
     host.dtype = dtype
     host.can_use_write_back_jit = False
-    if layout == "page_first":
+    if layout == "layer_first":
+        k_dims = (NUM_LAYERS, TOTAL_ITEMS, HEAD_NUM, K_HEAD_DIM)
+        v_dims = (NUM_LAYERS, TOTAL_ITEMS, HEAD_NUM, V_HEAD_DIM)
+    elif layout == "page_first":
         k_dims = (TOTAL_ITEMS, NUM_LAYERS, HEAD_NUM, K_HEAD_DIM)
         v_dims = (TOTAL_ITEMS, NUM_LAYERS, HEAD_NUM, V_HEAD_DIM)
     elif layout == "page_first_direct":
@@ -97,6 +100,8 @@ def make_device_pool(dtype):
 
 
 def _host_k_tokens(host, indices, layer_id):
+    if host.layout == "layer_first":
+        return host.k_buffer[layer_id, indices]
     if host.layout == "page_first":
         return host.k_buffer[indices, layer_id]
     pages = indices[::PAGE_SIZE] // PAGE_SIZE
@@ -104,6 +109,8 @@ def _host_k_tokens(host, indices, layer_id):
 
 
 def _host_v_tokens(host, indices, layer_id):
+    if host.layout == "layer_first":
+        return host.v_buffer[layer_id, indices]
     if host.layout == "page_first":
         return host.v_buffer[indices, layer_id]
     pages = indices[::PAGE_SIZE] // PAGE_SIZE
@@ -135,10 +142,11 @@ def assert_load_matches_host(host, device_pool, host_indices_host, load_indices)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_asymmetric_mha_kernel_page_first_roundtrip(dtype):
+@pytest.mark.parametrize("layout", ["page_first", "layer_first"])
+def test_asymmetric_mha_kernel_roundtrip(dtype, layout):
     # Covers D2H backup + H2D load through AsymmetricMHATokenToKVPoolHost using
     # MiMoV2's real K/V head dims and the real MLA single-buffer kernels.
-    host = make_host_pool(dtype)
+    host = make_host_pool(dtype, layout=layout)
     device_pool = make_device_pool(dtype)
 
     device_pages = torch.tensor([1, 2, 3], dtype=torch.int64)
@@ -170,11 +178,12 @@ def test_asymmetric_mha_kernel_page_first_roundtrip(dtype):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_asymmetric_mha_direct_page_first_direct_roundtrip(dtype):
+@pytest.mark.parametrize("layout", ["page_first_direct", "layer_first"])
+def test_asymmetric_mha_direct_roundtrip(dtype, layout):
     # Covers D2H backup + H2D load through AsymmetricMHATokenToKVPoolHost using
     # page_first_direct/direct. K and V are copied through separate direct calls
     # because their per-token strides differ.
-    host = make_host_pool(dtype, layout="page_first_direct")
+    host = make_host_pool(dtype, layout=layout)
     device_pool = make_device_pool(dtype)
     direct_stream = torch.cuda.Stream()
 

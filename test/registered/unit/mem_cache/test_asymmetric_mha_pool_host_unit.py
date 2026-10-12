@@ -97,17 +97,32 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
             device="cpu",
             enable_memory_saver=False,
         )
-        host = AsymmetricMHATokenToKVPoolHost(
-            device_pool=device,
-            host_to_device_ratio=2.0,
-            host_size=0,
-            page_size=2,
-            layout="page_first",
-            pin_memory=False,
-            device="cpu",
-            allocator_type="default",
-        )
-        self.assertTrue(host.device_rows_packed)
+        for layout in ("page_first", "layer_first"):
+            with self.subTest(layout=layout):
+                host = AsymmetricMHATokenToKVPoolHost(
+                    device_pool=device,
+                    host_to_device_ratio=2.0,
+                    host_size=0,
+                    page_size=2,
+                    layout=layout,
+                    pin_memory=False,
+                    device="cpu",
+                    allocator_type="default",
+                )
+                self.assertTrue(host.device_rows_packed)
+                if layout == "layer_first":
+                    from sglang.srt.mem_cache.hicache_storage import PoolName
+                    from sglang.srt.mem_cache.pool_host.group import (
+                        HostPoolGroup,
+                        PoolEntry,
+                    )
+
+                    group = HostPoolGroup(
+                        [PoolEntry(PoolName.KV, host, device, lambda i: i)]
+                    )
+                    device_infos, host_infos = group.get_contiguous_buf_infos()
+                    self.assertEqual(device_infos[2], host_infos[2])
+                    self.assertEqual(host_infos[2], [32] * 3 + [48] * 3)
 
     def test_staged_write_back_jit_uses_separate_kv_buffers(self):
         host = _make_host("page_first")

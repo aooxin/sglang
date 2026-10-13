@@ -59,4 +59,6 @@ exec python3 -m sglang.launch_server \
     --cuda-graph-backend-decode disabled \
     --deepep-config '{"normal_dispatch": {"num_sms": 24, "num_max_nvl_chunked_send_tokens": 32, "num_max_nvl_chunked_recv_tokens": 288, "num_max_rdma_chunked_send_tokens": 12, "num_max_rdma_chunked_recv_tokens": 128}, "normal_combine": {"num_sms": 24, "num_max_nvl_chunked_send_tokens": 16, "num_max_nvl_chunked_recv_tokens": 288, "num_max_rdma_chunked_send_tokens": 12, "num_max_rdma_chunked_recv_tokens": 128}}' \
     --tokenizer-worker-num 8 \
-    --disable-radix-cache
+    --disable-radix-cache \
+    2>&1 | tee ./sglang_server.log
+

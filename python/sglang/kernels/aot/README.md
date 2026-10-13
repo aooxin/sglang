@@ -44,6 +44,97 @@ make build MAX_JOBS=2
 make build MAX_JOBS=2 CMAKE_ARGS="-DSGL_KERNEL_COMPILE_THREADS=1"
 ```
 
+### Build FA3 only with CUDA 12.9
+
+`build_fa.sh` adapts the 0510 FA3 build script referenced in the
+[CUDA 13.2 adaptation document](https://mi.feishu.cn/docx/B0tGdaEZCoPfsIxIo6Pcuhn0nDb)
+to the 0520 source layout. It produces a `flash_ops.abi3.so` and a separate
+`sglang-kernel-fa3-cu129` wheel under `dist_fa/`, using the selected Python's
+Torch headers, libraries and C++ ABI. This supports the intended combination of
+CUDA 12.9 nvcc and an existing `torch==2.13.0+cu130` environment.
+
+Prerequisites: a CUDA 12.9 toolkit (compiler, headers and libraries), a compatible
+C++ compiler, CMake >=3.26, Ninja, `flock`, and CPython >=3.10 with matching Python
+development headers, CUDA-enabled Torch 2.13 and `wheel`. The selected Python must
+already be able to import Torch. The final native loading check also needs the
+CUDA driver library `libcuda.so.1`; it does not execute GPU kernels.
+
+From the **0520 repository root**:
+
+```bash
+cd python/sglang/kernels/aot
+bash build_fa.sh
+```
+
+The default compiler is `/usr/local/cuda-12.9/bin/nvcc`. Select a different
+CUDA 12.9 location or Python environment explicitly when needed:
+
+```bash
+FA3_NVCC=/usr/local/cuda-12.9/bin/nvcc \
+FA3_PYTHON=/opt/sglang/bin/python3 \
+MAX_JOBS=2 \
+bash build_fa.sh
+```
+
+Like the original script, the default build retains the normal FA3 architecture
+list: SM80, SM86 and SM90a on x86_64. For an H20/H100-only build, reduce the work:
+
+```bash
+bash build_fa.sh -DENABLE_BELOW_SM90=OFF
+```
+
+The standalone project in `cmake/fa3/` implements the original `BUILD_FA_ONLY`
+behavior. It builds only `flash_ops`, using the same pinned CUTLASS/sgl-attn
+revisions, forward dtypes and default feature flags as this tree's FA3 target.
+It links directly to the current Torch libraries, so Torch's CMake CUDA-major
+check does not reject the intentional compiler/runtime combination. The
+extension uses the CUDA toolkit's static runtime, matching CMake's default in
+the original build; it does not add a dynamic `libcudart.so.12` dependency.
+
+Builds retain intermediate files in `build_fa/` and append output to
+`build_fa/build.log`. Ninja reports completed steps as `[completed/total, elapsed]`.
+Watch the log from another shell:
+
+```bash
+tail -F build_fa/build.log
+```
+
+For a build that survives an SSH disconnect, launch it with `nohup`:
+
+```bash
+nohup bash build_fa.sh -DENABLE_BELOW_SM90=OFF \
+  > /tmp/sglang-fa3-launch.log 2>&1 < /dev/null &
+tail -F build_fa/build.log
+```
+
+The script prints `[fa3-build] COMPLETE` only after compilation, native loading,
+the 0520 operator-schema check and packaging succeed. A failed step returns a
+nonzero exit code. Re-running the script uses Ninja's incremental build; a second
+script invocation on the same build directory is rejected while one is active.
+
+`FA3_BUILD_DIR` and `FA3_DIST_DIR` override the build and output directories.
+Use a fresh build directory when switching compiler versions. For an offline
+build, supply the pinned dependency archives (their SHA256 is still checked):
+
+```bash
+bash build_fa.sh \
+  -DFA3_CUTLASS_URL=/path/to/cutlass-57e3cfb47a2d9e0d46eb6335c3dc411498efa198.tar.gz \
+  -DFA3_ATTENTION_URL=/path/to/sgl-attn-f89bc2306632d1ec5f97b014dded4254f5b4a907.tar.gz
+```
+
+Successful outputs are:
+
+- `dist_fa/flash_ops.abi3.so`: the extension for manual deployment/testing.
+- `dist_fa/sglang_kernel_fa3_cu129-*.whl`: a FA3-only wheel containing
+  `sgl_kernel/flash_ops.abi3.so` and build metadata.
+- `dist_fa/manifest.json`: Torch/CUDA/ABI, nvcc, architecture, size and SHA256.
+
+The script only builds artifacts. It leaves installation and replacement to a
+separate step, and the manifest records that GPU execution has not been tested.
+The `.abi3.so` suffix describes Python's stable ABI; the extension still needs a
+compatible Torch C++ ABI when deployed. Validate it on the target GPU before
+integrating it into an image.
+
 ## Contribution
 
 ### Steps to add a new kernel:

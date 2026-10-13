@@ -1,5 +1,6 @@
-"""MiMo checkpoint bytes and SM90 DeepGEMM scale layouts must agree."""
+"""MiMo checkpoint bytes and DeepGEMM scale layouts must agree."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -7,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import DeepEPMode, MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.layers.quantization import fp8
@@ -103,6 +105,62 @@ def test_other_fp4_checkpoints_keep_numeric_fp32_scales():
     torch.testing.assert_close(
         experts.w13_weight_scale_inv[0, 0], torch.tensor([0.5, 1.0, 2.0, 4.0])
     )
+
+
+@pytest.mark.parametrize(
+    "serialized_e8m0,scale_dtype",
+    [(True, None), (False, None), (False, torch.float8_e8m0fnu)],
+    ids=["mimo_uint8", "numeric_fp32", "typed_e8m0"],
+)
+def test_blackwell_deepgemm_packs_decoded_scales(serialized_e8m0, scale_dtype):
+    experts = _load_experts(serialized_e8m0=serialized_e8m0, scale_dtype=scale_dtype)
+
+    def pack_scales(sf, *, mn, k, recipe, num_groups, disable_ue8m0_cast):
+        # CPU equivalent of DeepGEMM's FP32 -> packed INT32 conversion for
+        # these aligned shapes. The native Blackwell API rejects raw uint8.
+        assert sf.dtype == torch.float32
+        assert sf.shape == (num_groups, mn, k // 32)
+        assert recipe == (1, 32) and not disable_ue8m0_cast
+        packed = (sf.view(torch.int32) >> 23).to(torch.uint8).view(torch.int32)
+        return packed.transpose(-1, -2).contiguous().transpose(-1, -2)
+
+    with (
+        get_context().override_server_args(
+            moe_runner_backend="deep_gemm",
+            moe_a2a_backend="deepep",
+            deepep_mode="normal",
+        ),
+        get_flags().moe.override(
+            runner_backend=MoeRunnerBackend.DEEP_GEMM,
+            a2a_backend=MoeA2ABackend.DEEPEP,
+            deepep_mode=DeepEPMode.NORMAL,
+        ),
+        patch.object(fp8, "_is_cpu", False),
+        patch.object(fp8, "get_platform", return_value=SimpleNamespace(is_sm90=False)),
+        patch.object(deep_gemm_wrapper, "DEEPGEMM_SCALE_UE8M0", True),
+        patch.dict(
+            sys.modules,
+            {
+                "deep_gemm": SimpleNamespace(
+                    transform_sf_into_required_layout=pack_scales
+                )
+            },
+        ),
+    ):
+        experts.quant_method.process_weights_after_loading(experts)
+
+    for name, rows in (("w13_weight_scale_inv", 256), ("w2_weight_scale_inv", 128)):
+        scale = getattr(experts, name)
+        assert scale.dtype == torch.int32
+        assert scale.shape == (1, rows, 1)
+        assert scale.stride(-2) == 1
+        assert scale.format_ue8m0
+        # Packing must preserve the original E8M0 exponent bytes. A numeric
+        # uint8 -> float32 cast would instead pack the exponents of 126..129.
+        expected = torch.tensor([126, 127, 128, 129], dtype=torch.uint8).repeat(
+            1, rows, 1
+        )
+        torch.testing.assert_close(scale.contiguous().view(torch.uint8), expected)
 
 
 @pytest.mark.parametrize(

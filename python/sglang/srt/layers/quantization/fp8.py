@@ -121,6 +121,67 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = logging.getLogger(__name__)
 
 
+def _dequant_mxfp4_to_fp8_block(
+    w_int8: torch.Tensor,
+    s_u8: torch.Tensor,
+    block_n: int,
+    block_k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dequantize MXFP4-packed MoE expert weights directly to block FP8.
+
+    The MXFP4 checkpoint stores two FP4 (E2M1) nibbles per int8 byte:
+      low  4 bits → even K index
+      high 4 bits → odd  K index
+    The per-32 block scale is stored as uint8 E8M0 (value = 2^(e-127)).
+
+    Args:
+        w_int8: [E, N, K//2]  int8  — packed FP4 weights
+        s_u8:   [E, N, K//32] uint8 — E8M0 per-32 block scales
+        block_n, block_k: target block size for the output FP8 scale
+
+    Returns:
+        w_fp8:  [E, N, K]              float8_e4m3fn
+        s_fp8:  [E, N//bn, K//bk]      float32  (block FP8 scale, inv not needed)
+    """
+    from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
+
+    E, N, Khalf = w_int8.shape
+    K = Khalf * 2
+    device = w_int8.device
+
+    # ── 1. unpack nibbles ──────────────────────────────────────────────────
+    w_u8 = w_int8.view(torch.uint8)               # [E, N, K//2]
+    lo = (w_u8 & 0x0F).long()                     # even K indices, [E, N, K//2]
+    hi = ((w_u8 >> 4) & 0x0F).long()              # odd  K indices, [E, N, K//2]
+    # interleave: even at 0::2, odd at 1::2  →  [E, N, K]
+    nibbles = torch.empty(E, N, K, dtype=torch.long, device=device)
+    nibbles[..., 0::2] = lo
+    nibbles[..., 1::2] = hi
+
+    # ── 2. lookup FP4 E2M1 → float32 ─────────────────────────────────────
+    # MXFP4QuantizeUtil.E2M1_values contains the 16 unsigned magnitudes;
+    # the sign bit is the MSB (bit 3) of the nibble.
+    values = torch.tensor(
+        MXFP4QuantizeUtil.E2M1_values, dtype=torch.float32, device=device
+    )
+    magnitude_idx = nibbles & 0x7                  # [E, N, K]  lower 3 bits
+    sign = ((nibbles >> 3) & 1).float()            # [E, N, K]  sign bit
+    w_fp32 = values[magnitude_idx]                 # [E, N, K]
+    w_fp32 = w_fp32 * (1.0 - 2.0 * sign)          # apply sign
+
+    # ── 3. apply E8M0 block scale: 2^(e - 127) ────────────────────────────
+    # s_u8 shape [E, N, K//32]; broadcast to [E, N, K]
+    scale_fp32 = torch.exp2(s_u8.float() - 127.0)                # [E, N, K//32]
+    scale_fp32 = scale_fp32.unsqueeze(-1).expand(
+        E, N, K // 32, 32
+    ).reshape(E, N, K)
+    w_fp32 = w_fp32 * scale_fp32                                  # [E, N, K]
+
+    # ── 4. block-quantize to FP8 e4m3fn ───────────────────────────────────
+    w_fp8, s_fp8 = _per_block_cast_to_fp8_online(w_fp32, block_n, block_k)
+    return w_fp8, s_fp8
+
+
 def _per_block_cast_to_fp8_online(
     x: torch.Tensor, block_n: int, block_k: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1154,6 +1215,35 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        # MXFP4 checkpoint + megamoe path: dequantize FP4 → block FP8 in-place
+        # before the rest of the block-quant processing runs.
+        if self.is_fp4_expert and (
+            get_moe_a2a_backend().is_megamoe() or get_moe_a2a_backend().is_deepep()
+        ) and not get_moe_runner_backend().is_mxfp4_w4a8():
+            block_n, block_k = self.quant_config.weight_block_size
+            w13_fp8, w13_scale = _dequant_mxfp4_to_fp8_block(
+                layer.w13_weight.data, layer.w13_weight_scale_inv.data,
+                block_n, block_k,
+            )
+            w2_fp8, w2_scale = _dequant_mxfp4_to_fp8_block(
+                layer.w2_weight.data, layer.w2_weight_scale_inv.data,
+                block_n, block_k,
+            )
+            del layer.w13_weight, layer.w13_weight_scale_inv
+            del layer.w2_weight, layer.w2_weight_scale_inv
+            w13_fp8 = torch.nn.Parameter(w13_fp8, requires_grad=False)
+            w13_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
+            w2_fp8 = torch.nn.Parameter(w2_fp8, requires_grad=False)
+            w2_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
+            w13_scale.format_ue8m0 = False
+            w2_scale.format_ue8m0 = False
+            layer.register_parameter("w13_weight", w13_fp8)
+            layer.register_parameter("w13_weight_scale_inv", w13_scale)
+            layer.register_parameter("w2_weight", w2_fp8)
+            layer.register_parameter("w2_weight_scale_inv", w2_scale)
+            # Mark as FP8 so the remainder of this method treats it normally.
+            self.is_fp4_expert = False
+
         if not self.quant_config.is_checkpoint_fp8_serialized and not self.use_mxfp8:
             # bf16/fp16 checkpoint served with an injected block-quant fp8
             # config (origin_dtype): quantize online before the serialized

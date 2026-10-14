@@ -4225,13 +4225,16 @@ class SenderWrapper:
         if self.socket is None:
             return
 
-        if (
-            isinstance(recv_obj, BaseReq)
-            and recv_obj.http_worker_ipc is not None
-            and output.http_worker_ipc is None
-        ):
-            # handle communicator reqs for multi-http worker case
-            output.http_worker_ipc = recv_obj.http_worker_ipc
+        # handle communicator reqs for multi-http worker case.
+        # Probe for the attribute rather than testing the type: a scheduler-side
+        # Req carries http_worker_ipc without being a BaseReq, and a BaseBatchReq
+        # routes by http_worker_ipcs instead. An isinstance() gate hid the first
+        # case and let AbortReq leave unrouted, to be dropped by the multi-http-worker
+        # router.
+        if hasattr(output, "http_worker_ipc"):
+            src_ipc = getattr(recv_obj, "http_worker_ipc", None)
+            if src_ipc is not None and output.http_worker_ipc is None:
+                output.http_worker_ipc = src_ipc
 
         self.socket.send_pyobj(output)
 

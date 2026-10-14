@@ -80,7 +80,10 @@ class SocketMapping:
     def send_output(self, ipc_name: str, output: Any):
         if ipc_name is None:
             # Some unhandled cases
-            logger.warning(f"IPC name is None, output type={type(output)}, skipping...")
+            rid = getattr(output, "rid", None) or getattr(output, "rids", None)
+            logger.warning(
+                f"IPC name is None, output type={type(output)}, rid={rid}, skipping..."
+            )
             return
 
         if ipc_name not in self._mapping:

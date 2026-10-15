@@ -9,6 +9,7 @@ import torch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.nvtx_utils import nvtx_annotated_method
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.utils.common import is_pin_memory_available
 
 logger = logging.getLogger(__name__)
 
@@ -71,17 +72,20 @@ class ScheduleBatchDisaggregationDecodeMixin:
         extend_input_logprob_token_ids = None
 
         # Set fields
+        _pin = is_pin_memory_available(self.device)
         self.input_ids = torch.tensor(
-            sum(input_ids, []), dtype=torch.int32, device=self.device
-        )
+            sum(input_ids, []), dtype=torch.int32, pin_memory=_pin
+        ).to(self.device, non_blocking=True)
         self.req_pool_indices = torch.tensor(
-            req_pool_indices, dtype=torch.int64, device=self.device
-        )
-        self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+            req_pool_indices, dtype=torch.int64, pin_memory=_pin
+        ).to(self.device, non_blocking=True)
+        self.seq_lens = torch.tensor(
+            seq_lens, dtype=torch.int64, pin_memory=_pin
+        ).to(self.device, non_blocking=True)
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         self.orig_seq_lens = torch.tensor(
-            seq_lens, dtype=torch.int32, device=self.device
-        )
+            seq_lens, dtype=torch.int32, pin_memory=_pin
+        ).to(self.device, non_blocking=True)
         self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)
 
@@ -132,7 +136,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
                         error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
-        self.output_ids = torch.tensor(self.output_ids, device=self.device)
+        self.output_ids = torch.tensor(
+            self.output_ids, pin_memory=is_pin_memory_available(self.device)
+        ).to(self.device, non_blocking=True)
 
         # Simulate the eagle run.
         if self.spec_algorithm.is_eagle():

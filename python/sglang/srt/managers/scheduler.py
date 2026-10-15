@@ -1603,6 +1603,7 @@ class Scheduler(
             "page_size_tokens": self.page_size,
             "page_element_sizes_bytes": page_element_sizes_bytes,
             "sliding_window_size": self.sliding_window_size,
+            "swa_retention_window": self.swa_retention_window,
         }
 
     def run_event_loop(self) -> None:

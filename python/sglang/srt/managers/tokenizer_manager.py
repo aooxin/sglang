@@ -2337,8 +2337,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 retraction_count,
                 cached_tokens_details,
                 is_abort=is_abort,
-                reasoning_tokens=recv_obj.reasoning_tokens[i],
-                require_reasoning=state.obj.require_reasoning,
+                reasoning_tokens=(
+                    recv_obj.reasoning_tokens[i]
+                    if not isinstance(recv_obj, BatchEmbeddingOutput)
+                    else 0
+                ),
+                require_reasoning=getattr(state.obj, "require_reasoning", False),
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):

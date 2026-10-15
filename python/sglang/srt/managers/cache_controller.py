@@ -2006,6 +2006,10 @@ class HiCacheController:
         if full_host_indices_to_release.numel() == 0:
             return
 
+        if not self.is_hybrid_swa:
+            self.append_host_mem_release(full_host_indices_to_release)
+            return
+
         swa_host_indices = self.mem_pool_host.unmapping_full_and_swa_indices(
             full_host_indices_to_release
         )

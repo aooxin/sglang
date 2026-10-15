@@ -11,6 +11,7 @@ from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -355,8 +356,10 @@ class SamplingBatchInfo:
             new_custom_logit_processor[k] = (processor, filtered_mask)
             new_custom_logit_processor_indices[k] = filtered_indices
             new_custom_logit_processor_indices_device[k] = torch.tensor(
-                filtered_indices, dtype=torch.long, device=self.device
-            )
+                filtered_indices,
+                dtype=torch.long,
+                pin_memory=is_pin_memory_available(self.device),
+            ).to(self.device, non_blocking=True)
             new_custom_logit_processor_params[k] = [param for _, param in pairs]
 
         self.custom_logit_processor = new_custom_logit_processor
@@ -465,6 +468,12 @@ class SamplingBatchInfo:
             other_custom_params = other.custom_params or [None] * len(other)
             left_processor_indices = self.custom_logit_processor_indices or {}
             right_processor_indices = other.custom_logit_processor_indices or {}
+            left_processor_indices_device = (
+                self.custom_logit_processor_indices_device or {}
+            )
+            right_processor_indices_device = (
+                other.custom_logit_processor_indices_device or {}
+            )
             bs1 = len(self)
             bs2 = len(other)
 
@@ -489,8 +498,19 @@ class SamplingBatchInfo:
                 right_indices = right_processor_indices.get(k, [])
                 merged_indices = left_indices + [idx + bs1 for idx in right_indices]
                 self.custom_logit_processor_indices[k] = merged_indices
-                self.custom_logit_processor_indices_device[k] = torch.tensor(
-                    merged_indices, dtype=torch.long, device=self.device
+                left_dev = left_processor_indices_device.get(k)
+                right_dev = right_processor_indices_device.get(k)
+                parts = []
+                if left_dev is not None and left_dev.numel():
+                    parts.append(left_dev)
+                if right_dev is not None and right_dev.numel():
+                    parts.append(right_dev + bs1)
+                self.custom_logit_processor_indices_device[k] = (
+                    torch.cat(parts)
+                    if parts
+                    else torch.tensor(
+                        merged_indices, dtype=torch.long, device=self.device
+                    )
                 )
                 self.custom_logit_processor_params[k] = [
                     self_custom_params[i] for i in left_indices

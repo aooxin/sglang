@@ -709,8 +709,8 @@ class ServingChatTestCase(unittest.TestCase):
             serving_chat = OpenAIServingChat(tokenizer_manager, TemplateManager())
             self.assertFalse(serving_chat.use_dpsk_v32_encoding)
 
-    def test_streaming_abort_yields_error(self):
-        """Test that an abort finish reason during streaming correctly yields an error and stops."""
+    def test_streaming_abort_before_first_chunk_returns_http_error(self):
+        """An initial abort returns an HTTP error before streaming starts."""
         err_msg = "Aborted by scheduler"
         err_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
@@ -755,36 +755,16 @@ class ServingChatTestCase(unittest.TestCase):
                 req, self.fastapi_request
             )
 
-            async def run_stream():
-                chunks = []
-                try:
-                    async for chunk in self.chat._generate_chat_stream(
-                        adapted_request, req, self.fastapi_request
-                    ):
-                        chunks.append(chunk)
-                except Exception as e:
-                    print(f"Error during stream iteration: {e}")
-                return chunks
-
         loop = get_or_create_event_loop()
-        chunks = loop.run_until_complete(run_stream())
-
-        error_chunk_data = None
-        for c in chunks:
-            if "error" in c:
-                error_chunk_data = json.loads(c[len("data: ") :])
-                break
-        self.assertIsNotNone(error_chunk_data, "Error chunk not found in stream")
-        self.assertEqual(error_chunk_data["error"]["message"], err_msg)
-        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
-
-        # Ensure the stream stops after the abort error
-        # The last chunk should be "data: [DONE]\n\n"
-        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
-
-        # Check that there is an error chunk and a DONE chunk
-        self.assertEqual(len(chunks), 2)
-        self.assertIn("error", chunks[0])
+        response = loop.run_until_complete(
+            self.chat._handle_streaming_request(
+                adapted_request, req, self.fastapi_request
+            )
+        )
+        self.assertEqual(response.status_code, err_code.value)
+        error = json.loads(response.body)
+        self.assertEqual(error["message"], err_msg)
+        self.assertEqual(error["code"], err_code.value)
 
     # ------------- X-Data-Parallel-Rank header tests -------------
     def test_extract_routed_dp_rank_from_header_no_header(self):

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Uni
 
 import jinja2
 import orjson
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
@@ -871,6 +871,15 @@ class OpenAIServingChat(OpenAIServingBase):
             first_chunk = await generator.__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
+        except HTTPException as e:
+            response = self.create_error_response(
+                e.detail, err_type=str(e.status_code), status_code=e.status_code
+            )
+            # No StreamingResponse was created; retain its request-abort cleanup.
+            response.background = self.tokenizer_manager.create_abort_task(
+                adapted_request
+            )
+            return response
 
         async def prepend_first_chunk():
             yield first_chunk
@@ -921,6 +930,9 @@ class OpenAIServingChat(OpenAIServingBase):
         video_tokens = {}
 
         stream_started = False
+        generator = self.tokenizer_manager.generate_request(
+            adapted_request, raw_request
+        )
         try:
             enable_cache_report = self.tokenizer_manager.server_args.enable_cache_report
             include_usage, continuous_usage_stats = should_include_usage(
@@ -938,9 +950,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 else 0
             )
 
-            async for content in self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ):
+            async for content in generator:
                 index = content.get("index", 0)
 
                 prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
@@ -957,9 +967,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 audio_tokens[index] = content["meta_info"].get("audio_tokens", 0)
                 video_tokens[index] = content["meta_info"].get("video_tokens", 0)
 
-                # Handle logprobs
+                finish_reason = content["meta_info"].get("finish_reason", None)
+                finish_reason_type = finish_reason["type"] if finish_reason else None
+
+                # Validation aborts may not carry logprob data.
                 choice_logprobs = None
-                if request.logprobs:
+                if request.logprobs and finish_reason_type != "abort":
                     n_prev_token = n_prev_tokens.get(index, 0)
                     total_output_logprobs = content["meta_info"][
                         "output_token_logprobs_length"
@@ -975,18 +988,22 @@ class OpenAIServingChat(OpenAIServingBase):
                 # nor duplicated across chunks; flush any leftover at the end.
                 remaining_logprobs = choice_logprobs
 
-                finish_reason = content["meta_info"].get("finish_reason", None)
-                finish_reason_type = finish_reason["type"] if finish_reason else None
-
                 # Track finish_reason for each index
                 if finish_reason_type:
                     # If the abort is from scheduler.
                     if finish_reason_type == "abort":
                         # FINISH_ABORT may carry status_code=None; .get()'s default only covers a missing key.
-                        code = (
+                        code = HTTPStatus(
                             finish_reason.get("status_code")
                             or HTTPStatus.INTERNAL_SERVER_ERROR
                         )
+                        if not stream_started:
+                            raise HTTPException(
+                                status_code=int(code),
+                                detail=finish_reason.get(
+                                    "message", "Generation aborted."
+                                ),
+                            )
                         error = self.create_streaming_error_response(
                             finish_reason.get("message", "Generation aborted."),
                             code.name,
@@ -1297,6 +1314,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+        finally:
+            await generator.aclose()
 
         yield "data: [DONE]\n\n"
 

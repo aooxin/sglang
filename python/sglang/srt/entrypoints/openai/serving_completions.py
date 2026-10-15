@@ -5,7 +5,7 @@ import time
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.protocol import (
@@ -206,6 +206,15 @@ class OpenAIServingCompletion(OpenAIServingBase):
             first_chunk = await generator.__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
+        except HTTPException as e:
+            response = self.create_error_response(
+                e.detail, err_type=str(e.status_code), status_code=e.status_code
+            )
+            # No StreamingResponse was created; retain its request-abort cleanup.
+            response.background = self.tokenizer_manager.create_abort_task(
+                adapted_request
+            )
+            return response
 
         async def prepend_first_chunk():
             yield first_chunk
@@ -240,6 +249,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
         routed_experts = {}
 
         stream_started = False
+        generator = self.tokenizer_manager.generate_request(
+            adapted_request, raw_request
+        )
         try:
             enable_cache_report = self.tokenizer_manager.server_args.enable_cache_report
             include_usage, continuous_usage_stats = should_include_usage(
@@ -247,9 +259,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 self.tokenizer_manager.server_args.stream_response_default_include_usage,
             )
 
-            async for content in self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ):
+            async for content in generator:
                 index = content.get("index", 0)
 
                 text = content["text"]
@@ -271,9 +281,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         echo_text = self._get_echo_text(request, index)
                         text = echo_text + text
 
-                # Handle logprobs
+                finish_reason = content["meta_info"].get("finish_reason", None)
+                finish_reason_type = finish_reason["type"] if finish_reason else None
+
+                # Validation aborts may not carry logprob data.
                 logprobs = None
-                if request.logprobs is not None:
+                if request.logprobs is not None and finish_reason_type != "abort":
                     # The first chunk and echo is enabled.
                     if not stream_buffer and request.echo:
                         input_token_logprobs = content["meta_info"][
@@ -307,16 +320,19 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 # Generate delta
                 delta = text[len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
-                finish_reason = content["meta_info"].get("finish_reason", None)
-                finish_reason_type = finish_reason["type"] if finish_reason else None
 
                 # If the abort is from scheduler.
                 if finish_reason_type == "abort":
                     # FINISH_ABORT may carry status_code=None; .get()'s default only covers a missing key.
-                    code = (
+                    code = HTTPStatus(
                         finish_reason.get("status_code")
                         or HTTPStatus.INTERNAL_SERVER_ERROR
                     )
+                    if not stream_started:
+                        raise HTTPException(
+                            status_code=int(code),
+                            detail=finish_reason.get("message", "Generation aborted."),
+                        )
                     error = self.create_streaming_error_response(
                         finish_reason.get("message", "Generation aborted."),
                         code.name,
@@ -424,6 +440,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+        finally:
+            await generator.aclose()
 
         yield "data: [DONE]\n\n"
 

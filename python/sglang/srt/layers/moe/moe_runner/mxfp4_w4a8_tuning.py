@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Final
+from typing import Any, Final
 
 TuningRange = tuple[int, int, int, int, bool]
 
@@ -237,4 +237,236 @@ HUMMING_FINE_TUNING_RANGES: Final[
         (73, 80, 80, 4, False),
         (81, 88, 88, 3, True),
     ),
+}
+
+# Best prefill (contiguous GEMM) configs per (N, K) weight shape.
+# Each entry is the exhaustive-sweep winner at the representative deployment
+# chunk size for that model family.  Used as the static fallback when no
+# per-chunk entry applies (see HUMMING_PER_CHUNK_PREFILL_TUNING_CONFIGS below,
+# which holds both the Flash and Pro shapes keyed by (N, K, chunk)).
+#
+# Flash models (4096×4096 W13, 4096×2048 W2) — static fallback = chunk=16384 winner
+# (flash_prefill_results, 2026-09-18):
+#   W13 (w13 dir, 4096×4096): bm88_bn256_bk128_wm88_wn32_wk128_s7_sk0_cta1 → 597.5T
+#   W2  (w2  dir, 4096×2048): bm88_bn256_bk128_wm88_wn32_wk128_s7_sk0_cta1 → 552.1T
+#
+# Pro models (4096×6144 W13, 6144×2048 W2) — static fallback = chunk=49152 winner
+# (humming_prefill_results_new, 2026-09-16). num_stages=2 configs are EXCLUDED
+# from selection (measured accuracy regression), so the W13 winners are the best
+# non-s2 configs — negligibly slower (<=0.4%) than the discarded s2/sk1 picks:
+#   W13 (w13 dir, 4096×6144): bm88_bn256_bk128_wm88_wn32_wk128_s6_sk0_cta1 → 680.9T
+#     (was s2/sk1 683.7T, dropped for accuracy)
+#   W2  (w2  dir, 6144×2048): bm88_bn256_bk128_wm88_wn32_wk128_s5_sk0_cta1 → 629.4T
+HUMMING_PREFILL_TUNING_CONFIGS: Final[
+    dict[tuple[int, int], dict[str, Any]]
+] = {
+    # Flash – W13 gate+up (4096 × 4096)
+    # Static fallback (chunk=16384 winner); used when chunk < 16384 or not in the
+    # per-chunk table below.
+    (4096, 4096): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 7,
+        "num_ctas_per_sm": 1,
+    },
+    # Flash – W2 down (4096 × 2048)
+    # Static fallback (chunk=16384 winner).
+    (4096, 2048): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 7,
+        "num_ctas_per_sm": 1,
+    },
+    # Pro – W13 gate+up (4096 × 6144)
+    # Static fallback (chunk=49152 winner, num_stages=2 excluded for accuracy).
+    (4096, 6144): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 6,
+        "num_ctas_per_sm": 1,
+    },
+    # Pro – W2 down (6144 × 2048)
+    # Static fallback (chunk=49152 winner).
+    (6144, 2048): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 5,
+        "num_ctas_per_sm": 1,
+    },
+}
+
+# Per-chunk-size Flash prefill configs, keyed by (N, K, chunk_size).
+# Swept at four single-DP chunk sizes (flash_prefill_results, 2026-09-18).
+# Flash W13 uses s7/sk0 for all chunks; W2 uses s5/sk0 except chunk=16384/32768
+# which are s7/sk0 outliers. num_stages=2 excluded (accuracy regression rule).
+HUMMING_PER_CHUNK_PREFILL_TUNING_CONFIGS: Final[
+    dict[tuple[int, int, int], dict[str, Any]]
+] = {
+    # ── Flash W13 gate+up (4096 × 4096) ──────────────────────────────────────
+    # Swept at chunk ∈ {8192, 16384, 24576, 32768} (flash_prefill_results, 2026-09-18).
+    # num_stages=2 excluded (accuracy regression rule). All chunks use s7/sk0.
+    (4096, 4096, 8192): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 7,
+        "num_ctas_per_sm": 1,
+    },  # 531.00T (was s2/sk1 543.98T, dropped for no-s2 rule)
+    (4096, 4096, 16384): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 7,
+        "num_ctas_per_sm": 1,
+    },  # 597.46T — outlier: s7/sk0
+    (4096, 4096, 24576): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 7,
+        "num_ctas_per_sm": 1,
+    },  # 616.09T (was s2/sk1 627.97T, dropped for no-s2 rule)
+    (4096, 4096, 32768): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 7,
+        "num_ctas_per_sm": 1,
+    },  # 632.90T (was s2/sk1 642.91T, dropped for no-s2 rule)
+    # W2 down (4096 × 2048)
+    (4096, 2048, 8192): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 5,
+        "num_ctas_per_sm": 1,
+    },  # 475.00T
+    (4096, 2048, 16384): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 7,
+        "num_ctas_per_sm": 1,
+    },  # 552.12T — outlier: s7/sk0
+    (4096, 2048, 24576): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 5,
+        "num_ctas_per_sm": 1,
+    },  # 575.19T
+    (4096, 2048, 32768): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 5,
+        "num_ctas_per_sm": 1,
+    },  # 598.02T
+    # ── Pro W13 gate+up (4096 × 6144) ────────────────────────────────────────
+    # Swept at chunk ∈ {16384, 32768, 49152, 65536} (humming_prefill_results_new,
+    # 2026-09-16). num_stages=2 configs are EXCLUDED from selection (measured
+    # accuracy regression); every chunk now uses sk0 with the best non-s2 stage
+    # count — s7 at 16384/32768/65536, s6 at 49152. The discarded s2/sk1 picks
+    # at 16384/49152 were only 0.07%/0.40% faster.
+    (4096, 6144, 16384): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 7,
+        "num_ctas_per_sm": 1,
+    },  # 623.4T (was s2/sk1 623.8T, dropped for accuracy)
+    (4096, 6144, 32768): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 7,
+        "num_ctas_per_sm": 1,
+    },  # 668.0T — outlier: s7/sk0
+    (4096, 6144, 49152): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 6,
+        "num_ctas_per_sm": 1,
+    },  # 680.9T (was s2/sk1 683.7T, dropped for accuracy)
+    (4096, 6144, 65536): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 7,
+        "num_ctas_per_sm": 1,
+    },  # 691.1T — outlier: s7/sk0
+    # W2 down (6144 × 2048)
+    (6144, 2048, 16384): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 5,
+        "num_ctas_per_sm": 1,
+    },  # 550.9T
+    (6144, 2048, 32768): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 7,
+        "num_ctas_per_sm": 1,
+    },  # 613.4T — outlier: s7/sk0
+    (6144, 2048, 49152): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 5,
+        "num_ctas_per_sm": 1,
+    },  # 629.4T
+    (6144, 2048, 65536): {
+        "block_shape": (88, 256, 128),
+        "warp_shape": (88, 32, 128),
+        "use_stream_k": False,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 7,
+        "num_ctas_per_sm": 1,
+    },  # 639.3T — outlier: s7/sk0
 }

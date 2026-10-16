@@ -13,6 +13,8 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
 )
 from sglang.srt.layers.moe.moe_runner.mxfp4_w4a8_tuning import (
     HUMMING_FINE_TUNING_RANGES,
+    HUMMING_PER_CHUNK_PREFILL_TUNING_CONFIGS,
+    HUMMING_PREFILL_TUNING_CONFIGS,
 )
 from sglang.srt.utils import log_info_on_rank0
 
@@ -178,18 +180,113 @@ def _humming_prefill_tuning_overrides(
     # forces warp_m==64, and the warp-spec/TMA/multicast paths are unviable for the
     # fused-E8M0 mxfp4 contiguous case), so prefill should prefer the deep_gemm
     # backend; this override only makes the Humming fallback as fast as it tunes.
-    tuned_warp_n32_bm64 = {
-        "block_shape": (64, 128, 128),
-        "warp_shape": (64, 32, 128),
-        "use_stream_k": False,
-        "use_f16_accum": False,
-        "num_sms": 132,
-        "num_stages": 5,
-        "num_ctas_per_sm": 2,
-    }
-    if (n, k) in _HUMMING_TUNED_MOE_SHAPES:
-        return [(4096, 1 << 30, tuned_warp_n32_bm64)]
-    return []
+    #
+    # C3 (2026-09-23, H20Z): per-chunk sweep for both Flash and Pro shapes, unified
+    # in HUMMING_PER_CHUNK_PREFILL_TUNING_CONFIGS.  Flash (4096×4096 W13, 4096×2048
+    # W2) swept at chunk ∈ {8192, 16384, 24576, 32768}; Pro (4096×6144 W13, 6144×2048
+    # W2) swept at chunk ∈ {16384, 32768, 49152, 65536}.  Outliers use s7/sk0
+    # (Flash chunk=16384; Pro chunk=32768/65536); the rest use s2/sk1 for W13 and
+    # s5/sk0 for W2.  At runtime we read the per-DP chunked_prefill_size directly
+    # from ServerArgs — this value is already divided by dp_size when
+    # enable_dp_attention=True (server_args.py _handle_data_parallelism), so no
+    # further division is needed.  Floor-match: pick the largest swept chunk <=
+    # current chunk_size (per shape family, since Flash and Pro were swept at
+    # different chunk sizes); if none fits, fall back to the static
+    # HUMMING_PREFILL_TUNING_CONFIGS entry.
+    if (n, k) not in _HUMMING_TUNED_MOE_SHAPES:
+        return []
+
+    cfg = _humming_per_chunk_prefill_config(n, k)
+    if cfg is None:
+        return []
+    return [(4096, 1 << 30, cfg)]
+
+
+# Swept chunk sizes for Flash prefill configs, in ascending order.
+_FLASH_SWEPT_CHUNKS = (8192, 16384, 24576, 32768)
+# Flash weight shapes that have a per-chunk table.
+_HUMMING_FLASH_NK_SHAPES = frozenset({(4096, 4096), (4096, 2048)})
+
+# Swept chunk sizes for Pro prefill configs, in ascending order.
+_PRO_SWEPT_CHUNKS = (16384, 32768, 49152, 65536)
+# Pro weight shapes that have a per-chunk table.
+_HUMMING_PRO_NK_SHAPES = frozenset({(4096, 6144), (6144, 2048)})
+
+
+def _humming_per_chunk_prefill_config(n: int, k: int) -> dict[str, Any] | None:
+    """Return the best prefill config for shape (n, k).
+
+    Covers both Flash (4096×4096 W13, 4096×2048 W2) and Pro (4096×6144 W13,
+    6144×2048 W2) shapes from the single HUMMING_PER_CHUNK_PREFILL_TUNING_CONFIGS
+    table. Reads the per-DP chunk_size at call time (weight init) and selects the
+    floor-matched swept config. Flash and Pro were swept at different chunk sizes,
+    so the swept-chunk set is chosen per shape family.
+
+    Falls back to HUMMING_PREFILL_TUNING_CONFIGS (static default) when the chunk
+    is below the smallest swept value or a key is missing.
+    """
+    chunk = _current_single_dp_chunk_size()
+
+    if (n, k) in _HUMMING_FLASH_NK_SHAPES:
+        swept_chunks = _FLASH_SWEPT_CHUNKS
+    elif (n, k) in _HUMMING_PRO_NK_SHAPES:
+        swept_chunks = _PRO_SWEPT_CHUNKS
+    else:
+        return HUMMING_PREFILL_TUNING_CONFIGS.get((n, k))
+
+    if chunk is not None and chunk >= swept_chunks[0]:
+        # Floor-match: largest swept chunk that does not exceed current chunk.
+        floor_chunk = max(c for c in swept_chunks if c <= chunk)
+        cfg = HUMMING_PER_CHUNK_PREFILL_TUNING_CONFIGS.get((n, k, floor_chunk))
+        if cfg is not None:
+            logger.info(
+                "Humming prefill config selected (per-chunk): "
+                "n=%d k=%d chunk_size=%d floor_chunk=%d | "
+                "block_shape=%s warp_shape=%s use_stream_k=%s "
+                "use_f16_accum=%s num_sms=%s num_stages=%s num_ctas_per_sm=%s",
+                n, k, chunk, floor_chunk,
+                cfg["block_shape"], cfg["warp_shape"], cfg["use_stream_k"],
+                cfg["use_f16_accum"], cfg["num_sms"], cfg["num_stages"],
+                cfg["num_ctas_per_sm"],
+            )
+            return cfg
+    # chunk below minimum, None, or key missing — fall through to static default.
+    _log_humming_warning_once(
+        f"prefill_chunk_fallback_{n}_{k}",
+        f"Humming prefill for (n={n}, k={k}): chunk_size={chunk} "
+        f"is below the smallest swept value {swept_chunks[0]} or unavailable; "
+        "using static fallback config.",
+    )
+    cfg = HUMMING_PREFILL_TUNING_CONFIGS.get((n, k))
+    if cfg is not None:
+        logger.info(
+            "Humming prefill config selected (static fallback): "
+            "n=%d k=%d | "
+            "block_shape=%s warp_shape=%s use_stream_k=%s "
+            "use_f16_accum=%s num_sms=%s num_stages=%s num_ctas_per_sm=%s",
+            n, k,
+            cfg["block_shape"], cfg["warp_shape"], cfg["use_stream_k"],
+            cfg["use_f16_accum"], cfg["num_sms"], cfg["num_stages"],
+            cfg["num_ctas_per_sm"],
+        )
+    return cfg
+
+
+def _current_single_dp_chunk_size() -> int | None:
+    """Return the per-DP chunked_prefill_size from ServerArgs, or None.
+
+    When enable_dp_attention=True, ServerArgs.__post_init__ already divides
+    chunked_prefill_size by dp_size (server_args.py _handle_data_parallelism),
+    so the value read here is the per-DP-group budget — do NOT divide again.
+    Returns None if ServerArgs is not yet initialised.
+    """
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        sa = get_global_server_args()
+        return getattr(sa, "chunked_prefill_size", None)
+    except Exception:
+        return None
 
 
 _HUMMING_DYNAMIC_MASKED_SHAPES = _HUMMING_TUNED_MOE_SHAPES
@@ -378,8 +475,11 @@ def _humming_masked_warmup_tuning_configs(
 # Both bounds converge to exactly 2 for the tiles they touch; the floor only
 # bites the smallest tile and the cap only the largest, so mid tiles (16/32/48,
 # heuristic ctas 2-3) are left as-is below the large-block threshold.
-_HUMMING_E8M0_MIN_CTAS_PER_SM = 2
-_HUMMING_E8M0_LARGE_BLOCK_M = 64
+#
+# NOTE: Bounds disabled (floor=1, ceiling=96) to allow exhaustive prefill tuning
+# results (block_m=88, num_ctas_per_sm=1) to pass through unchanged.
+_HUMMING_E8M0_MIN_CTAS_PER_SM = 1
+_HUMMING_E8M0_LARGE_BLOCK_M = 96
 _HUMMING_E8M0_LARGE_BLOCK_MAX_CTAS = 2
 
 

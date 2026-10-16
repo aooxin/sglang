@@ -487,6 +487,8 @@ class Envs:
     SGLANG_ENABLE_SPEC_V2 = EnvBool(False)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     SGLANG_ENABLE_WAR_BARRIER = EnvBool(False)
+    # Defer PD-decode admission metadata (D2H + send) to after run_batch().
+    SGLANG_DEFER_PD_SEND_METADATA = EnvBool(False)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

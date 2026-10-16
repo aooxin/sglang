@@ -318,6 +318,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             (), dtype=torch.int64, device=device
         )
 
+        self._pa_prefix_lens = torch.zeros(1, dtype=torch.int64, device=device)
+        self._pa_prefix_lens_cpu = torch.zeros(1, dtype=torch.int64)
+        self._pa_last_loc = torch.full((1,), -1, dtype=torch.int64, device=device)
+        self._pa_seq_lens_full = torch.zeros(1, dtype=torch.int64, device=device)
+        self._pa_seq_lens_full_cpu = torch.zeros(1, dtype=torch.int64)
+        self._pa_seq_lens_swa = torch.zeros(1, dtype=torch.int64, device=device)
+        self._pa_seq_lens_swa_cpu = torch.zeros(1, dtype=torch.int64)
+
         self.need_sort = need_sort
         self.free_pages = None
         self.release_pages = None
@@ -481,39 +489,30 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             alloc_full_indices = self.full_attn_allocator.alloc(need_size)
             alloc_swa_indices = self.swa_attn_allocator.alloc(swa_need_size)
         else:
-            # TODO(yingchun): 在 __init__ 中优化为常量
-            prefix_lens = torch.tensor([0], dtype=torch.int64, device=self.device)
-            prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
-            last_loc = torch.tensor([-1], dtype=torch.int64, device=self.device)
-
-            seq_lens_full = torch.tensor(
-                [need_size], dtype=torch.int64, device=self.device
-            )
-            seq_lens_full_cpu = torch.tensor([need_size], dtype=torch.int64)
-            seq_lens_swa = torch.tensor(
-                [swa_need_size], dtype=torch.int64, device=self.device
-            )
-            seq_lens_swa_cpu = torch.tensor([swa_need_size], dtype=torch.int64)
-            num_tokens = need_size + len(seq_lens_full) * self.page_size
-            swa_num_tokens = swa_need_size + len(seq_lens_swa) * self.page_size
+            num_tokens = need_size + self.page_size
+            swa_num_tokens = swa_need_size + self.page_size
             if num_tokens > self.full_attn_allocator.available_size():
                 return None
             if swa_num_tokens > self.swa_attn_allocator.available_size():
                 return None
+            self._pa_seq_lens_full.fill_(need_size)
+            self._pa_seq_lens_full_cpu.fill_(need_size)
+            self._pa_seq_lens_swa.fill_(swa_need_size)
+            self._pa_seq_lens_swa_cpu.fill_(swa_need_size)
             alloc_full_indices = self.full_attn_allocator.alloc_extend(
-                prefix_lens=prefix_lens,
-                prefix_lens_cpu=prefix_lens_cpu,
-                seq_lens=seq_lens_full,
-                seq_lens_cpu=seq_lens_full_cpu,
-                last_loc=last_loc,
+                prefix_lens=self._pa_prefix_lens,
+                prefix_lens_cpu=self._pa_prefix_lens_cpu,
+                seq_lens=self._pa_seq_lens_full,
+                seq_lens_cpu=self._pa_seq_lens_full_cpu,
+                last_loc=self._pa_last_loc,
                 extend_num_tokens=need_size,
             )
-            swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
+            swa_last_loc = self.translate_loc_from_full_to_swa(self._pa_last_loc)
             alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
-                prefix_lens=prefix_lens,
-                prefix_lens_cpu=prefix_lens_cpu,
-                seq_lens=seq_lens_swa,
-                seq_lens_cpu=seq_lens_swa_cpu,
+                prefix_lens=self._pa_prefix_lens,
+                prefix_lens_cpu=self._pa_prefix_lens_cpu,
+                seq_lens=self._pa_seq_lens_swa,
+                seq_lens_cpu=self._pa_seq_lens_swa_cpu,
                 last_loc=swa_last_loc,
                 extend_num_tokens=swa_need_size,
             )
@@ -522,7 +521,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_swa_indices is not None
         # Clear stale mappings on all allocated full indices before writing
         # the current request's SWA tail mapping.
-        self.full_to_swa_index_mapping[alloc_full_indices] = 0
+        self.full_to_swa_index_mapping[alloc_full_indices] = self._mapping_zero_scalar
         self.full_to_swa_index_mapping[alloc_full_indices[-swa_need_size:]] = (
             alloc_swa_indices
         )

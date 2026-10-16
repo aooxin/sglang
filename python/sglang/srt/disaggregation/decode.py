@@ -26,7 +26,7 @@ from collections import deque
 from dataclasses import dataclass
 from enum import Enum, auto
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -75,7 +75,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
-from sglang.srt.utils.common import ceil_align, floor_align
+from sglang.srt.utils.common import ceil_align, floor_align, is_pin_memory_available
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -247,6 +247,26 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.mamba_pool.clear()
 
 
+class D2HHandle(NamedTuple):
+    kind: str
+    buf: Optional[torch.Tensor] = None
+    n: int = 0
+    keepalive: Optional[torch.Tensor] = None
+    host_arr: Optional[np.ndarray] = None
+
+
+class StatePlan(NamedTuple):
+    mode: str
+    payload: Any = None
+    page_size: int = 0
+
+
+class DeferredPost(NamedTuple):
+    kv_handle: D2HHandle
+    state_plan: StatePlan
+    page_size: int
+
+
 @dataclass
 class DecodeRequest:
     req: Req
@@ -254,6 +274,7 @@ class DecodeRequest:
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
     pd_d2h_state: PDD2HState = PDD2HState.WAIT_PREFILL
+    _deferred_post: Optional[DeferredPost] = None
 
     @property
     def seqlen(self) -> int:
@@ -625,6 +646,16 @@ class DecodePreallocQueue:
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
         self._init_hybrid_extra_tokens()
+        self._init_async_d2h_staging()
+
+    def _init_async_d2h_staging(self):
+        self.defer_pd_posts = envs.SGLANG_DEFER_PD_SEND_METADATA.get()
+        self._d2h_device = self.req_to_token_pool.req_to_token.device
+        self._d2h_pin_memory = is_pin_memory_available(self._d2h_device)
+        self._d2h_pinned_pool: List[torch.Tensor] = []
+        self._d2h_slot = 0
+        self._d2h_pending = False
+        self._d2h_event: Optional[torch.cuda.Event] = None
 
     def _init_hybrid_extra_tokens(self):
         self.evict_len_per_step = None
@@ -654,24 +685,165 @@ class DecodePreallocQueue:
             )
         return arr.astype(np.int32, copy=False)
 
-    def _pre_alloc_and_get_kv_indices(
+    def _reset_async_d2h(self):
+        self._d2h_slot = 0
+
+    def _next_pinned(self, n: int) -> torch.Tensor:
+        i = self._d2h_slot
+        self._d2h_slot += 1
+        if i >= len(self._d2h_pinned_pool):
+            self._d2h_pinned_pool.append(None)
+        buf = self._d2h_pinned_pool[i]
+        if buf is None or buf.numel() < n:
+            buf = torch.empty(
+                max(n, 1), dtype=torch.int64, pin_memory=self._d2h_pin_memory
+            )
+            self._d2h_pinned_pool[i] = buf
+        return buf
+
+    def _issue_async_d2h(self, src) -> D2HHandle:
+        if isinstance(src, torch.Tensor) and src.is_cuda and self._d2h_pin_memory:
+            n = src.numel()
+            buf = self._next_pinned(n)
+            src64 = src if src.dtype == torch.int64 else src.to(torch.int64)
+            buf[:n].copy_(src64, non_blocking=True)
+            self._d2h_pending = True
+            return D2HHandle(kind="pinned", buf=buf, n=n, keepalive=src64)
+        if isinstance(src, torch.Tensor):
+            return D2HHandle(kind="host", host_arr=src.detach().cpu().numpy())
+        return D2HHandle(kind="host", host_arr=np.asarray(src))
+
+    def _finalize_d2h(self, handle: D2HHandle) -> np.ndarray:
+        if handle.kind == "pinned":
+            arr = handle.buf[: handle.n].numpy()
+        else:
+            arr = handle.host_arr
+        if arr.size and (arr.min() < 0 or arr.max() > np.iinfo(np.int32).max):
+            raise ValueError(
+                f"KV metadata index out of int32 range: min={arr.min()} max={arr.max()}"
+            )
+        return arr.astype(np.int32, copy=False)
+
+    def _record_async_d2h(self):
+        if not self._d2h_pending:
+            return
+        if self._d2h_event is None:
+            self._d2h_event = torch.cuda.Event()
+        self._d2h_event.record()
+
+    def _sync_async_d2h(self):
+        if self._d2h_pending:
+            self._d2h_event.synchronize()
+            self._d2h_pending = False
+
+    def _issue_async_state_d2h(
+        self, decode_req: DecodeRequest, pd_d2h_mgr, page_size
+    ) -> StatePlan:
+        req = decode_req.req
+
+        if pd_d2h_mgr is not None:
+            if req.host_state_indices is None:
+                return StatePlan(mode="none", page_size=page_size)
+            handle = D2HHandle(
+                kind="host", host_arr=np.asarray(req.host_state_indices)
+            )
+            return StatePlan(mode="page", payload=handle, page_size=page_size)
+
+        if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+            src = self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                req.req_pool_idx
+            ]
+            return StatePlan(mode="list_sync", payload=src, page_size=page_size)
+
+        if isinstance(self.token_to_kv_pool, SWAKVPool):
+            seq_len = len(req.origin_input_ids)
+            window_size = self.scheduler.swa_retention_window
+            window_start = max(0, seq_len - window_size)
+            window_start = (window_start // page_size) * page_size
+            window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, window_start:seq_len
+            ]
+            window_kv_indices_swa = (
+                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    window_kv_indices_full
+                )
+            )
+            return StatePlan(
+                mode="page",
+                payload=self._issue_async_d2h(window_kv_indices_swa),
+                page_size=page_size,
+            )
+
+        if isinstance(self.token_to_kv_pool, NSATokenToKVPool):
+            seq_len = len(req.origin_input_ids)
+            kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :seq_len
+            ]
+            return StatePlan(
+                mode="page",
+                payload=self._issue_async_d2h(kv_indices_full),
+                page_size=self.token_to_kv_pool.page_size,
+            )
+
+        return StatePlan(mode="none", page_size=page_size)
+
+    def _finalize_state(self, state_plan: StatePlan):
+        if state_plan.mode == "none":
+            return None
+        if state_plan.mode == "list_sync":
+            return [state_plan.payload.cpu().numpy()]
+        return kv_to_page_indices(
+            self._finalize_d2h(state_plan.payload), state_plan.page_size
+        )
+
+    def _pre_alloc_raw_indices(
         self, decode_req: DecodeRequest, pd_d2h_mgr, origin_input_len: int
-    ) -> Optional[np.ndarray]:
+    ):
         req = decode_req.req
 
         if pd_d2h_mgr is not None:
             if not pd_d2h_mgr.pre_alloc(req):
                 return None
-            return self._to_metadata_indices(req.host_kv_indices[:origin_input_len])
+            return req.host_kv_indices[:origin_input_len]
 
         dst_kv_indices = self._pre_alloc(req)
         if self.scheduler.enable_hisparse:
-            return self._to_metadata_indices(dst_kv_indices[:origin_input_len])
+            return dst_kv_indices[:origin_input_len]
 
-        kv_indices_full = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :origin_input_len
-        ]
-        return self._to_metadata_indices(kv_indices_full)
+        return self.req_to_token_pool.req_to_token[req.req_pool_idx, :origin_input_len]
+
+    def _pre_alloc_and_get_kv_indices(
+        self, decode_req: DecodeRequest, pd_d2h_mgr, origin_input_len: int
+    ) -> Optional[np.ndarray]:
+        raw = self._pre_alloc_raw_indices(decode_req, pd_d2h_mgr, origin_input_len)
+        if raw is None:
+            return None
+        return self._to_metadata_indices(raw)
+
+    def _post_metadata(
+        self, decode_req: DecodeRequest, kv_indices, state_indices, page_size
+    ):
+        page_indices = kv_to_page_indices(kv_indices, page_size)
+        decode_req.kv_receiver.send_metadata(
+            page_indices, decode_req.metadata_buffer_index, state_indices
+        )
+        if (
+            self.transfer_queue.enable_staging
+            and decode_req.kv_receiver.require_staging
+        ):
+            self.transfer_queue.staging_handler.register_decode_req(
+                decode_req.req.bootstrap_room, decode_req
+            )
+
+    def finalize_deferred_posts(self, posts: List[DecodeRequest]):
+        self._sync_async_d2h()
+        for decode_req in posts:
+            kv_handle, state_plan, page_size = decode_req._deferred_post
+            decode_req._deferred_post = None
+            kv_indices = self._finalize_d2h(kv_handle)
+            state_indices = self._finalize_state(state_plan)
+            self._post_metadata(decode_req, kv_indices, state_indices, page_size)
+        self.transfer_queue.extend(posts)
 
     def _get_state_indices(
         self, decode_req: DecodeRequest, pd_d2h_mgr, page_size: int
@@ -1332,6 +1504,9 @@ class DecodePreallocQueue:
         polls_by_room: Optional[Dict[int, int]] = None,
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
+        defer_posts = self.defer_pd_posts
+        if defer_posts:
+            self._reset_async_d2h()
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check, polls_by_room=polls_by_room)
 
@@ -1400,29 +1575,40 @@ class DecodePreallocQueue:
                 allocatable_tokens = next_allocatable_tokens
 
             origin_input_len = len(decode_req.req.origin_input_ids)
-            kv_indices = self._pre_alloc_and_get_kv_indices(
-                decode_req, pd_d2h_mgr, origin_input_len
-            )
-            if kv_indices is None:
-                # Host pool full — keep req in queue, retry next tick.
-                break
+            if defer_posts:
+                raw_kv = self._pre_alloc_raw_indices(
+                    decode_req, pd_d2h_mgr, origin_input_len
+                )
+                if raw_kv is None:
+                    break
+                decode_req.metadata_buffer_index = (
+                    self.req_to_metadata_buffer_idx_allocator.alloc()
+                )
+                assert decode_req.metadata_buffer_index is not None
+                decode_req._deferred_post = DeferredPost(
+                    kv_handle=self._issue_async_d2h(raw_kv),
+                    state_plan=self._issue_async_state_d2h(
+                        decode_req, pd_d2h_mgr, page_size
+                    ),
+                    page_size=page_size,
+                )
+            else:
+                kv_indices = self._pre_alloc_and_get_kv_indices(
+                    decode_req, pd_d2h_mgr, origin_input_len
+                )
+                if kv_indices is None:
+                    # Host pool full — keep req in queue, retry next tick.
+                    break
 
-            state_indices = self._get_state_indices(decode_req, pd_d2h_mgr, page_size)
-
-            decode_req.metadata_buffer_index = (
-                self.req_to_metadata_buffer_idx_allocator.alloc()
-            )
-            assert decode_req.metadata_buffer_index is not None
-            page_indices = kv_to_page_indices(kv_indices, page_size)
-            decode_req.kv_receiver.send_metadata(
-                page_indices, decode_req.metadata_buffer_index, state_indices
-            )
-            if (
-                self.transfer_queue.enable_staging
-                and decode_req.kv_receiver.require_staging
-            ):
-                self.transfer_queue.staging_handler.register_decode_req(
-                    decode_req.req.bootstrap_room, decode_req
+                state_indices = self._get_state_indices(
+                    decode_req, pd_d2h_mgr, page_size
+                )
+                decode_req.metadata_buffer_index = (
+                    self.req_to_metadata_buffer_idx_allocator.alloc()
+                )
+                assert decode_req.metadata_buffer_index is not None
+                self._post_metadata(
+                    decode_req, kv_indices, state_indices, page_size
                 )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
@@ -1446,6 +1632,9 @@ class DecodePreallocQueue:
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+
+        if defer_posts:
+            self._record_async_d2h()
 
         return preallocated_reqs, failed_reqs
 
@@ -2191,6 +2380,7 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_input_requests(recv_reqs)
             # polling and allocating kv cache
             self.process_decode_queue()
+            self.flush_deferred_pd_posts()
 
             # Get the next batch to run
             batch = self.get_next_disagg_decode_batch_to_run()
@@ -2248,6 +2438,8 @@ class SchedulerDisaggregationDecodeMixin:
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
+
+            self.flush_deferred_pd_posts()
 
             # Process the last batch
             if self.last_batch:
@@ -2433,7 +2625,11 @@ class SchedulerDisaggregationDecodeMixin:
             req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated(
                 polls_by_room=prealloc_polls_by_room
             )
-            self.disagg_decode_transfer_queue.extend(req_conns)
+            if self.disagg_decode_prealloc_queue.defer_pd_posts:
+                if req_conns:
+                    self._deferred_pd_posts = req_conns
+            else:
+                self.disagg_decode_transfer_queue.extend(req_conns)
             transferred_reqs = self.disagg_decode_transfer_queue.pop_transferred(
                 polls_by_room=transfer_polls_by_room
             )  # the requests which kv has arrived
@@ -2444,3 +2640,11 @@ class SchedulerDisaggregationDecodeMixin:
                 self.waiting_queue.extend(transferred_reqs)
             else:
                 self.waiting_queue.extend(transferred_reqs)
+
+    @nvtx_annotated_method("scheduler.disagg_decode.flush_deferred_pd_posts")
+    def flush_deferred_pd_posts(self: Scheduler):
+        posts = self._deferred_pd_posts
+        if not posts:
+            return
+        self._deferred_pd_posts = None
+        self.disagg_decode_prealloc_queue.finalize_deferred_posts(posts)

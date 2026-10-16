@@ -1217,9 +1217,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # MXFP4 checkpoint + megamoe path: dequantize FP4 → block FP8 in-place
         # before the rest of the block-quant processing runs.
-        if self.is_fp4_expert and (
-            get_moe_a2a_backend().is_megamoe() or get_moe_a2a_backend().is_deepep()
-        ) and not get_moe_runner_backend().is_mxfp4_w4a8():
+        if (
+            self.is_fp4_expert
+            and get_moe_a2a_backend().is_megamoe()
+            and not get_moe_runner_backend().is_mxfp4_w4a8()
+        ):
             block_n, block_k = self.quant_config.weight_block_size
             w13_fp8, w13_scale = _dequant_mxfp4_to_fp8_block(
                 layer.w13_weight.data, layer.w13_weight_scale_inv.data,

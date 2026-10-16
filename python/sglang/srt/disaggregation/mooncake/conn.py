@@ -1867,10 +1867,19 @@ class MooncakeKVManager(CommonKVManager):
                         self.update_status(room, KVPoll.WaitingForInput)
                     continue
 
-                bootstrap_room, status, prefill_rank = msg
-                status = int(status.decode("ascii"))
-                bootstrap_room = int(bootstrap_room.decode("ascii"))
-                prefill_rank = int(prefill_rank.decode("ascii"))
+                try:
+                    bootstrap_room, status, prefill_rank = msg
+                    status = int(status.decode("ascii"))
+                    bootstrap_room = int(bootstrap_room.decode("ascii"))
+                    prefill_rank = int(prefill_rank.decode("ascii"))
+                except ValueError:
+                    logger.warning(
+                        "Ignoring malformed KV transfer status message: "
+                        "frame_count=%d, frame_sizes=%s",
+                        len(msg),
+                        [len(frame) for frame in msg],
+                    )
+                    continue
 
                 if status == KVPoll.Success:
                     if bootstrap_room in self.request_status:

@@ -4,6 +4,7 @@ import unittest
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mimo_utils import mimo_tool_call_text
 
 register_cpu_ci(5, "stage-a-test-cpu")
 
@@ -78,7 +79,12 @@ class TestMiMoDetector(unittest.TestCase):
         return normal_text, tool_calls
 
     def test_has_tool_call(self):
-        self.assertTrue(self.detector.has_tool_call("<tool_call>test</tool_call>"))
+        self.assertTrue(
+            self.detector.has_tool_call(
+                mimo_tool_call_text("<tool_call>test</tool_call>")
+            )
+        )
+        self.assertFalse(self.detector.has_tool_call("<tool_call>test</tool_call>"))
         self.assertFalse(self.detector.has_tool_call("No tool call here"))
 
     def test_detect_and_parse_no_tools(self):
@@ -92,7 +98,9 @@ class TestMiMoDetector(unittest.TestCase):
     def test_detect_and_parse_single_tool(self):
         model_output = "<tool_call><function=get_current_weather><parameter=city>Dallas</parameter><parameter=state>TX</parameter><parameter=unit>fahrenheit</parameter></function></tool_call>"
 
-        result = self.detector.detect_and_parse(model_output, self.tools)
+        result = self.detector.detect_and_parse(
+            mimo_tool_call_text(model_output), self.tools
+        )
 
         self.assertEqual(result.normal_text, "")
         self.assertEqual(len(result.calls), 1)
@@ -112,7 +120,9 @@ class TestMiMoDetector(unittest.TestCase):
 </function>
 </tool_call>"""
 
-        result = self.detector.detect_and_parse(model_output, self.tools)
+        result = self.detector.detect_and_parse(
+            mimo_tool_call_text(model_output), self.tools
+        )
 
         self.assertEqual(result.normal_text, "")
         self.assertEqual(len(result.calls), 1)
@@ -125,7 +135,9 @@ class TestMiMoDetector(unittest.TestCase):
     def test_detect_and_parse_with_surrounding_content(self):
         model_output = "Sure, checking now.<tool_call><function=get_current_weather><parameter=city>Dallas</parameter><parameter=state>TX</parameter></function></tool_call>"
 
-        result = self.detector.detect_and_parse(model_output, self.tools)
+        result = self.detector.detect_and_parse(
+            mimo_tool_call_text(model_output), self.tools
+        )
 
         self.assertEqual(result.normal_text, "Sure, checking now.")
         self.assertEqual(len(result.calls), 1)
@@ -134,7 +146,9 @@ class TestMiMoDetector(unittest.TestCase):
     def test_detect_and_parse_type_conversion(self):
         model_output = '<tool_call><function=calculate_area><parameter=shape>rectangle</parameter><parameter=dimensions>{"width": 10, "height": 20}</parameter><parameter=precision>2</parameter><parameter=enabled>true</parameter></function></tool_call>'
 
-        result = self.detector.detect_and_parse(model_output, self.tools)
+        result = self.detector.detect_and_parse(
+            mimo_tool_call_text(model_output), self.tools
+        )
 
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "calculate_area")
@@ -154,16 +168,22 @@ class TestMiMoDetector(unittest.TestCase):
             "<tool_call><function=get_current_weather><parameter=city>Orlando</parameter><parameter=state>FL</parameter></function></tool_call>"
         )
 
-        result = self.detector.detect_and_parse(model_output, self.tools)
+        result = self.detector.detect_and_parse(
+            mimo_tool_call_text(model_output), self.tools
+        )
 
         self.assertEqual(len(result.calls), 2)
         self.assertEqual(json.loads(result.calls[0].parameters)["city"], "Dallas")
         self.assertEqual(json.loads(result.calls[1].parameters)["city"], "Orlando")
 
     def test_detect_and_parse_no_parameters(self):
-        model_output = "<tool_call><function=get_current_weather></function></tool_call>"
+        model_output = (
+            "<tool_call><function=get_current_weather></function></tool_call>"
+        )
 
-        result = self.detector.detect_and_parse(model_output, self.tools)
+        result = self.detector.detect_and_parse(
+            mimo_tool_call_text(model_output), self.tools
+        )
 
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_current_weather")
@@ -176,7 +196,9 @@ class TestMiMoDetector(unittest.TestCase):
 </function>
 </tool_call>"""
 
-        result = self.detector.detect_and_parse(model_output, self.tools)
+        result = self.detector.detect_and_parse(
+            mimo_tool_call_text(model_output), self.tools
+        )
 
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "get_current_weather")
@@ -194,7 +216,9 @@ class TestMiMoDetector(unittest.TestCase):
 line 2
 line 3</parameter></function></tool_call>"""
 
-        result = self.detector.detect_and_parse(model_output, [write_tool])
+        result = self.detector.detect_and_parse(
+            mimo_tool_call_text(model_output), [write_tool]
+        )
 
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "write_file")
@@ -206,7 +230,9 @@ line 3</parameter></function></tool_call>"""
     def test_detect_and_parse_special_chars_in_value(self):
         model_output = "<tool_call><function=get_current_weather><parameter=city>Dallas->TX</parameter></function></tool_call>"
 
-        result = self.detector.detect_and_parse(model_output, self.tools)
+        result = self.detector.detect_and_parse(
+            mimo_tool_call_text(model_output), self.tools
+        )
 
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(json.loads(result.calls[0].parameters)["city"], "Dallas->TX")
@@ -214,7 +240,9 @@ line 3</parameter></function></tool_call>"""
     def test_html_entities_are_preserved(self):
         model_output = "<tool_call><function=get_current_weather><parameter=city>Dallas &amp; Fort Worth &current</parameter><parameter=state>TX</parameter></function></tool_call>"
 
-        result = self.detector.detect_and_parse(model_output, self.tools)
+        result = self.detector.detect_and_parse(
+            mimo_tool_call_text(model_output), self.tools
+        )
 
         self.assertEqual(len(result.calls), 1)
         params = json.loads(result.calls[0].parameters)
@@ -226,7 +254,9 @@ line 3</parameter></function></tool_call>"""
         template round-trippable."""
         model_output = "<tool_call><function=get_current_weather><parameter=city>null</parameter></function></tool_call>"
 
-        result = self.detector.detect_and_parse(model_output, self.tools)
+        result = self.detector.detect_and_parse(
+            mimo_tool_call_text(model_output), self.tools
+        )
 
         self.assertEqual(json.loads(result.calls[0].parameters), {"city": "null"})
 
@@ -236,7 +266,9 @@ line 3</parameter></function></tool_call>"""
             f"<tool_call><function=exec>{FREEFORM_EXEC_CODE}</function></tool_call>"
         )
 
-        result = self.detector.detect_and_parse(model_output, self.tools)
+        result = self.detector.detect_and_parse(
+            mimo_tool_call_text(model_output), self.tools
+        )
 
         self.assertEqual(result.normal_text, "")
         self.assertEqual(len(result.calls), 1)
@@ -247,7 +279,9 @@ line 3</parameter></function></tool_call>"""
         code = 'if (a < b && c > d) { print("x <y> &amp; z"); }'
         model_output = f"<tool_call><function=exec>{code}</function></tool_call>"
 
-        result = self.detector.detect_and_parse(model_output, self.tools)
+        result = self.detector.detect_and_parse(
+            mimo_tool_call_text(model_output), self.tools
+        )
 
         self.assertEqual(len(result.calls), 1)
         self.assertEqual(result.calls[0].name, "exec")
@@ -258,7 +292,9 @@ line 3</parameter></function></tool_call>"""
             "Running it.<tool_call><function=exec>await run();</function></tool_call>"
         )
 
-        result = self.detector.detect_and_parse(model_output, self.tools)
+        result = self.detector.detect_and_parse(
+            mimo_tool_call_text(model_output), self.tools
+        )
 
         self.assertEqual(result.normal_text, "Running it.")
         self.assertEqual(len(result.calls), 1)
@@ -269,7 +305,9 @@ line 3</parameter></function></tool_call>"""
             "<tool_call><function=not_a_tool>await run();</function></tool_call>"
         )
 
-        result = self.detector.detect_and_parse(model_output, self.tools)
+        result = self.detector.detect_and_parse(
+            mimo_tool_call_text(model_output), self.tools
+        )
 
         self.assertEqual(result.calls, [])
         self.assertIn("not_a_tool", result.normal_text)
@@ -285,7 +323,9 @@ line 3</parameter></function></tool_call>"""
             "</tool_call>",
         ]
 
-        normal_text, tool_calls = self._collect_streaming_result(chunks)
+        normal_text, tool_calls = self._collect_streaming_result(
+            map(mimo_tool_call_text, chunks)
+        )
 
         self.assertEqual(normal_text, "Let me check.")
         self.assertEqual(len(tool_calls), 1)
@@ -303,7 +343,9 @@ line 3</parameter></function></tool_call>"""
             "\n</tool_call>",
         ]
 
-        normal_text, tool_calls = self._collect_streaming_result(chunks)
+        normal_text, tool_calls = self._collect_streaming_result(
+            map(mimo_tool_call_text, chunks)
+        )
 
         self.assertEqual(normal_text, "Let me check.")
         self.assertEqual(len(tool_calls), 1)
@@ -321,7 +363,9 @@ line 3</parameter></function></tool_call>"""
             "<parameter=state>",
         ]
 
-        normal_text, tool_calls = self._collect_streaming_result(chunks)
+        normal_text, tool_calls = self._collect_streaming_result(
+            map(mimo_tool_call_text, chunks)
+        )
 
         self.assertEqual(normal_text, "")
         self.assertEqual(len(tool_calls), 1)
@@ -329,7 +373,7 @@ line 3</parameter></function></tool_call>"""
         self.assertEqual(tool_calls[0]["parameters"], '{"city": "Dallas", "state": ')
 
         result = self.detector.parse_streaming_increment(
-            "TX</parameter></function></tool_call>", self.tools
+            mimo_tool_call_text("TX</parameter></function></tool_call>"), self.tools
         )
 
         self.assertEqual(result.normal_text, "")
@@ -347,6 +391,7 @@ line 3</parameter></function></tool_call>"""
             "Some text in between."
             '<tool_call><function=calculate_area><parameter=shape>circle</parameter><parameter=dimensions>{"radius": 5}</parameter><parameter=precision>2</parameter><parameter=enabled>false</parameter></function></tool_call>'
         )
+        model_output = mimo_tool_call_text(model_output)
         chunks = [model_output[i : i + 20] for i in range(0, len(model_output), 20)]
 
         normal_text, tool_calls = self._collect_streaming_result(chunks)
@@ -370,9 +415,8 @@ line 3</parameter></function></tool_call>"""
         )
 
     def test_streaming_freeform(self):
-        model_output = (
-            f"Let me run it.<tool_call><function=exec>{FREEFORM_EXEC_CODE}</function></tool_call>"
-        )
+        model_output = f"Let me run it.<tool_call><function=exec>{FREEFORM_EXEC_CODE}</function></tool_call>"
+        model_output = mimo_tool_call_text(model_output)
         chunks = [model_output[i : i + 16] for i in range(0, len(model_output), 16)]
 
         normal_text, tool_calls = self._collect_streaming_result(chunks)
@@ -386,7 +430,9 @@ line 3</parameter></function></tool_call>"""
         code = 'if (a < b && c > d) { print("x <y> & z"); }\nreturn 1;'
         model_output = f"<tool_call><function=exec>{code}</function></tool_call>"
 
-        normal_text, tool_calls = self._collect_streaming_result(list(model_output))
+        normal_text, tool_calls = self._collect_streaming_result(
+            list(mimo_tool_call_text(model_output))
+        )
 
         self.assertEqual(normal_text, "")
         self.assertEqual(len(tool_calls), 1)
@@ -398,6 +444,7 @@ line 3</parameter></function></tool_call>"""
             "<tool_call><function=exec>await run();</function></tool_call>"
             "<tool_call><function=get_current_weather><parameter=city>Dallas</parameter></function></tool_call>"
         )
+        model_output = mimo_tool_call_text(model_output)
         chunks = [model_output[i : i + 10] for i in range(0, len(model_output), 10)]
 
         normal_text, tool_calls = self._collect_streaming_result(chunks)
@@ -406,9 +453,7 @@ line 3</parameter></function></tool_call>"""
         self.assertEqual(tool_calls[0]["name"], "exec")
         self.assertEqual(tool_calls[0]["parameters"], "await run();")
         self.assertEqual(tool_calls[1]["name"], "get_current_weather")
-        self.assertEqual(
-            json.loads(tool_calls[1]["parameters"]), {"city": "Dallas"}
-        )
+        self.assertEqual(json.loads(tool_calls[1]["parameters"]), {"city": "Dallas"})
 
     def test_streaming_freeform_tracking_state(self):
         """The serving layer's unstreamed-args check requires that, for a
@@ -417,6 +462,7 @@ line 3</parameter></function></tool_call>"""
         model_output = (
             f"<tool_call><function=exec>{FREEFORM_EXEC_CODE}</function></tool_call>"
         )
+        model_output = mimo_tool_call_text(model_output)
         chunks = [model_output[i : i + 16] for i in range(0, len(model_output), 16)]
 
         _, tool_calls = self._collect_streaming_result(chunks)
@@ -425,9 +471,7 @@ line 3</parameter></function></tool_call>"""
         self.assertEqual(
             self.detector.prev_tool_call_arr[0]["arguments"], FREEFORM_EXEC_CODE
         )
-        self.assertEqual(
-            self.detector.streamed_args_for_tool[0], FREEFORM_EXEC_CODE
-        )
+        self.assertEqual(self.detector.streamed_args_for_tool[0], FREEFORM_EXEC_CODE)
 
     def test_streaming_empty_function_body_is_empty_dict(self):
         chunks = [
@@ -437,7 +481,9 @@ line 3</parameter></function></tool_call>"""
             "</tool_call>",
         ]
 
-        normal_text, tool_calls = self._collect_streaming_result(chunks)
+        normal_text, tool_calls = self._collect_streaming_result(
+            map(mimo_tool_call_text, chunks)
+        )
 
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(json.loads(tool_calls[0]["parameters"]), {})
@@ -457,6 +503,7 @@ class TestMiMoReasoningToolCalls(unittest.TestCase):
         chat.tool_call_parser = "mimo"
         finish_reason = {"type": "stop", "matched": "</s>"}
         reasoning_text = "Need weather data.<tool_call><function=get_current_weather><parameter=city>Dallas</parameter></function></tool_call>"
+        reasoning_text = mimo_tool_call_text(reasoning_text)
 
         tool_calls, text, reasoning_text, finish_reason = (
             chat._process_tool_calls_with_reasoning_fallback(

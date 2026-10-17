@@ -95,7 +95,11 @@ from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, mistral_utils
-from sglang.srt.utils.patch_tokenizer import patch_tokenizer
+from sglang.srt.utils.patch_tokenizer import (
+    patch_mimo_tokenizer,
+    patch_tokenizer,
+    replace_mimo_chat_template,
+)
 
 _fastokens_patched = False
 
@@ -794,6 +798,7 @@ def get_tokenizer(
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
     tokenizer_backend: str = "huggingface",
+    is_mimo: bool = False,
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
@@ -904,6 +909,7 @@ def get_tokenizer(
         )
 
     _fix_special_tokens_pattern(tokenizer)
+    patch_mimo_tokenizer(tokenizer, is_mimo=is_mimo)
     attach_additional_stop_token_ids(tokenizer)
     tokenizer = patch_tokenizer(tokenizer)
     return tokenizer
@@ -1359,6 +1365,14 @@ def get_processor(
 
     _fix_special_tokens_pattern(tokenizer)
     _fix_added_tokens_encoding(tokenizer)
+    patch_mimo_tokenizer(
+        tokenizer,
+        is_mimo="mimo" in getattr(config, "model_type", "").lower(),
+    )
+    if getattr(processor, "chat_template", None) is not None:
+        processor.chat_template = replace_mimo_chat_template(
+            tokenizer, processor.chat_template
+        )
     attach_additional_stop_token_ids(tokenizer)
     return processor
 

@@ -18,6 +18,7 @@ import unittest
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mimo_utils import mimo_tool_call_text
 
 register_cpu_ci(10, "stage-a-test-cpu")
 
@@ -184,7 +185,7 @@ TEST_CASES = [
     # 18. Freeform with angle brackets and HTML-ish content
     (
         "Freeform with angle brackets",
-        '<tool_call><function=exec>if (a < b && c > d) { render("<div class=\'x\'>hi</div>"); }</function></tool_call>',
+        "<tool_call><function=exec>if (a < b && c > d) { render(\"<div class='x'>hi</div>\"); }</function></tool_call>",
     ),
     # 19. Freeform with leading and trailing newlines (part of the arguments)
     (
@@ -223,6 +224,11 @@ TEST_CASES = [
         '<tool_call>\n<function=calc>\n<parameter=shape>rectangle</parameter>\n<parameter=dimensions>{"width": 10, "height": 20}</parameter>\n<parameter=precision>3</parameter>\n<parameter=enabled>true</parameter>\n</function>\n</tool_call>',
     ),
 ]
+
+
+# Namespace complete fixtures before computing chunk boundaries, including the
+# one-character splits through the internal token suffix.
+TEST_CASES = [(label, mimo_tool_call_text(text)) for label, text in TEST_CASES]
 
 
 def run_non_streaming(text, tools):
@@ -420,6 +426,7 @@ class TestMiMoStreamingFailureModes(unittest.TestCase):
             "prefix <tool_call><function=evil_unknown>"
             "<parameter=command>rm -rf /</parameter></function></tool_call>"
         )
+        text = mimo_tool_call_text(text)
 
         ns_text, ns_calls = run_non_streaming(text, TOOLS)
         st_text, st_calls = run_streaming(text, TOOLS, [1] * len(text))
@@ -437,6 +444,7 @@ class TestMiMoStreamingFailureModes(unittest.TestCase):
             "prefix <tool_call><function=evil_unknown>"
             "await doBadThings();</function></tool_call>"
         )
+        text = mimo_tool_call_text(text)
 
         ns_text, ns_calls = run_non_streaming(text, TOOLS)
         st_text, st_calls = run_streaming(text, TOOLS, [1] * len(text))
@@ -462,7 +470,9 @@ class TestMiMoStreamingFailureModes(unittest.TestCase):
         sax = _MiMoStreamingSAX(TOOLS)
         sax._parser = _AlwaysFailExpat()
 
-        calls = sax.feed_chunk("<tool_call><function=bash><parameter=command>")
+        calls = sax.feed_chunk(
+            mimo_tool_call_text("<tool_call><function=bash><parameter=command>")
+        )
         self.assertEqual(calls, [], "no tool_call may be emitted on parse error")
         self.assertTrue(sax.tool_call_completed, "SAX must hand control back")
         self.assertTrue(

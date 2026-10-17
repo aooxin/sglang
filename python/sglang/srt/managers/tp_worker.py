@@ -285,6 +285,8 @@ class TpModelWorker(BaseTpWorker):
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                     tokenizer_backend=server_args.tokenizer_backend,
+                    is_mimo=server_args.tool_call_parser == "mimo"
+                    or server_args.reasoning_parser == "mimo",
                 )
         self.device = self.model_runner.device
 

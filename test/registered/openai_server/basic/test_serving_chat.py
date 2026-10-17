@@ -24,6 +24,7 @@ from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.utils import get_or_create_event_loop
+from sglang.srt.utils.patch_tokenizer import mimo_token
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
@@ -1050,7 +1051,9 @@ class ToolCallSpecialTokenGateTestCase(unittest.TestCase):
     def setUp(self):
         self.tm = _MockTokenizerManager()
         self.tm.server_args.tool_call_parser = "mimo"
-        self.tm.tokenizer.convert_tokens_to_ids = Mock(return_value=self.OPEN_ID)
+        self.tm.tokenizer.get_added_vocab = Mock(
+            return_value={mimo_token("<tool_call>"): self.OPEN_ID}
+        )
         self.template_manager = _MockTemplateManager()
         self.chat = OpenAIServingChat(self.tm, self.template_manager)
 

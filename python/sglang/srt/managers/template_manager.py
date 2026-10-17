@@ -40,6 +40,7 @@ from sglang.srt.parser.conversation import (
     register_conv_template,
 )
 from sglang.srt.parser.jinja_template_utils import detect_jinja_template_content_format
+from sglang.srt.utils.patch_tokenizer import mimo_token, replace_mimo_chat_template
 
 logger = logging.getLogger(__name__)
 
@@ -92,8 +93,17 @@ class TemplateManager:
             return False
 
         # TODO: remove this hard code the reasoning pattern
-        force_reasoning_pattern = r"<\|im_start\|>assistant\\n<think>\\n"
-        has_reasoning = re.search(force_reasoning_pattern, template) is not None
+        force_reasoning_patterns = (
+            r"<\|im_start\|>assistant\\n<think>\\n",
+            re.escape(mimo_token("<|im_start|>"))
+            + r"assistant\\n"
+            + re.escape(mimo_token("<think>"))
+            + r"\\n",
+        )
+        has_reasoning = any(
+            re.search(pattern, template) is not None
+            for pattern in force_reasoning_patterns
+        )
 
         if has_reasoning:
             logger.info("Detected the force reasoning pattern in chat template.")
@@ -143,6 +153,9 @@ class TemplateManager:
 
         # Detect reasoning pattern from chat template
         if tokenizer_manager.tokenizer:
+            tokenizer_manager.tokenizer.chat_template = replace_mimo_chat_template(
+                tokenizer_manager.tokenizer, tokenizer_manager.tokenizer.chat_template
+            )
             self._force_reasoning = self._detect_reasoning_pattern(
                 tokenizer_manager.tokenizer.chat_template
             )

@@ -18,6 +18,7 @@ from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mimo_utils import mimo_tool_call_text
 
 register_cpu_ci(15, "stage-a-test-cpu")
 
@@ -2597,7 +2598,7 @@ class TestMiMoDetectorStreaming(unittest.TestCase):
         detector = MiMoDetector()
         text = ""
         tool_calls = {}
-        for chunk in chunks:
+        for chunk in map(mimo_tool_call_text, chunks):
             result = detector.parse_streaming_increment(chunk, tools)
             text += result.normal_text
             for call in result.calls:

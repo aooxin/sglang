@@ -2,6 +2,7 @@ from typing import Dict, Optional, Tuple, Type
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.harmony_parser import HarmonyParser
+from sglang.srt.utils.patch_tokenizer import mimo_token
 
 
 class StreamingParseResult:
@@ -235,6 +236,26 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         super().__init__(
             "<think>",
             "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+
+
+class MiMoReasoningDetector(BaseReasoningFormatDetector):
+    """MiMo reasoning with the namespaced control-token spellings."""
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        super().__init__(
+            mimo_token("<think>"),
+            mimo_token("</think>"),
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
@@ -495,7 +516,7 @@ class ReasoningParser:
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
         "kimi_k2": KimiK2Detector,
-        "mimo": Qwen3Detector,
+        "mimo": MiMoReasoningDetector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,

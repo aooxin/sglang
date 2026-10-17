@@ -43,6 +43,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.qwen_vl import FRAME_FACTOR
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.common import download_mm_data, get_int_env_var
+from sglang.srt.utils.patch_tokenizer import replace_mimo_chat_template
 from sglang.utils import logger
 
 try:
@@ -2022,22 +2023,35 @@ class MiMoV2Processor(BaseMultimodalProcessor):
         )
         self._processor = self.mimo_processor
 
-        self.AUDIO_TOKEN_REGEX = re.compile(
-            r"<\|mimo_audio_start\|>(?:<\|audio_pad\|>)+<\|mimo_audio_end\|>"
+        # Apply the same mapping as the chat template. Some vision-only exports
+        # reserve audio IDs in the config but omit them from the tokenizer.
+        def media_marker(start, pad, end):
+            start, pad, end = replace_mimo_chat_template(
+                self.mimo_processor.tokenizer, [start, pad, end]
+            )
+            pattern = re.compile(
+                re.escape(start) + "(?:" + re.escape(pad) + ")+" + re.escape(end)
+            )
+            return start + pad + end, pattern
+
+        image_token, image_regex = media_marker(
+            "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"
+        )
+        video_token, video_regex = media_marker(
+            "<|vision_start|>", "<|video_pad|>", "<|vision_end|>"
+        )
+        audio_token, self.AUDIO_TOKEN_REGEX = media_marker(
+            "<|mimo_audio_start|>", "<|audio_pad|>", "<|mimo_audio_end|>"
         )
 
         self.mm_tokens = MultimodalSpecialTokens(
-            image_token="<|vision_start|><|image_pad|><|vision_end|>",
+            image_token=image_token,
             image_token_id=self.IM_TOKEN_ID,
-            image_token_regex=re.compile(
-                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
-            ),
-            video_token="<|vision_start|><|video_pad|><|vision_end|>",
-            video_token_regex=re.compile(
-                r"<\|vision_start\|>(?:<\|video_pad\|>)+<\|vision_end\|>"
-            ),
+            image_token_regex=image_regex,
+            video_token=video_token,
+            video_token_regex=video_regex,
             video_token_id=self.VIDEO_TOKEN_ID,
-            audio_token="<|mimo_audio_start|><|audio_pad|><|mimo_audio_end|>",
+            audio_token=audio_token,
             audio_token_id=self.AUDIO_TOKEN_ID,
             audio_token_regex=self.AUDIO_TOKEN_REGEX,
         ).build(_processor)

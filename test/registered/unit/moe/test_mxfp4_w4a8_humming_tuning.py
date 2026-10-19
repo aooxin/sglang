@@ -85,7 +85,10 @@ class TestHummingMaskedTuning(unittest.TestCase):
             with self.subTest(shape=shape):
                 overrides = target._humming_prefill_tuning_overrides(*shape)
                 self.assertEqual(len(overrides), 1)
-                self.assertEqual(overrides[0][2]["block_shape"], (64, 128, 128))
+                # No chunk_size is set in the unit-test env, so every MiMo shape
+                # resolves through the static fallback (HUMMING_PREFILL_TUNING_CONFIGS),
+                # which was re-tuned to the measured block_m=88 / block_k=256 tile.
+                self.assertEqual(overrides[0][2]["block_shape"], (88, 256, 128))
 
     def test_out_of_range_and_unsupported_shape_fall_back(self):
         unsupported_entry = SimpleNamespace(
@@ -231,8 +234,11 @@ class TestHummingMaskedTuning(unittest.TestCase):
 
         tuned = target._tune_humming_fused_e8m0_configs(config)
 
+        # The E8M0 CTA bounds are disabled (floor=1, ceiling=96) so the exhaustive
+        # prefill tuning results (e.g. block_m=88, num_ctas_per_sm=1) pass through
+        # unchanged; the small tile keeps its num_ctas_per_sm=1 and warp_shape.
         self.assertEqual(tuned["warp_shape"], (8, 16, 128))
-        self.assertEqual(tuned["num_ctas_per_sm"], 2)
+        self.assertEqual(tuned["num_ctas_per_sm"], 1)
 
 
 if __name__ == "__main__":

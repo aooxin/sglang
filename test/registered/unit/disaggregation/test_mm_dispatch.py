@@ -54,28 +54,30 @@ class TestDispatchByModality(unittest.TestCase):
     def test_counts_align_and_conserve_items(self):
         # 3 groups of 2: g0('0')->Ea, g1('9')->Eb, g2('1')->Ea => Ea:4, Eb:2
         mm = [_img("0"), _img("0"), _img("9"), _img("9"), _img("1"), _img("1")]
-        call_urls, nia, reordered = self.r._dispatch_by_modality(mm)
+        call_urls, ers, total = self.r._dispatch_by_modality("R", mm, 1234)
 
         self.assertEqual(set(call_urls), {"http://Ea:80", "http://Eb:80"})
-        self.assertEqual(len(reordered), 6)  # length conserved
-        counts = nia[Modality.IMAGE]
-        self.assertEqual(len(counts), len(call_urls))  # padded to call_urls len
-        self.assertEqual(sum(counts), 6)
-        ea, eb = call_urls.index("http://Ea:80"), call_urls.index("http://Eb:80")
-        self.assertEqual(counts[ea], 4)
-        self.assertEqual(counts[eb], 2)
-
-    def test_reordered_aligns_with_encoder_idx(self):
-        # Every item in a built part must route (by SHA1) to that part's URL.
-        mm = [_img("0"), _img("9"), _img("1"), _img("8"), _img("2"), _img("f")]
-        call_urls, nia, reordered = self.r._dispatch_by_modality(mm)
-        modalities = list(dict.fromkeys(m.get("modality") for m in reordered))
-        ers, _ = self.r._build_encode_requests("R", reordered, 1234, nia, modalities)
+        self.assertEqual(total, len(ers))
+        self.assertTrue(all(er["num_parts"] == total for er in ers))
+        # items are conserved across all parts
+        self.assertEqual(sum(len(er["mm_items"]) for er in ers), 6)
+        # count items routed to each encoder URL
+        per_url = {u: 0 for u in call_urls}
         for er in ers:
-            url = call_urls[er["encoder_idx"]]
-            for item_url in er["mm_items"]:
-                key = extract_mm_item_key(item_url)
-                self.assertEqual(self.r._dispatcher.pick(key), url)
+            per_url[call_urls[er["encoder_idx"]]] += len(er["mm_items"])
+        self.assertEqual(per_url["http://Ea:80"], 4)
+        self.assertEqual(per_url["http://Eb:80"], 2)
+
+    def test_parts_routed_by_group_head(self):
+        # No physical reorder: each part keeps prompt order and is routed by its
+        # first item's SHA1 (group head), not per-item.
+        mm = [_img("0"), _img("9"), _img("1"), _img("8"), _img("2"), _img("f")]
+        call_urls, ers, _ = self.r._dispatch_by_modality("R", mm, 1234)
+        # group_size=2 => 3 parts, each keeping original order within the group
+        self.assertEqual([er["mm_items"][0] for er in ers], [m["url"] for m in mm[::2]])
+        for er in ers:
+            head_key = extract_mm_item_key(er["mm_items"][0])
+            self.assertEqual(call_urls[er["encoder_idx"]], self.r._dispatcher.pick(head_key))
 
     def test_video_forced_single_encoder(self):
         vid = [
@@ -86,10 +88,12 @@ class TestDispatchByModality(unittest.TestCase):
             }
             for i in range(3)
         ]
-        call_urls, nia, reordered = self.r._dispatch_by_modality(vid)
+        call_urls, ers, total = self.r._dispatch_by_modality("R", vid, 1234)
         self.assertEqual(len(call_urls), 1)
-        self.assertEqual(nia[Modality.VIDEO], [3])
-        self.assertEqual(len(reordered), 3)
+        self.assertEqual(total, 1)  # all video items in one part
+        self.assertEqual(len(ers), 1)
+        self.assertEqual(ers[0]["encoder_idx"], 0)
+        self.assertEqual(len(ers[0]["mm_items"]), 3)
 
 
 class TestSha1EncodeRequests(unittest.TestCase):

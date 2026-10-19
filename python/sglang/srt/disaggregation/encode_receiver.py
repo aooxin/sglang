@@ -1284,17 +1284,13 @@ class MMReceiverBase(ABC):
 
         return LocalHashRingDispatcher(self.encode_urls[0])
 
-    def _dispatch_by_modality(self, mm_data):
-        """Pick E endpoints per mm item by SHA1 consistent hash.
+    def _dispatch_by_modality(self, req_id, mm_data, embedding_port):
+        """Group mm items in original order; one encode part per group, routed by
+        the group's first item's SHA1.
 
-        Adapts the source branch's per-modality dispatch to this branch's
-        single-pass (all-modalities) encode(). Returns:
-          call_urls: deduped URL list for THIS encode call; ``encoder_idx``
-                     indexes into it (not self.encode_urls).
-          num_items_assigned: OrderedDict{modality: [count per call_urls idx]},
-                     each list padded to len(call_urls) to match encode()'s loop.
-          reordered: mm_data reordered so items are grouped by (modality, bucket),
-                     aligned with the assignment counts.
+        No physical reorder: part_idx stays monotonic over the prompt order so the
+        receiver's part_idx concatenation keeps the placeholder order. encoder_idx
+        indexes the returned call_urls (not self.encode_urls).
         """
         modalities = list(dict.fromkeys(m.get("modality") for m in mm_data))
         call_urls: List[str] = []
@@ -1304,47 +1300,44 @@ class MMReceiverBase(ABC):
                 call_urls.append(u)
             return call_urls.index(u)
 
-        # Per modality, bucket items by their target call_urls index. call_urls
-        # grows as buckets are discovered, so counts/items are keyed by idx and
-        # materialized only after the list has stabilized.
-        counts_by_modality = OrderedDict()  # modality -> {idx: count}
-        items_by_modality = OrderedDict()  # modality -> {idx: [items]}
+        encode_requests: List[Dict] = []
+        part_idx = 0
         for modality in modalities:
             items = [m for m in mm_data if m.get("modality") == modality]
             if not items:
                 continue
-            counts: Dict[int, int] = {}
-            grouped: Dict[int, List[Dict]] = {}
             # video/audio must share one encoder (EmbeddingData merge overwrites
-            # cross-item state), so route the whole batch by the first item.
+            # cross-item state), so route the whole batch as a single group.
             if modality in (Modality.VIDEO, Modality.AUDIO):
-                idx = _url_idx(self._dispatcher.pick(extract_mm_item_key(items[0])))
-                counts[idx] = len(items)
-                grouped[idx] = list(items)
+                groups = [items]
             else:
-                # Per-item routing: each item's SHA1 must land on the pod that
-                # caches it. Items sharing a target URL merge into one part
-                # downstream, so this costs no extra encode calls per node.
-                for item in items:
-                    idx = _url_idx(self._dispatcher.pick(extract_mm_item_key(item)))
-                    counts[idx] = counts.get(idx, 0) + 1
-                    grouped.setdefault(idx, []).append(item)
-            counts_by_modality[modality] = counts
-            items_by_modality[modality] = grouped
-
-        n = len(call_urls)
-        num_items_assigned = OrderedDict()
-        reordered: List[Dict] = []
-        for modality, counts in counts_by_modality.items():
-            num_items_assigned[modality] = [counts.get(i, 0) for i in range(n)]
-            grouped = items_by_modality[modality]
-            # Emit items in ascending call_urls-index order so they line up with
-            # the part-building loop's enumerate(num_items_assigned) consumption.
-            for i in range(n):
-                if i in grouped:
-                    reordered.extend(grouped[i])
-
-        return call_urls, num_items_assigned, reordered
+                groups = [
+                    items[s : s + self._group_size]
+                    for s in range(0, len(items), self._group_size)
+                ]
+            for grp in groups:
+                encoder_idx = _url_idx(
+                    self._dispatcher.pick(extract_mm_item_key(grp[0]))
+                )
+                encode_requests.append(
+                    {
+                        "encoder_idx": encoder_idx,
+                        "mm_items": [it.get("url") for it in grp],
+                        "mm_items_preprocess_kwargs": [
+                            it.get("preprocess_kwargs") for it in grp
+                        ],
+                        "part_idx": part_idx,
+                        "req_id": create_part_req_id(req_id, part_idx),
+                        "modality": modality.name,
+                        "prefill_host": self.host,
+                        "embedding_port": embedding_port,
+                    }
+                )
+                part_idx += 1
+        total_num_parts = len(encode_requests)
+        for er in encode_requests:
+            er["num_parts"] = total_num_parts
+        return call_urls, encode_requests, total_num_parts
 
 
 class MMReceiverHTTP(MMReceiverBase):
@@ -1497,20 +1490,20 @@ class MMReceiverHTTP(MMReceiverBase):
         caller_assigned = num_items_assigned is not None
 
         if self._dispatcher is not None and not caller_assigned:
-            # Endpoint discovery: pick E pods by SHA1 consistent hash. call_urls
-            # is this call's URL list; encoder_idx indexes it (not encode_urls).
-            call_urls, num_items_assigned, mm_data = self._dispatch_by_modality(mm_data)
-        else:
-            call_urls = self.encode_urls
-
-        if self.sha1_routing_header and not caller_assigned:
+            # Endpoint discovery routes locally and keeps the original order;
+            # mutually exclusive with the gateway SHA1-header path (no header).
+            call_urls, encode_requests, total_num_parts = self._dispatch_by_modality(
+                req_id, mm_data, embedding_port
+            )
+            sha1_by_part = {}
+        elif self.sha1_routing_header and not caller_assigned:
             # Gateway SHA1 routing: regroup by fixed batch size, all -> gateway.
+            call_urls = self.encode_urls
             encode_requests, total_num_parts, sha1_by_part = (
                 self._build_sha1_encode_requests(req_id, mm_data, embedding_port)
             )
         else:
-            # get unique modalities with order preserved (mm_data may have been
-            # reordered by dispatch to align with num_items_assigned).
+            call_urls = self.encode_urls
             modalities = list(dict.fromkeys(m.get("modality") for m in mm_data))
             if num_items_assigned is None:
                 num_items_assigned = self._assign_items_by_modality(

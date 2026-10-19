@@ -54,7 +54,6 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.utils.patch_tokenizer import mimo_token
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -108,8 +107,6 @@ class OpenAIServingChat(OpenAIServingBase):
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
-        if self.tool_call_parser == "mimo":
-            self._TOOLCALL_TAGS = tuple(map(mimo_token, self._TOOLCALL_TAGS))
 
         # Get default sampling parameters from model's generation config
         self.default_sampling_params = (
@@ -170,12 +167,12 @@ class OpenAIServingChat(OpenAIServingBase):
             try:
                 tokenizer = self.tokenizer_manager.tokenizer
                 if tokenizer is not None:
-                    tid = tokenizer.get_added_vocab().get(self._TOOLCALL_TAGS[0])
+                    tid = tokenizer.convert_tokens_to_ids("<tool_call>")
                     if isinstance(tid, int) and tid >= 0:
                         self._toolcall_special_id = tid
             except Exception as e:
                 logger.warning(
-                    f"Failed to resolve the mimo {self._TOOLCALL_TAGS[0]!r} special token id; "
+                    f"Failed to resolve the mimo '<tool_call>' special token id; "
                     f"token-level tool-call gate will be inactive: {e}"
                 )
                 self._toolcall_special_id = None

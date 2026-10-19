@@ -27,16 +27,12 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.utils.patch_tokenizer import mimo_token
 
 logger = logging.getLogger(__name__)
 
 _STRING_TYPES = frozenset(["string", "str", "text", "varchar", "char", "enum"])
 _COMPLEX_TYPES = frozenset(["object", "array", "arr"])
 _COMPLEX_PREFIXES = ("dict", "list")
-_TOOL_CALL_START = mimo_token("<tool_call>")
-_TOOL_CALL_END = mimo_token("</tool_call>")
-_TOOL_CALL_ELEMENT = _TOOL_CALL_START[1:-1]
 
 
 def _get_param_type(func_name: str, param_name: str, tools: List[Tool]) -> str:
@@ -331,8 +327,8 @@ class _MiMoStreamingSAX:
                 if self._in_tool_call or self._pre_inside_parameter:
                     return None, start_pos
                 for prefix in (
-                    _TOOL_CALL_START,
-                    _TOOL_CALL_END,
+                    "<tool_call>",
+                    "</tool_call>",
                     "<function=",
                     "</function>",
                     "<parameter=",
@@ -408,8 +404,8 @@ class _MiMoStreamingSAX:
         is_tool_tag = any(
             processed.startswith(t)
             for t in (
-                _TOOL_CALL_START,
-                _TOOL_CALL_END,
+                "<tool_call>",
+                "</tool_call>",
                 "<function",
                 "</function>",
                 "<parameter",
@@ -424,7 +420,7 @@ class _MiMoStreamingSAX:
     def _start_element(self, name: str, attrs: Dict[str, str]):
         if name == "root":
             return
-        if name == _TOOL_CALL_ELEMENT:
+        if name == "tool_call":
             self._in_tool_call = True
             self._parameters = {}
             self._param_count = 0
@@ -653,7 +649,7 @@ class _MiMoStreamingSAX:
             self._current_function_name = None
             self._freeform_pending_ws = ""
 
-        elif name == _TOOL_CALL_ELEMENT:
+        elif name == "tool_call":
             self._tool_call_completed = True
             self._in_tool_call = False
 
@@ -686,12 +682,9 @@ class MiMoDetector(BaseFormatDetector):
 
     def __init__(self):
         super().__init__()
-        self.bot_token = _TOOL_CALL_START
-        self.eot_token = _TOOL_CALL_END
-        self.tool_call_regex = re.compile(
-            re.escape(self.bot_token) + r"(.*?)" + re.escape(self.eot_token),
-            re.DOTALL,
-        )
+        self.bot_token = "<tool_call>"
+        self.eot_token = "</tool_call>"
+        self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
         self.func_regex = re.compile(r"<function=([^>]+)>(.*?)</function>", re.DOTALL)
         self.param_regex = re.compile(
             r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL

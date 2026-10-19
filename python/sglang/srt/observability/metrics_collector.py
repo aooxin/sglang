@@ -106,6 +106,7 @@ class SchedulerStats:
     full_token_usage: float = 0.0
     pending_prealloc_token_usage: float = 0.0
     swa_token_usage: float = 0.0
+    draft_swa_token_usage: float = 0.0
     mamba_usage: float = 0.0
     decode_sum_seq_lens: int = 0
     gen_throughput: float = 0.0
@@ -175,9 +176,13 @@ class SchedulerStats:
     swa_available_size: int = 0
     swa_tree_evictable_tokens: int = 0
     full_tree_evictable_tokens: int = 0
+    draft_swa_available_size: int = 0
+    draft_swa_tree_evictable_tokens: int = 0
+    draft_swa_tree_protected_tokens: int = 0
     # Gauge: L2 host pool available size
     host_full_available_size: int = 0
     host_swa_available_size: int = 0
+    host_draft_swa_available_size: int = 0
     # Gauge: tree token breakdown (device/host × full/swa)
     dev_full_tokens: int = 0
     dev_swa_tokens: int = 0
@@ -187,6 +192,10 @@ class SchedulerStats:
     host_swa_tokens: int = 0
     host_full_tokens_locked: int = 0
     host_swa_tokens_locked: int = 0
+    dev_draft_swa_tokens: int = 0
+    dev_draft_swa_tokens_locked: int = 0
+    host_draft_swa_tokens: int = 0
+    host_draft_swa_tokens_locked: int = 0
     # Gauge: tree node/leaf breakdown (device/host)
     dev_nodes: int = 0
     dev_leaves: int = 0
@@ -199,6 +208,10 @@ class SchedulerStats:
     swa_evicted_from_tree_delta: int = 0
     full_evicted_from_tree_delta: int = 0
     swa_dynamic_anchor_protected_tokens_delta: int = 0
+    # DFLASH two-window draft-swa deltas
+    draft_swa_active_freed_tokens_delta: int = 0
+    draft_swa_evicted_from_tree_delta: int = 0
+    draft_swa_prefix_shrink_tokens_delta: int = 0
 
 
 ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 3, 5, 7, 10, 20, 50, 100, 200]
@@ -289,6 +302,12 @@ class SchedulerMetricsCollector:
         self.swa_token_usage = Gauge(
             name="sglang:swa_token_usage",
             documentation="The token usage for SWA layers.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.draft_swa_token_usage = Gauge(
+            name="sglang:draft_swa_token_usage",
+            documentation="The token usage for the DFLASH draft SWA pool.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1024,6 +1043,24 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.draft_swa_available_size = Gauge(
+            name="sglang:draft_swa_available_size",
+            documentation="Number of available DFLASH draft SWA KV token slots in the pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.draft_swa_tree_evictable_tokens = Gauge(
+            name="sglang:draft_swa_tree_evictable_tokens",
+            documentation="Number of evictable DFLASH draft SWA KV tokens currently held in the radix tree.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.draft_swa_tree_protected_tokens = Gauge(
+            name="sglang:draft_swa_tree_protected_tokens",
+            documentation="Number of protected (locked) DFLASH draft SWA KV tokens currently held in the radix tree.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.host_full_available_size = Gauge(
             name="sglang:host_full_available_size",
             documentation="Number of available full-attention KV token slots in the host (L2) pool.",
@@ -1033,6 +1070,12 @@ class SchedulerMetricsCollector:
         self.host_swa_available_size = Gauge(
             name="sglang:host_swa_available_size",
             documentation="Number of available SWA KV token slots in the host (L2) pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.host_draft_swa_available_size = Gauge(
+            name="sglang:host_draft_swa_available_size",
+            documentation="Number of available DFLASH draft SWA KV token slots in the host (L2) pool.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1081,6 +1124,30 @@ class SchedulerMetricsCollector:
         self.host_swa_tokens_locked = Gauge(
             name="sglang:host_swa_tokens_locked",
             documentation="Number of locked SWA KV tokens on host (L2).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.dev_draft_swa_tokens = Gauge(
+            name="sglang:dev_draft_swa_tokens",
+            documentation="Number of DFLASH draft-SWA KV tokens on device (L1) in the radix tree.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.dev_draft_swa_tokens_locked = Gauge(
+            name="sglang:dev_draft_swa_tokens_locked",
+            documentation="Number of locked DFLASH draft-SWA KV tokens on device (L1).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.host_draft_swa_tokens = Gauge(
+            name="sglang:host_draft_swa_tokens",
+            documentation="Number of DFLASH draft-SWA KV tokens on host (L2) in the radix tree.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.host_draft_swa_tokens_locked = Gauge(
+            name="sglang:host_draft_swa_tokens_locked",
+            documentation="Number of locked DFLASH draft-SWA KV tokens on host (L2).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1138,6 +1205,21 @@ class SchedulerMetricsCollector:
         self.swa_dynamic_anchor_protected_tokens_total = Counter(
             name="sglang:swa_dynamic_anchor_protected_tokens_total",
             documentation="Cumulative SWA KV tokens withheld from freeing by per-request Full-KV-guided branch-window protection.",
+            labelnames=labels.keys(),
+        )
+        self.draft_swa_active_freed_tokens_total = Counter(
+            name="sglang:draft_swa_active_freed_tokens_total",
+            documentation="Cumulative DFLASH draft-SWA KV tokens proactively freed outside the draft window.",
+            labelnames=labels.keys(),
+        )
+        self.draft_swa_evicted_from_tree_total = Counter(
+            name="sglang:draft_swa_evicted_from_tree_total",
+            documentation="Cumulative DFLASH draft-SWA KV tokens evicted from the radix tree by cache pressure.",
+            labelnames=labels.keys(),
+        )
+        self.draft_swa_prefix_shrink_tokens_total = Counter(
+            name="sglang:draft_swa_prefix_shrink_tokens_total",
+            documentation="Cumulative matched-prefix tokens dropped by the DFLASH draft window constraint beyond target-swa alone (match-time joint <= target).",
             labelnames=labels.keys(),
         )
 
@@ -1347,6 +1429,7 @@ class SchedulerMetricsCollector:
             self.pending_prealloc_token_usage, stats.pending_prealloc_token_usage
         )
         self._log_gauge(self.swa_token_usage, stats.swa_token_usage)
+        self._log_gauge(self.draft_swa_token_usage, stats.draft_swa_token_usage)
         self._log_gauge(self.mamba_usage, stats.mamba_usage)
         self._log_gauge(self.decode_sum_seq_lens, stats.decode_sum_seq_lens)
         self._log_gauge(self.gen_throughput, stats.gen_throughput)
@@ -1450,10 +1533,24 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.swa_available_size, stats.swa_available_size)
         self._log_gauge(self.swa_tree_evictable_tokens, stats.swa_tree_evictable_tokens)
         self._log_gauge(
+            self.draft_swa_available_size, stats.draft_swa_available_size
+        )
+        self._log_gauge(
+            self.draft_swa_tree_evictable_tokens,
+            stats.draft_swa_tree_evictable_tokens,
+        )
+        self._log_gauge(
+            self.draft_swa_tree_protected_tokens,
+            stats.draft_swa_tree_protected_tokens,
+        )
+        self._log_gauge(
             self.full_tree_evictable_tokens, stats.full_tree_evictable_tokens
         )
         self._log_gauge(self.host_full_available_size, stats.host_full_available_size)
         self._log_gauge(self.host_swa_available_size, stats.host_swa_available_size)
+        self._log_gauge(
+            self.host_draft_swa_available_size, stats.host_draft_swa_available_size
+        )
         self._log_gauge(self.dev_full_tokens, stats.dev_full_tokens)
         self._log_gauge(self.dev_swa_tokens, stats.dev_swa_tokens)
         self._log_gauge(self.dev_full_tokens_locked, stats.dev_full_tokens_locked)
@@ -1462,6 +1559,14 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.host_swa_tokens, stats.host_swa_tokens)
         self._log_gauge(self.host_full_tokens_locked, stats.host_full_tokens_locked)
         self._log_gauge(self.host_swa_tokens_locked, stats.host_swa_tokens_locked)
+        self._log_gauge(self.dev_draft_swa_tokens, stats.dev_draft_swa_tokens)
+        self._log_gauge(
+            self.dev_draft_swa_tokens_locked, stats.dev_draft_swa_tokens_locked
+        )
+        self._log_gauge(self.host_draft_swa_tokens, stats.host_draft_swa_tokens)
+        self._log_gauge(
+            self.host_draft_swa_tokens_locked, stats.host_draft_swa_tokens_locked
+        )
         self._log_gauge(self.dev_nodes, stats.dev_nodes)
         self._log_gauge(self.dev_leaves, stats.dev_leaves)
         self._log_gauge(self.dev_leaves_locked, stats.dev_leaves_locked)
@@ -1483,6 +1588,18 @@ class SchedulerMetricsCollector:
         if stats.swa_dynamic_anchor_protected_tokens_delta > 0:
             self.swa_dynamic_anchor_protected_tokens_total.labels(**self.labels).inc(
                 stats.swa_dynamic_anchor_protected_tokens_delta
+            )
+        if stats.draft_swa_active_freed_tokens_delta > 0:
+            self.draft_swa_active_freed_tokens_total.labels(**self.labels).inc(
+                stats.draft_swa_active_freed_tokens_delta
+            )
+        if stats.draft_swa_evicted_from_tree_delta > 0:
+            self.draft_swa_evicted_from_tree_total.labels(**self.labels).inc(
+                stats.draft_swa_evicted_from_tree_delta
+            )
+        if stats.draft_swa_prefix_shrink_tokens_delta > 0:
+            self.draft_swa_prefix_shrink_tokens_total.labels(**self.labels).inc(
+                stats.draft_swa_prefix_shrink_tokens_delta
             )
 
         self.last_log_time = time.perf_counter()
@@ -1651,6 +1768,12 @@ class TokenizerMetricsCollector:
         self.storage_swa_hit_tokens_total = Counter(
             name="sglang:storage_swa_hit_tokens_total",
             documentation="Cumulative SWA-safe L3 storage hit tokens per request.",
+            labelnames=labels.keys(),
+        )
+
+        self.storage_draft_swa_hit_tokens_total = Counter(
+            name="sglang:storage_draft_swa_hit_tokens_total",
+            documentation="Cumulative DFLASH draft-SWA-safe L3 storage hit tokens per request.",
             labelnames=labels.keys(),
         )
 
@@ -1887,6 +2010,7 @@ class TokenizerMetricsCollector:
         raw_cached_tokens: int,
         storage_full_hit_tokens: int,
         storage_swa_hit_tokens: int,
+        storage_draft_swa_hit_tokens: int,
         e2e_latency: float,
         has_grammar: bool,
         retraction_count: int,
@@ -1940,6 +2064,10 @@ class TokenizerMetricsCollector:
         if storage_swa_hit_tokens > 0:
             self.storage_swa_hit_tokens_total.labels(**labels).inc(
                 storage_swa_hit_tokens
+            )
+        if storage_draft_swa_hit_tokens > 0:
+            self.storage_draft_swa_hit_tokens_total.labels(**labels).inc(
+                storage_draft_swa_hit_tokens
             )
         self.num_requests_total.labels(**labels).inc(1)
         if has_grammar:
@@ -2139,6 +2267,20 @@ class StorageMetricsCollector:
             buckets=bucket_prefetch_io_latency,
         )
 
+        self.histogram_draft_storage_resolve_latency_seconds = Histogram(
+            name="sglang:draft_storage_resolve_latency_seconds",
+            documentation="Histogram of per-op DFLASH two-window draft L3 prefetch resolve latency (existence probe + TP sync + draft host mapping) in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_prefetch_io_latency,
+        )
+
+        self.histogram_draft_prefetch_io_latency_seconds = Histogram(
+            name="sglang:draft_prefetch_io_latency_seconds",
+            documentation="Histogram of per-batch DFLASH draft prefetch IO (draft_page_get_func) latency in seconds.",
+            labelnames=labels.keys(),
+            buckets=bucket_prefetch_io_latency,
+        )
+
         self.prefetch_queue_length = Gauge(
             name="sglang:prefetch_queue_length",
             documentation="The length of the prefetch queue.",
@@ -2275,6 +2417,16 @@ class StorageMetricsCollector:
 
     def log_prefetch_io_latency(self, latency_s: float):
         self._log_histogram(self.histogram_prefetch_io_latency_seconds, latency_s)
+
+    def log_draft_storage_resolve_latency(self, latency_s: float):
+        self._log_histogram(
+            self.histogram_draft_storage_resolve_latency_seconds, latency_s
+        )
+
+    def log_draft_prefetch_io_latency(self, latency_s: float):
+        self._log_histogram(
+            self.histogram_draft_prefetch_io_latency_seconds, latency_s
+        )
 
     def log_storage_metrics(self, storage_metrics: Optional[StorageMetrics] = None):
         if storage_metrics is None:

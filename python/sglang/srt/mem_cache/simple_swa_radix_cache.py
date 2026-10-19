@@ -55,6 +55,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _window_ok(
+    indices: torch.Tensor, window: int, lens: torch.Tensor
+) -> torch.Tensor:
+    """Boolean mask over candidate prefix lengths ``lens``.
+
+    Entry ``i`` is True iff the window ``[lens[i] - window, lens[i])`` contains
+    no freed slot (all non-zero). ``indices`` non-negative; zero = freed/invalid.
+    """
+    bad = (indices == 0).to(torch.int32)
+    prefix_bad = torch.nn.functional.pad(torch.cumsum(bad, dim=0), (1, 0))
+    starts = torch.clamp(lens - window, min=0)
+    return (prefix_bad[lens] - prefix_bad[starts]) == 0
+
+
+def _last_valid_len(valid: torch.Tensor) -> int:
+    """Largest prefix length whose ``valid`` entry is True (0 if none)."""
+    if not torch.any(valid):
+        return 0
+    return int(torch.nonzero(valid, as_tuple=False)[-1].item() + 1)
+
+
 def compute_swa_safe_len(swa_indices: torch.Tensor, sliding_window_size: int) -> int:
     """
     Find the longest prefix whose SWA tail window has all non-zero indices.
@@ -85,18 +106,82 @@ def compute_swa_safe_len(swa_indices: torch.Tensor, sliding_window_size: int) ->
         return matched_len
 
     # --- Slow path: some slots are freed; find the longest safe prefix. ---
-    bad = (swa_indices == 0).to(torch.int32)
-    prefix_bad = torch.nn.functional.pad(torch.cumsum(bad, dim=0), (1, 0))
-
     lens = torch.arange(1, matched_len + 1, device=swa_indices.device)
-    starts = torch.clamp(lens - sliding_window_size, min=0)
-    bad_count = prefix_bad[lens] - prefix_bad[starts]
-    valid = bad_count == 0
+    valid = _window_ok(swa_indices, sliding_window_size, lens)
+    return _last_valid_len(valid)
 
-    if not torch.any(valid):
+
+def _draft_safe_fixed_edge(
+    draft_indices: torch.Tensor,
+    draft_window_size: int,
+    total_len: int,
+    n: int,
+) -> int:
+    """Fixed-left-edge draft-safe length.
+
+    Draft KV is only materialized for the last ``draft_window_size`` tokens,
+    i.e. the region ``[s, total_len)`` with ``s = max(0, total_len -
+    draft_window_size)``; everything before ``s`` is re-materialized from
+    target hidden states on demand, so holes there are irrelevant. For a reuse
+    length ``L`` the draft slots that can be read are ``[s, L)`` (a FIXED left
+    edge, unlike the target sliding window ``[L - w, L)``). Since the left edge
+    is fixed, the first dead slot at position ``h >= s`` invalidates every
+    ``L > h``; the draft-safe length is therefore that first dead position
+    (else the full matched length ``n``).
+    """
+    s = max(0, total_len - draft_window_size)
+    if s >= n:
+        return n
+    dead_pos = torch.nonzero(draft_indices[s:n] == 0, as_tuple=False)
+    if dead_pos.numel() == 0:
+        return n
+    return s + int(dead_pos[0].item())
+
+
+def compute_draft_safe_len(
+    draft_indices: torch.Tensor,
+    draft_window_size: int,
+    total_len: int,
+) -> int:
+    """Longest prefix safe under the draft window alone (fixed left edge).
+    """
+    n = len(draft_indices)
+    if n == 0:
         return 0
+    return _draft_safe_fixed_edge(draft_indices, draft_window_size, total_len, n)
 
-    return int(torch.nonzero(valid, as_tuple=False)[-1].item() + 1)
+
+def compute_target_and_joint_safe_len(
+    target_indices: torch.Tensor,
+    target_window_size: int,
+    draft_indices: torch.Tensor,
+    draft_window_size: int,
+    total_len: int,
+) -> tuple[int, int]:
+    """Compute target-only and target∩draft safe prefix lengths.
+
+    ``target_safe_len`` uses the strict per-candidate sliding window (matches
+    ``compute_swa_safe_len``). The draft side uses the fixed-left-edge frame
+    (see ``_draft_safe_fixed_edge``), which is monotone: it accepts exactly
+    ``[0, draft_safe]``. The joint length is the longest target-safe prefix
+    that fits inside that frame. Returns ``(target_safe_len, joint_safe_len)``
+    with ``joint_safe_len <= target_safe_len``.
+    """
+    n = len(target_indices)
+    if n == 0:
+        return 0, 0
+    assert len(draft_indices) == n, f"{len(draft_indices)=}, {n=}"
+    assert (target_indices >= 0).all(), "target_indices must be non-negative"
+
+    lens = torch.arange(1, n + 1, device=target_indices.device)
+    target_valid = _window_ok(target_indices, target_window_size, lens)
+    target_safe_len = _last_valid_len(target_valid)
+
+    draft_safe = _draft_safe_fixed_edge(
+        draft_indices, draft_window_size, total_len, n
+    )
+    joint_safe_len = _last_valid_len(target_valid[:draft_safe])
+    return target_safe_len, joint_safe_len
 
 
 class SimpleSWARadixCache(RadixCache):
@@ -270,6 +355,78 @@ class SimpleSWARadixCache(RadixCache):
             self.metrics_collector.observe_swa_dynamic_anchor_position(branch)
         return branch
 
+    @classmethod
+    def _load_draft_swa_reserved_config(
+        cls, draft_window_size: int, page_size: int
+    ) -> tuple[list[int], int, int]:
+        raw_points = envs.SGLANG_DFLASH_DRAFT_SWA_RESERVED_POINTS.get().strip()
+        reserved_chunk = envs.SGLANG_DFLASH_DRAFT_SWA_RESERVED_CHUNK.get()
+        reserved_max_point = envs.SGLANG_DFLASH_DRAFT_SWA_RESERVED_MAX_POINT.get()
+
+        if not raw_points:
+            points: list[int] = []
+        else:
+            try:
+                points = [int(point.strip()) for point in raw_points.split(",")]
+            except ValueError as exc:
+                raise ValueError(
+                    "SGLANG_DFLASH_DRAFT_SWA_RESERVED_POINTS must be a "
+                    "comma-separated integer list"
+                ) from exc
+            if any(point <= 0 for point in points):
+                raise ValueError(
+                    "SGLANG_DFLASH_DRAFT_SWA_RESERVED_POINTS must contain "
+                    "positive integers"
+                )
+            if len(points) != len(set(points)):
+                raise ValueError(
+                    "SGLANG_DFLASH_DRAFT_SWA_RESERVED_POINTS must not contain "
+                    "duplicates"
+                )
+            if points != sorted(points):
+                raise ValueError(
+                    "SGLANG_DFLASH_DRAFT_SWA_RESERVED_POINTS must be sorted in "
+                    "ascending order"
+                )
+
+        # Chunk / max-point default to 0 (disabled). Only 0 or positive
+        # page-aligned values are valid.
+        if reserved_chunk < 0:
+            raise ValueError(
+                "SGLANG_DFLASH_DRAFT_SWA_RESERVED_CHUNK must be non-negative"
+            )
+        if reserved_chunk % page_size != 0:
+            raise ValueError(
+                "SGLANG_DFLASH_DRAFT_SWA_RESERVED_CHUNK must be a multiple of "
+                "page_size"
+            )
+        if reserved_max_point < 0:
+            raise ValueError(
+                "SGLANG_DFLASH_DRAFT_SWA_RESERVED_MAX_POINT must be non-negative"
+            )
+        if reserved_max_point % page_size != 0:
+            raise ValueError(
+                "SGLANG_DFLASH_DRAFT_SWA_RESERVED_MAX_POINT must be a multiple "
+                "of page_size"
+            )
+
+        if draft_window_size > 0 and any(
+            point % draft_window_size != 0 for point in points
+        ):
+            raise ValueError(
+                "SGLANG_DFLASH_DRAFT_SWA_RESERVED_POINTS must be multiples of "
+                "draft_swa_window_size"
+            )
+
+        config_active = bool(points) or reserved_chunk > 0
+        if config_active and draft_window_size % page_size != 0:
+            raise ValueError(
+                "DFLASH draft-swa reserved points require draft_swa_window_size "
+                f"({draft_window_size}) to be a multiple of page_size "
+                f"({page_size})"
+            )
+
+        return points, reserved_chunk, reserved_max_point
     def __init__(
         self,
         params: CacheInitParams,
@@ -292,6 +449,14 @@ class SimpleSWARadixCache(RadixCache):
         self.swa_active_freed_tokens: int = 0
         self.swa_evicted_from_tree: int = 0
         self.full_evicted_from_tree: int = 0
+        # DFLASH two-window draft-swa cumulative counters (same delta model).
+        self.draft_swa_active_freed_tokens: int = 0
+        self.draft_swa_evicted_from_tree: int = 0
+        # Cumulative prefix-shrink metric: target-SWA holes inside the
+        # draft-bounded frame trim the reusable prefix from draft_safe down to
+        # the joint-safe length, i.e. draft_safe - safe_len. Zero when nothing
+        # shrinks.
+        self.draft_swa_prefix_shrink_tokens: int = 0
         assert self.sliding_window_size % self.page_size == 0
         logger.info(
             f"SimpleSWARadixCache initialized with sliding_window_size={self.sliding_window_size}"
@@ -307,6 +472,35 @@ class SimpleSWARadixCache(RadixCache):
         # (tree-owned slots are protected by the tree_prefix_len lower bound).
         self._swa_evictable_size: int = 0
         self._swa_protected_size: int = 0
+
+        # same partition for the draft-swa pool.
+        self._draft_independent_swa: bool = (
+            self.token_to_kv_pool_allocator.has_draft_swa
+        )
+        self.draft_swa_window: int = (
+            int(getattr(self.token_to_kv_pool_allocator, "draft_swa_window_size", 0) or 0)
+            if self._draft_independent_swa
+            else 0
+        )
+        # Draft-swa reserved-point config (mirror of the target-swa config
+        # loaded above). Disabled by default so draft eviction only keeps the
+        # window tail; enabled via SGLANG_DFLASH_DRAFT_SWA_RESERVED_* env vars.
+        if self._draft_independent_swa:
+            assert self.draft_swa_window > 0
+            (
+                self.draft_swa_reserved_points,
+                self.draft_swa_reserved_chunk,
+                self.draft_swa_reserved_max_point,
+            ) = self._load_draft_swa_reserved_config(
+                self.draft_swa_window, self.page_size
+            )
+        else:
+            assert self.draft_swa_window == 0
+            self.draft_swa_reserved_points = []
+            self.draft_swa_reserved_chunk = 0
+            self.draft_swa_reserved_max_point = 0
+        self._draft_swa_evictable_size: int = 0
+        self._draft_swa_protected_size: int = 0
 
         # Invariant check sampling counter. Triggered every
         # SGLANG_DEBUG_SWA_INVARIANT_INTERVAL queries when
@@ -330,10 +524,21 @@ class SimpleSWARadixCache(RadixCache):
         # full 看起来能回收很多，并不代表 swa 也能回收很多。
         # 尤其在 SimpleSWARadixCache 下，窗口外 SWA 早就被清空了，真正决定
         # 能否继续调度的往往是“剩余 live SWA + 可再驱逐的 live SWA”。
-        return (
+        msg = (
             f"Available full tokens: {full_available_size + full_evictable_size} ({full_available_size=} + {full_evictable_size=})\n"
             f"Available swa tokens: {swa_available_size + swa_evictable_size} ({swa_available_size=} + {swa_evictable_size=})\n"
         )
+        if self._draft_independent_swa:
+            draft_swa_available_size = (
+                self.token_to_kv_pool_allocator.draft_swa_available_size()
+            )
+            draft_swa_evictable_size = self.draft_swa_evictable_size()
+            msg += (
+                f"Available draft swa tokens: "
+                f"{draft_swa_available_size + draft_swa_evictable_size} "
+                f"({draft_swa_available_size=} + {draft_swa_evictable_size=})\n"
+            )
+        return msg
 
     def _segment_free_slots(
         self,
@@ -543,27 +748,135 @@ class SimpleSWARadixCache(RadixCache):
             self.swa_active_freed_tokens += freed_swa_size
         if swa_free_end > req.swa_evicted_seqlen:
             req.swa_evicted_seqlen = swa_free_end
+
+        freed_draft_swa_size = self._evict_draft_swa(req, prelen, tree_prefix_len)
+        if self.debug_mode:
+            log_info_on_rank0(
+                logger, f"evict_swa freed SWA: {freed_swa_size}, draft SWA: {freed_draft_swa_size}"
+            )
         return freed_swa_size
 
+    def _evict_draft_swa(self, req: Req, prelen: int, tree_prefix_len: int) -> int:
+        allocator = self.token_to_kv_pool_allocator
+        if not self._draft_independent_swa:
+            return 0
+        draft_window = allocator.draft_swa_window_size
+        draft_free_end = floor_align(max(0, prelen - draft_window), self.page_size)
+        effective_start = ceil_align(
+            max(req.draft_swa_evicted_seqlen, tree_prefix_len), self.page_size
+        )
+        freed = 0
+        if draft_free_end > effective_start:
+            free_slots = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx,
+                effective_start:draft_free_end,
+            ]
+            filtered_free_slots = self._filter_draft_swa_free_slots_before_free(
+                free_slots, effective_start, draft_free_end, tree_prefix_len
+            )
+            for one_free_slots in filtered_free_slots:
+                freed += allocator.free_draft_swa(one_free_slots)
+            self.draft_swa_active_freed_tokens += freed
+        if draft_free_end > req.draft_swa_evicted_seqlen:
+            req.draft_swa_evicted_seqlen = draft_free_end
+        return freed
+
+    def _filter_draft_swa_free_slots_before_free(
+        self,
+        free_slots: torch.Tensor,  # read-only here
+        effective_start: int,
+        draft_free_end: int,
+        tree_prefix_len: int,
+    ) -> List[torch.Tensor]:
+        window = self.draft_swa_window
+        if (
+            self.draft_swa_reserved_chunk > 0
+            and draft_free_end - effective_start >= self.draft_swa_reserved_chunk
+            and effective_start - tree_prefix_len >= self.draft_swa_reserved_chunk
+            and effective_start + window < self.draft_swa_reserved_max_point
+        ):
+            effective_start += window
+            free_slots = free_slots[window:]
+
+        if not self.draft_swa_reserved_points:
+            return [free_slots]
+
+        # No overlap with any reserved point window.
+        if (
+            effective_start >= self.draft_swa_reserved_points[-1]
+            or draft_free_end <= self.draft_swa_reserved_points[0] - window
+        ):
+            return [free_slots]
+
+        result = []
+        last_wend = effective_start
+        for wend in self.draft_swa_reserved_points:
+            wbegin = wend - window
+            if wbegin <= draft_free_end and last_wend < wbegin:
+                result.append(
+                    free_slots[last_wend - effective_start : wbegin - effective_start]
+                )
+                last_wend = wend
+        if last_wend < draft_free_end:
+            result.append(free_slots[last_wend - effective_start :])
+
+        return result
+
     # TODO(yingchun): 在节点上缓存 SWA 数量（注意在 splice/free 时更新），避免频繁的 GPU sync
-    def _count_live_swa_tokens(self, value: torch.Tensor) -> int:
+    def _count_live_swa_tokens(self, value: torch.Tensor, draft: bool = False) -> int:
         assert (
             value is not None and value.numel() > 0
         ), "value must be a non-empty tensor"
-        mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+        allocator = self.token_to_kv_pool_allocator
+        mapping = (
+            allocator.full_to_draft_swa_index_mapping
+            if draft
+            else allocator.full_to_swa_index_mapping
+        )
         return int(torch.count_nonzero(mapping[value]).item())
 
-    def _batch_count_live_swa(self, values: list[torch.Tensor]) -> int:
+    def _count_live_draft_swa_tokens(self, value: torch.Tensor) -> int:
+        if not self._draft_independent_swa:
+            return 0
+        return self._count_live_swa_tokens(value, draft=True)
+
+    def _count_live_swa_and_draft(self, value: torch.Tensor) -> tuple[int, int]:
+        """(target_swa_live, draft_swa_live) for one node value in a single D2H
+        sync. draft is 0 when draft-swa is off. Merges the two count_nonzero
+        results into one .tolist() so the protected/evictable transition paths
+        pay one GPU->CPU sync instead of two.
+        """
+        assert (
+            value is not None and value.numel() > 0
+        ), "value must be a non-empty tensor"
+        allocator = self.token_to_kv_pool_allocator
+        swa_cnt = torch.count_nonzero(allocator.full_to_swa_index_mapping[value])
+        if not self._draft_independent_swa:
+            return int(swa_cnt.item()), 0
+        draft_cnt = torch.count_nonzero(
+            allocator.full_to_draft_swa_index_mapping[value]
+        )
+        swa_live, draft_live = torch.stack((swa_cnt, draft_cnt)).tolist()
+        return swa_live, draft_live
+
+    def _batch_count_live_swa(
+        self, values: list[torch.Tensor], draft: bool = False
+    ) -> int:
         """Count live SWA tokens across multiple value tensors in one GPU op."""
         if not values:
             return 0
         all_indices = torch.cat(values)
         if all_indices.numel() == 0:
             return 0
-        mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+        allocator = self.token_to_kv_pool_allocator
+        mapping = (
+            allocator.full_to_draft_swa_index_mapping
+            if draft
+            else allocator.full_to_swa_index_mapping
+        )
         return int(torch.count_nonzero(mapping[all_indices]).item())
 
-    def _collect_swa_sizes_recomputed(self) -> tuple[int, int]:
+    def _collect_swa_sizes_recomputed(self, draft: bool = False) -> tuple[int, int]:
         """Full tree traversal to recompute live SWA sizes. Used as a
         reference by tests / debug invariant checks; production queries use
         the incrementally-maintained counters."""
@@ -582,8 +895,8 @@ class SimpleSWARadixCache(RadixCache):
                 stack.append(child)
 
         return (
-            self._batch_count_live_swa(evictable_values),
-            self._batch_count_live_swa(protected_values),
+            self._batch_count_live_swa(evictable_values, draft=draft),
+            self._batch_count_live_swa(protected_values, draft=draft),
         )
 
     def _check_swa_invariant_if_due(self) -> None:
@@ -608,6 +921,25 @@ class SimpleSWARadixCache(RadixCache):
                 f"sampled_at_query={self._swa_invariant_query_counter}"
             )
 
+        if not self._draft_independent_swa:
+            return
+        try:
+            real_draft_evictable, real_draft_protected = (
+                self._collect_swa_sizes_recomputed(draft=True)
+            )
+        except Exception as e:
+            logger.warning(f"draft SWA invariant: tree traversal failed: {e}")
+            return
+        draft_evictable_drift = self._draft_swa_evictable_size - real_draft_evictable
+        draft_protected_drift = self._draft_swa_protected_size - real_draft_protected
+        if draft_evictable_drift != 0 or draft_protected_drift != 0:
+            logger.warning(
+                "draft SWA counter drift detected: "
+                f"_draft_swa_evictable_size={self._draft_swa_evictable_size} (real={real_draft_evictable}, drift={draft_evictable_drift}); "
+                f"_draft_swa_protected_size={self._draft_swa_protected_size} (real={real_draft_protected}, drift={draft_protected_drift}); "
+                f"sampled_at_query={self._swa_invariant_query_counter}"
+            )
+
     def full_evictable_size(self) -> int:
         return self.evictable_size()
 
@@ -621,45 +953,99 @@ class SimpleSWARadixCache(RadixCache):
     def swa_protected_size(self) -> int:
         return self._swa_protected_size
 
+    def draft_swa_evictable_size(self) -> int:
+        self._check_swa_invariant_if_due()
+        return self._draft_swa_evictable_size
+
+    def draft_swa_protected_size(self) -> int:
+        return self._draft_swa_protected_size
+
     def _on_node_becomes_protected(self, node: TreeNode) -> None:
-        swa_live = self._count_live_swa_tokens(node.value)
+        swa_live, draft_live = self._count_live_swa_and_draft(node.value)
         self._swa_evictable_size -= swa_live
         self._swa_protected_size += swa_live
+        if self._draft_independent_swa:
+            self._draft_swa_evictable_size -= draft_live
+            self._draft_swa_protected_size += draft_live
+
+        node._swa_prot_booked = swa_live
+        node._draft_swa_prot_booked = draft_live
 
     def _on_node_becomes_evictable(self, node: TreeNode) -> None:
-        swa_live = self._count_live_swa_tokens(node.value)
+        swa_live, draft_live = self._count_live_swa_and_draft(node.value)
+
+        booked = getattr(node, "_swa_prot_booked", 0)
         self._swa_evictable_size += swa_live
-        self._swa_protected_size -= swa_live
+        self._swa_protected_size -= booked
+        node._swa_prot_booked = 0
+        if self._draft_independent_swa:
+            draft_booked = getattr(node, "_draft_swa_prot_booked", 0)
+            self._draft_swa_evictable_size += draft_live
+            self._draft_swa_protected_size -= draft_booked
+            node._draft_swa_prot_booked = 0
 
     def _on_tree_value_added(self, node: TreeNode) -> None:
-        self._swa_evictable_size += self._count_live_swa_tokens(node.value)
+        swa_live, draft_live = self._count_live_swa_and_draft(node.value)
+        self._swa_evictable_size += swa_live
+        if self._draft_independent_swa:
+            self._draft_swa_evictable_size += draft_live
 
-    def _on_tree_value_removed(self, node: TreeNode) -> None:
+    def _on_tree_value_removed(
+        self,
+        node: TreeNode,
+        swa_live: Optional[int] = None,
+        draft_live: Optional[int] = None,
+    ) -> None:
         # Called before node.value is released; if the node is protected
         # (lock_ref > 0) the SWA tokens were in _swa_protected_size, otherwise
         # in _swa_evictable_size. Deduct from the right bucket.
-        swa_live = self._count_live_swa_tokens(node.value)
-        if swa_live == 0:
-            return
-        if node.lock_ref > 0:
-            self._swa_protected_size -= swa_live
-        else:
-            self._swa_evictable_size -= swa_live
+        # swa_live/draft_live let callers that already counted (e.g. evict)
+        # pass the values in and skip the extra count_nonzero().item() D2H syncs.
+        # When neither is provided, count both in a single combined sync.
+        if swa_live is None and draft_live is None:
+            swa_live, draft_live = self._count_live_swa_and_draft(node.value)
+        elif swa_live is None:
+            swa_live = self._count_live_swa_tokens(node.value)
+        if swa_live > 0:
+            if node.lock_ref > 0:
+                self._swa_protected_size -= swa_live
+            else:
+                self._swa_evictable_size -= swa_live
+        if self._draft_independent_swa:
+            if draft_live is None:
+                draft_live = self._count_live_draft_swa_tokens(node.value)
+            if draft_live > 0:
+                if node.lock_ref > 0:
+                    self._draft_swa_protected_size -= draft_live
+                else:
+                    self._draft_swa_evictable_size -= draft_live
 
     def _on_node_swa_mapping_increased(
-        self, node: TreeNode, num_transferred: int
+        self, node: TreeNode, num_transferred: int, draft_num_transferred: int = 0
     ) -> None:
-        if num_transferred <= 0:
-            return
-        if node.lock_ref > 0:
-            self._swa_protected_size += num_transferred
-        else:
-            self._swa_evictable_size += num_transferred
+        if num_transferred > 0:
+            if node.lock_ref > 0:
+                self._swa_protected_size += num_transferred
+                node._swa_prot_booked = (
+                    getattr(node, "_swa_prot_booked", 0) + num_transferred
+                )
+            else:
+                self._swa_evictable_size += num_transferred
+        if draft_num_transferred > 0:
+            if node.lock_ref > 0:
+                self._draft_swa_protected_size += draft_num_transferred
+                node._draft_swa_prot_booked = (
+                    getattr(node, "_draft_swa_prot_booked", 0) + draft_num_transferred
+                )
+            else:
+                self._draft_swa_evictable_size += draft_num_transferred
 
     def reset(self):
         super().reset()
         self._swa_evictable_size = 0
         self._swa_protected_size = 0
+        self._draft_swa_evictable_size = 0
+        self._draft_swa_protected_size = 0
 
     def evict(self, params: EvictParams) -> EvictResult:
         """Evict cache entries to satisfy both full and SWA shortages.
@@ -672,7 +1058,8 @@ class SimpleSWARadixCache(RadixCache):
             return EvictResult()
         full_num_tokens = params.num_tokens
         swa_num_tokens = params.swa_num_tokens
-        if full_num_tokens <= 0 and swa_num_tokens <= 0:
+        draft_swa_num_tokens = params.draft_swa_num_tokens
+        if full_num_tokens <= 0 and swa_num_tokens <= 0 and draft_swa_num_tokens <= 0:
             return EvictResult()
 
         start_time = time.perf_counter()
@@ -684,9 +1071,9 @@ class SimpleSWARadixCache(RadixCache):
 
         full_num_evicted = 0
         swa_num_evicted = 0
-
+        draft_swa_num_evicted = 0
         while (
-            full_num_evicted < full_num_tokens or swa_num_evicted < swa_num_tokens
+            full_num_evicted < full_num_tokens or swa_num_evicted < swa_num_tokens or draft_swa_num_evicted < draft_swa_num_tokens
         ) and len(eviction_heap) > 0:
             priority, x = heapq.heappop(eviction_heap)
 
@@ -696,12 +1083,15 @@ class SimpleSWARadixCache(RadixCache):
                 continue
 
             value = x.value
-            reclaimed_swa = self._count_live_swa_tokens(value)
+            reclaimed_swa, reclaimed_draft = self._count_live_swa_and_draft(value)
 
-            self._on_tree_value_removed(x)
+            self._on_tree_value_removed(
+                x, swa_live=reclaimed_swa, draft_live=reclaimed_draft
+            )
             self.token_to_kv_pool_allocator.free(value)
             full_num_evicted += len(value)
             swa_num_evicted += reclaimed_swa
+            draft_swa_num_evicted += reclaimed_draft
             self._delete_leaf(x)
 
             # TODO(yingchun): 需要像 RadixCache 一样增加 x.parent.lock_ref == 0 条件吗？
@@ -712,30 +1102,77 @@ class SimpleSWARadixCache(RadixCache):
             self._record_remove_event(x)
         self.swa_evicted_from_tree += swa_num_evicted
         self.full_evicted_from_tree += full_num_evicted
+        self.draft_swa_evicted_from_tree += draft_swa_num_evicted
 
-        self.update_eviction_metrics(full_num_evicted + swa_num_evicted, start_time)
+        if (
+                full_num_evicted < full_num_tokens
+                or swa_num_evicted < swa_num_tokens
+                or draft_swa_num_evicted < draft_swa_num_tokens
+        ):
+            logger.warning(
+                f"Evicted {full_num_evicted}/{full_num_tokens} full tokens, "
+                f"{swa_num_evicted}/{swa_num_tokens} swa tokens, "
+                f"{draft_swa_num_evicted}/{draft_swa_num_tokens} draft swa tokens "
+                "from device cache",
+            )
+
+        # TODO(yingchun): 区分几个不同 pool 的指标
+        self.update_eviction_metrics(full_num_evicted + swa_num_evicted + draft_swa_num_evicted, start_time)
         return EvictResult(
             num_tokens_evicted=full_num_evicted,
             swa_num_tokens_evicted=swa_num_evicted,
+            draft_swa_num_tokens_evicted=draft_swa_num_evicted,
         )
 
     def _compute_safe_prefix_len(
-        self, full_matched_result: MatchResult
+        self, full_matched_result: MatchResult, total_len: int
     ) -> tuple[int, Optional[int]]:
         """Compute the maximum device prefix length that is SWA-safe.
 
-        Looks up SWA indices from the device allocator's mapping and delegates
-        to the shared ``compute_swa_safe_len()`` for the actual check.
+        Target-only mode delegates to ``compute_swa_safe_len()``. DFLASH
+        two-window mode bounds the prefix by the draft fixed-edge frame first
+        (``_draft_safe_fixed_edge`` over [s, n)), then checks target SWA only
+        within that frame, so both mapping lookups are restricted to the
+        needed sub-range instead of the full matched prefix.
 
         Returns:
             (safe_len, None): safe_len is the longest SWA-safe device prefix
             length. The second element is always None (no host portion).
         """
+        device_indices = full_matched_result.device_indices
+        if not self._draft_independent_swa:
+            swa_indices = self.token_to_kv_pool_allocator.full_to_swa_index_mapping[
+                device_indices
+            ]
+            assert len(swa_indices) == len(device_indices)
+            return compute_swa_safe_len(swa_indices, self.sliding_window_size), None
+
+        # Two-window DFLASH: bound the reused prefix by the draft frame FIRST,
+        # then check target SWA only inside it -- this also shrinks both mapping
+        # lookups. The draft frame is the fixed left edge s = max(0, total_len -
+        # draft_swa_window); draft KV only exists in [s, total_len), and the
+        # joint-safe prefix never exceeds draft_safe, so target SWA never needs
+        # indices past draft_safe.
+        n = len(device_indices)
+        s = max(0, total_len - self.draft_swa_window)
+        full_to_draft = self.token_to_kv_pool_allocator.full_to_draft_swa_index_mapping
+        # Stage 1: probe draft mapping only for the frame [s, n) and take the
+        # first hole (fixed-edge: holes before s are exempt).
+        if s >= n:
+            draft_safe = n
+        else:
+            draft_frame = full_to_draft[device_indices[s:n]]
+            dead = torch.nonzero(draft_frame == 0, as_tuple=False)
+            draft_safe = n if dead.numel() == 0 else s + int(dead[0].item())
+
+        # Stage 2: target SWA only over [0, draft_safe); the result is already
+        # the joint-safe length since the range is capped by draft presence.
         swa_indices = self.token_to_kv_pool_allocator.full_to_swa_index_mapping[
-            full_matched_result.device_indices
+            device_indices[:draft_safe]
         ]
-        assert len(swa_indices) == len(full_matched_result.device_indices)
         safe_len = compute_swa_safe_len(swa_indices, self.sliding_window_size)
+        if draft_safe > safe_len:
+            self.draft_swa_prefix_shrink_tokens += draft_safe - safe_len
         return safe_len, None
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
@@ -746,8 +1183,8 @@ class SimpleSWARadixCache(RadixCache):
         unaware of SWA indices already freed to 0. For hybrid SWA, we must make
         sure the matched tail window still maps to live SWA slots.
         """
-        # TODO(yingchun): 需要保证/能保证 page size > 1 的情况吗？
         key = params.key
+        total_len = len(key.token_ids)
         # Use a copy to avoid mutating caller-provided key object.
         raw_params = MatchPrefixParams(
             key=RadixKey(list(key.token_ids), key.extra_key),
@@ -765,7 +1202,9 @@ class SimpleSWARadixCache(RadixCache):
         # 满足"这个前缀尾部窗口里的 SWA mapping 仍然活着"。
         # 否则 prefill 虽然能在树上找到 full index，但一旦要访问 SWA state
         # 就会发现对应 mapping 已经被置 0。
-        swa_matched_len, _ = self._compute_safe_prefix_len(full_matched_result)
+        swa_matched_len, _ = self._compute_safe_prefix_len(
+            full_matched_result, total_len
+        )
         if swa_matched_len >= full_matched_len:
             return full_matched_result
 
@@ -815,10 +1254,6 @@ class SimpleSWARadixCache(RadixCache):
                 self.sliding_window_size,
                 tree_prefix_len=req.cache_protected_len,
             )
-            if self.debug_mode and freed_swa_size > 0:
-                log_info_on_rank0(
-                    logger, f"cache_unfinished_req chunked: free SWA: {freed_swa_size}"
-                )
 
             # Save kv_indices as prefix_indices for the next chunk / scheduling
             # round.  No tree insertion, lock-ref update, or req_to_token rewrite
@@ -845,10 +1280,6 @@ class SimpleSWARadixCache(RadixCache):
             self.sliding_window_size,
             tree_prefix_len=req.cache_protected_len,
         )
-        if self.debug_mode and freed_swa_size > 0:
-            log_info_on_rank0(
-                logger, f"cache_unfinished_req unchunked: free SWA: {freed_swa_size}"
-            )
 
         # Save kv_indices as prefix_indices for the next chunk / scheduling
         # round.  No tree insertion, lock-ref update, or req_to_token rewrite
@@ -886,7 +1317,5 @@ class SimpleSWARadixCache(RadixCache):
             self.sliding_window_size,
             tree_prefix_len=tree_prefix_len,
         )
-        if self.debug_mode and freed_swa_size > 0:
-            log_info_on_rank0(logger, f"cache_finished_req: free SWA: {freed_swa_size}")
 
         super().cache_finished_req(req, is_insert)

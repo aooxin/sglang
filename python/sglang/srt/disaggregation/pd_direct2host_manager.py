@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
 from sglang.srt.mem_cache.mimo_memory_pool import MiMoTokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.nvtx_utils import nvtx_annotated_method
+from sglang.srt.utils.common import floor_align
 
 try:
     from transfer_kernel.kvcacheio import transfer_kv_multi_pool_fuse
@@ -61,6 +62,7 @@ class PDDirect2HostManager:
         token_to_kv_pool_allocator: "BaseTokenToKVPoolAllocator",
         server_args: "ServerArgs",
         sliding_window_size: Optional[int] = None,
+        draft_swa_window_size: Optional[int] = None,
         draft_token_to_kv_pool: Optional[KVCache] = None,
         draft_token_to_kv_pool_list: Optional[List[KVCache]] = None,
     ) -> None:
@@ -76,14 +78,38 @@ class PDDirect2HostManager:
         if not draft_pools and draft_token_to_kv_pool is not None:
             draft_pools.append(draft_token_to_kv_pool)
 
+        # DFLASH draft-SWA has an independent window/mapping/slot-count from the
+        # target SWA, so it needs its own host pool group and its own indices;
+        # it must NOT be merged into transit_state_pools (which share target
+        # indices). Its device buffer is the draft pool's swa_kv_pool.
+        self.draft_swa_window_size = draft_swa_window_size
+        self.draft_swa_attn_allocator = getattr(
+            self.token_to_kv_pool_allocator, "draft_swa_attn_allocator", None
+        )
+        draft_swa_device_pool = (
+            self.draft_swa_attn_allocator.get_kvcache()
+            if self.draft_swa_attn_allocator is not None
+            else None
+        )
+
         self.transit_pools = [self._make_host_kv_pool(device_pool)]
         self.transit_state_pools: List[MHATokenToKVPoolHost] = []
         target_state_pool = self._make_host_state_pool(device_pool)
         if target_state_pool is not None:
             self.transit_state_pools.append(target_state_pool)
 
+        self.transit_draft_state_pools: List[MHATokenToKVPoolHost] = []
         for draft_pool in draft_pools:
             self.transit_pools.append(self._make_host_kv_pool(draft_pool))
+            draft_swa_pool = getattr(draft_pool, "swa_kv_pool", None)
+            if (
+                draft_swa_device_pool is not None
+                and draft_swa_pool is draft_swa_device_pool
+            ):
+                self.transit_draft_state_pools.append(
+                    self._make_host_pool_over(draft_swa_device_pool)
+                )
+                continue
             draft_state_pool = self._make_host_state_pool(draft_pool)
             if draft_state_pool is not None:
                 self.transit_state_pools.append(draft_state_pool)
@@ -94,9 +120,31 @@ class PDDirect2HostManager:
                 "target pool also has SWA state."
             )
 
+        if self.draft_swa_attn_allocator is not None:
+            if not self.draft_swa_window_size:
+                raise ValueError(
+                    "PD direct-to-host: allocator exposes draft_swa_attn_allocator "
+                    "but draft_swa_window_size was not provided."
+                )
+            if target_state_pool is None:
+                raise NotImplementedError(
+                    "PD direct-to-host only supports draft SWA state when the "
+                    "target pool also has SWA state."
+                )
+            if not self.transit_draft_state_pools:
+                raise RuntimeError(
+                    "PD direct-to-host: draft_swa_attn_allocator is set but its "
+                    "device pool was not found among the draft KV pools."
+                )
+
         self.transit_pool = self.transit_pools[0]
         self.transit_state_pool = (
             self.transit_state_pools[0] if self.transit_state_pools else None
+        )
+        self.transit_draft_state_pool = (
+            self.transit_draft_state_pools[0]
+            if self.transit_draft_state_pools
+            else None
         )
 
         for pool in self.transit_pools[1:]:
@@ -117,7 +165,6 @@ class PDDirect2HostManager:
         h2d_stream_priority, _ = torch.cuda.Stream.priority_range()
         self.h2d_stream = torch.cuda.Stream(priority=h2d_stream_priority)
         self.h2d_gate_event: Optional[torch.cuda.Event] = None
-        # ack_id -> (req, host_indices, device_indices, event, state_indices, keepalive)
         self.ongoing_h2d: Dict[
             int,
             Tuple[
@@ -125,6 +172,7 @@ class PDDirect2HostManager:
                 torch.Tensor,
                 torch.Tensor,
                 torch.cuda.Event,
+                Optional[torch.Tensor],
                 Optional[torch.Tensor],
                 List[Any],
             ],
@@ -161,32 +209,61 @@ class PDDirect2HostManager:
         used = total - self.transit_pool.available_size()
         return used / total
 
-    def h2d_required_tokens(self, req: "Req") -> Tuple[int, int]:
+    def h2d_required_tokens(self, req: "Req") -> Tuple[int, int, int]:
+        """Device slots this req will consume on H2D, per pool.
+
+        Returns (need_full, need_swa, need_draft_swa) derived from the host
+        transit indices allocated in pre_alloc(). Used by admission control to
+        check the req fits before start_h2d(). Returns zeros when the req has no
+        host buffers yet (pre_alloc not run).
+        """
         host_indices = getattr(req, "host_kv_indices", None)
         if host_indices is None:
-            return 0, 0
+            return 0, 0, 0
 
         need_full = len(host_indices)
         host_state_indices = getattr(req, "host_state_indices", None)
         need_swa = len(host_state_indices) if host_state_indices is not None else 0
-        return need_full, need_swa
+        host_draft_state_indices = getattr(req, "host_draft_state_indices", None)
+        need_draft_swa = (
+            len(host_draft_state_indices)
+            if host_draft_state_indices is not None
+            else 0
+        )
+        return need_full, need_swa, need_draft_swa
 
-    def _available_tokens(self) -> Tuple[int, int]:
+    def _available_tokens(self) -> Tuple[int, int, int]:
+        """Free device slots per pool: (full, swa, draft_swa).
+
+        For hybrid-SWA allocators reads the full/swa pools separately; for
+        non-SWA allocators swa is 0 and the single pool counts as full.
+        draft_swa is 0 unless DFLASH draft-SWA is active. Counterpart to
+        h2d_required_tokens() for admission control.
+        """
         if hasattr(self.token_to_kv_pool_allocator, "full_available_size"):
             full_available = self.token_to_kv_pool_allocator.full_available_size()
             swa_available = self.token_to_kv_pool_allocator.swa_available_size()
         else:
             full_available = self.token_to_kv_pool_allocator.available_size()
             swa_available = 0
-        return full_available, swa_available
+        if self.transit_draft_state_pool is not None and hasattr(
+            self.token_to_kv_pool_allocator, "draft_swa_available_size"
+        ):
+            draft_swa_available = (
+                self.token_to_kv_pool_allocator.draft_swa_available_size()
+            )
+        else:
+            draft_swa_available = 0
+        return full_available, swa_available, draft_swa_available
 
     def h2d_admission_snapshot(
         self, reserved_decode_tokens: int
-    ) -> Tuple[int, int, int, int, int]:
-        full_available, swa_available = self._available_tokens()
+    ) -> Tuple[int, int, int, int, int, int]:
+        full_available, swa_available, draft_swa_available = self._available_tokens()
         return (
             full_available,
             swa_available,
+            draft_swa_available,
             reserved_decode_tokens,
             int(self.retract_in_progress),
             int(self._h2d_gate_busy()),
@@ -196,11 +273,13 @@ class PDDirect2HostManager:
     def can_admit_h2d_from_snapshot(
         need_full: int,
         need_swa: int,
-        snapshot: Tuple[int, int, int, int, int],
+        need_draft_swa: int,
+        snapshot: Tuple[int, int, int, int, int, int],
     ) -> bool:
         (
             full_available,
             swa_available,
+            draft_swa_available,
             reserved_decode_tokens,
             retract_in_progress,
             h2d_gate_busy,
@@ -210,6 +289,8 @@ class PDDirect2HostManager:
         if need_full + reserved_decode_tokens > full_available:
             return False
         if need_swa > swa_available:
+            return False
+        if need_draft_swa > draft_swa_available:
             return False
         return True
 
@@ -231,11 +312,14 @@ class PDDirect2HostManager:
     # Pool-level handshake info
 
     def _make_host_kv_pool(self, device_pool: KVCache):
+        if isinstance(device_pool, SWAKVPool):
+            device_pool = device_pool.full_kv_pool
+        return self._make_host_pool_over(device_pool)
+
+    def _make_host_pool_over(self, device_pool: KVCache):
         host_size = self.server_args.pd_direct2host_host_size
         host_ratio = self.server_args.pd_direct2host_host_ratio
 
-        if isinstance(device_pool, SWAKVPool):
-            device_pool = device_pool.full_kv_pool
         if isinstance(device_pool, MLATokenToKVPool):
             return MLATokenToKVPoolHost(
                 device_pool=device_pool,
@@ -272,15 +356,7 @@ class PDDirect2HostManager:
     def _make_host_state_pool(self, device_pool: KVCache):
         if not isinstance(device_pool, SWAKVPool):
             return None
-        host_size = self.server_args.pd_direct2host_host_size
-        host_ratio = self.server_args.pd_direct2host_host_ratio
-        return MHATokenToKVPoolHost(
-            device_pool=device_pool.swa_kv_pool,
-            host_to_device_ratio=host_ratio,
-            host_size=host_size if host_size is not None else 0,
-            page_size=self.page_size,
-            layout=_TRANSIT_LAYOUT,
-        )
+        return self._make_host_pool_over(device_pool.swa_kv_pool)
 
     def get_host_kv_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs, data_lens, item_lens = [], [], []
@@ -294,6 +370,15 @@ class PDDirect2HostManager:
     def get_host_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs, data_lens, item_lens = [], [], []
         for pool in self.transit_state_pools:
+            ptrs, lens, items = self._buf_infos_for(pool)
+            data_ptrs += ptrs
+            data_lens += lens
+            item_lens += items
+        return data_ptrs, data_lens, item_lens
+
+    def get_host_draft_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        data_ptrs, data_lens, item_lens = [], [], []
+        for pool in self.transit_draft_state_pools:
             ptrs, lens, items = self._buf_infos_for(pool)
             data_ptrs += ptrs
             data_lens += lens
@@ -379,15 +464,47 @@ class PDDirect2HostManager:
                 swa_buffer_len,
             )
 
+        host_draft_state_indices: Optional[torch.Tensor] = None
+        if self.transit_draft_state_pool is not None:
+            draft_window = self.draft_swa_window_size or seq_len
+            draft_window_start = max(0, seq_len - draft_window)
+            draft_window_start = floor_align(draft_window_start, self.page_size)
+            draft_swa_buffer_len = need_size - draft_window_start
+            host_draft_state_indices = self.transit_draft_state_pool.alloc(
+                draft_swa_buffer_len
+            )
+            if host_draft_state_indices is None:
+                self.transit_pool.free(host_indices)
+                if (
+                    host_state_indices is not None
+                    and self.transit_state_pool is not None
+                ):
+                    self.transit_state_pool.free(host_state_indices)
+                return False
+            logger.debug(
+                "[pd_d2h pre_alloc] rid=%s draft_window_start=%d "
+                "draft_swa_buffer_len=%d",
+                getattr(req, "rid", "?"),
+                draft_window_start,
+                draft_swa_buffer_len,
+            )
+
         req_pool_indices = self.req_to_token_pool.alloc([req])
         if req_pool_indices is None:
             self.transit_pool.free(host_indices)
             if host_state_indices is not None and self.transit_state_pool is not None:
                 self.transit_state_pool.free(host_state_indices)
+            if (
+                host_draft_state_indices is not None
+                and self.transit_draft_state_pool is not None
+            ):
+                self.transit_draft_state_pool.free(host_draft_state_indices)
             return False
         req.req_pool_idx = req_pool_indices[0]
+
         req.host_kv_indices = host_indices
         req.host_state_indices = host_state_indices
+        req.host_draft_state_indices = host_draft_state_indices
         req.host_state_seq_len = seq_len
 
         req.kv_allocated_len = seq_len
@@ -460,10 +577,33 @@ class PDDirect2HostManager:
                 device_state_indices.shape[0],
             )
 
+        device_draft_state_indices: Optional[torch.Tensor] = None
+        host_draft_state_indices = getattr(req, "host_draft_state_indices", None)
+        if self.transit_draft_state_pool is not None and (
+            host_draft_state_indices is not None
+        ):
+            draft_translator = getattr(
+                self.token_to_kv_pool_allocator,
+                "translate_loc_from_full_to_draft_swa",
+                None,
+            )
+            if draft_translator is None:
+                self.token_to_kv_pool_allocator.free(device_indices)
+                raise RuntimeError(
+                    "Draft-SWA transit pool present but allocator has no "
+                    "translate_loc_from_full_to_draft_swa()."
+                )
+            draft_swa_buffer_len = host_draft_state_indices.shape[0]
+            device_draft_state_indices = draft_translator(
+                device_indices[-draft_swa_buffer_len:]
+            ).to(torch.int64)
+
         kv_host_indices_for_io = host_indices
         kv_device_indices_for_io = device_indices
         state_host_indices_for_io = getattr(req, "host_state_indices", None)
         state_device_indices_for_io = device_state_indices
+        draft_state_host_indices_for_io = host_draft_state_indices
+        draft_state_device_indices_for_io = device_draft_state_indices
 
         if io_backend == "kernel":
             kv_host_indices_for_io = host_indices.to(
@@ -475,6 +615,11 @@ class PDDirect2HostManager:
                     device_indices.device, non_blocking=True
                 )
                 keepalive.append(state_host_indices_for_io)
+            if draft_state_host_indices_for_io is not None:
+                draft_state_host_indices_for_io = draft_state_host_indices_for_io.to(
+                    device_indices.device, non_blocking=True
+                )
+                keepalive.append(draft_state_host_indices_for_io)
 
         direct_kv_indices = None
         direct_state_indices = None
@@ -521,6 +666,11 @@ class PDDirect2HostManager:
                         state_host_indices_for_io,
                         state_device_indices_for_io,
                     ),
+                    (
+                        self.transit_draft_state_pools,
+                        draft_state_host_indices_for_io,
+                        draft_state_device_indices_for_io,
+                    ),
                 ],
                 io_backend=io_backend,
                 keepalive=keepalive,
@@ -542,6 +692,16 @@ class PDDirect2HostManager:
                             io_backend=io_backend,
                             direct_device_indices=direct_state_indices,
                         )
+                if self.transit_draft_state_pools and (
+                    draft_state_host_indices_for_io is not None
+                ):
+                    for transit_draft_state_pool in self.transit_draft_state_pools:
+                        self._load_to_device_pool(
+                            transit_pool=transit_draft_state_pool,
+                            host_indices=draft_state_host_indices_for_io,
+                            device_indices=draft_state_device_indices_for_io,
+                            io_backend=io_backend,
+                        )
             event = torch.cuda.Event()
             event.record(self.h2d_stream)
             self.h2d_gate_event = event
@@ -555,6 +715,7 @@ class PDDirect2HostManager:
             device_indices,
             event,
             device_state_indices,
+            device_draft_state_indices,
             keepalive,
         )
         return True
@@ -592,6 +753,7 @@ class PDDirect2HostManager:
             device_indices,
             event,
             _device_state_indices,
+            _device_draft_state_indices,
             _io_keepalive,
         ) = entry
         if not event.query():
@@ -637,20 +799,32 @@ class PDDirect2HostManager:
         seq_len: Optional[int] = None,
     ) -> Optional[torch.Tensor]:
         if hasattr(self.token_to_kv_pool_allocator, "pre_alloc"):
+            effective_seq_len = seq_len if seq_len is not None else num_tokens
             chunked_size = num_tokens
             if self.sliding_window_size is not None:
-                # Keep this formula aligned with the host-state swa_buffer_len
-                # in pre_alloc(); otherwise full->SWA translation can hit slot 0.
-                effective_seq_len = seq_len if seq_len is not None else num_tokens
+                # Pass the swa BUFFER length (not the window) so the device
+                # reserves exactly the host swa slot count; otherwise full->SWA
+                # translation can hit slot 0. Keep aligned with pre_alloc().
                 align_start = (
                     max(effective_seq_len - self.sliding_window_size, 0)
                     // self.page_size
                     * self.page_size
                 )
                 chunked_size = num_tokens - align_start
+            draft_chunked_size = None
+            if (
+                self.transit_draft_state_pool is not None
+                and self.draft_swa_window_size is not None
+            ):
+                draft_align_start = floor_align(
+                    max(effective_seq_len - self.draft_swa_window_size, 0),
+                    self.page_size
+                )
+                draft_chunked_size = num_tokens - draft_align_start
             result = self.token_to_kv_pool_allocator.pre_alloc(
                 num_tokens,
                 chunked_size,
+                draft_chunked_size,
             )
             if result is not None and self.sliding_window_size is not None:
                 W = self.sliding_window_size
@@ -851,8 +1025,15 @@ class PDDirect2HostManager:
         host_state_indices = getattr(req, "host_state_indices", None)
         if host_state_indices is not None and self.transit_state_pool is not None:
             self.transit_state_pool.free(host_state_indices)
+        host_draft_state_indices = getattr(req, "host_draft_state_indices", None)
+        if (
+            host_draft_state_indices is not None
+            and self.transit_draft_state_pool is not None
+        ):
+            self.transit_draft_state_pool.free(host_draft_state_indices)
         req.host_kv_indices = None
         req.host_state_indices = None
+        req.host_draft_state_indices = None
 
     def _free_req_slot_if_allocated(self, req: "Req") -> None:
         req_pool_idx = getattr(req, "req_pool_idx", None)

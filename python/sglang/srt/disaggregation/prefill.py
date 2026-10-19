@@ -59,6 +59,7 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
 )
 from sglang.srt.speculative.dflash_info import DFlashDraftInput
+from sglang.srt.utils.common import floor_align
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -204,22 +205,34 @@ class PrefillBootstrapQueue:
             kv_args.state_item_lens = []
             kv_args.state_type = "none"
 
+        # DFLASH two-window: route the draft swa state into its own group when
+        # the draft has an independent swa free-list/mapping.
+        kv_args.draft_state_data_ptrs = []
+        kv_args.draft_state_data_lens = []
+        kv_args.draft_state_item_lens = []
+        draft_independent_swa = (
+            self.scheduler.token_to_kv_pool_allocator.has_draft_swa
+        )
+
+        def _append_draft_state(pool):
+            state_data_ptrs, state_data_lens, state_item_lens = (
+                pool.get_state_buf_infos()
+            )
+            if draft_independent_swa:
+                kv_args.draft_state_data_ptrs += state_data_ptrs
+                kv_args.draft_state_data_lens += state_data_lens
+                kv_args.draft_state_item_lens += state_item_lens
+            else:
+                kv_args.state_data_ptrs += state_data_ptrs
+                kv_args.state_data_lens += state_data_lens
+                kv_args.state_item_lens += state_item_lens
+
         if len(self.draft_token_to_kv_pool_list):
             for draft_kv_pool in self.draft_token_to_kv_pool_list:
                 if hasattr(draft_kv_pool, "get_state_buf_infos"):
-                    state_data_ptrs, state_data_lens, state_item_lens = (
-                        draft_kv_pool.get_state_buf_infos()
-                    )
-                    kv_args.state_data_ptrs += state_data_ptrs
-                    kv_args.state_data_lens += state_data_lens
-                    kv_args.state_item_lens += state_item_lens
+                    _append_draft_state(draft_kv_pool)
         elif hasattr(self.draft_token_to_kv_pool, "get_state_buf_infos"):
-            state_data_ptrs, state_data_lens, state_item_lens = (
-                self.draft_token_to_kv_pool.get_state_buf_infos()
-            )
-            kv_args.state_data_ptrs += state_data_ptrs
-            kv_args.state_data_lens += state_data_lens
-            kv_args.state_item_lens += state_item_lens
+            _append_draft_state(self.draft_token_to_kv_pool)
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
@@ -1038,6 +1051,7 @@ class SchedulerDisaggregationPrefillMixin:
         )
         req.start_send_idx = end_idx
         state_indices = None
+        draft_state_indices = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
@@ -1062,10 +1076,9 @@ class SchedulerDisaggregationPrefillMixin:
                 # SWA hybrid model: send last window KV indices
                 # match decode & main-KV token range so the state-index count agrees on both sides
                 seq_len = min(len(req.fill_ids), len(req.origin_input_ids))
-                window_size = self.swa_retention_window
-                window_start = max(0, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
 
+                # Target model: use sliding_window_size.
+                window_start = floor_align(max(0, seq_len - self.sliding_window_size), page_size)
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, window_start:seq_len
                 ]
@@ -1078,6 +1091,22 @@ class SchedulerDisaggregationPrefillMixin:
                 )
                 state_indices = window_kv_indices_swa.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
+
+                # Draft model: use independent draft_swa_window_size.
+                if self.token_to_kv_pool_allocator.has_draft_swa:
+                    draft_window_start = floor_align(max(0, seq_len - self.draft_swa_window_size), page_size)
+                    draft_window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, draft_window_start:seq_len
+                    ]
+
+                    # Translate to draft SWA pool indices
+                    draft_window_kv_indices_swa = self.token_to_kv_pool_allocator.translate_loc_from_full_to_draft_swa(
+                        draft_window_kv_indices_full
+                    )
+                    draft_state_indices = draft_window_kv_indices_swa.cpu().numpy()
+                    draft_state_indices = kv_to_page_indices(
+                        draft_state_indices, page_size
+                    )
             elif isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(), NSATokenToKVPool
             ):
@@ -1108,7 +1137,7 @@ class SchedulerDisaggregationPrefillMixin:
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"
             )
             return
-        req.disagg_kv_sender.send(page_indices, state_indices)
+        req.disagg_kv_sender.send(page_indices, state_indices, draft_state_indices)
         if last_chunk and self._pd_trace:
             _sender = req.disagg_kv_sender
             logger.info(

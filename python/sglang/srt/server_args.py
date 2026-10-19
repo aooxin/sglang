@@ -370,6 +370,7 @@ class ServerArgs:
     cache_hit_ratio_waiting_bonus_cap: Optional[float] = None
     page_size: Optional[int] = None
     swa_full_tokens_ratio: float = 0.8
+    draft_swa_full_tokens_ratio: Optional[float] = None
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
     enable_prefill_delayer: bool = False
@@ -3840,6 +3841,13 @@ class ServerArgs:
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
+        if self.draft_swa_full_tokens_ratio is not None and not (
+            0 < self.draft_swa_full_tokens_ratio <= 1.0
+        ):
+            raise ValueError(
+                "--draft-swa-full-tokens-ratio should be in range (0, 1.0]."
+            )
+
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
             logger.warning(
@@ -4505,6 +4513,14 @@ class ServerArgs:
             default=ServerArgs.swa_full_tokens_ratio,
             help="The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. "
             "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.",
+        )
+        parser.add_argument(
+            "--draft-swa-full-tokens-ratio",
+            type=float,
+            default=ServerArgs.draft_swa_full_tokens_ratio,
+            help="DFLASH two-window only: the ratio of the draft SWA pool KV tokens / full layer KV tokens. "
+            "It should be in range (0, 1.0]. When unset, the draft SWA pool size is auto-derived from "
+            "draft_window / target_window.",
         )
         parser.add_argument(
             "--disable-hybrid-swa-memory",

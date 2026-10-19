@@ -38,6 +38,7 @@ def _prefill_stats():
         log_input_tokens=0,
         log_hit_tokens=0,
         log_host_hit_tokens=0,
+        log_storage_hit_tokens=0,
         num_running_reqs=QueueCount(total=0),
         total_flops=0,
     )

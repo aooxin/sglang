@@ -34,8 +34,6 @@ export SGLANG_TEST_GCACHE_FI_TRANSFER_PROB=0.05
 export SGLANG_TEST_GCACHE_FI_EXISTS_PROB=0.05
 export SGLANG_TEST_GCACHE_FI_TIMEOUT_PROB=0.05
 export SGLANG_TEST_GCACHE_FI_TIMEOUT_SLEEP_S=1.8
-export ORG_ID=3002791
-export CLOUDML_DEPLOY_ID=s-20260824110953-406sk-hsbd9
 
 # ========== 按实际路径修改 ==========
 TARGET_MODEL=/mnt/aie-shared-models-n-datasets-wlcb/models/mimo-v25-serve-0811-dflash/
@@ -82,6 +80,7 @@ python3 -m sglang.launch_server \
     --disable-tokenizer-batch-decode \
     --tokenizer-worker-num 8 \
     --swa-full-tokens-ratio 0.022 \
+    --draft-swa-full-tokens-ratio 0.5 \
     --enable-hierarchical-cache \
     --hicache-ratio 2.2 \
     --hicache-mem-layout page_first \
@@ -90,7 +89,4 @@ python3 -m sglang.launch_server \
     --hicache-storage-backend gcache \
     --numa-node 0 0 0 0 1 1 1 1 \
     --hicache-storage-backend-extra-config '{"hicache_storage_pass_prefix_keys": true}' \
-    --disaggregation-two-phase-prealloc \
-    --enable-trace \
-    --otlp-traces-endpoint "http://preview-micollector-llm.api.xiaomi.net:80/v1/traces" \
-    --otlp-traces-resource-attrs "{\"tracing.service.name\": \"${ORG_ID}_${CLOUDML_DEPLOY_ID}\", \"langfuse.project.name\": \"${ORG_ID}_MiMo-V2.5\"}"
+    --disaggregation-two-phase-prealloc

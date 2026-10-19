@@ -28,7 +28,6 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
-    PoolName,
 )
 
 if TYPE_CHECKING:
@@ -256,14 +255,29 @@ class PrefetchOperation(StorageOperation):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         swa_host_indices: Optional[torch.Tensor] = None,
+        draft_swa_host_indices: Optional[torch.Tensor] = None,
         host_indices_ready_event: Optional[torch.cuda.Event] = None,
         trace_enabled: bool = False,
     ):
         self.request_id = request_id
         self.key = key
         self.swa_valid_mask: Optional[torch.Tensor] = None
+        self.draft_swa_host_indices: Optional[torch.Tensor] = draft_swa_host_indices
+        self.draft_swa_valid_mask: Optional[torch.Tensor] = None
+        # DFLASH two-window L3: the mapped draft region is the CONTIGUOUS page
+        # range [draft_swa_start_page, draft_swa_start_page + draft_safe_pages)
+        # (a tail suffix of the hit prefix, not a leading prefix). draft KV must
+        # be a hole-free run per fixed-edge semantics.
+        self.draft_swa_start_page: int = 0
+        self.draft_safe_pages: int = 0
+        # Draft pages actually fetched OK in _page_transfer within the mapped
+        # suffix (contiguous; first failed page truncates it). Initialized to
+        # draft_safe_pages at resolve time and shrunk on fetch failure; then
+        # TP-aligned (MIN) in check_prefetch_progress. <= draft_safe_pages.
+        self.draft_completed_pages: int = 0
         self.full_hit_count: int = 0
         self.swa_hit_count: int = 0
+        self.draft_swa_hit_count: int = 0
         self.trace_enabled = trace_enabled
         self.trace_attrs: Dict[str, Any] = {}
         # CUDA event marking that the async index-tensor clones (host_indices /
@@ -340,7 +354,9 @@ class PrefetchOperation(StorageOperation):
                 return None
             return self.io_finish_time - self.io_start_time
 
-    def get_stage_durations(self, finish_time: Optional[float] = None) -> dict[str, float]:
+    def get_stage_durations(
+        self, finish_time: Optional[float] = None
+    ) -> dict[str, float]:
         with self._lock:
             durations = {}
             if self.queue_exit_time > 0.0:
@@ -389,10 +405,12 @@ class FaultInjector:
         Test target: all_reduce(MIN) alignment in prefetch_thread_func.
 
     - SGLANG_TEST_GCACHE_FI_TRANSFER_PROB:
-        Injection site: _page_get_zero_copy(), before operation.increment(inc).
-        Effect: current rank under-reports completed tokens by dropping some
-        pages from the reported increment.
-        Test target: all_reduce(MIN) alignment in check_prefetch_progress.
+        Injection sites (shared switch, independent RNGs):
+          * _page_get_zero_copy(): under-report completed target tokens.
+          * _draft_page_get_zero_copy(): under-report the fetched draft page
+            prefix (draft_completed_pages), leaving completed_tokens intact.
+        Test target: all_reduce(MIN) alignment in check_prefetch_progress (both
+        target completion and draft surplus-slot release).
 
     - SGLANG_TEST_GCACHE_FI_TIMEOUT_PROB:
         Injection site: _page_transfer() batch loop, before page_get_func.
@@ -437,6 +455,17 @@ class FaultInjector:
         self._transfer_trigger_rng = random.Random(_seed_base + 2)
         self._transfer_amount_rng = random.Random(_seed_base + 3)
         self._timeout_trigger_rng = random.Random(_seed_base + 4)
+        # Draft injection shares the transfer probability switch
+        # (SGLANG_TEST_GCACHE_FI_TRANSFER_PROB) but uses its own RNG pair so
+        # draft and target faults trigger independently per rank.
+        self._draft_trigger_rng = random.Random(_seed_base + 5)
+        self._draft_amount_rng = random.Random(_seed_base + 6)
+        # Draft exists/timeout injection: share the same exists/timeout
+        # probability switches as target but use dedicated RNGs so the draft
+        # existence probe and draft IO timeout trigger independently per rank.
+        self._draft_exists_trigger_rng = random.Random(_seed_base + 7)
+        self._draft_exists_amount_rng = random.Random(_seed_base + 8)
+        self._draft_timeout_trigger_rng = random.Random(_seed_base + 9)
 
         # Track operations that have already triggered timeout injection (at most once per operation)
         self._fi_timeout_triggered: set = set()
@@ -496,6 +525,116 @@ class FaultInjector:
                 drop_pages,
             )
         return inc
+
+    def maybe_inject_draft_fault(self, completed_pages: int) -> int:
+        """Fault injection for the draft (DFLASH two-window) IO-transfer stage.
+
+        Page-based sibling of ``maybe_inject_transfer_fault``, gated by the same
+        SGLANG_TEST_GCACHE_FI_TRANSFER_PROB switch but with its own RNG so draft
+        and target faults trigger independently. Each TP rank under-reports the
+        fetched contiguous draft page prefix, simulating a partial draft-KV
+        read. Only shrinks the draft prefix; it never touches
+        ``operation.completed_tokens``. Per-rank divergence is safe because
+        ``check_prefetch_progress`` reconciles draft prefixes with an
+        all_reduce(MIN) before releasing surplus draft host slots.
+
+        Prerequisites: prob > 0, TP world size > 1, at least 2 pages completed.
+
+        Returns:
+            The (possibly reduced) ``completed_pages`` value.
+        """
+        if (
+            self._fi_transfer_prob > 0.0
+            and self.tp_world_size > 1
+            and completed_pages >= 2
+            and self._draft_trigger_rng.random() < self._fi_transfer_prob
+        ):
+            orig = completed_pages
+            drop_pages = self._draft_amount_rng.randint(1, max(1, completed_pages // 2))
+            completed_pages -= drop_pages
+            logger.warning(
+                "[FaultInjection][draft] tp_rank=%d: "
+                "draft completed_pages %d -> %d (%d pages dropped)",
+                self.tp_rank,
+                orig,
+                completed_pages,
+                drop_pages,
+            )
+        return completed_pages
+
+    def maybe_inject_draft_exists_fault(self, draft_exist: list) -> list:
+        """Fault injection for the draft (DFLASH two-window) existence probe.
+
+        Sibling of maybe_inject_exists_fault on the draft existence result
+        (batch_exists_draft). Gated by the same SGLANG_TEST_GCACHE_FI_EXISTS_PROB
+        switch but with its own RNG so the draft probe degrades independently
+        per rank. When triggered, flips some present entries to absent (0),
+        simulating partial draft-KV loss in GCache on this rank while other
+        ranks still report present. The downstream all_reduce(MIN) on draft_mask
+        reconciles the per-rank divergence.
+
+        Prerequisites: prob > 0, TP world size > 1, at least 2 entries.
+
+        Returns:
+            The (possibly degraded) ``draft_exist`` list.
+        """
+        if (
+            self._fi_exists_prob > 0.0
+            and self.tp_world_size > 1
+            and len(draft_exist) >= 2
+            and self._draft_exists_trigger_rng.random() < self._fi_exists_prob
+        ):
+            present = [i for i, ok in enumerate(draft_exist) if ok]
+            if present:
+                flip_count = self._draft_exists_amount_rng.randint(
+                    1, max(1, len(present) // 2)
+                )
+                flip_indices = self._draft_exists_amount_rng.sample(
+                    present, min(flip_count, len(present))
+                )
+                for idx in flip_indices:
+                    draft_exist[idx] = 0
+                logger.warning(
+                    "[FaultInjection][draft_exists] tp_rank=%d: "
+                    "flipped %d draft-exist entries to absent",
+                    self.tp_rank,
+                    len(flip_indices),
+                )
+        return draft_exist
+
+    def maybe_inject_draft_timeout_fault(self, operation_id: int):
+        """Fault injection for the draft IO-transfer stage: simulate IO timeout.
+
+        Sibling of maybe_inject_timeout_fault but on the draft fetch path, gated
+        by the same SGLANG_TEST_GCACHE_FI_TIMEOUT_PROB switch with its own RNG so
+        the draft IO hang triggers independently per rank. Triggers at most once
+        per operation.
+
+        Prerequisites: _fi_timeout_prob > 0, TP world size > 1, not yet injected
+        for this operation on the draft path.
+        """
+        key = ("draft", operation_id)
+        if (
+            self._fi_timeout_prob > 0.0
+            and self.tp_world_size > 1
+            and key not in self._fi_timeout_triggered
+            and self._draft_timeout_trigger_rng.random() < self._fi_timeout_prob
+        ):
+            self._fi_timeout_triggered.add(key)
+            logger.warning(
+                "[FaultInjection][draft_timeout] tp_rank=%d: operation_id=%d, "
+                "sleeping %.1fs to simulate draft IO timeout",
+                self.tp_rank,
+                operation_id,
+                self._fi_timeout_sleep_s,
+            )
+            time.sleep(self._fi_timeout_sleep_s)
+            logger.warning(
+                "[FaultInjection][draft_timeout] tp_rank=%d: operation_id=%d, "
+                "sleep finished, resuming remaining draft batches",
+                self.tp_rank,
+                operation_id,
+            )
 
     def maybe_inject_timeout_fault(self, operation_id: int):
         """Fault injection for the transfer thread: simulate IO timeout.
@@ -588,11 +727,7 @@ class FaultInjector:
                 orig_count,
                 storage_query_count,
                 drop_pages,
-                (
-                    f", swa_valid_pages={swa_valid_pages}"
-                    if self.is_hybrid_swa
-                    else ""
-                ),
+                (f", swa_valid_pages={swa_valid_pages}" if self.is_hybrid_swa else ""),
             )
         return hash_values, storage_query_count, swa_valid_pages
 
@@ -638,6 +773,7 @@ class HiCacheController:
         self.has_draft_kv_pool = False
         self.has_draft_kv_pool_list = False
         self.draft_l3_enabled = False
+        self.draft_dflash_l3_enabled = False
         self.mem_pool_device_draft = None
         self.mem_pool_host_draft = None
         self.mem_pool_device_draft_list = []
@@ -657,7 +793,9 @@ class HiCacheController:
             if sliding_window_size is not None
             else None
         )
+        self.draft_sliding_window_pages: Optional[int] = None
         self.is_hybrid_swa = sliding_window_size is not None
+        self._draft_independent_swa = self._compute_draft_independent_swa()
 
         if is_dp_attention_enabled():
             self.tp_rank = get_attention_tp_rank()
@@ -814,6 +952,7 @@ class HiCacheController:
         self.host_mem_release_queue = Queue()
         # Host swa only
         self.swa_only_host_mem_release_queue = Queue()
+        self.dflash_only_host_mem_release_queue = Queue()
         self.key_refresh_queue: Queue = Queue()
         self.key_refresh_interval: float = (
             Envs.SGLANG_HICACHE_KEY_REFRESH_INTERVAL.get()
@@ -954,7 +1093,10 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic", "nixl", "gcache"]) or (
+            if (
+                self.storage_backend_type
+                in ["hf3fs", "mooncake", "eic", "nixl", "gcache"]
+            ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
             ):
@@ -1120,6 +1262,7 @@ class HiCacheController:
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
             self.swa_only_host_mem_release_queue.queue.clear()
+            self.dflash_only_host_mem_release_queue.queue.clear()
             self.key_refresh_queue.queue.clear()
             self._key_last_refresh.clear()
 
@@ -1144,24 +1287,58 @@ class HiCacheController:
             self.backup_thread.start()
             self.key_refresh_thread.start()
 
+    def _compute_draft_independent_swa(self) -> bool:
+        return self.mem_pool_device_allocator.has_draft_swa
+
+    @property
+    def draft_independent_swa(self) -> bool:
+        return self._draft_independent_swa
+
     def alloc_host(
         self,
         device_indices: torch.Tensor,
-    ) -> tuple[Optional[torch.Tensor], int, int]:
+    ) -> tuple[Optional[torch.Tensor], int, int, int]:
         if self.is_hybrid_swa:
             swa_device_indices = (
                 self.mem_pool_device_allocator.translate_loc_from_full_to_swa(
                     device_indices
                 )
             )
-            return self.mem_pool_host.alloc_host(device_indices, swa_device_indices)
+            host_indices, lack_full_size, lack_swa_size = self.mem_pool_host.alloc_host(
+                device_indices, swa_device_indices
+            )
+            if host_indices is None or not self.draft_independent_swa:
+                return host_indices, lack_full_size, lack_swa_size, 0
+
+            # DFLASH two-window: also reserve draft host swa slots for the
+            # positions whose draft device swa is live (draft window differs
+            # from the target's, hence its own mask + mapping + ring).
+            draft_swa_device_indices = (
+                self.mem_pool_device_allocator.translate_loc_from_full_to_draft_swa(
+                    device_indices
+                )
+            )
+            ok, lack_draft_swa_size = (
+                self.mem_pool_host_draft.alloc_swa_for_full_indices(
+                    host_indices,
+                    draft_swa_device_indices != 0,
+                )
+            )
+            if not ok:
+                # Roll back the target host allocation (also clears any SWA
+                # mapping via the registered cascade) so the caller can evict
+                # and retry atomically.
+                full_freed, swa_freed, draft_swa_freed = self.mem_pool_host.free(host_indices)
+                assert draft_swa_freed == 0, "draft SWA slots should be none at this moment, but got %d" % draft_swa_freed
+                return None, 0, 0, lack_draft_swa_size
+            return host_indices, 0, 0, 0
 
         need_size = len(device_indices)
         host_indices = self.mem_pool_host.alloc(need_size)
         if host_indices is None:
             lack_full_size = need_size - self.mem_pool_host.available_size()
-            return None, max(0, lack_full_size), 0
-        return host_indices, 0, 0
+            return None, max(0, lack_full_size), 0, 0
+        return host_indices, 0, 0, 0
 
     def get_swa_host_indices(
         self,
@@ -1287,6 +1464,45 @@ class HiCacheController:
 
         return swa_args if isinstance(draft_host_pool, SWATokenToKVPoolHost) else {}
 
+    def _build_draft_swa_args(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        swa_args: dict,
+    ) -> dict:
+        """SWA index args for the draft host pool copy.
+
+        Single-window: the draft shares the target's swa slot spaces, so reuse
+        the target swa_args. Two-window: build them from the draft's own device
+        and host mappings (different window => different validity/slots).
+        """
+        if not self.draft_independent_swa:
+            return self._draft_swa_args(self.mem_pool_host_draft, swa_args)
+        draft_swa_host_indices = self.mem_pool_host_draft.gather_swa_mapping(
+            host_indices
+        )
+        draft_swa_device_indices = (
+            self.mem_pool_device_allocator.full_to_draft_swa_index_mapping[
+                device_indices
+            ]
+        )
+        # Unlike the target invariant (device.nonzero ⊆ host.nonzero, restored
+        # by rewrite_swa_backup before writing), the draft has no rewrite path:
+        # a device-side splice_swa_mapping can legitimately add draft slots to
+        # an already-backuped node, leaving draft device-only positions. Copy
+        # only the intersection; device-only draft slots simply stay unbacked
+        # (after evict + load_back the joint safe-len / draft_free match check
+        # handles the hole).
+        valid = (
+            ((draft_swa_device_indices != 0) & (draft_swa_host_indices != 0))
+            .nonzero()
+            .flatten()
+        )
+        return {
+            "swa_host_indices": draft_swa_host_indices[valid],
+            "swa_device_indices": draft_swa_device_indices[valid],
+        }
+
     def start_writing(self) -> None:
         if len(self.write_queue) == 0:
             return
@@ -1299,6 +1515,13 @@ class HiCacheController:
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
+
+        # Precompute draft SWA args on the default stream (like swa_args).
+        draft_swa_args = (
+            self._build_draft_swa_args(host_indices, device_indices, swa_args)
+            if self.has_draft_kv_pool
+            else {}
+        )
 
         start_event.record()
         with device_module.stream(self.write_stream):
@@ -1328,7 +1551,7 @@ class HiCacheController:
                     host_indices,
                     device_indices,
                     self.io_backend,
-                    **self._draft_swa_args(self.mem_pool_host_draft, swa_args),
+                    **draft_swa_args,
                 )
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
@@ -1341,6 +1564,10 @@ class HiCacheController:
             if swa_args:
                 swa_args["swa_host_indices"].record_stream(self.write_stream)
                 swa_args["swa_device_indices"].record_stream(self.write_stream)
+            if self.draft_independent_swa:
+                assert draft_swa_args, "draft_swa_args should not be empty when draft_independent_swa is True"
+                draft_swa_args["swa_host_indices"].record_stream(self.write_stream)
+                draft_swa_args["swa_device_indices"].record_stream(self.write_stream)
 
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
@@ -1349,14 +1576,26 @@ class HiCacheController:
         host_indices: torch.Tensor,
         host_hit_length: int,
     ):
+        """Assert the SWA tail window of a host prefix has valid (non-zero) slots.
+
+        host_indices: full-pool host slots of the prefix (token granularity).
+        host_hit_length: length (tokens, from position 0) of the prefix being
+            validated (pass the real prefix length, e.g. len(host_indices)).
+            Only its trailing SWA window matters, so the check is clamped to
+            ``min(host_hit_length, sliding_window_size)``; slots older than the
+            window are irrelevant to SWA reuse. The tail window is guaranteed
+            fully SWA-present by the resolve-time swa-safe-prefix gate, so every
+            tail slot must be non-zero.
+        """
         if not self.is_hybrid_swa:
             return
         assert self.sliding_window_size is not None and self.sliding_window_size > 0
         # TODO(yingchun): swa_host_indices 与调用者重复计算，可传入参数直接用
         swa_host_indices = self.mem_pool_host.gather_swa_mapping(host_indices)
         ensure_swa_length = min(host_hit_length, self.sliding_window_size)
+        tail = swa_host_indices[-ensure_swa_length:]
         # TODO(yingchun): this assert has D2H op
-        if swa_host_indices[-ensure_swa_length:].min().item() <= 0:
+        if tail.min().item() <= 0:
             # [SWA-DIAG] 炸前 dump 整段 mapping 的逐页概览，用于区分：
             #   - 常量页（如整页为 1）→ 页号被按 token 粒度误写
             #   - 递增序列页 → arange 类张量被误写入 mapping
@@ -1382,8 +1621,8 @@ class HiCacheController:
             logger.error(
                 "[SWA-DIAG] assert_host_indices failed. host_hit_length=%d "
                 "ensure_swa_length=%d segment_len=%d page_size=%d pad=%d "
-                "per_page(first,min,max,nonzero)=%s host_indices_head=%s "
-                "host_indices_tail=%s tail_window_raw=%s",
+                "per_page(first,min,max,nonzero)=%s "
+                "host_indices_head=%s host_indices_tail=%s tail_window_raw=%s",
                 host_hit_length,
                 ensure_swa_length,
                 n,
@@ -1392,18 +1631,18 @@ class HiCacheController:
                 page_summary,
                 host_indices[:8].tolist(),
                 host_indices[-8:].tolist(),
-                swa_host_indices[-ensure_swa_length:].tolist(),
+                tail.tolist(),
             )
             raise AssertionError(
                 f"Last {ensure_swa_length} SWA slots must be valid, "
-                f"got {swa_host_indices[-ensure_swa_length:].tolist()}"
+                f"got {tail.tolist()}"
             )
 
     def alloc_device(
         self,
         host_indices: torch.Tensor,
         swa_valid_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[Optional[torch.Tensor], int, int]:
+    ) -> Tuple[Optional[torch.Tensor], int, int, int]:
         if not self.is_hybrid_swa:
             need_size = len(host_indices)
             device_indices = self.mem_pool_device_allocator.alloc(need_size)
@@ -1411,8 +1650,8 @@ class HiCacheController:
                 lack_full_size = (
                     need_size - self.mem_pool_device_allocator.available_size()
                 )
-                return None, max(0, lack_full_size), 0
-            return device_indices, 0, 0
+                return None, max(0, lack_full_size), 0, 0
+            return device_indices, 0, 0, 0
 
         if swa_valid_mask is None:
             swa_host_indices = self.mem_pool_host.gather_swa_mapping(host_indices)
@@ -1420,7 +1659,18 @@ class HiCacheController:
             swa_valid_mask = swa_host_indices.bool().to(
                 self.mem_pool_device_allocator.device
             )
-        return self.mem_pool_device_allocator.alloc_device(host_indices, swa_valid_mask)
+        draft_swa_valid_mask = None
+        if self.draft_independent_swa:
+            # Draft-swa validity comes from the draft host pool's OWN mapping
+            # (its window differs from the target's).
+            draft_swa_valid_mask = (
+                self.mem_pool_host_draft.gather_swa_mapping(host_indices)
+                .bool()
+                .to(self.mem_pool_device_allocator.device)
+            )
+        return self.mem_pool_device_allocator.alloc_device(
+            host_indices, swa_valid_mask, draft_swa_valid_mask
+        )
 
     def load(
         self,
@@ -1590,8 +1840,12 @@ class HiCacheController:
                 "swa_device_indices": swa_device_indices[valid_swa_device_indices],
             }
 
-        producer_event = self.layer_done_counter.events[producer_id]
-        producer_event.start_event.record()
+        # Precompute draft SWA args on the default stream (like swa_args).
+        draft_swa_args = (
+            self._build_draft_swa_args(host_indices, device_indices, swa_args)
+            if self.has_draft_kv_pool
+            else {}
+        )
 
         # Host indices are the gather SOURCE here (H2D); out-of-range reads
         # garbage KV instead of stomping memory, but it still means the index
@@ -1604,6 +1858,10 @@ class HiCacheController:
             hot=True,
         )
 
+        # Cover both target and draft index gathers before the load stream
+        # consumes them; record_stream below only protects tensor lifetimes.
+        producer_event = self.layer_done_counter.events[producer_id]
+        producer_event.start_event.record()
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             # Full layers should skip SWA-only refill entries; SWA layers use
@@ -1651,7 +1909,6 @@ class HiCacheController:
                         _, is_draft_swa_layer = (
                             self.mem_pool_host_draft.device_pool.layers_mapping[i]
                         )
-                        _kw = self._draft_swa_args(self.mem_pool_host_draft, swa_args)
                         self.mem_pool_host_draft.load_to_device_per_layer(
                             self.mem_pool_device_draft,
                             host_indices if is_draft_swa_layer else full_host_indices,
@@ -1662,7 +1919,7 @@ class HiCacheController:
                             ),
                             i,
                             self.io_backend,
-                            **_kw,
+                            **draft_swa_args,
                         )
                 producer_event.complete(i)
             # NOTE: We must save the host indices and device indices here,
@@ -1677,6 +1934,10 @@ class HiCacheController:
             if swa_args:
                 swa_args["swa_host_indices"].record_stream(self.load_stream)
                 swa_args["swa_device_indices"].record_stream(self.load_stream)
+            if self.draft_independent_swa:
+                assert draft_swa_args, "draft_swa_args should not be empty when draft_independent_swa is True"
+                draft_swa_args["swa_host_indices"].record_stream(self.load_stream)
+                draft_swa_args["swa_device_indices"].record_stream(self.load_stream)
 
         self.ack_load_queue.append(
             HiCacheAck(
@@ -1687,20 +1948,32 @@ class HiCacheController:
         )
         return producer_id
 
-    def evict_device(self, device_indices: torch.Tensor) -> Tuple[int, int]:
+    def evict_device(self, device_indices: torch.Tensor) -> Tuple[int, int, int]:
         assert device_indices is not None
         if not self.is_hybrid_swa:
             self.mem_pool_device_allocator.free(device_indices)
-            return len(device_indices), 0
+            return len(device_indices), 0, 0
 
         swa_device_indices = (
             self.mem_pool_device_allocator.translate_loc_from_full_to_swa(
                 device_indices
             )
         )
+        # TODO(yingchun): 直接使用 free 返回的数量，避免 D2H 的计数
         swa_freed_size = torch.count_nonzero(swa_device_indices).item()
+        draft_swa_freed_size = 0
+        if self.draft_independent_swa:
+            # Count BEFORE free: allocator.free() cascades into the draft
+            # free-list and zeroes the draft mapping.
+            draft_swa_freed_size = int(
+                torch.count_nonzero(
+                    self.mem_pool_device_allocator.translate_loc_from_full_to_draft_swa(
+                        device_indices
+                    )
+                ).item()
+            )
         self.mem_pool_device_allocator.free(device_indices)
-        return len(device_indices), swa_freed_size
+        return len(device_indices), swa_freed_size, draft_swa_freed_size
 
     def set_draft_kv_pool(
         self,
@@ -1710,6 +1983,9 @@ class HiCacheController:
         draft_host_kv_pool_list,
     ):
         if draft_kv_pool_list:
+            assert (
+                not self.mem_pool_device_allocator.has_draft_swa
+            ), "DFLASH two-window draft swa does not support multi-pool draft lists."
             self.has_draft_kv_pool_list = True
             self.mem_pool_device_draft_list = draft_kv_pool_list
             self.mem_pool_host_draft_list = draft_host_kv_pool_list
@@ -1722,6 +1998,22 @@ class HiCacheController:
             self.mem_pool_device_draft = draft_kv_pool
             self.mem_pool_host_draft = draft_host_kv_pool
             self.draft_l3_enabled = True  # L3 enabled for single-pool draft
+            if self.draft_independent_swa:
+                assert self.is_hybrid_swa and self.mem_pool_host_draft is not None, (
+                    "DFLASH draft SWA allocator present but HiCache host draft "
+                    f"pool missing (is_hybrid_swa={self.is_hybrid_swa}, "
+                    f"mem_pool_host_draft={self.mem_pool_host_draft}); "
+                    "draft KV registration is inconsistent."
+                )
+                win = getattr(
+                    self.mem_pool_device_allocator, "draft_swa_window_size", None
+                )
+                if win is not None:
+                    assert win % self.page_size == 0
+                    assert win > 0
+                    self.draft_sliding_window_pages = (
+                        win // self.page_size
+                    )
             logger.info(
                 "HiCache draft KV registered: %s (host %d slots)",
                 type(draft_kv_pool).__name__,
@@ -1735,40 +2027,41 @@ class HiCacheController:
     def _maybe_register_draft_with_storage(self) -> None:
         self.draft_page_get_func = None
         self.draft_page_set_func = None
+        self.draft_dflash_l3_enabled = False
         if not self.draft_l3_enabled or not self.enable_storage:
             return
 
-        self.storage_backend.register_draft_mem_pool_host(
-            self.mem_pool_host_draft
-        )
+        if self.storage_backend_type != "gcache":
+            self.draft_l3_enabled = False
+            raise NotImplementedError(
+                "HiCache draft L3 is only supported on the gcache backend "
+                f"(backend={self.storage_backend_type}); disable draft L3 for "
+                "this backend (L2 backup/load is unaffected)."
+            )
 
-        draft_zero_copy_backends = {"gcache"}
-        if self.storage_backend_type in draft_zero_copy_backends:
-            self.draft_page_get_func = self._draft_page_get_zero_copy
-            self.draft_page_set_func = self._draft_page_set_zero_copy
-            logger.info(
-                "HiCache draft L3 enabled with zero-copy path (backend=%s)",
-                self.storage_backend_type,
-            )
-        else:
-            self.draft_page_get_func = self._draft_page_get_generic
-            self.draft_page_set_func = self._draft_page_set_generic
-            logger.info(
-                "HiCache draft L3 enabled with generic path (backend=%s)",
-                self.storage_backend_type,
-            )
+        if self.draft_independent_swa:
+            self.draft_dflash_l3_enabled = True
+
+        self.storage_backend.register_draft_mem_pool_host(self.mem_pool_host_draft)
+        self.draft_page_get_func = self._draft_page_get_zero_copy
+        self.draft_page_set_func = self._draft_page_set_zero_copy
+        logger.info(
+            "HiCache draft L3 enabled with zero-copy path (backend=%s)",
+            self.storage_backend_type,
+        )
 
     def evict_host(
         self, host_indices: torch.Tensor, backup_only: bool = True
-    ) -> Tuple[int, int]:
+    ) -> Tuple[int, int, int]:
         assert host_indices is not None
         if not backup_only:
             raise ValueError("Other eviction policies are not supported yet.")
 
         freed = self.mem_pool_host.free(host_indices)
         if isinstance(freed, tuple):
-            return int(freed[0]), int(freed[1])
-        return int(freed), 0
+            # SWATokenToKVPoolHost returns (full, swa, draft_swa).
+            return int(freed[0]), int(freed[1]), int(freed[2])
+        return int(freed), 0, 0
 
     def prefetch(
         self,
@@ -1779,6 +2072,7 @@ class HiCacheController:
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
         host_indices_ready_event: Optional[torch.cuda.Event] = None,
+        draft_swa_host_indices: Optional[torch.Tensor] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
@@ -1790,6 +2084,7 @@ class HiCacheController:
             last_hash,
             prefix_keys,
             swa_host_indices=swa_host_indices,
+            draft_swa_host_indices=draft_swa_host_indices,
             host_indices_ready_event=host_indices_ready_event,
             trace_enabled=self.enable_trace,
         )
@@ -2000,6 +2295,91 @@ class HiCacheController:
                 self.swa_only_host_mem_release_queue.qsize(),
             )
 
+    def append_dflash_only_host_mem_release(
+        self,
+        dflash_only_to_release: Optional[torch.Tensor],
+        allow_all_zero: bool = True,
+    ):
+        """Release DFLASH draft-swa-only host slots (two-window path).
+
+        Mirrors append_swa_only_host_mem_release but validates against the
+        DRAFT host pool's swa ring domain and queues into the dflash release
+        queue (drained via mem_pool_host_draft.free_swa_only). allow_all_zero
+        has the same meaning: False for pristine draft-swa alloc results,
+        True for full_to_draft_swa mapping lookups (unmapped pages read 0).
+        """
+        if dflash_only_to_release is None:
+            return
+        if dflash_only_to_release.numel() == 0:
+            return
+        assert (
+            self.draft_independent_swa
+        ), "dflash-only release requires DFLASH two-window draft"
+
+        page_size = self.mem_pool_host.page_size
+        paged = dflash_only_to_release.view(-1, page_size)
+        domain_upper = self.mem_pool_host_draft.swa_pool_host.size + page_size
+        below_domain = dflash_only_to_release < page_size
+        if allow_all_zero:
+            below_domain &= dflash_only_to_release != 0
+        out_of_domain_mask = below_domain | (dflash_only_to_release >= domain_upper)
+        if bool(out_of_domain_mask.any()):
+            bad_pos = out_of_domain_mask.nonzero(as_tuple=False).view(-1)
+            legal_domain = ("0 or " if allow_all_zero else "") + (
+                f"[{page_size}, {domain_upper})"
+            )
+            logger.error(
+                "[DFLASH-DIAG] append_dflash_only_host_mem_release: slot values "
+                "outside legal domain %s (allow_all_zero=%s). "
+                "numel=%d num_bad=%d bad_positions(head)=%s bad_values(head)=%s "
+                "draft_swa_available=%s raw_head=%s",
+                legal_domain,
+                allow_all_zero,
+                dflash_only_to_release.numel(),
+                int(out_of_domain_mask.sum()),
+                bad_pos[:64].tolist(),
+                dflash_only_to_release[bad_pos[:64]].tolist(),
+                self.mem_pool_host_draft.swa_pool_host.available_size(),
+                dflash_only_to_release[:128].tolist(),
+                stack_info=True,
+            )
+            raise AssertionError(
+                f"DFLASH draft-swa slot values outside legal domain {legal_domain}; "
+                f"foreign write suspected"
+            )
+
+        if allow_all_zero:
+            valid_count_per_page = paged.count_nonzero(dim=1)
+            bad_page_mask = (valid_count_per_page != 0) & (
+                valid_count_per_page != page_size
+            )
+            if bool(bad_page_mask.any()):
+                bad_idx = bad_page_mask.nonzero(as_tuple=False).view(-1)
+                logger.error(
+                    "[DFLASH-DIAG] append_dflash_only_host_mem_release: mixed pages. "
+                    "num_pages=%d bad_pages(idx)=%s valid_count_per_page=%s",
+                    paged.shape[0],
+                    bad_idx.tolist()[:64],
+                    valid_count_per_page.tolist(),
+                    stack_info=True,
+                )
+                raise AssertionError(
+                    f"Each draft-swa page must be all-zero or all-valid, "
+                    f"got {valid_count_per_page.tolist()}"
+                )
+            pages_to_queue = paged[valid_count_per_page > 0]
+        else:
+            pages_to_queue = paged
+
+        if len(pages_to_queue) > 0:
+            ready_event = self._record_release_ready_event(pages_to_queue)
+            for page in pages_to_queue:
+                self.dflash_only_host_mem_release_queue.put((page, ready_event))
+            self._log_queue_length(
+                "dflash_only_host_mem_release_queue",
+                self.dflash_only_host_mem_release_queue.qsize(),
+            )
+
     def append_full_and_swa_mem_release_separately(
         self, full_host_indices_to_release: torch.Tensor
     ):
@@ -2009,6 +2389,16 @@ class HiCacheController:
         if not self.is_hybrid_swa:
             self.append_host_mem_release(full_host_indices_to_release)
             return
+
+        if self.draft_independent_swa:
+            draft_swa_host_indices = (
+                self.mem_pool_host_draft.unmapping_full_and_swa_indices(
+                    full_host_indices_to_release
+                )
+            )
+            self.append_dflash_only_host_mem_release(
+                draft_swa_host_indices, allow_all_zero=True
+            )
 
         swa_host_indices = self.mem_pool_host.unmapping_full_and_swa_indices(
             full_host_indices_to_release
@@ -2059,6 +2449,7 @@ class HiCacheController:
 
     def _page_transfer(self, operation):
         operation.mark_io_start()
+        draft_fetch_failed = False
         try:
             # Transfer batch by batch
             prefix_keys = operation.prefix_keys
@@ -2078,15 +2469,82 @@ class HiCacheController:
                 if self._fault_injector.enabled:
                     self._fault_injector.maybe_inject_timeout_fault(operation.id)
 
-                if self.draft_l3_enabled:
+                # 处理 DFlash 独立窗口的 draft KV cache
+                t0_draft_io = time.perf_counter()
+                if self.draft_dflash_l3_enabled:
+                    assert not draft_fetch_failed
+                    draft_start = operation.draft_swa_start_page
+                    draft_end = draft_start + operation.draft_safe_pages
+                    # narrow the batch to the intersection with the draft window,
+                    # and fetch only that segment.
+                    seg_start = max(i, draft_start)
+                    seg_end = min(i + len(batch_hashes), draft_end)
+                    if seg_end > seg_start:
+                        # convert absolute page indices (seg_start/seg_end) into
+                        # batch-relative offsets to slice out the needed segment
+                        # in batch_hashes and batch_host_indices.
+                        lo = seg_start - i
+                        hi = seg_end - i
+                        # draft-prefix-relative offset.
+                        draft_page_start = seg_start - draft_start
+                        if self._fault_injector.enabled:
+                            self._fault_injector.maybe_inject_draft_timeout_fault(
+                                operation.id
+                            )
+                        draft_fetch_failed = self.draft_page_get_func(
+                            operation,
+                            batch_hashes[lo:hi],
+                            batch_host_indices[
+                                lo * self.page_size : hi * self.page_size
+                            ],
+                            draft_page_start,
+                            extra_info,
+                        )
+                elif self.draft_l3_enabled:
+                    # Single-pool draft (gcache): fetch the whole batch.
+                    # FIXME: no fetch-failure handling (unlike the two-window path).
                     self.draft_page_get_func(
-                        batch_hashes, batch_host_indices, extra_info
+                        operation, batch_hashes, batch_host_indices, i, extra_info
                     )
+                if self.metrics_collector is not None:
+                    self.metrics_collector.log_draft_prefetch_io_latency(
+                        time.perf_counter() - t0_draft_io
+                    )
+
+                # A draft fetch failure caps the target prefix.
+                target_batch_len = len(batch_hashes)
+                stop_after_batch = False
+                if self.draft_dflash_l3_enabled and draft_fetch_failed:
+                    draft_end = (
+                        operation.draft_swa_start_page
+                        + operation.draft_completed_pages
+                    )
+                    assert draft_end >= i, f"{draft_end=}, {i=}"
+                    target_batch_len = min(target_batch_len, draft_end - i)
+                    # Stop once this batch reaches draft_end (cut mid-batch, or
+                    # ends exactly at it): later pages have no valid draft KV.
+                    stop_after_batch = target_batch_len < len(batch_hashes) or (
+                        i + target_batch_len >= draft_end
+                    )
+                target_hashes = batch_hashes[:target_batch_len]
+                target_host_indices = batch_host_indices[
+                    : target_batch_len * self.page_size
+                ]
+                # swa_needed_per_page was sized to the full batch; a draft
+                # failure shrinks target_batch_len, so re-slice it to keep the
+                # length equal to target_hashes.
+                if (
+                    target_batch_len < len(batch_hashes)
+                    and extra_info.swa_needed_per_page is not None
+                ):
+                    extra_info.swa_needed_per_page = extra_info.swa_needed_per_page[
+                        :target_batch_len
+                    ]
 
                 # Get one batch token, and update the completed_tokens if succeed
                 t0_io = time.perf_counter()
                 self.page_get_func(
-                    operation, batch_hashes, batch_host_indices, extra_info
+                    operation, target_hashes, target_host_indices, extra_info
                 )
                 if self.metrics_collector is not None:
                     self.metrics_collector.log_prefetch_io_latency(
@@ -2095,10 +2553,14 @@ class HiCacheController:
                 # Check termination
                 if (
                     operation.completed_tokens
-                    != prev_completed_tokens + len(batch_hashes) * self.page_size
+                    != prev_completed_tokens + target_batch_len * self.page_size
                 ):
                     operation.mark_terminate()
                     break  # Some operations fail or operation terminated by controller
+
+                if stop_after_batch:
+                    operation.mark_terminate()
+                    break
 
                 if prefix_keys and len(prefix_keys) > 0:
                     prefix_keys += batch_hashes
@@ -2118,7 +2580,7 @@ class HiCacheController:
                 self._page_transfer(operation)
                 # operation terminated by controller, release pre-allocated memory
                 self.append_full_and_swa_mem_release_separately(
-                    operation.host_indices[operation.completed_tokens :]
+                    operation.host_indices[operation.completed_tokens:]
                 )
                 if self._fault_injector.enabled:
                     self._fault_injector.cleanup_timeout_tracking(operation.id)
@@ -2201,6 +2663,9 @@ class HiCacheController:
             [swa_valid_len:-1] = 0 padding.
                 After all_reduce(MIN) the mask is a natural prefix hit_info[:hit_pages].
             [-1] = storage_hit_count
+                When draft L3 is on, the mask is additionally zeroed past the
+                DFlash draft-present bound so swa_valid_len (hence hit_pages) is
+                capped by draft presence; no separate draft length is carried.
         - non-hybrid: shape [1], carrying only storage_hit_count.
         """
         last_hash = operation.last_hash
@@ -2214,8 +2679,20 @@ class HiCacheController:
         backend_queried_keys = 0
         backend_hit_keys = 0
         first_full_miss_component = "none"
+        first_gcache_miss_page = -1
+        first_miss_component = "unknown"
 
         logical_len = len(key)
+
+        # draft_valid_pages accumulates per-page draft existence in absolute
+        # page coords over the frame, filled lazily as the loop reaches it.
+        draft_probe = self.draft_dflash_l3_enabled
+        draft_frame_start = 0
+        draft_valid_pages: list = []
+        if draft_probe:
+            total_pages = logical_len // self.page_size
+            draft_window_pages = self.draft_sliding_window_pages or 0
+            draft_frame_start = max(0, total_pages - draft_window_pages)
 
         for start in range(0, logical_len, self.page_size * self.storage_batch_size):
             end = min(start + self.page_size * self.storage_batch_size, logical_len)
@@ -2224,7 +2701,7 @@ class HiCacheController:
                 last_hash = self.get_hash_str(
                     key.raw_page_slice(i, self.page_size),
                     last_hash,
-                    step = key.step if key.is_ngram else 0,
+                    step=key.step if key.is_ngram else 0,
                 )
                 batch_hashes.append(last_hash)
             extra_info = HiCacheStorageExtraInfo(
@@ -2244,6 +2721,27 @@ class HiCacheController:
                 hit_page_num = self.storage_backend.batch_exists(
                     batch_hashes, extra_info
                 )
+
+            # Probe draft existence for the target-hit pages of this batch that
+            # fall inside the draft frame [draft_frame_start, ...). Only hit
+            # pages have draft KV worth probing.
+            if draft_probe:
+                batch_start_page = start // self.page_size
+                hit_end_page = batch_start_page + hit_page_num
+                seg_start_page = max(batch_start_page, draft_frame_start)
+                if hit_end_page > seg_start_page:
+                    lo = seg_start_page - batch_start_page
+                    draft_hashes = batch_hashes[lo:hit_page_num]
+                    draft_exist = self.storage_backend.batch_exists_draft(
+                        draft_hashes, extra_info
+                    )
+                    if self._fault_injector.enabled:
+                        draft_exist = (
+                            self._fault_injector.maybe_inject_draft_exists_fault(
+                                list(draft_exist)
+                            )
+                        )
+                    draft_valid_pages.extend(draft_exist)
             if operation.trace_enabled:
                 queried_page_count += len(batch_hashes)
                 backend_diagnostics = extra_info.extra_info or {}
@@ -2253,6 +2751,16 @@ class HiCacheController:
                 backend_hit_keys += int(
                     backend_diagnostics.get("gcache_hit_keys", 0)
                 )
+                batch_first_miss_page = int(
+                    backend_diagnostics.get("first_miss_page", -1)
+                )
+                if first_gcache_miss_page < 0 and batch_first_miss_page >= 0:
+                    first_gcache_miss_page = (
+                        start // self.page_size + batch_first_miss_page
+                    )
+                    first_miss_component = str(
+                        backend_diagnostics.get("first_miss_component", "unknown")
+                    )
                 if first_full_miss_component == "none":
                     batch_full_miss_component = backend_diagnostics.get(
                         "first_full_miss_component", "none"
@@ -2283,11 +2791,11 @@ class HiCacheController:
                     "hicache_prefetch_query.queried_pages": queried_page_count,
                     "hicache_prefetch_query.local_full_hit_pages": local_full_hit_pages,
                     "hicache_prefetch_query.first_full_miss_page": first_full_miss_page,
-                    "hicache_prefetch_query.full_hit_ratio": round(
-                        local_full_hit_pages / queried_page_count, 6
-                    )
-                    if queried_page_count > 0
-                    else 0.0,
+                    "hicache_prefetch_query.full_hit_ratio": (
+                        round(local_full_hit_pages / queried_page_count, 6)
+                        if queried_page_count > 0
+                        else 0.0
+                    ),
                 }
             )
             if backend_queried_keys > 0:
@@ -2325,15 +2833,25 @@ class HiCacheController:
                 hit_info[:valid_page_count] = torch.tensor(
                     swa_valid_pages, dtype=torch.int
                 )
+            if draft_probe:
+                # Fixed-edge draft-present upper bound: the first draft hole at
+                # or after draft_frame_start caps every longer prefix.
+                first_hole = next(
+                    (j for j, ok in enumerate(draft_valid_pages) if not ok),
+                    len(draft_valid_pages),
+                )
+                draft_safe_len = draft_frame_start + first_hole
+                if draft_safe_len < valid_page_count:
+                    hit_info[draft_safe_len:valid_page_count] = 0
             # 尾部残留 bits [swa_valid_len : valid_page_count) 不清零也安全：下游只消费 hit_info[:swa_valid_len]
             swa_valid_len = self._compute_safe_storage_prefix(
                 hit_info[:valid_page_count],
                 self.sliding_window_pages,
             )
             if operation.trace_enabled:
-                operation.trace_attrs[
-                    "hicache_prefetch_query.local_swa_safe_pages"
-                ] = swa_valid_len
+                operation.trace_attrs["hicache_prefetch_query.local_swa_safe_pages"] = (
+                    swa_valid_len
+                )
             hit_info[-1] = swa_valid_len * self.page_size
             return (
                 hash_values[:swa_valid_len],
@@ -2349,6 +2867,78 @@ class HiCacheController:
                 storage_query_count,
                 raw_query_hit_count,
             )
+
+    def _release_unresolved_draft_reservation(self, operation) -> None:
+        """Enqueue an unmapped draft-SWA reservation for release.
+
+        Queues onto the draft-only release queue so the main thread's
+        TP-MIN-aligned drain frees the ring (never freed synchronously on this
+        prefetch thread, which would diverge draft availability across ranks).
+        """
+        draft_reserved = operation.draft_swa_host_indices
+        operation.draft_swa_host_indices = None
+        self.append_dflash_only_host_mem_release(draft_reserved, allow_all_zero=False)
+
+    def _resolve_draft_l3_prefetch(self, operation, hit_pages: int) -> None:
+        """Map the DFLASH two-window draft SWA prefix onto the reserved slots.
+
+        Draft existence has been probed, so the aligned hit_pages already
+        satisfies hit_pages <= draft-present bound on every rank: pages
+        [s, hit_pages) are draft-present everywhere.
+        """
+        if not self.draft_independent_swa:
+            return
+
+        draft_reserved = operation.draft_swa_host_indices
+        operation.draft_swa_host_indices = None
+        ps = self.page_size
+        reserved_pages = 0 if draft_reserved is None else len(draft_reserved) // ps
+        # draft_swa_host_indices is allocated in best-effort mode, so it may be None
+        # if the draft host pool is exhausted.
+        if reserved_pages <= 0:
+            return
+
+        # s is the fixed left edge max(0, total_pages - draft_window_pages).
+        # hit_pages is the draft-capped SWA-safe prefix, so [s, hit_pages) is
+        # draft-present.
+        # map_pages <= 0 means nothing to map (whole prefix before the frame),
+        # so release the reservation.
+        draft_window_pages = self.draft_sliding_window_pages or 0
+        total_pages = len(operation.key) // self.page_size
+        s = max(0, total_pages - draft_window_pages)
+        map_pages = min(hit_pages - s, reserved_pages)
+        if map_pages <= 0:
+            self.append_dflash_only_host_mem_release(
+                draft_reserved, allow_all_zero=False
+            )
+            return
+
+        t0_resolve = time.perf_counter()
+        try:
+            # [s, s + map_pages) is draft-present, so the mask is all-True.
+            start_page = s
+            end_page = s + map_pages
+            draft_valid_mask = torch.ones(map_pages, dtype=torch.bool)
+            trimmed_mask, surplus_draft = (
+                self.mem_pool_host_draft.mapping_full_and_swa_indices(
+                    operation.host_indices[start_page * ps : end_page * ps],
+                    draft_reserved,
+                    draft_valid_mask,
+                )
+            )
+            if surplus_draft is not None:
+                self.append_dflash_only_host_mem_release(
+                    surplus_draft, allow_all_zero=False
+                )
+            operation.draft_swa_valid_mask = trimmed_mask
+            operation.draft_swa_start_page = start_page
+            operation.draft_safe_pages = map_pages
+            operation.draft_swa_hit_count = map_pages * ps
+        finally:
+            if self.metrics_collector is not None:
+                self.metrics_collector.log_draft_storage_resolve_latency(
+                    time.perf_counter() - t0_resolve
+                )
 
     def prefetch_thread_func(self):
         """
@@ -2400,6 +2990,14 @@ class HiCacheController:
                         "prefetch_thread_func(swa_host_indices)",
                         hot=False,
                     )
+                if operation.draft_swa_host_indices is not None:
+                    assert_indices_in_bounds(
+                        operation.draft_swa_host_indices,
+                        self.page_size,
+                        self.mem_pool_host_draft.swa_pool_host.size + self.page_size,
+                        "prefetch_thread_func(draft_swa_host_indices)",
+                        hot=False,
+                    )
 
                 # 通过 batch_exists 查看 storage 上存在的 KV cache（含 SWA 的有效区间 mask）
                 operation.mark_query_start()
@@ -2431,7 +3029,6 @@ class HiCacheController:
                     pre_mask_true_count = (
                         int(hit_info[:hit_pages].sum()) if self.is_hybrid_swa else 0
                     )
-
                     torch.distributed.all_reduce(
                         hit_info,
                         op=torch.distributed.ReduceOp.MIN,
@@ -2490,6 +3087,7 @@ class HiCacheController:
                         operation.swa_host_indices,
                         allow_all_zero=False,
                     )
+                    self._release_unresolved_draft_reservation(operation)
                     if self.metrics_collector is not None:
                         self.metrics_collector.log_revoke_tokens(
                             revoke_tokens, reason="insufficient_l3_hits"
@@ -2530,6 +3128,7 @@ class HiCacheController:
                             operation.swa_host_indices,
                             allow_all_zero=False,
                         )
+                        self._release_unresolved_draft_reservation(operation)
                         if self.metrics_collector is not None:
                             self.metrics_collector.log_revoke_tokens(
                                 revoke_tokens, reason="insufficient_swa_hits"
@@ -2547,7 +3146,6 @@ class HiCacheController:
                 self.append_host_mem_release(operation.host_indices[storage_hit_count:])
                 # 截取需要从 storage prefetch 的部分
                 operation.hash_value = hash_value[:hit_pages]
-                # FIXME(yingchun): 需要先 free，再截断
                 operation.host_indices = operation.host_indices[:storage_hit_count]
                 # 把一开始未做 mapping 的 full 和 swa 的 host memory 做 mapping
                 if self.is_hybrid_swa:
@@ -2560,7 +3158,8 @@ class HiCacheController:
                         )
                     )
                     self.assert_host_indices(
-                        operation.host_indices, self.sliding_window_size
+                        operation.host_indices,
+                        len(operation.host_indices),
                     )
                     # free the SWA ONLY pre-allocated memory for pages that are not hit
                     if surplus_swa is not None:
@@ -2571,6 +3170,11 @@ class HiCacheController:
                     # Reset swa_host_indices to None after being mapped
                     operation.swa_host_indices = None
                     operation.swa_valid_mask = trimmed_swa_mask
+
+                if self.draft_dflash_l3_enabled and hit_pages > 0:
+                    self._resolve_draft_l3_prefetch(operation, hit_pages)
+                else:
+                    self._release_unresolved_draft_reservation(operation)
 
                 logger.debug(
                     f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
@@ -2613,44 +3217,50 @@ class HiCacheController:
     def _draft_page_set_zero_copy(
         self, hash_values, host_indices, extra_info=None
     ) -> None:
-        self.storage_backend.batch_set_v1_draft(
-            hash_values, host_indices, extra_info
-        )
+        self.storage_backend.batch_set_v1_draft(hash_values, host_indices, extra_info)
 
     def _draft_page_get_zero_copy(
-        self, hash_values, host_indices, extra_info=None
-    ) -> None:
-        self.storage_backend.batch_get_v1_draft(
+        self, operation, hash_values, host_indices, draft_page_start, extra_info=None
+    ) -> bool:
+        """Fetch a draft page batch and record the fetched-OK contiguous prefix.
+
+        ``draft_page_start`` is this batch's first page counted from the start
+        of the resolved draft prefix ``[0, draft_safe_pages)``. Adding the number
+        of contiguous pages fetched OK in this batch gives the absolute truncation
+        point.
+
+        Returns True iff the draft prefix was truncated (caller stops issuing
+        further draft fetches).
+        """
+        draft_mask = self.storage_backend.batch_get_v1_draft(
             hash_values, host_indices, extra_info
         )
-
-    def _draft_page_set_generic(
-        self, hash_values, host_indices, extra_info=None
-    ) -> None:
-        # `{hash}.draft` mirrors HiCacheStorage._get_component_key's
-        # `{key}.{pool_name}` convention so target/draft pages never collide.
-        draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
-        draft_data = [
-            self.mem_pool_host_draft.get_data_page(host_indices[i * self.page_size])
-            for i in range(len(draft_keys))
-        ]
-        self.storage_backend.batch_set(draft_keys, draft_data)
-
-    def _draft_page_get_generic(
-        self, hash_values, host_indices, extra_info=None
-    ) -> None:
-        draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
-        draft_dummy = [
-            self.mem_pool_host_draft.get_dummy_flat_data_page() for _ in draft_keys
-        ]
-        draft_pages = self.storage_backend.batch_get(draft_keys, draft_dummy)
-        if draft_pages is None:
-            return
-        for i, p in enumerate(draft_pages):
-            if p is not None:
-                self.mem_pool_host_draft.set_from_flat_data_page(
-                    host_indices[i * self.page_size], p
-                )
+        completed_pages = 0
+        if draft_mask is None:
+            logger.warning(
+                f"Prefetch operation {operation.request_id} failed to retrieve "
+                f"draft page {hash_values[0]}."
+            )
+        else:
+            assert len(draft_mask) == len(
+                hash_values
+            ), f"{len(draft_mask)=}, {len(hash_values)=}"
+            for page_idx, ok in enumerate(draft_mask):
+                if not ok:
+                    logger.warning(
+                        f"Prefetch operation {operation.request_id} failed to "
+                        f"retrieve draft page {hash_values[page_idx]}."
+                    )
+                    break
+                completed_pages += 1
+        if self._fault_injector.enabled:
+            completed_pages = self._fault_injector.maybe_inject_draft_fault(
+                completed_pages
+            )
+        new_completed_pages = draft_page_start + completed_pages
+        assert new_completed_pages >= operation.draft_completed_pages
+        operation.draft_completed_pages = new_completed_pages
+        return completed_pages != len(hash_values)
 
     # Backup batch by batch
     def _page_backup(self, operation):
@@ -2679,9 +3289,21 @@ class HiCacheController:
 
             # Best-effort draft L3 write alongside target.
             if self.draft_l3_enabled:
-                self.draft_page_set_func(
-                    batch_hashes, batch_host_indices, extra_info
-                )
+                # Two-window: the draft host pool (all-SWA, no full layers) only
+                # has KV for pages whose draft SWA mapping is live. When none are
+                # mapped the set produces zero keys (a wasteful no-op); skip it.
+                if self.draft_dflash_l3_enabled:
+                    draft_swa = self.mem_pool_host_draft.gather_swa_mapping(
+                        batch_host_indices[:: self.page_size]
+                    )
+                    if torch.count_nonzero(draft_swa).item() > 0:
+                        self.draft_page_set_func(
+                            batch_hashes, batch_host_indices, extra_info
+                        )
+                else:
+                    self.draft_page_set_func(
+                        batch_hashes, batch_host_indices, extra_info
+                    )
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes

@@ -61,6 +61,7 @@ class TransferKVChunk:
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List[int]]
+    draft_state_indices: Optional[List[int]] = None
     enqueue_ts: float = 0.0
     shard_idx: int = -1
 
@@ -85,6 +86,7 @@ class TransferInfo:
     dst_state_indices: List[int]
     required_dst_info_num: int
     is_dummy: bool
+    dst_draft_state_indices: List[int] = dataclasses.field(default_factory=list)
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -95,6 +97,7 @@ class TransferInfo:
             dst_kv_indices = np.array([], dtype=np.int32)
             dst_aux_index = None
             dst_state_indices = []
+            dst_draft_state_indices = []
         else:
             dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
             dst_aux_index = int(msg[5].decode("ascii"))
@@ -102,6 +105,10 @@ class TransferInfo:
                 dst_state_indices = []
             else:
                 dst_state_indices = list(np.frombuffer(msg[6], dtype=np.int32))
+            if len(msg) > 8 and msg[8] != b"":
+                dst_draft_state_indices = list(np.frombuffer(msg[8], dtype=np.int32))
+            else:
+                dst_draft_state_indices = []
             is_dummy = False
         return cls(
             room=int(msg[0].decode("ascii")),
@@ -113,6 +120,7 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
+            dst_draft_state_indices=dst_draft_state_indices,
         )
 
     @classmethod
@@ -149,8 +157,13 @@ class KVArgsRegisterInfo:
     # HiSparse: decode host pool stores KV at token granularity
     enable_hisparse: bool = False
     enable_pd_direct2host: bool = False
-    # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
+    # staging is logically optional (None when disabled) but ALWAYS occupies
+    # two message frames; the sender emits empty frames when disabled, so frame
+    # positions never shift.
     staging: Optional[StagingRegisterInfo] = None
+    # DFLASH two-window: destination draft swa state buffer pointers. item_lens
+    # are not transferred; the transfer reuses the prefill-local device item_len.
+    dst_draft_state_data_ptrs: list[int] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -181,8 +194,16 @@ class KVArgsRegisterInfo:
             enable_pd_direct2host=(
                 msg[13].decode("ascii") == "1" if len(msg) > 13 else False
             ),
-            # Note: always put the staging field at the final
+            # staging reads msg[14], msg[15] (from_zmq_fields offset=14); both
+            # are empty frames when disabled, so positions do NOT shift.
             staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
+            # DFLASH two-window: draft swa state buffer ptrs occupy msg[16],
+            # right after the two staging frames (see _register_kv_args order).
+            dst_draft_state_data_ptrs=(
+                list(struct.unpack(f"{len(msg[16])//8}Q", msg[16]))
+                if len(msg) > 16 and len(msg[16]) > 0
+                else []
+            ),
         )
 
 
@@ -354,6 +375,38 @@ class MooncakeKVManager(CommonKVManager):
             if self.kv_args.state_data_ptrs and self.kv_args.state_data_lens:
                 self.engine.batch_register(
                     self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+                )
+
+        # DFLASH two-window: draft swa buffers live in a separate group and must
+        # be registered with the RDMA engine too, otherwise transfers to them
+        # silently no-op (buffer not known to the engine). In the D2H decode
+        # path the pinned host draft buffers are the RDMA destinations instead.
+        if decode_d2h:
+            host_draft_state_data_ptrs = getattr(
+                self.kv_args, "host_draft_state_data_ptrs", []
+            )
+            host_draft_state_data_lens = getattr(
+                self.kv_args, "host_draft_state_data_lens", []
+            )
+            draft_state_data_ptrs = getattr(self.kv_args, "draft_state_data_ptrs", [])
+            if len(host_draft_state_data_ptrs) != len(draft_state_data_ptrs):
+                raise RuntimeError(
+                    "PD direct-to-host requires host draft state buffers to cover "
+                    "all decode draft state buffers. "
+                    f"host={len(host_draft_state_data_ptrs)} "
+                    f"device={len(draft_state_data_ptrs)}"
+                )
+            if host_draft_state_data_ptrs and host_draft_state_data_lens:
+                self.engine.batch_register(
+                    host_draft_state_data_ptrs,
+                    host_draft_state_data_lens,
+                )
+        else:
+            draft_state_data_ptrs = getattr(self.kv_args, "draft_state_data_ptrs", None)
+            draft_state_data_lens = getattr(self.kv_args, "draft_state_data_lens", None)
+            if draft_state_data_ptrs and draft_state_data_lens:
+                self.engine.batch_register(
+                    draft_state_data_ptrs, draft_state_data_lens
                 )
 
     # ------------------------------------------------------------------
@@ -1168,6 +1221,52 @@ class MooncakeKVManager(CommonKVManager):
         else:
             return 0
 
+    def maybe_send_draft_state(
+        self,
+        req: TransferInfo,
+        prefill_draft_state_indices: list[int],
+        dst_draft_state_data_ptrs: list[int],
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ):
+        """Send the DFLASH draft swa state (two-window) as a separate group.
+
+        Mirrors the swa branch of maybe_send_extra but on the draft buffers,
+        which carry their own distinct slot indices.
+        """
+        draft_state_data_ptrs = getattr(self.kv_args, "draft_state_data_ptrs", [])
+        draft_state_item_lens = getattr(self.kv_args, "draft_state_item_lens", [])
+        # Src (prefill-local) and dst (decode-side) draft buffers must agree:
+        # either both sides run two-window (both non-empty) or neither does
+        # (both empty). A one-sided config means prefill/decode disagree on
+        # DFLASH two-window and would silently corrupt/no-op the transfer.
+        if bool(draft_state_data_ptrs) != bool(dst_draft_state_data_ptrs):
+            raise RuntimeError(
+                f"DFLASH draft state buffer mismatch for room={req.room}: "
+                f"src_ptrs={len(draft_state_data_ptrs)} "
+                f"dst_ptrs={len(dst_draft_state_data_ptrs)}; prefill and decode "
+                "disagree on two-window (draft SWA) configuration."
+            )
+        if not draft_state_data_ptrs:
+            return 0
+        prefill_draft_state_indices = np.array(prefill_draft_state_indices, dtype=np.int32)
+        dst_draft_state_indices = np.array(req.dst_draft_state_indices, dtype=np.int32)
+        if len(prefill_draft_state_indices) != len(dst_draft_state_indices):
+            raise RuntimeError(
+                f"Draft state index length mismatch for room={req.room}: "
+                f"prefill={len(prefill_draft_state_indices)} "
+                f"dst={len(dst_draft_state_indices)}; prefill and decode "
+                "disagree on the draft swa window / page layout."
+            )
+        return self._send_kvcache_generic(
+            mooncake_session_id=req.mooncake_session_id,
+            src_data_ptrs=draft_state_data_ptrs,
+            dst_data_ptrs=dst_draft_state_data_ptrs,
+            item_lens=draft_state_item_lens,
+            prefill_data_indices=prefill_draft_state_indices,
+            dst_data_indices=dst_draft_state_indices,
+            executor=executor,
+        )
+
     def _send_mamba_state(
         self,
         req: TransferInfo,
@@ -1610,6 +1709,13 @@ class MooncakeKVManager(CommonKVManager):
                                     executor,
                                     target_rank_registration_info,
                                 )
+                            if kv_chunk.draft_state_indices is not None:
+                                self.maybe_send_draft_state(
+                                    req,
+                                    kv_chunk.draft_state_indices,
+                                    target_rank_registration_info.dst_draft_state_data_ptrs,
+                                    executor,
+                                )
 
                             # Only the last chunk we need to send the aux data
                             _t_aux_start = time.monotonic()
@@ -1803,6 +1909,7 @@ class MooncakeKVManager(CommonKVManager):
                             pending.dst_kv_indices = info.dst_kv_indices
                             pending.dst_aux_index = info.dst_aux_index
                             pending.dst_state_indices = info.dst_state_indices
+                            pending.dst_draft_state_indices = info.dst_draft_state_indices
                         else:
                             room_infos[mooncake_session_id] = info
                         # NOTE: after bootstrapping we can mark the req as waiting for input
@@ -1999,6 +2106,7 @@ class MooncakeKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        draft_state_indices: Optional[List[int]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -2036,6 +2144,7 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                draft_state_indices=draft_state_indices,
                 enqueue_ts=_enqueue_ts,
                 shard_idx=shard_idx,
             )
@@ -2103,6 +2212,7 @@ class MooncakeKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
+        draft_state_indices: Optional[List[int]] = None,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
@@ -2137,6 +2247,7 @@ class MooncakeKVSender(CommonKVSender):
                 True,
                 aux_index=self.aux_index,
                 state_indices=state_indices,
+                draft_state_indices=draft_state_indices,
             )
 
     def poll(self) -> KVPoll:
@@ -2261,6 +2372,33 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_state_dim_per_tensor = b"".join(
                 struct.pack("I", dim) for dim in state_dim_per_tensor
             )
+            # DFLASH two-window: draft swa state buffers (separate group). In the
+            # D2H path the pinned host draft buffers are the RDMA destinations.
+            device_draft_state_item_lens = getattr(
+                self.kv_mgr.kv_args, "draft_state_item_lens", []
+            )
+            if self.kv_mgr.enable_pd_direct2host:
+                draft_state_data_ptrs = getattr(
+                    self.kv_mgr.kv_args, "host_draft_state_data_ptrs", []
+                )
+                # _send_kvcache_generic strides src (device) and dst (host) with
+                # one item_len, so the host transit pool must mirror the device
+                # per-item layout.
+                host_draft_state_item_lens = getattr(
+                    self.kv_mgr.kv_args, "host_draft_state_item_lens", []
+                )
+                assert host_draft_state_item_lens == device_draft_state_item_lens, (
+                    "PD direct-to-host draft state item_lens must mirror the "
+                    f"device layout: host={host_draft_state_item_lens} "
+                    f"device={device_draft_state_item_lens}"
+                )
+            else:
+                draft_state_data_ptrs = getattr(
+                    self.kv_mgr.kv_args, "draft_state_data_ptrs", []
+                )
+            packed_draft_state_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in draft_state_data_ptrs
+            )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
             tp_rank = self.kv_mgr.kv_args.engine_rank
             dst_tp_rank = str(tp_rank).encode("ascii")
@@ -2306,6 +2444,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                     enable_pd_direct2host,
                     packed_staging_base_ptr,
                     staging_total_size_str,
+                    packed_draft_state_data_ptrs,
                 ],
             )
             if count is not None:
@@ -2328,6 +2467,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        draft_state_indices: Optional[List[int]] = None,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -2379,6 +2519,14 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         else b""
                     ),
                     str(self.required_dst_info_num).encode("ascii"),
+                    (
+                        np.array(
+                            draft_state_indices,
+                            dtype=np.int32,
+                        ).tobytes()
+                        if not is_dummy and draft_state_indices is not None
+                        else b""
+                    ),
                 ],
             )
             if count is not None:

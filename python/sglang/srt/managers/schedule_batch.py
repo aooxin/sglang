@@ -645,6 +645,9 @@ class Req(ReqDllmMixin):
         #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
         # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
         self.swa_evicted_seqlen = 0
+        # DFLASH two-window SWA: how far the draft's own swa slots have been evicted
+        # (draft window, independent of swa_evicted_seqlen).
+        self.draft_swa_evicted_seqlen = 0
 
         # The index of the extend / decode batch
         self.extend_batch_idx = 0
@@ -853,6 +856,7 @@ class Req(ReqDllmMixin):
         self.raw_cached_tokens = 0
         self.storage_full_hit_tokens = 0
         self.storage_swa_hit_tokens = 0
+        self.storage_draft_swa_hit_tokens = 0
         self.raw_prefix_len = 0
         # Length of the (real or fake) matched prefix; read by fake-cache-hit path and radix free.
         self.last_matched_prefix_len = 0
@@ -1381,6 +1385,7 @@ class Req(ReqDllmMixin):
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
         self.swa_evicted_seqlen = 0
+        self.draft_swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
@@ -2109,7 +2114,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
         evict_from_tree_cache(self.tree_cache, num_tokens)
-        return self.token_to_kv_pool_allocator.available_size() >= num_tokens
+        allocator = self.token_to_kv_pool_allocator
+        available = allocator.available_size()
+        if available < num_tokens:
+            if hasattr(allocator, "full_available_size"):
+                full_avail = allocator.full_available_size()
+                swa_avail = allocator.swa_available_size()
+                draft_swa_avail = (
+                    allocator.draft_swa_available_size()
+                    if getattr(allocator, "has_draft_swa", False)
+                    else None
+                )
+                logger.info(
+                    f"check_decode_mem insufficient: need={num_tokens}, "
+                    f"available(min)={available}, "
+                    f"full_available={full_avail}, swa_available={swa_avail}, "
+                    f"draft_swa_available={draft_swa_avail}"
+                )
+            else:
+                logger.warning(
+                    f"check_decode_mem insufficient: need={num_tokens}, "
+                    f"available={available}"
+                )
+            return False
+        return True
 
     def retract_all(self, server_args: ServerArgs):
         retracted_reqs = self.reqs

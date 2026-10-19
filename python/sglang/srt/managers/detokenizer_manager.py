@@ -366,6 +366,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             raw_cached_tokens=recv_obj.raw_cached_tokens,
             storage_full_hit_tokens=recv_obj.storage_full_hit_tokens,
             storage_swa_hit_tokens=recv_obj.storage_swa_hit_tokens,
+            storage_draft_swa_hit_tokens=recv_obj.storage_draft_swa_hit_tokens,
             cached_tokens_details=recv_obj.cached_tokens_details,
             image_tokens=recv_obj.image_tokens,
             audio_tokens=recv_obj.audio_tokens,

@@ -264,6 +264,7 @@ class StatePlan(NamedTuple):
 class DeferredPost(NamedTuple):
     kv_handle: D2HHandle
     state_plan: StatePlan
+    draft_state_plan: StatePlan
     page_size: int
 
 
@@ -320,9 +321,9 @@ class PDD2HFusedPoller:
 
     def poll(
         self,
-        prealloc_entries: List[Tuple[int, int, int, int, int, int]],
-        transfer_entries: List[Tuple[int, int, int, int, int, int]],
-        admission_snapshot: Tuple[int, int, int, int, int],
+        prealloc_entries: List[Tuple[int, int, int, int, int, int, int]],
+        transfer_entries: List[Tuple[int, int, int, int, int, int, int]],
+        admission_snapshot: Tuple[int, int, int, int, int, int],
     ) -> Tuple[Dict[int, int], Dict[int, int], Optional[int], bool]:
         """Gather queue snapshots and select a TP-wide H2D candidate room.
 
@@ -344,7 +345,7 @@ class PDD2HFusedPoller:
             device="cpu",
         )
         gathered_headers = torch.empty(
-            (world_size, 8), dtype=torch.int64, device="cpu"
+            (world_size, 9), dtype=torch.int64, device="cpu"
         )
         torch.distributed.all_gather_into_tensor(
             gathered_headers.flatten(), header, group=group
@@ -369,7 +370,7 @@ class PDD2HFusedPoller:
 
         stride = max_p + max_t
         local_entries = torch.full(
-            (stride, 6), -1, dtype=torch.int64, device="cpu"
+            (stride, 7), -1, dtype=torch.int64, device="cpu"
         )
         for i, entry in enumerate(prealloc_entries):
             local_entries[i] = torch.tensor(entry, dtype=torch.int64)
@@ -377,7 +378,7 @@ class PDD2HFusedPoller:
             local_entries[max_p + i] = torch.tensor(entry, dtype=torch.int64)
 
         gathered_entries = torch.empty(
-            (world_size, stride, 6), dtype=torch.int64, device="cpu"
+            (world_size, stride, 7), dtype=torch.int64, device="cpu"
         )
         torch.distributed.all_gather_into_tensor(
             gathered_entries.flatten(), local_entries.flatten(), group=group
@@ -452,12 +453,12 @@ class PDD2HFusedPoller:
         gathered_entries: torch.Tensor,
         counts: List[int],
         world_size: int,
-    ) -> Tuple[Dict[int, int], Optional[int], Dict[int, Tuple[int, int]]]:
+    ) -> Tuple[Dict[int, int], Optional[int], Dict[int, Tuple[int, int, int]]]:
         entries_array = gathered_entries.numpy()
         present_counts: Dict[int, int] = {}
         min_status_by_room: Dict[int, int] = {}
         last_entries_by_room: Dict[int, Dict[int, Tuple[int, int, int]]] = {}
-        first_entries_by_room: Dict[int, Dict[int, Tuple[int, int]]] = {}
+        first_entries_by_room: Dict[int, Dict[int, Tuple[int, int, int]]] = {}
 
         for rank, count in enumerate(counts):
             rank_rooms = set()
@@ -470,6 +471,7 @@ class PDD2HFusedPoller:
                     metadata_room_value,
                     need_full_value,
                     need_swa_value,
+                    need_draft_swa_value,
                 ) = entry
                 room = int(room_value)
                 poll = int(poll_value)
@@ -482,6 +484,7 @@ class PDD2HFusedPoller:
                     first_entries_by_room.setdefault(room, {})[rank] = (
                         int(need_full_value),
                         int(need_swa_value),
+                        int(need_draft_swa_value),
                     )
 
                 min_status_by_room[room] = min(
@@ -536,7 +539,7 @@ class PDD2HFusedPoller:
         ]
         candidate_room = min(candidate_rooms) if candidate_rooms else None
 
-        candidate_entries_by_rank: Dict[int, Tuple[int, int]] = {}
+        candidate_entries_by_rank: Dict[int, Tuple[int, int, int]] = {}
         if candidate_room is not None:
             candidate_entries_by_rank = first_entries_by_room.get(
                 candidate_room, {}
@@ -548,7 +551,7 @@ class PDD2HFusedPoller:
     def _h2d_admit_from_summary(
         candidate_room: Optional[int],
         gathered_headers: torch.Tensor,
-        candidate_entries_by_rank: Dict[int, Tuple[int, int]],
+        candidate_entries_by_rank: Dict[int, Tuple[int, int, int]],
     ) -> bool:
         if candidate_room is None:
             return False
@@ -558,13 +561,14 @@ class PDD2HFusedPoller:
             candidate_entry = candidate_entries_by_rank.get(rank)
             if candidate_entry is None:
                 return False
-            need_full, need_swa = candidate_entry
+            need_full, need_swa, need_draft_swa = candidate_entry
             (
                 _,
                 _,
                 _,
                 full_available_value,
                 swa_available_value,
+                draft_swa_available_value,
                 reserved_decode_tokens_value,
                 retract_in_progress_value,
                 h2d_gate_busy_value,
@@ -572,9 +576,11 @@ class PDD2HFusedPoller:
             if not PDDirect2HostManager.can_admit_h2d_from_snapshot(
                 need_full,
                 need_swa,
+                need_draft_swa,
                 (
                     int(full_available_value),
                     int(swa_available_value),
+                    int(draft_swa_available_value),
                     int(reserved_decode_tokens_value),
                     int(retract_in_progress_value),
                     int(h2d_gate_busy_value),
@@ -613,6 +619,7 @@ class DecodePreallocQueue:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self._has_pre_alloc = hasattr(token_to_kv_pool_allocator, "pre_alloc")
+        self._draft_independent_swa = token_to_kv_pool_allocator.has_draft_swa
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.draft_token_to_kv_pool_list = draft_token_to_kv_pool_list or []
@@ -737,34 +744,53 @@ class DecodePreallocQueue:
             self._d2h_pending = False
 
     def _issue_async_state_d2h(
-        self, decode_req: DecodeRequest, pd_d2h_mgr, page_size
+        self,
+        decode_req: DecodeRequest,
+        pd_d2h_mgr,
+        page_size,
+        draft: bool = False,
     ) -> StatePlan:
         req = decode_req.req
 
         if pd_d2h_mgr is not None:
-            if req.host_state_indices is None:
-                return StatePlan(mode="none", page_size=page_size)
-            handle = D2HHandle(
-                kind="host", host_arr=np.asarray(req.host_state_indices)
+            host_state_indices = (
+                getattr(req, "host_draft_state_indices", None)
+                if draft
+                else req.host_state_indices
             )
+            if host_state_indices is None:
+                return StatePlan(mode="none", page_size=page_size)
+            handle = D2HHandle(kind="host", host_arr=np.asarray(host_state_indices))
             return StatePlan(mode="page", payload=handle, page_size=page_size)
 
         if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
+            if draft:
+                return StatePlan(mode="none", page_size=page_size)
             src = self.req_to_token_pool.req_index_to_mamba_index_mapping[
                 req.req_pool_idx
             ]
             return StatePlan(mode="list_sync", payload=src, page_size=page_size)
 
         if isinstance(self.token_to_kv_pool, SWAKVPool):
+            if draft and not self._draft_independent_swa:
+                return StatePlan(mode="none", page_size=page_size)
             seq_len = len(req.origin_input_ids)
-            window_size = self.scheduler.swa_retention_window
+            window_size = (
+                self.scheduler.draft_swa_window_size
+                if draft
+                else self.scheduler.sliding_window_size
+            )
             window_start = max(0, seq_len - window_size)
             window_start = (window_start // page_size) * page_size
             window_kv_indices_full = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, window_start:seq_len
             ]
             window_kv_indices_swa = (
-                self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                self.token_to_kv_pool_allocator.translate_loc_from_full_to_draft_swa(
+                    window_kv_indices_full
+                )
+                if draft
+                else self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                     window_kv_indices_full
                 )
             )
@@ -775,6 +801,8 @@ class DecodePreallocQueue:
             )
 
         if isinstance(self.token_to_kv_pool, NSATokenToKVPool):
+            if draft:
+                return StatePlan(mode="none", page_size=page_size)
             seq_len = len(req.origin_input_ids)
             kv_indices_full = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :seq_len
@@ -787,7 +815,7 @@ class DecodePreallocQueue:
 
         return StatePlan(mode="none", page_size=page_size)
 
-    def _finalize_state(self, state_plan: StatePlan):
+    def _materialize_state_plan(self, state_plan: StatePlan):
         if state_plan.mode == "none":
             return None
         if state_plan.mode == "list_sync":
@@ -821,11 +849,19 @@ class DecodePreallocQueue:
         return self._to_metadata_indices(raw)
 
     def _post_metadata(
-        self, decode_req: DecodeRequest, kv_indices, state_indices, page_size
+        self,
+        decode_req: DecodeRequest,
+        kv_indices,
+        state_indices,
+        draft_state_indices,
+        page_size,
     ):
         page_indices = kv_to_page_indices(kv_indices, page_size)
         decode_req.kv_receiver.send_metadata(
-            page_indices, decode_req.metadata_buffer_index, state_indices
+            page_indices,
+            decode_req.metadata_buffer_index,
+            state_indices,
+            draft_state_indices,
         )
         if (
             self.transfer_queue.enable_staging
@@ -835,14 +871,21 @@ class DecodePreallocQueue:
                 decode_req.req.bootstrap_room, decode_req
             )
 
-    def finalize_deferred_posts(self, posts: List[DecodeRequest]):
+    def _flush_deferred_posts(self, posts: List[DecodeRequest]):
         self._sync_async_d2h()
         for decode_req in posts:
-            kv_handle, state_plan, page_size = decode_req._deferred_post
+            kv_handle, state_plan, draft_state_plan, page_size = decode_req._deferred_post
             decode_req._deferred_post = None
             kv_indices = self._finalize_d2h(kv_handle)
-            state_indices = self._finalize_state(state_plan)
-            self._post_metadata(decode_req, kv_indices, state_indices, page_size)
+            state_indices = self._materialize_state_plan(state_plan)
+            draft_state_indices = self._materialize_state_plan(draft_state_plan)
+            self._post_metadata(
+                decode_req,
+                kv_indices,
+                state_indices,
+                draft_state_indices,
+                page_size,
+            )
         self.transfer_queue.extend(posts)
 
     def _get_state_indices(
@@ -867,9 +910,7 @@ class DecodePreallocQueue:
 
         if isinstance(self.token_to_kv_pool, SWAKVPool):
             seq_len = len(req.origin_input_ids)
-            window_size = self.scheduler.swa_retention_window
-            window_start = max(0, seq_len - window_size)
-            window_start = (window_start // page_size) * page_size
+            window_start = floor_align(max(0, seq_len - self.scheduler.sliding_window_size), page_size)
             window_kv_indices_full = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, window_start:seq_len
             ]
@@ -891,6 +932,38 @@ class DecodePreallocQueue:
 
         return None
 
+    def _get_draft_state_indices(
+        self, decode_req: DecodeRequest, pd_d2h_mgr, page_size: int
+    ):
+        # DFLASH two-window: the draft's swa state uses distinct slots over the
+        # same window range as the target swa state, translated via the draft
+        # mapping. Only produced when the allocator exposes a draft-swa mapping.
+        if pd_d2h_mgr is not None:
+            req = decode_req.req
+            host_draft_state_indices = getattr(req, "host_draft_state_indices", None)
+            if host_draft_state_indices is None:
+                return None
+            draft_state_indices = self._to_metadata_indices(host_draft_state_indices)
+            return kv_to_page_indices(draft_state_indices, page_size)
+        if not isinstance(self.token_to_kv_pool, SWAKVPool):
+            return None
+        if not self._draft_independent_swa:
+            return None
+
+        req = decode_req.req
+        seq_len = len(req.origin_input_ids)
+        window_start = floor_align(max(0, seq_len - self.scheduler.draft_swa_window_size), page_size)
+        window_kv_indices_full = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, window_start:seq_len
+        ]
+        draft_window_kv_indices_swa = (
+            self.token_to_kv_pool_allocator.translate_loc_from_full_to_draft_swa(
+                window_kv_indices_full
+            )
+        )
+        draft_state_indices = self._to_metadata_indices(draft_window_kv_indices_swa)
+        return kv_to_page_indices(draft_state_indices, page_size)
+
     def _bootstrap_room(self, decode_req: DecodeRequest) -> int:
         bootstrap_room = decode_req.req.bootstrap_room
         if bootstrap_room is None:
@@ -900,21 +973,21 @@ class DecodePreallocQueue:
             )
         return int(bootstrap_room)
 
-    def local_poll_entries(self) -> List[Tuple[int, int, int, int, int, int]]:
+    def local_poll_entries(self) -> List[Tuple[int, int, int, int, int, int, int]]:
         """Snapshot prealloc room, poll, local state, and metadata placeholder.
 
         Pure local computation — the collective exchange is done by
         PDD2HFusedPoller so that all ranks issue exactly one collective per
         scheduler iteration regardless of local queue state.
         """
-        entries: List[Tuple[int, int, int, int, int, int]] = []
+        entries: List[Tuple[int, int, int, int, int, int, int]] = []
         for decode_req in self.queue:
             room = self._bootstrap_room(decode_req)
             if decode_req.waiting_for_input:
-                entries.append((room, int(KVPoll.WaitingForInput), 1, -1, -1, -1))
+                entries.append((room, int(KVPoll.WaitingForInput), 1, -1, -1, -1, -1))
             else:
                 entries.append(
-                    (room, int(decode_req.kv_receiver.poll()), 0, -1, -1, -1)
+                    (room, int(decode_req.kv_receiver.poll()), 0, -1, -1, -1, -1)
                 )
         return entries
 
@@ -994,22 +1067,33 @@ class DecodePreallocQueue:
             kv_args.state_item_lens = []
             kv_args.state_type = "none"
 
+        # DFLASH two-window: when the draft has its own swa free-list/mapping,
+        # its swa state must transfer as a separate group with its own slot
+        # indices (draft_state_*), not folded into the target state group.
+        kv_args.draft_state_data_ptrs = []
+        kv_args.draft_state_data_lens = []
+        kv_args.draft_state_item_lens = []
+        draft_independent_swa = self._draft_independent_swa
+
+        def _append_draft_state(pool):
+            state_data_ptrs, state_data_lens, state_item_lens = (
+                pool.get_state_buf_infos()
+            )
+            if draft_independent_swa:
+                kv_args.draft_state_data_ptrs += state_data_ptrs
+                kv_args.draft_state_data_lens += state_data_lens
+                kv_args.draft_state_item_lens += state_item_lens
+            else:
+                kv_args.state_data_ptrs += state_data_ptrs
+                kv_args.state_data_lens += state_data_lens
+                kv_args.state_item_lens += state_item_lens
+
         if len(self.draft_token_to_kv_pool_list):
             for draft_kv_pool in self.draft_token_to_kv_pool_list:
                 if hasattr(draft_kv_pool, "get_state_buf_infos"):
-                    state_data_ptrs, state_data_lens, state_item_lens = (
-                        draft_kv_pool.get_state_buf_infos()
-                    )
-                    kv_args.state_data_ptrs += state_data_ptrs
-                    kv_args.state_data_lens += state_data_lens
-                    kv_args.state_item_lens += state_item_lens
+                    _append_draft_state(draft_kv_pool)
         elif hasattr(self.draft_token_to_kv_pool, "get_state_buf_infos"):
-            state_data_ptrs, state_data_lens, state_item_lens = (
-                self.draft_token_to_kv_pool.get_state_buf_infos()
-            )
-            kv_args.state_data_ptrs += state_data_ptrs
-            kv_args.state_data_lens += state_data_lens
-            kv_args.state_item_lens += state_item_lens
+            _append_draft_state(self.draft_token_to_kv_pool)
 
         # PD direct-to-host: when enabled, the decode side advertises
         # pinned host buffers as the RDMA destinations instead of device
@@ -1027,6 +1111,11 @@ class DecodePreallocQueue:
                 kv_args.host_state_data_lens,
                 kv_args.host_state_item_lens,
             ) = pd_d2h_mgr.get_host_state_buf_infos()
+            (
+                kv_args.host_draft_state_data_ptrs,
+                kv_args.host_draft_state_data_lens,
+                kv_args.host_draft_state_item_lens,
+            ) = pd_d2h_mgr.get_host_draft_state_buf_infos()
         else:
             kv_args.host_kv_data_ptrs = []
             kv_args.host_kv_data_lens = []
@@ -1034,6 +1123,9 @@ class DecodePreallocQueue:
             kv_args.host_state_data_ptrs = []
             kv_args.host_state_data_lens = []
             kv_args.host_state_item_lens = []
+            kv_args.host_draft_state_data_ptrs = []
+            kv_args.host_draft_state_data_lens = []
+            kv_args.host_draft_state_item_lens = []
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
@@ -1161,26 +1253,25 @@ class DecodePreallocQueue:
         )
 
     def _swa_required_tokens(
-        self, req: Req, page_size: int, include_output_ids: bool = True
+        self,
+        req: Req,
+        page_size: int,
+        window_size: int,
+        include_output_ids: bool = True,
     ) -> int:
         req_len = req.seqlen if include_output_ids else len(req.origin_input_ids)
         return ceil_align(
-            min(
-                req_len,
-                self.scheduler.swa_retention_window,
-            )
+            min(req_len, window_size)
             + min(self.num_reserved_decode_tokens, self.evict_len_per_step)
             + self.swa_extra_need_tokens,
             page_size,
         )
 
-    def _swa_tokens_for_retracted_req(self, req: Req, page_size: int) -> int:
+    def _swa_tokens_for_retracted_req(
+        self, req: Req, page_size: int, window_size: int
+    ) -> int:
         return ceil_align(
-            min(
-                req.seqlen,
-                self.scheduler.swa_retention_window,
-            )
-            + self.evict_len_per_step,
+            min(req.seqlen, window_size) + self.evict_len_per_step,
             page_size,
         )
 
@@ -1188,7 +1279,7 @@ class DecodePreallocQueue:
         retractable_tokens = 0
         swa_retractable_tokens = 0
         is_hybrid_swa = self.scheduler.model_config.is_hybrid_swa
-        sliding_window_size = self.scheduler.swa_retention_window
+        sliding_window_size = self.scheduler.sliding_window_size
         for req in self.scheduler.running_batch.reqs:
             req_len = req.seqlen
             retractable_tokens += req_len
@@ -1210,14 +1301,15 @@ class DecodePreallocQueue:
         )
 
     def _max_swa_tokens_for_req(
-        self, req: Req, swa_retractable_tokens: int, page_size: int
+        self,
+        req: Req,
+        swa_retractable_tokens: int,
+        page_size: int,
+        window_size: int,
     ) -> int:
         return ceil_align(
             max(
-                min(
-                    len(req.origin_input_ids),
-                    self.scheduler.swa_retention_window,
-                )
+                min(len(req.origin_input_ids), window_size)
                 + self.swa_extra_need_tokens
                 + min(
                     req.sampling_params.max_new_tokens,
@@ -1229,6 +1321,73 @@ class DecodePreallocQueue:
             ),
             page_size,
         )
+
+    def _draft_swa_retractable_tokens(self) -> int:
+        draft_window = self.scheduler.draft_swa_window_size
+        return sum(
+            min(req.seqlen, draft_window)
+            for req in self.scheduler.running_batch.reqs
+        )
+
+    def _full_pool_allocatable_tokens(
+        self,
+        available_size: int,
+        need_space_for_single_req: int,
+        total_reqs: int,
+        count_retracted: bool,
+    ) -> int:
+        """Full-attention pool allocatable budget.
+        """
+        alloc = available_size - max(
+            # preserve some space for future decode
+            self.num_reserved_decode_tokens * total_reqs,
+            # make sure each request can finish if reach max_tokens with all other requests retracted
+            need_space_for_single_req,
+        )
+        # Note: if the last prebuilt extend just finishes, and we enter
+        # `pop_preallocated` immediately in the next iteration the extend batch
+        # is not in any queue, so we need to explicitly add the token slots here.
+        if (
+            self.scheduler.last_batch
+            and self.scheduler.last_batch.forward_mode.is_prebuilt()
+        ):
+            alloc -= self.num_reserved_decode_tokens * len(
+                self.scheduler.last_batch.reqs
+            )
+        if count_retracted:
+            page_size = self.token_to_kv_pool_allocator.page_size
+            alloc -= sum(
+                self._full_required_tokens(req, page_size)
+                for req in self.retracted_queue
+            )
+        return alloc
+
+    def _swa_pool_allocatable_tokens(
+        self,
+        available_size: int,
+        window_size: int,
+        swa_retractable_tokens: Optional[int],
+        count_retracted: bool,
+    ) -> int:
+        """Window-pool (target-swa or draft-swa) allocatable budget.
+        """
+        page_size = self.token_to_kv_pool_allocator.page_size
+        need_swa_space_for_single_req = 0
+        if swa_retractable_tokens is not None:
+            for req in self.scheduler.running_batch.reqs:
+                need_swa_space_for_single_req = max(
+                    need_swa_space_for_single_req,
+                    self._max_swa_tokens_for_req(
+                        req, swa_retractable_tokens, page_size, window_size
+                    ),
+                )
+        alloc_swa = available_size - need_swa_space_for_single_req
+        if count_retracted:
+            alloc_swa -= sum(
+                self._swa_tokens_for_retracted_req(req, page_size, window_size)
+                for req in self.retracted_queue
+            )
+        return alloc_swa
 
     def extend(self, reqs: List[Req], is_retracted: bool = False) -> None:
         """Add a request to the pending queue."""
@@ -1245,6 +1404,17 @@ class DecodePreallocQueue:
         indices_to_remove = set()
         allocatable_tokens = self._allocatable_tokens(count_retracted=False)
         page_size = self.token_to_kv_pool_allocator.page_size
+        draft_independent_swa = self._draft_independent_swa
+        draft_swa_allocatable_tokens = (
+            self._swa_pool_allocatable_tokens(
+                available_size=self.token_to_kv_pool_allocator.draft_swa_available_size(),
+                window_size=self.scheduler.draft_swa_window_size,
+                swa_retractable_tokens=self._draft_swa_retractable_tokens(),
+                count_retracted=False,
+            )
+            if draft_independent_swa
+            else 0
+        )
 
         for i, req in enumerate(self.retracted_queue):
             if rids_to_check is not None and req.rid not in rids_to_check:
@@ -1263,15 +1433,28 @@ class DecodePreallocQueue:
                     req, page_size
                 )
                 swa_required_tokens_for_request = self._swa_required_tokens(
-                    req, page_size
+                    req, page_size, self.scheduler.sliding_window_size
+                )
+                draft_swa_required_tokens_for_request = (
+                    self._swa_required_tokens(
+                        req, page_size, self.scheduler.draft_swa_window_size
+                    )
+                    if draft_independent_swa
+                    else 0
                 )
                 if (
                     full_required_tokens_for_request > full_allocatable_tokens
                     or swa_required_tokens_for_request > swa_allocatable_tokens
+                    or (
+                        draft_independent_swa
+                        and draft_swa_required_tokens_for_request
+                        > draft_swa_allocatable_tokens
+                    )
                 ):
                     break
                 full_allocatable_tokens -= full_required_tokens_for_request
                 swa_allocatable_tokens -= swa_required_tokens_for_request
+                draft_swa_allocatable_tokens -= draft_swa_required_tokens_for_request
                 allocatable_tokens = (full_allocatable_tokens, swa_allocatable_tokens)
 
             resumed_reqs.append(req)
@@ -1449,7 +1632,10 @@ class DecodePreallocQueue:
         allocatable_tokens: Union[int, Tuple[int, int]],
         retractable_tokens: Optional[int],
         swa_retractable_tokens: Optional[int],
-    ) -> Optional[Union[int, Tuple[int, int]]]:
+        draft_swa_active: bool = False,
+        draft_swa_allocatable_tokens: int = 0,
+        draft_swa_retractable_tokens: int = 0,
+    ) -> Optional[Tuple[Union[int, Tuple[int, int]], int]]:
         required_tokens_for_request = self._full_required_tokens(
             req, page_size, include_output_ids=False
         )
@@ -1463,39 +1649,83 @@ class DecodePreallocQueue:
                 max_tokens_for_request,
             ) > allocatable_tokens:
                 return None
-            return allocatable_tokens - required_tokens_for_request
+            return (
+                allocatable_tokens - required_tokens_for_request,
+                draft_swa_allocatable_tokens,
+            )
 
         assert swa_retractable_tokens is not None
         full_allocatable_tokens, swa_allocatable_tokens = allocatable_tokens
         swa_required_tokens_for_request = self._swa_required_tokens(
-            req, page_size, include_output_ids=False
+            req,
+            page_size,
+            self.scheduler.sliding_window_size,
+            include_output_ids=False,
         )
         swa_max_tokens_for_request = self._max_swa_tokens_for_req(
-            req, swa_retractable_tokens, page_size
+            req, swa_retractable_tokens, page_size, self.scheduler.sliding_window_size
+        )
+        draft_swa_required_tokens_for_request = (
+            self._swa_required_tokens(
+                req,
+                page_size,
+                self.scheduler.draft_swa_window_size,
+                include_output_ids=False,
+            )
+            if draft_swa_active
+            else 0
+        )
+        draft_swa_max_tokens_for_request = (
+            self._max_swa_tokens_for_req(
+                req,
+                draft_swa_retractable_tokens,
+                page_size,
+                self.scheduler.draft_swa_window_size,
+            )
+            if draft_swa_active
+            else 0
         )
         if (
             max(required_tokens_for_request, max_tokens_for_request)
             > full_allocatable_tokens
             or max(swa_required_tokens_for_request, swa_max_tokens_for_request)
             > swa_allocatable_tokens
+            or (
+                draft_swa_active
+                and max(
+                    draft_swa_required_tokens_for_request,
+                    draft_swa_max_tokens_for_request,
+                )
+                > draft_swa_allocatable_tokens
+            )
         ):
             return None
         if (
             required_tokens_for_request > full_allocatable_tokens
             or swa_required_tokens_for_request > swa_allocatable_tokens
+            or (
+                draft_swa_active
+                and draft_swa_required_tokens_for_request
+                > draft_swa_allocatable_tokens
+            )
         ):
             logger.warning(
                 f"Not enough space for req: {req.rid} {req.bootstrap_room=}, "
                 f"full_required_tokens_for_request: {required_tokens_for_request} > "
                 f"full_allocatable_tokens: {full_allocatable_tokens}, "
                 f"swa_required_tokens_for_request: {swa_required_tokens_for_request} > "
-                f"swa_allocatable_tokens: {swa_allocatable_tokens}"
+                f"swa_allocatable_tokens: {swa_allocatable_tokens}, "
+                f"draft_swa_required_tokens_for_request: {draft_swa_required_tokens_for_request} > "
+                f"draft_swa_allocatable_tokens: {draft_swa_allocatable_tokens}"
             )
             return None
 
         return (
-            full_allocatable_tokens - required_tokens_for_request,
-            swa_allocatable_tokens - swa_required_tokens_for_request,
+            (
+                full_allocatable_tokens - required_tokens_for_request,
+                swa_allocatable_tokens - swa_required_tokens_for_request,
+            ),
+            draft_swa_allocatable_tokens - draft_swa_required_tokens_for_request,
         )
 
     def pop_preallocated(
@@ -1516,13 +1746,31 @@ class DecodePreallocQueue:
 
         pd_d2h_mgr = getattr(self.scheduler, "pd_direct2host_manager", None)
         use_device_admission = pd_d2h_mgr is None
+        draft_independent_swa = self._draft_independent_swa
+        draft_swa_retractable_tokens = 0
+        draft_swa_allocatable_tokens = 0
         if use_device_admission:
+            # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
+            # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
             # Keep enough device KV capacity for requests already admitted to decode.
             retractable_tokens, swa_retractable_tokens = self._retractable_tokens()
             allocatable_tokens = self._allocatable_tokens(
                 retractable_tokens=retractable_tokens,
                 swa_retractable_tokens=swa_retractable_tokens,
                 count_retracted=True,
+            )
+            draft_swa_retractable_tokens = (
+                self._draft_swa_retractable_tokens() if draft_independent_swa else 0
+            )
+            draft_swa_allocatable_tokens = (
+                self._swa_pool_allocatable_tokens(
+                    available_size=self.token_to_kv_pool_allocator.draft_swa_available_size(),
+                    window_size=self.scheduler.draft_swa_window_size,
+                    swa_retractable_tokens=draft_swa_retractable_tokens,
+                    count_retracted=True,
+                )
+                if draft_independent_swa
+                else 0
             )
         if self.scheduler.enable_hisparse:
             page_size = 1  # host pool page_size
@@ -1563,16 +1811,19 @@ class DecodePreallocQueue:
                 break
 
             if use_device_admission:
-                next_allocatable_tokens = self._check_projected_device_capacity(
+                capacity = self._check_projected_device_capacity(
                     decode_req.req,
                     page_size,
                     allocatable_tokens,
                     retractable_tokens,
                     swa_retractable_tokens,
+                    draft_swa_active=draft_independent_swa,
+                    draft_swa_allocatable_tokens=draft_swa_allocatable_tokens,
+                    draft_swa_retractable_tokens=draft_swa_retractable_tokens,
                 )
-                if next_allocatable_tokens is None:
+                if capacity is None:
                     break
-                allocatable_tokens = next_allocatable_tokens
+                allocatable_tokens, draft_swa_allocatable_tokens = capacity
 
             origin_input_len = len(decode_req.req.origin_input_ids)
             if defer_posts:
@@ -1590,6 +1841,12 @@ class DecodePreallocQueue:
                     state_plan=self._issue_async_state_d2h(
                         decode_req, pd_d2h_mgr, page_size
                     ),
+                    draft_state_plan=self._issue_async_state_d2h(
+                        decode_req,
+                        pd_d2h_mgr,
+                        page_size,
+                        draft=True,
+                    ),
                     page_size=page_size,
                 )
             else:
@@ -1603,12 +1860,19 @@ class DecodePreallocQueue:
                 state_indices = self._get_state_indices(
                     decode_req, pd_d2h_mgr, page_size
                 )
+                draft_state_indices = self._get_draft_state_indices(
+                    decode_req, pd_d2h_mgr, page_size
+                )
                 decode_req.metadata_buffer_index = (
                     self.req_to_metadata_buffer_idx_allocator.alloc()
                 )
                 assert decode_req.metadata_buffer_index is not None
                 self._post_metadata(
-                    decode_req, kv_indices, state_indices, page_size
+                    decode_req,
+                    kv_indices,
+                    state_indices,
+                    draft_state_indices,
+                    page_size,
                 )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
@@ -1652,15 +1916,14 @@ class DecodePreallocQueue:
     ) -> Union[int, Tuple[int, int]]:
         page_size = self.token_to_kv_pool_allocator.page_size
         running_reqs = self.scheduler.running_batch.reqs
-        if (
-            retractable_tokens is not None
-            and len(running_reqs) > 0
-        ):
-            need_space_for_single_req = 0
-            need_swa_space_for_single_req = 0
-            is_hybrid_swa = self.scheduler.model_config.is_hybrid_swa
-            if is_hybrid_swa:
-                assert swa_retractable_tokens is not None
+        compute_single_req_need = (
+            retractable_tokens is not None and len(running_reqs) > 0
+        )
+        is_hybrid_swa = self.scheduler.model_config.is_hybrid_swa
+        if compute_single_req_need and is_hybrid_swa:
+            assert swa_retractable_tokens is not None
+        need_space_for_single_req = 0
+        if compute_single_req_need:
             for req in running_reqs:
                 need_space_for_single_req = max(
                     need_space_for_single_req,
@@ -1668,84 +1931,36 @@ class DecodePreallocQueue:
                         req, retractable_tokens, page_size
                     ),
                 )
-                if is_hybrid_swa:
-                    need_swa_space_for_single_req = max(
-                        need_swa_space_for_single_req,
-                        self._max_swa_tokens_for_req(
-                            req, swa_retractable_tokens, page_size
-                        ),
-                    )
-        else:
-            need_space_for_single_req = 0
-            need_swa_space_for_single_req = 0
         total_reqs = (
             len(running_reqs)
             + len(self.transfer_queue.queue)
             + len(self.scheduler.waiting_queue)
         )
-        if not self.scheduler.model_config.is_hybrid_swa:
-            available_size = self.token_to_kv_pool_allocator.available_size()
-            reserved_tokens = self.num_reserved_decode_tokens * total_reqs
-
-            allocatable_tokens = available_size - max(
-                # preserve some space for future decode
-                reserved_tokens,
-                # make sure each request can finish if reach max_tokens with all other requests retracted
-                need_space_for_single_req,
-            )
-
-            # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
-            #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
-            if (
-                self.scheduler.last_batch
-                and self.scheduler.last_batch.forward_mode.is_prebuilt()
-            ):
-                allocatable_tokens -= self.num_reserved_decode_tokens * len(
-                    self.scheduler.last_batch.reqs
-                )
-
-            if count_retracted:
-                allocatable_tokens -= sum(
-                    self._full_required_tokens(req, page_size)
-                    for req in self.retracted_queue
-                )
-            return allocatable_tokens
+        # Full-pool budget: identical for hybrid-SWA (full sub-pool) and
+        # non-hybrid (single pool); only the available_size source differs.
+        full_available_size = (
+            self.token_to_kv_pool_allocator.full_available_size()
+            if is_hybrid_swa
+            else self.token_to_kv_pool_allocator.available_size()
+        )
+        alloc_full = self._full_pool_allocatable_tokens(
+            available_size=full_available_size,
+            need_space_for_single_req=need_space_for_single_req,
+            total_reqs=total_reqs,
+            count_retracted=count_retracted,
+        )
+        if not is_hybrid_swa:
+            return alloc_full
         else:
-            need_full_space_for_single_req = need_space_for_single_req
-
-            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-            swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
-
-            reserved_full = self.num_reserved_decode_tokens * total_reqs
-            alloc_full = full_available_size - max(
-                reserved_full,
-                need_full_space_for_single_req,
-            )
-
             # SWA side: no reserved decode tokens, only window budget + optional spec extra
-
-            alloc_swa = swa_available_size - need_swa_space_for_single_req
-
-            if (
-                self.scheduler.last_batch
-                and self.scheduler.last_batch.forward_mode.is_prebuilt()
-            ):
-                alloc_full -= self.num_reserved_decode_tokens * len(
-                    self.scheduler.last_batch.reqs
-                )
-
-            if count_retracted:
-                alloc_full -= sum(
-                    self._full_required_tokens(req, page_size)
-                    for req in self.retracted_queue
-                )
-
-                alloc_swa -= sum(
-                    # pre-alloc for prefill + alloc for decode
-                    self._swa_tokens_for_retracted_req(req, page_size)
-                    for req in self.retracted_queue
-                )
-
+            alloc_swa = self._swa_pool_allocatable_tokens(
+                available_size=self.token_to_kv_pool_allocator.swa_available_size(),
+                window_size=self.scheduler.sliding_window_size,
+                swa_retractable_tokens=(
+                    swa_retractable_tokens if compute_single_req_need else None
+                ),
+                count_retracted=count_retracted,
+            )
             return (alloc_full, alloc_swa)
 
     def _pre_alloc(self, req: Req) -> torch.Tensor:
@@ -1786,7 +2001,8 @@ class DecodePreallocQueue:
         elif self._has_pre_alloc:
             kv_loc = self.token_to_kv_pool_allocator.pre_alloc(
                 fill_len,
-                self.scheduler.swa_retention_window,
+                self.scheduler.sliding_window_size,
+                self.scheduler.draft_swa_window_size,
             )
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
@@ -1810,16 +2026,31 @@ class DecodePreallocQueue:
         # populate metadata
         req.fill_ids = req.origin_input_ids + req.output_ids
         req.set_extend_input_len(len(req.fill_ids))
-        # 会在 maybe_evict_swa 中使用
+        # 更新 req.swa_evicted_seqlen, 会在 maybe_evict_swa 中使用
         req.swa_evicted_seqlen = floor_align(
             max(
                 len(req.origin_input_ids)
                 + max(len(req.output_ids) - 1, 0)
-                - self.scheduler.swa_retention_window,
+                - self.scheduler.sliding_window_size,
                 0,
             ),
             self.token_to_kv_pool_allocator.page_size,
         )
+
+        # 更新 req.draft_swa_evicted_seqlen, 会在 _maybe_evict_draft_swa 中使用
+        if self._draft_independent_swa:
+            draft_swa_window_size = int(
+                self.token_to_kv_pool_allocator.draft_swa_window_size or 0
+            )
+            req.draft_swa_evicted_seqlen = floor_align(
+                max(
+                    len(req.origin_input_ids)
+                    + max(len(req.output_ids) - 1, 0)
+                    - draft_swa_window_size,
+                    0,
+                ),
+                self.token_to_kv_pool_allocator.page_size,
+            )
 
         # Return the transfer destination indices:
         if self.scheduler.enable_hisparse:
@@ -1967,16 +2198,18 @@ class DecodeTransferQueue:
 
     def local_poll_entries(
         self, pd_d2h_mgr
-    ) -> List[Tuple[int, int, int, int, int, int]]:
+    ) -> List[Tuple[int, int, int, int, int, int, int]]:
         """Snapshot transfer room, poll, state, and visible metadata room.
 
         Pure local computation — the collective exchange is done by
         PDD2HFusedPoller (see DecodePreallocQueue.local_poll_entries).
         """
-        entries: List[Tuple[int, int, int, int, int, int]] = []
+        entries: List[Tuple[int, int, int, int, int, int, int]] = []
         for decode_req in self.queue:
             room = self._bootstrap_room(decode_req)
-            need_full, need_swa = pd_d2h_mgr.h2d_required_tokens(decode_req.req)
+            need_full, need_swa, need_draft_swa = pd_d2h_mgr.h2d_required_tokens(
+                decode_req.req
+            )
             metadata_room = -1
             if decode_req.pd_d2h_state is PDD2HState.WAIT_PREFILL:
                 poll = int(decode_req.kv_receiver.poll())
@@ -2001,6 +2234,7 @@ class DecodeTransferQueue:
                     metadata_room,
                     need_full,
                     need_swa,
+                    need_draft_swa,
                 )
             )
         return entries
@@ -2647,4 +2881,4 @@ class SchedulerDisaggregationDecodeMixin:
         if not posts:
             return
         self._deferred_pd_posts = None
-        self.disagg_decode_prealloc_queue.finalize_deferred_posts(posts)
+        self.disagg_decode_prealloc_queue._flush_deferred_posts(posts)

@@ -717,12 +717,14 @@ class RadixCache(BasePrefixCache):
         """
 
     def _on_node_swa_mapping_increased(
-        self, node: TreeNode, num_transferred: int
+        self, node: TreeNode, num_transferred: int, draft_num_transferred: int = 0
     ) -> None:
         """Hook fired AFTER an external mutation increased ``node.value``'s
         live SWA-mapping count by ``num_transferred`` (e.g. via
         ``splice_swa_mapping`` transferring SWA slots from a request-side
-        source into a tree-resident target).
+        source into a tree-resident target). ``draft_num_transferred`` is the
+        DFLASH two-window draft-swa transfer count (0 when the draft pool is off
+        or the mutation did not touch draft mappings).
 
         Subclasses that maintain per-slot SWA bucket counters (e.g.
         ``_swa_evictable_size`` / ``_swa_protected_size``) MUST add

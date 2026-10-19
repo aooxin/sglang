@@ -69,6 +69,16 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.is_not_in_free_group = True
         self.free_group = []
 
+    @property
+    def has_draft_swa(self) -> bool:
+        """Whether this allocator carries an independent DFLASH draft-SWA pool.
+
+        False on plain allocators; SWATokenToKVPoolAllocator overrides it. Lets
+        callers gate DFLASH two-window logic without probing for the
+        draft_swa_attn_allocator attribute across the codebase.
+        """
+        return False
+
     def _bitmap_assert_alloc(self, indices: torch.Tensor):
         """Assert that none of the units being allocated are already in use."""
         already_allocated = self._alloc_bitmap[indices]

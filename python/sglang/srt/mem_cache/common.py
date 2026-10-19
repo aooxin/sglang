@@ -242,7 +242,18 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         full_available_size = allocator.full_available_size()
         swa_available_size = allocator.swa_available_size()
 
-        if full_available_size < num_tokens or swa_available_size < num_tokens:
+        draft_swa_shortage = False
+        draft_swa_num_tokens = 0
+        if allocator.has_draft_swa:
+            draft_swa_available_size = allocator.draft_swa_available_size()
+            draft_swa_shortage = draft_swa_available_size < num_tokens
+            draft_swa_num_tokens = max(0, num_tokens - draft_swa_available_size)
+
+        if (
+            full_available_size < num_tokens
+            or swa_available_size < num_tokens
+            or draft_swa_shortage
+        ):
             full_num_tokens = max(0, num_tokens - full_available_size)
             swa_num_tokens = max(0, num_tokens - swa_available_size)
             # 这里不能再像普通 radix cache 那样只看一个 shortage。
@@ -252,7 +263,7 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
             # 因此驱逐接口必须同时收到 full/swa 两个缺口。
             if isinstance(tree_cache, (SWARadixCache, SimpleSWARadixCache)):
                 tree_cache.evict(
-                    EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+                    EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens, draft_swa_num_tokens=draft_swa_num_tokens)
                 )
             else:
                 tree_cache.evict(

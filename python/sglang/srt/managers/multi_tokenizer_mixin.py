@@ -156,6 +156,7 @@ def _handle_output_by_index(output, i):
             raw_cached_tokens=_extract_field_by_index(output, "raw_cached_tokens", i),
             storage_full_hit_tokens=_extract_field_by_index(output, "storage_full_hit_tokens", i),
             storage_swa_hit_tokens=_extract_field_by_index(output, "storage_swa_hit_tokens", i),
+            storage_draft_swa_hit_tokens=_extract_field_by_index(output, "storage_draft_swa_hit_tokens", i),
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
@@ -220,6 +221,7 @@ def _handle_output_by_index(output, i):
             raw_cached_tokens=_extract_field_by_index(output, "raw_cached_tokens", i),
             storage_full_hit_tokens=_extract_field_by_index(output, "storage_full_hit_tokens", i),
             storage_swa_hit_tokens=_extract_field_by_index(output, "storage_swa_hit_tokens", i),
+            storage_draft_swa_hit_tokens=_extract_field_by_index(output, "storage_draft_swa_hit_tokens", i),
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
@@ -247,6 +249,7 @@ def _handle_output_by_index(output, i):
             raw_cached_tokens=_extract_field_by_index(output, "raw_cached_tokens", i),
             storage_full_hit_tokens=_extract_field_by_index(output, "storage_full_hit_tokens", i),
             storage_swa_hit_tokens=_extract_field_by_index(output, "storage_swa_hit_tokens", i),
+            storage_draft_swa_hit_tokens=_extract_field_by_index(output, "storage_draft_swa_hit_tokens", i),
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),

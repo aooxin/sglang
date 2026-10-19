@@ -16,12 +16,17 @@ from sglang.srt.utils import is_cuda
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
 
-def _dflash_maybe_simulate_accept_len(accept_len: torch.Tensor) -> torch.Tensor:
+
+def _dflash_maybe_simulate_accept_len(
+    accept_len: torch.Tensor, max_accept_len: int
+) -> torch.Tensor:
     sim = envs.SGLANG_SIMULATE_ACC_LEN.get()
     if sim < 0:
         return accept_len
-    # Env value is the EAGLE-style total accept count (>= 1); dflash draft-only count = value - 1.
-    target = max(0.0, float(sim) - 1.0)
+    # Env value is the EAGLE-style total accept count (>= 1); dflash draft-only
+    # count = value - 1, clamped to [0, max_accept_len] (max_accept_len =
+    # draft_token_num - 1) so bonus indexing stays in-bounds.
+    target = min(max(0.0, float(sim) - 1.0), float(max_accept_len))
     lower = int(math.floor(target))
     frac = target - lower
     if frac == 0.0:
@@ -31,6 +36,7 @@ def _dflash_maybe_simulate_accept_len(accept_len: torch.Tensor) -> torch.Tensor:
         accept_len.dtype
     )
     return torch.full_like(accept_len, lower) + bump
+
 
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
@@ -546,7 +552,7 @@ def compute_dflash_accept_len_and_bonus(
 
     matches = candidates[:, 1:] == target_predict[:, :-1]
     accept_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
-    accept_len = _dflash_maybe_simulate_accept_len(accept_len)
+    accept_len = _dflash_maybe_simulate_accept_len(accept_len, matches.shape[1])
     bonus = target_predict[torch.arange(bs, device=target_predict.device), accept_len]
     return accept_len, bonus.to(torch.int64)
 
@@ -731,11 +737,13 @@ def compute_dflash_sampling_accept_len_and_bonus(
         deterministic=True,
     )
 
-    accept_len = accept_token_num
-    accept_len = _dflash_maybe_simulate_accept_len(accept_len)
+    real_accept_len = accept_token_num
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
-    accept_pos = accept_index[row_ids, accept_len.to(torch.long)].to(torch.long)
+    accept_pos = accept_index[row_ids, real_accept_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)
+    accept_len = _dflash_maybe_simulate_accept_len(
+        real_accept_len, draft_token_num - 1
+    )
     return accept_len, bonus
 
 

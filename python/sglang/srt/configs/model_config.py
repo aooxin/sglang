@@ -447,6 +447,11 @@ class ModelConfig:
             and not self.disable_hybrid_swa_memory
         )
 
+        if self.is_hybrid_swa and "DFlashDraftModel" in self.hf_config.architectures:
+            dflash_config = getattr(self.hf_text_config, "dflash_config", None) or {}
+            if not dflash_config.get("use_swa", False):
+                self.is_hybrid_swa = False
+
         if self.is_hybrid_swa:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
@@ -1550,6 +1555,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "MiMoV2MTP",
         "Step3p5ForCausalLM",
         "Step3p5MTP",
+        "DFlashDraftModel",
     }
     return any(arch in hybrid_swa_archs for arch in model_architectures)
 
@@ -1582,6 +1588,19 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
         ]
+    elif "DFlashDraftModel" in model_architectures:
+        # DFLASH draft: every draft layer uses sliding-window attention (see
+        # DFlashDraftModel — each layer's RadixAttention gets the same
+        # dflash_config.swa_window_size when use_swa is set), so all layers are
+        # SWA and none are full.
+        dflash_config = getattr(hf_text_config, "dflash_config", None) or {}
+        use_swa = dflash_config.get("use_swa", False)
+        if use_swa:
+            swa_attention_layer_ids = list(range(num_hidden_layers))
+            full_attention_layer_ids = []
+        else:
+            swa_attention_layer_ids = []
+            full_attention_layer_ids = list(range(num_hidden_layers))
     elif "MiMoV2MTP" in model_architectures:
         swa_attention_layer_ids = [0]
         full_attention_layer_ids = []

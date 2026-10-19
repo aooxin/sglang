@@ -325,6 +325,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._pa_seq_lens_full_cpu = torch.zeros(1, dtype=torch.int64)
         self._pa_seq_lens_swa = torch.zeros(1, dtype=torch.int64, device=device)
         self._pa_seq_lens_swa_cpu = torch.zeros(1, dtype=torch.int64)
+        self._pa_seq_lens_draft_swa = torch.zeros(1, dtype=torch.int64, device=device)
+        self._pa_seq_lens_draft_swa_cpu = torch.zeros(1, dtype=torch.int64)
 
         self.need_sort = need_sort
         self.free_pages = None
@@ -333,21 +335,38 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
         self.debug_mode = envs.SGLANG_DEBUG_MEMORY_POOL.get()
 
+        self.draft_swa_attn_allocator: Optional[TokenToKVPoolAllocator] = None
+        self.full_to_draft_swa_index_mapping: Optional[torch.Tensor] = None
+        self.draft_swa_window_size: Optional[int] = None
+        self._size_draft_swa: Optional[int] = None
+
         self.clear()
         self._kvcache = kvcache
         self._kvcache.register_mapping(weakref.proxy(self.full_to_swa_index_mapping))
 
+    @property
+    def has_draft_swa(self) -> bool:
+        return self.draft_swa_attn_allocator is not None
+
     def available_size(self):
-        return min(
+        sizes = [
             self.full_attn_allocator.available_size(),
             self.swa_attn_allocator.available_size(),
-        )
+        ]
+        if self.draft_swa_attn_allocator is not None:
+            sizes.append(self.draft_swa_attn_allocator.available_size())
+        return min(sizes)
 
     def full_available_size(self):
         return self.full_attn_allocator.available_size()
 
     def swa_available_size(self):
         return self.swa_attn_allocator.available_size()
+
+    def draft_swa_available_size(self):
+        if self.draft_swa_attn_allocator is not None:
+            return self.draft_swa_attn_allocator.available_size()
+        return 0
 
     @property
     def size(self):
@@ -367,6 +386,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         msg += (
             f"#full-attn-available-size: {self.full_attn_allocator.available_size()}, "
         )
+        if self.draft_swa_attn_allocator is not None:
+            msg += (
+                "#draft-swa-available-size: "
+                f"{self.draft_swa_attn_allocator.available_size()}, "
+            )
         return msg
 
     def get_kvcache(self):
@@ -379,6 +403,70 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self._kvcache.full_to_swa_index_mapping is not None
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
 
+    def register_draft_swa(
+        self,
+        draft_swa_pool: MHATokenToKVPool,
+        target_swa_window_size: int,
+        draft_swa_window_size: int,
+        need_sort: bool = False,
+    ) -> torch.Tensor:
+        """Set up a second swa slot space + mapping for the DFLASH draft window.
+
+        """
+        if self.draft_swa_attn_allocator is not None:
+            raise RuntimeError(
+                "DFLASH draft swa pool is already registered, cannot register again."
+            )
+        if not target_swa_window_size or not draft_swa_window_size:
+            raise ValueError(
+                "register_draft_swa requires positive target/draft swa window "
+                f"sizes, got target={target_swa_window_size} "
+                f"draft={draft_swa_window_size}."
+            )
+        self.draft_swa_window_size = draft_swa_window_size
+        self._size_draft_swa = draft_swa_pool.size
+        assert self._size_draft_swa % self.page_size == 0
+        if self.page_size == 1:
+            self.draft_swa_attn_allocator = TokenToKVPoolAllocator(
+                self._size_draft_swa,
+                self.dtype,
+                self.device,
+                draft_swa_pool,
+                need_sort,
+                pool_label="draft_swa",
+            )
+        else:
+            PagedClass = (
+                NPUPagedTokenToKVPoolAllocator
+                if _is_npu
+                else PagedTokenToKVPoolAllocator
+            )
+            self.draft_swa_attn_allocator = PagedClass(
+                self._size_draft_swa,
+                self.page_size,
+                self.dtype,
+                self.device,
+                draft_swa_pool,
+                need_sort,
+                pool_label="draft_swa",
+            )
+        # Same shape/sentinel as full_to_swa_index_mapping (last item -1 -> -1).
+        self.full_to_draft_swa_index_mapping = torch.cat(
+            [
+                torch.zeros(
+                    self._size_full + self.page_size,
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                torch.tensor([-1], dtype=torch.int64, device=self.device),
+            ]
+        )
+        return self.full_to_draft_swa_index_mapping
+
+    def translate_loc_from_full_to_draft_swa(self, kv_indices: torch.Tensor):
+        assert self.full_to_draft_swa_index_mapping is not None
+        return self.full_to_draft_swa_index_mapping[kv_indices].to(torch.int32)
+
     def alloc(self, need_size: int):
         # TODO(yingchun): 社区版依然有下面的 assert
         # assert self.page_size == 1
@@ -388,6 +476,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
         if need_size > self.swa_attn_allocator.available_size():
             return None
+        if self.draft_swa_attn_allocator is not None:
+            if need_size > self.draft_swa_attn_allocator.available_size():
+                return None
 
         alloc_full_indices = self.full_attn_allocator.alloc(need_size)
         alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
@@ -400,11 +491,39 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+
+        if self.draft_swa_attn_allocator is not None:
+            alloc_draft_swa = self.draft_swa_attn_allocator.alloc(need_size)
+            assert alloc_draft_swa is not None, (
+                "DFLASH draft swa pool is full during alloc "
+                f"(need={need_size}, avail={self.draft_swa_attn_allocator.available_size()})."
+            )
+            if _is_npu:
+                self.full_to_draft_swa_index_mapping[
+                    alloc_full_indices.to(torch.int64)
+                ] = alloc_draft_swa.to(torch.int64)
+            else:
+                self.full_to_draft_swa_index_mapping[alloc_full_indices] = (
+                    alloc_draft_swa
+                )
         return alloc_full_indices
 
     def alloc_device(
-        self, host_indices: torch.Tensor, swa_valid_mask: torch.Tensor
-    ) -> Tuple[Optional[torch.Tensor], int, int]:
+        self,
+        host_indices: torch.Tensor,
+        swa_valid_mask: torch.Tensor,
+        draft_swa_valid_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], int, int, int]:
+        """Allocate device slots for a host->device load (HiCache load_back).
+
+        Allocates full slots for every position, target-swa slots for
+        ``swa_valid_mask`` positions and, in DFLASH two-window mode, draft-swa
+        slots for ``draft_swa_valid_mask`` positions.
+
+        Returns ``(full_device_indices, lack_full, lack_swa, lack_draft_swa)``;
+        the indices are ``None`` when any pool lacks capacity, with the lack
+        sizes telling the caller which pool(s) to evict.
+        """
         full_need_size = len(host_indices)
         assert full_need_size % self.page_size == 0
         assert len(host_indices) == len(swa_valid_mask)
@@ -412,10 +531,26 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_need_size = int(swa_valid_mask.sum())
         assert swa_need_size % self.page_size == 0
 
+        draft_need_size = 0
+        if self.draft_swa_attn_allocator is not None and draft_swa_valid_mask is not None:
+            assert len(host_indices) == len(draft_swa_valid_mask)
+            draft_need_size = int(draft_swa_valid_mask.sum())
+            assert draft_need_size % self.page_size == 0
+
         lack_full_size = full_need_size - self.full_attn_allocator.available_size()
         lack_swa_size = swa_need_size - self.swa_attn_allocator.available_size()
-        if lack_full_size > 0 or lack_swa_size > 0:
-            return None, max(0, lack_full_size), max(0, lack_swa_size)
+        lack_draft_swa_size = (
+            draft_need_size - self.draft_swa_attn_allocator.available_size()
+            if self.draft_swa_attn_allocator is not None
+            else 0
+        )
+        if lack_full_size > 0 or lack_swa_size > 0 or lack_draft_swa_size > 0:
+            return (
+                None,
+                max(0, lack_full_size),
+                max(0, lack_swa_size),
+                max(0, lack_draft_swa_size),
+            )
 
         full_device_indices = self.full_attn_allocator.alloc(full_need_size)
         assert full_device_indices is not None
@@ -426,7 +561,19 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             swa_mapping[swa_valid_mask] = swa_device_indices
         self.full_to_swa_index_mapping[full_device_indices] = swa_mapping
 
-        return full_device_indices, 0, 0
+        if self.draft_swa_attn_allocator is not None:
+            draft_mapping = torch.zeros(
+                full_need_size, dtype=torch.int64, device=self.device
+            )
+            if draft_need_size > 0:
+                draft_device_indices = self.draft_swa_attn_allocator.alloc(
+                    draft_need_size
+                )
+                assert draft_device_indices is not None
+                draft_mapping[draft_swa_valid_mask] = draft_device_indices
+            self.full_to_draft_swa_index_mapping[full_device_indices] = draft_mapping
+
+        return full_device_indices, 0, 0, 0
 
     def alloc_missing_swa_for_full_indices(
         self, full_indices: torch.Tensor, swa_host_valid_mask: torch.Tensor
@@ -474,23 +621,43 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         return refill_mask, refill_size, 0
 
-    def pre_alloc(self, need_size: int, chunked_size: int):
+    def pre_alloc(self, need_size: int, sliding_window_size: int, draft_swa_window_size: Optional[int] = None):
         # Pre-allocate KV cache for decode requests in PD-disaggregation mode.
         if need_size <= 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
 
-        align_start = floor_align(max(need_size - chunked_size, 0), self.page_size)
+        align_start = floor_align(max(need_size - sliding_window_size, 0), self.page_size)
         swa_need_size = need_size - align_start
+
+        if self.draft_swa_attn_allocator is not None and draft_swa_window_size:
+            draft_align_start = floor_align(
+                max(need_size - draft_swa_window_size, 0), self.page_size
+            )
+            draft_swa_need_size = need_size - draft_align_start
+        else:
+            draft_swa_need_size = swa_need_size
+
         if self.page_size == 1:
             if need_size > self.full_attn_allocator.available_size():
                 return None
             if swa_need_size > self.swa_attn_allocator.available_size():
                 return None
+            if (
+                self.draft_swa_attn_allocator is not None
+                and draft_swa_need_size > self.draft_swa_attn_allocator.available_size()
+            ):
+                return None
             alloc_full_indices = self.full_attn_allocator.alloc(need_size)
             alloc_swa_indices = self.swa_attn_allocator.alloc(swa_need_size)
+            alloc_draft_swa_indices = (
+                self.draft_swa_attn_allocator.alloc(draft_swa_need_size)
+                if self.draft_swa_attn_allocator is not None
+                else None
+            )
         else:
             num_tokens = need_size + self.page_size
             swa_num_tokens = swa_need_size + self.page_size
+            draft_swa_num_tokens = draft_swa_need_size + self.page_size
             if num_tokens > self.full_attn_allocator.available_size():
                 return None
             if swa_num_tokens > self.swa_attn_allocator.available_size():
@@ -499,6 +666,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self._pa_seq_lens_full_cpu.fill_(need_size)
             self._pa_seq_lens_swa.fill_(swa_need_size)
             self._pa_seq_lens_swa_cpu.fill_(swa_need_size)
+            if (
+                self.draft_swa_attn_allocator is not None
+                and draft_swa_num_tokens
+                > self.draft_swa_attn_allocator.available_size()
+            ):
+                return None
+            self._pa_seq_lens_draft_swa.fill_(draft_swa_need_size)
+            self._pa_seq_lens_draft_swa_cpu.fill_(draft_swa_need_size)
             alloc_full_indices = self.full_attn_allocator.alloc_extend(
                 prefix_lens=self._pa_prefix_lens,
                 prefix_lens_cpu=self._pa_prefix_lens_cpu,
@@ -516,6 +691,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 last_loc=swa_last_loc,
                 extend_num_tokens=swa_need_size,
             )
+            if self.draft_swa_attn_allocator is not None:
+                draft_swa_last_loc = self.translate_loc_from_full_to_draft_swa(
+                    self._pa_last_loc
+                )
+                alloc_draft_swa_indices = self.draft_swa_attn_allocator.alloc_extend(
+                    prefix_lens=self._pa_prefix_lens,
+                    prefix_lens_cpu=self._pa_prefix_lens_cpu,
+                    seq_lens=self._pa_seq_lens_draft_swa,
+                    seq_lens_cpu=self._pa_seq_lens_draft_swa_cpu,
+                    last_loc=draft_swa_last_loc,
+                    extend_num_tokens=draft_swa_need_size,
+                )
+            else:
+                alloc_draft_swa_indices = None
 
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
@@ -525,6 +714,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[alloc_full_indices[-swa_need_size:]] = (
             alloc_swa_indices
         )
+        if self.draft_swa_attn_allocator is not None:
+            assert alloc_draft_swa_indices is not None
+            self.full_to_draft_swa_index_mapping[alloc_full_indices] = self._mapping_zero_scalar
+            self.full_to_draft_swa_index_mapping[
+                alloc_full_indices[-draft_swa_need_size:]
+            ] = alloc_draft_swa_indices
         return alloc_full_indices
 
     def alloc_extend(
@@ -546,6 +741,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_tokens > self.full_attn_allocator.available_size():
             return None
         if num_tokens > self.swa_attn_allocator.available_size():
+            return None
+        if (
+            self.draft_swa_attn_allocator is not None
+            and num_tokens > self.draft_swa_attn_allocator.available_size()
+        ):
             return None
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
@@ -576,6 +776,36 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
 
+        if self.draft_swa_attn_allocator is not None:
+            draft_swa_last_loc = self.translate_loc_from_full_to_draft_swa(last_loc)
+            freed_tail = draft_swa_last_loc == 0
+            if self.debug_mode:
+                assert torch.all(
+                    ~freed_tail | (prefix_lens % self.page_size == 0)
+                ), "draft_free-reused prefix must be page-aligned"
+                draft_swa_last_loc = torch.where(
+                    freed_tail,
+                    torch.full_like(draft_swa_last_loc, -1),
+                    draft_swa_last_loc,
+                )
+            alloc_draft_swa_indices = self.draft_swa_attn_allocator.alloc_extend(
+                prefix_lens,
+                prefix_lens_cpu,
+                seq_lens,
+                seq_lens_cpu,
+                draft_swa_last_loc,
+                extend_num_tokens,
+            )
+            assert alloc_draft_swa_indices is not None
+            if _is_npu:
+                self.full_to_draft_swa_index_mapping[
+                    alloc_full_indices.to(torch.int64)
+                ] = alloc_draft_swa_indices.to(torch.int64)
+            else:
+                self.full_to_draft_swa_index_mapping[alloc_full_indices] = (
+                    alloc_draft_swa_indices
+                )
+
         return alloc_full_indices
 
     def alloc_decode(
@@ -604,8 +834,24 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
 
+        if self.draft_swa_attn_allocator is not None:
+            draft_swa_last_loc = self.translate_loc_from_full_to_draft_swa(last_loc)
+            alloc_draft_swa_indices = self.draft_swa_attn_allocator.alloc_decode(
+                seq_lens, seq_lens_cpu, draft_swa_last_loc
+            )
+            assert alloc_draft_swa_indices is not None
+            if _is_npu:
+                self.full_to_draft_swa_index_mapping[
+                    alloc_full_indices.to(torch.int64)
+                ] = alloc_draft_swa_indices.to(torch.int64)
+            else:
+                self.full_to_draft_swa_index_mapping[alloc_full_indices] = (
+                    alloc_draft_swa_indices
+                )
+
         return alloc_full_indices
 
+    # TODO(yingchun): 返回三个池实际 free 的数量，方便上层统计
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
@@ -614,12 +860,19 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.is_not_in_free_group:
             self.full_attn_allocator.free(free_index)
             self.free_swa(free_index)
+            if self.draft_swa_attn_allocator is not None:
+                self.free_draft_swa(free_index)
         else:
             self.free_group.append(free_index)
         assert (
             self.full_attn_allocator.available_size() <= self.full_attn_allocator.size
         )
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
+        if self.draft_swa_attn_allocator is not None:
+            assert (
+                self.draft_swa_attn_allocator.available_size()
+                <= self.draft_swa_attn_allocator.size
+            )
 
     def free_full_and_swa_no_filter(
         self,
@@ -635,6 +888,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 assert (swa_indices > 0).all().item()
             self.swa_attn_allocator.free(swa_indices, is_page_aligned=True)
         self.full_to_swa_index_mapping[full_free_index] = self._mapping_zero_scalar
+        if self.draft_swa_attn_allocator is not None:
+            self.free_draft_swa(full_free_index)
 
     def free_swa(self, free_index: torch.Tensor) -> int:
         swa_indices = self.full_to_swa_index_mapping[free_index]
@@ -657,13 +912,31 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.swa_attn_allocator.free(swa_indices, is_page_aligned=True)
         self.full_to_swa_index_mapping[free_index] = self._mapping_zero_scalar
 
+    def free_draft_swa(self, free_index: torch.Tensor) -> int:
+        """Free DFLASH draft-swa slots for `free_index` (full locs).
+
+        Like free_swa but on the draft mapping/free-list: only frees live (>0)
+        slots and zeros the mapping, so draft-window eviction is idempotent.
+        """
+        assert self.draft_swa_attn_allocator is not None
+        draft_swa_indices = self.full_to_draft_swa_index_mapping[free_index]
+        draft_swa_valid = draft_swa_indices.bool()
+        draft_swa_freed = int(draft_swa_valid.sum())
+        if draft_swa_freed > 0:
+            self.draft_swa_attn_allocator.free(draft_swa_indices[draft_swa_valid])
+        self.full_to_draft_swa_index_mapping[free_index] = 0
+        return draft_swa_freed
+
     def splice_swa_mapping(
         self, tgt_full_indices: torch.Tensor, src_full_indices: torch.Tensor
-    ) -> int:
+    ) -> Tuple[int, int]:
         """
         transfer swa kvcache from src_full_indices[i] to tgt_full_indices[i] if tgt_full_indices[i]
         do not have its own swa page.
-        return the num of tokens transferred.
+
+        Returns (num_transferred, draft_num_transferred): the target-swa and
+        DFLASH draft-swa transfer counts. Callers must feed BOTH into the tree
+        cache's incremental counters (draft is 0 when the draft pool is off).
         """
         assert len(tgt_full_indices) == len(src_full_indices)
         tgt_swa = self.full_to_swa_index_mapping[tgt_full_indices]
@@ -696,7 +969,25 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.page_size,
                 "SWATokenToKVPoolAllocator.splice_swa_mapping(post_src_mapping)",
             )
-        return num_transferred
+
+        # DFLASH two-window: mirror the ownership transfer on the draft
+        # mapping (same full index space, independent slot space). Cascaded
+        # here so every splice call site stays draft-correct automatically.
+        draft_transfer_valid = 0
+        if self.draft_swa_attn_allocator is not None:
+            tgt_draft = self.full_to_draft_swa_index_mapping[tgt_full_indices]
+            src_draft = self.full_to_draft_swa_index_mapping[src_full_indices]
+            draft_transfer_mask = (tgt_draft == 0) & (src_draft != 0)
+            draft_transfer_valid = int(draft_transfer_mask.count_nonzero())
+            assert draft_transfer_valid % self.page_size == 0
+            if draft_transfer_valid > 0:
+                self.full_to_draft_swa_index_mapping[
+                    tgt_full_indices[draft_transfer_mask]
+                ] = src_draft[draft_transfer_mask]
+                self.full_to_draft_swa_index_mapping[
+                    src_full_indices[draft_transfer_mask]
+                ] = 0
+        return num_transferred, draft_transfer_valid
 
     def backup_state(self):
         return [
@@ -714,6 +1005,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.clear()
         # Note: the last item is -1, we don't clear it, see the comment in __init__
         self.full_to_swa_index_mapping[:-1].fill_(0)
+        if self.draft_swa_attn_allocator is not None:
+            self.draft_swa_attn_allocator.clear()
+            self.full_to_draft_swa_index_mapping[:-1].fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
 

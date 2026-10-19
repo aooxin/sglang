@@ -26,6 +26,11 @@ class KVArgs:
     state_type: str  # "none", "mamba", "swa"
     # for mamba state different tp slice transfer
     state_dim_per_tensor: List[int]  # dimension to slice for each state tensor
+    # DFlash two-window: draft swa state transferred over the draft window,
+    # separate from the target swa state group above.
+    draft_state_data_ptrs: List[int]
+    draft_state_data_lens: List[int]
+    draft_state_item_lens: List[int]
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
@@ -45,6 +50,9 @@ class KVArgs:
     host_state_data_ptrs: List[int]
     host_state_data_lens: List[int]
     host_state_item_lens: List[int]
+    host_draft_state_data_ptrs: List[int]
+    host_draft_state_data_lens: List[int]
+    host_draft_state_item_lens: List[int]
 
 
 class KVPoll:
@@ -97,6 +105,7 @@ class BaseKVSender(ABC):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
+        draft_state_indices: Optional[List[int]] = None,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
@@ -144,6 +153,7 @@ class BaseKVReceiver(ABC):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        draft_state_indices: Optional[List[int]] = None,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.

@@ -78,6 +78,7 @@ class PrefillStats:
     log_input_tokens: int
     log_hit_tokens: int
     log_host_hit_tokens: int
+    log_storage_hit_tokens: int
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
@@ -94,6 +95,7 @@ class PrefillStats:
             log_input_tokens=adder.log_input_tokens,
             log_hit_tokens=adder.log_hit_tokens,
             log_host_hit_tokens=getattr(adder, "log_host_hit_tokens", 0),
+            log_storage_hit_tokens=getattr(adder, "log_storage_hit_tokens", 0),
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
@@ -147,6 +149,9 @@ class SchedulerMetricsMixin:
         self.last_swa_evicted_from_tree: int = 0
         self.last_full_evicted_from_tree: int = 0
         self.last_swa_dynamic_anchor_protected_tokens: int = 0
+        self.last_draft_swa_active_freed_tokens: int = 0
+        self.last_draft_swa_evicted_from_tree: int = 0
+        self.last_draft_swa_prefix_shrink_tokens: int = 0
         self.last_tree_cache_info_time: float = 0.0
 
         self.stats = SchedulerStats()
@@ -396,6 +401,14 @@ class SchedulerMetricsMixin:
                 f"swa token usage: {swa_token_usage:.2f}",
             ]
 
+            draft_swa_usage = self._get_draft_swa_usage()
+            if draft_swa_usage is not None:
+                draft_swa_num_used, _, draft_swa_token_usage = draft_swa_usage
+                msg_parts.append(
+                    f"#draft swa token: {draft_swa_num_used}, "
+                    f"draft swa token usage: {draft_swa_token_usage:.2f}"
+                )
+
         if self.is_hybrid_ssm:
             num_used_m, _, full_tok_m, mamba_usage, *_ = self._get_mamba_token_info()
             num_used = max(num_used, num_used_m) if num_used is not None else num_used_m
@@ -440,7 +453,9 @@ class SchedulerMetricsMixin:
             f"#new-seq: {prefill_stats.num_new_seqs}, "
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
-            f"[ host-hit-token: {prefill_stats.log_host_hit_tokens}, device-hit-token:{prefill_stats.log_hit_tokens - prefill_stats.log_host_hit_tokens}] "
+            f"[L1: {prefill_stats.log_hit_tokens - prefill_stats.log_host_hit_tokens}, "
+            f"L2: {prefill_stats.log_host_hit_tokens - prefill_stats.log_storage_hit_tokens}, "
+            f"L3: {prefill_stats.log_storage_hit_tokens}] "
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.waiting_queue)}, "
@@ -532,6 +547,7 @@ class SchedulerMetricsMixin:
                 self.stats.swa_available_size = swa_available_size
                 self.stats.swa_tree_evictable_tokens = swa_evictable_size
                 self.stats.full_tree_evictable_tokens = full_evictable_size
+                self._record_draft_swa_stats()
                 # L2 host pool and release queues are only present with HiCache
                 cc = getattr(self.tree_cache, "cache_controller", None)
                 if cc is not None:
@@ -541,6 +557,10 @@ class SchedulerMetricsMixin:
                         host_full_avail, host_swa_avail = host_pool.swa_available_size()
                         self.stats.host_full_available_size = host_full_avail
                         self.stats.host_swa_available_size = host_swa_avail
+                    if getattr(cc, "draft_independent_swa", False):
+                        self.stats.host_draft_swa_available_size = (
+                            cc.mem_pool_host_draft.swa_pool_host.available_size()
+                        )
                 # Tree token breakdown (device/host × full/swa), rate-limited
                 now = time.perf_counter()
                 if now - self.last_tree_cache_info_time >= TREE_CACHE_INFO_INTERVAL:
@@ -554,6 +574,14 @@ class SchedulerMetricsMixin:
                         self.stats.host_swa_tokens = tree_info.host.swa_tokens
                         self.stats.host_full_tokens_locked = tree_info.host.full_tokens_locked
                         self.stats.host_swa_tokens_locked = tree_info.host.swa_tokens_locked
+                        self.stats.dev_draft_swa_tokens = tree_info.dev.draft_swa_tokens
+                        self.stats.dev_draft_swa_tokens_locked = (
+                            tree_info.dev.draft_swa_tokens_locked
+                        )
+                        self.stats.host_draft_swa_tokens = tree_info.host.draft_swa_tokens
+                        self.stats.host_draft_swa_tokens_locked = (
+                            tree_info.host.draft_swa_tokens_locked
+                        )
                         self.stats.dev_nodes = tree_info.dev.nodes
                         self.stats.dev_leaves = tree_info.dev.leaves
                         self.stats.dev_leaves_locked = tree_info.dev.leaves_locked
@@ -591,6 +619,31 @@ class SchedulerMetricsMixin:
                     self.last_swa_dynamic_anchor_protected_tokens = (
                         cur_swa_anchor_protected
                     )
+                    # DFLASH two-window draft-swa deltas (attribute may be absent
+                    # on non-DFLASH caches; guard with getattr).
+                    if hasattr(self.tree_cache, "draft_swa_active_freed_tokens"):
+                        cur_draft_freed = (
+                            self.tree_cache.draft_swa_active_freed_tokens
+                        )
+                        cur_draft_evicted = (
+                            self.tree_cache.draft_swa_evicted_from_tree
+                        )
+                        self.stats.draft_swa_active_freed_tokens_delta = (
+                                cur_draft_freed - self.last_draft_swa_active_freed_tokens
+                        )
+                        self.stats.draft_swa_evicted_from_tree_delta = (
+                                cur_draft_evicted - self.last_draft_swa_evicted_from_tree
+                        )
+                        self.last_draft_swa_active_freed_tokens = cur_draft_freed
+                        self.last_draft_swa_evicted_from_tree = cur_draft_evicted
+                    if hasattr(self.tree_cache, "draft_swa_prefix_shrink_tokens"):
+                        cur_draft_shrink = (
+                            self.tree_cache.draft_swa_prefix_shrink_tokens
+                        )
+                        self.stats.draft_swa_prefix_shrink_tokens_delta = (
+                            cur_draft_shrink - self.last_draft_swa_prefix_shrink_tokens
+                        )
+                        self.last_draft_swa_prefix_shrink_tokens = cur_draft_shrink
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
 
@@ -734,6 +787,14 @@ class SchedulerMetricsMixin:
                 f"swa token usage: {swa_token_usage:.2f}",
             ]
 
+            draft_swa_usage = self._get_draft_swa_usage()
+            if draft_swa_usage is not None:
+                draft_swa_num_used, _, draft_swa_token_usage = draft_swa_usage
+                msg_parts += [
+                    f"#draft swa token: {draft_swa_num_used}",
+                    f"draft swa token usage: {draft_swa_token_usage:.2f}",
+                ]
+
         if self.is_hybrid_ssm:
             num_used_m, mamba_num, full_tok_m, mamba_usage, *_ = (
                 self._get_mamba_token_info()
@@ -874,6 +935,7 @@ class SchedulerMetricsMixin:
             self.stats.full_token_usage = full_token_usage
             if self.is_hybrid_swa:
                 self.stats.swa_token_usage = swa_token_usage
+                self._record_draft_swa_stats()
             if self.is_hybrid_ssm:
                 self.stats.mamba_usage = mamba_usage
             self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
@@ -1003,6 +1065,38 @@ class SchedulerMetricsMixin:
             host_pool.size - host_pool.available_size()
         )
         self.stats.hicache_host_total_tokens = host_pool.size
+
+    def _get_draft_swa_usage(self: Scheduler):
+        """DFLASH draft-swa pool usage, or None when draft-swa is not enabled.
+
+        Returns (num_used, total, usage) or None.
+        """
+        draft_swa_alloc = getattr(
+            self.token_to_kv_pool_allocator, "draft_swa_attn_allocator", None
+        )
+        if draft_swa_alloc is None:
+            return None
+        total = draft_swa_alloc.size
+        num_used = total - draft_swa_alloc.available_size()
+        usage = num_used / total if total > 0 else 0.0
+        return num_used, total, usage
+
+    def _record_draft_swa_stats(self: Scheduler):
+        """Populate DFLASH draft-swa pool stats on self.stats (Prometheus).
+        """
+        usage_info = self._get_draft_swa_usage()
+        if usage_info is None:
+            return
+        draft_swa_num_used, draft_swa_total, draft_swa_token_usage = usage_info
+        self.stats.draft_swa_available_size = draft_swa_total - draft_swa_num_used
+        self.stats.draft_swa_token_usage = draft_swa_token_usage
+        if hasattr(self.tree_cache, "draft_swa_evictable_size"):
+            self.stats.draft_swa_tree_evictable_tokens = (
+                self.tree_cache.draft_swa_evictable_size()
+            )
+            self.stats.draft_swa_tree_protected_tokens = (
+                self.tree_cache.draft_swa_protected_size()
+            )
 
     def update_lora_metrics(self: Scheduler):
         """Update LoRA pool metrics for monitoring and autoscaling."""

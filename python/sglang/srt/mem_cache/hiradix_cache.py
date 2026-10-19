@@ -50,7 +50,9 @@ from sglang.srt.mem_cache.radix_cache import (
 )
 from sglang.srt.mem_cache.simple_swa_radix_cache import (
     SimpleSWARadixCache,
+    compute_draft_safe_len,
     compute_swa_safe_len,
+    compute_target_and_joint_safe_len,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
@@ -79,6 +81,10 @@ class SWATreeInfo:
     full_tokens_locked: int = 0
     swa_tokens: int = 0
     swa_tokens_locked: int = 0
+    # DFLASH two-window: draft SWA tokens (independent draft window). Stay 0
+    # unless a draft SWA pool is registered.
+    draft_swa_tokens: int = 0
+    draft_swa_tokens_locked: int = 0
     nodes: int = 0
     leaves: int = 0
     leaves_locked: int = 0
@@ -111,13 +117,15 @@ class BaseHiRadixCache(abc.ABC):
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
         # Cumulative token eviction counters (device tree). These back the
-        # sglang:full_evicted_from_tree_total / sglang:swa_evicted_from_tree_total
-        # metrics and are read by scheduler_metrics_mixin. They must live on the
-        # base class so both HiRadixCache (non-SWA) and HiSimpleSWARadixCache
-        # expose them and BaseHiRadixCache.evict() can accumulate into them.
+        # sglang:full_evicted_from_tree_total / sglang:swa_evicted_from_tree_total /
+        # sglang:draft_swa_evicted_from_tree_total metrics and are read by
+        # scheduler_metrics_mixin. They must live on the base class so both
+        # HiRadixCache (non-SWA) and HiSimpleSWARadixCache expose them and
+        # BaseHiRadixCache.evict() can accumulate into them.
         self.swa_active_freed_tokens: int = 0
         self.swa_evicted_from_tree: int = 0
         self.full_evicted_from_tree: int = 0
+        self.draft_swa_evicted_from_tree: int = 0
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
@@ -163,6 +171,9 @@ class BaseHiRadixCache(abc.ABC):
                     self.page_size,
                     server_args.hicache_mem_layout,
                     allocator_type=server_args.hicache_storage_backend,
+                )
+                self.token_to_kv_pool_host.maybe_bump_reserve_swa_size(
+                    params.sliding_window_size
                 )
         else:
             raise ValueError(f"BaseHiRadixCache only supports MHA, MLA and SWA yet")
@@ -270,6 +281,7 @@ class BaseHiRadixCache(abc.ABC):
         self.prefetch_stage_durations_by_reqid: dict[str, dict[str, float]] = {}
         self.storage_full_hit_by_reqid = {}
         self.storage_swa_hit_by_reqid = {}
+        self.storage_draft_swa_hit_by_reqid = {}
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -588,6 +600,7 @@ class BaseHiRadixCache(abc.ABC):
         n_release: Optional[int],
         log_metrics: bool,
         n_swa_only_release: Optional[int] = None,
+        n_dflash_only_release: Optional[int] = None,
     ):
         cc = self.cache_controller
 
@@ -607,6 +620,7 @@ class BaseHiRadixCache(abc.ABC):
                 self.prefetch_stage_durations_by_reqid.pop(req_id, None)
                 self.storage_full_hit_by_reqid.pop(req_id, None)
                 self.storage_swa_hit_by_reqid.pop(req_id, None)
+                self.storage_draft_swa_hit_by_reqid.pop(req_id, None)
                 self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
                 info = self.ongoing_prefetch.pop(req_id, None)
                 if info is not None:
@@ -664,10 +678,25 @@ class BaseHiRadixCache(abc.ABC):
                 )
                 cc.mem_pool_host.free_swa_only(swa_host_indices)
 
+        def _drain_dflash_only_release():
+            if n_dflash_only_release is None:
+                return
+            entries = list(
+                _drain_queue(
+                    cc.dflash_only_host_mem_release_queue, n_dflash_only_release
+                )
+            )
+            if entries:
+                dflash_host_indices = torch.cat(
+                    _wait_release_ready_events(entries), dim=0
+                )
+                cc.mem_pool_host_draft.free_swa_only(dflash_host_indices)
+
         _drain_revoke()
         _drain_backup()
         _drain_release()
         _drain_swa_only_release()
+        _drain_dflash_only_release()
 
     def _parse_storage_backend_extra_config(
         self, storage_backend_extra_config: Optional[str]
@@ -768,6 +797,7 @@ class BaseHiRadixCache(abc.ABC):
         self.prefetch_stage_durations_by_reqid.clear()
         self.storage_full_hit_by_reqid.clear()
         self.storage_swa_hit_by_reqid.clear()
+        self.storage_draft_swa_hit_by_reqid.clear()
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.prefetch_trace_attrs_by_reqid.clear()
@@ -828,26 +858,27 @@ class BaseHiRadixCache(abc.ABC):
             ).inc(1)
 
     def write_backup(self, node: TreeNode, write_back=False):
-        full_host_indices, lack_full_size, lack_swa_size = (
+        full_host_indices, lack_full_size, lack_swa_size, lack_draft_swa_size = (
             self.cache_controller.alloc_host(
                 device_indices=node.value,
             )
         )
         if full_host_indices is None:
-            assert lack_full_size > 0 or lack_swa_size > 0
+            assert lack_full_size > 0 or lack_swa_size > 0 or lack_draft_swa_size > 0
             if self.enable_hicache_metrics:
                 self._log_alloc_retry(
                     scenario="write_backup",
                     lack_full=lack_full_size > 0,
                     lack_swa=lack_swa_size > 0,
                 )
-            self.evict_host(lack_full_size, lack_swa_size)
-            full_host_indices, lack_full_size, lack_swa_size = (
+            self.evict_host(lack_full_size, lack_swa_size, lack_draft_swa_size)
+            full_host_indices, lack_full_size, lack_swa_size, lack_draft_swa_size = (
                 self.cache_controller.alloc_host(
                     device_indices=node.value,
                 )
             )
         if full_host_indices is None:
+            assert lack_full_size > 0 or lack_swa_size > 0 or lack_draft_swa_size > 0
             if self.enable_hicache_metrics:
                 self._log_alloc_failure(
                     scenario="write_backup",
@@ -1105,25 +1136,28 @@ class BaseHiRadixCache(abc.ABC):
         if self.tp_world_size > 1:
             # synchronize TP workers to make the same update to radix cache
             cc = self.cache_controller
-            states = torch.tensor(
-                [
-                    finish_count,
-                    cc.mem_pool_host.full_pool_host.available_size(),
-                    cc.mem_pool_host.swa_pool_host.available_size(),
-                ],
-                dtype=torch.int,
-                device="cpu",
-            )
+            draft_independent_swa = cc.draft_independent_swa
+            states_list = [
+                finish_count,
+                cc.mem_pool_host.full_pool_host.available_size(),
+                cc.mem_pool_host.swa_pool_host.available_size(),
+            ]
+            if draft_independent_swa:
+                states_list.append(
+                    cc.mem_pool_host_draft.swa_pool_host.available_size()
+                )
+            states = torch.tensor(states_list, dtype=torch.int, device="cpu")
             torch.distributed.all_reduce(
                 states,
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_group,
             )
+            states = states.tolist()
             (
                 finish_count,
                 n_host_full_available_size,
                 n_host_swa_available_size,
-            ) = states.tolist()
+            ) = states[:3]
             # TODO(yingchun): 重复代码，可封装为函数
             assert (
                 n_host_full_available_size
@@ -1133,6 +1167,11 @@ class BaseHiRadixCache(abc.ABC):
                 n_host_swa_available_size
                 == cc.mem_pool_host.swa_pool_host.available_size()
             )
+            if draft_independent_swa:
+                assert (
+                    states[3]
+                    == cc.mem_pool_host_draft.swa_pool_host.available_size()
+                ), "draft host swa availability diverged across TP ranks"
 
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
@@ -1264,6 +1303,7 @@ class BaseHiRadixCache(abc.ABC):
         start_time = time.perf_counter()
         full_num_tokens = params.num_tokens
         swa_num_tokens = params.swa_num_tokens
+        draft_swa_num_tokens = params.draft_swa_num_tokens
         leaves = list(self.evictable_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -1272,10 +1312,13 @@ class BaseHiRadixCache(abc.ABC):
 
         full_evicted = 0
         swa_evicted = 0
+        draft_swa_evicted = 0
         write_back_nodes = []
-        while (full_evicted < full_num_tokens or swa_evicted < swa_num_tokens) and len(
-            eviction_heap
-        ):
+        while (
+            full_evicted < full_num_tokens
+            or swa_evicted < swa_num_tokens
+            or draft_swa_evicted < draft_swa_num_tokens
+        ) and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
             if x.lock_ref > 0:
@@ -1316,13 +1359,15 @@ class BaseHiRadixCache(abc.ABC):
                     swa_evicted += freed_swa
                     write_back_nodes.append(x)
                 else:
-                    freed_full, freed_swa = self._evict_regular(x)
+                    freed_full, freed_swa, freed_draft_swa = self._evict_regular(x)
                     full_evicted += freed_full
                     swa_evicted += freed_swa
+                    draft_swa_evicted += freed_draft_swa
             else:
-                freed_full, freed_swa = self._evict_backuped(x)
+                freed_full, freed_swa, freed_draft_swa = self._evict_backuped(x)
                 full_evicted += freed_full
                 swa_evicted += freed_swa
+                draft_swa_evicted += freed_draft_swa
 
             for child in x.parent.children.values():
                 if child in write_back_nodes:
@@ -1340,24 +1385,35 @@ class BaseHiRadixCache(abc.ABC):
                 assert node.backuped
                 self._evict_backuped(node)
 
-        if full_evicted < full_num_tokens or swa_evicted < swa_num_tokens:
-            logger.info(
-                f"Evicted {full_evicted}/{full_num_tokens} full tokens and "
-                f"{swa_evicted}/{swa_num_tokens} swa tokens from device cache"
+        if (
+            full_evicted < full_num_tokens
+            or swa_evicted < swa_num_tokens
+            or draft_swa_evicted < draft_swa_num_tokens
+        ):
+            logger.warning(
+                f"Evicted {full_evicted}/{full_num_tokens} full tokens, "
+                f"{swa_evicted}/{swa_num_tokens} swa tokens and "
+                f"{draft_swa_evicted}/{draft_swa_num_tokens} draft swa tokens "
+                "from device cache"
             )
 
         self.swa_evicted_from_tree += swa_evicted
         self.full_evicted_from_tree += full_evicted
+        self.draft_swa_evicted_from_tree += draft_swa_evicted
 
         self.update_eviction_metrics(full_evicted + swa_evicted, start_time)
         return EvictResult(
-            num_tokens_evicted=full_evicted, swa_num_tokens_evicted=swa_evicted
+            num_tokens_evicted=full_evicted,
+            swa_num_tokens_evicted=swa_evicted,
+            draft_swa_num_tokens_evicted=draft_swa_evicted,
         )
 
     def _evict_backuped(self, node: TreeNode):
         # GPU -> CPU demotion: no BlockRemoved since block is still reachable via load_back
         self._on_tree_value_removed(node)
-        full_evicted, swa_evicted = self.cache_controller.evict_device(node.value)
+        full_evicted, swa_evicted, draft_swa_evicted = (
+            self.cache_controller.evict_device(node.value)
+        )
         assert full_evicted > 0
         self.evictable_size_ -= full_evicted
         node.value = None
@@ -1365,7 +1421,7 @@ class BaseHiRadixCache(abc.ABC):
         self._update_host_leaf_status(node)
         # update leaf status for the parent because the node is evicted
         self._update_leaf_status(node.parent)
-        return full_evicted, swa_evicted
+        return full_evicted, swa_evicted, draft_swa_evicted
 
     def _evict_regular(self, node: TreeNode):
         # evict a node not initiated write to host -- emit BlockRemoved
@@ -1376,10 +1432,20 @@ class BaseHiRadixCache(abc.ABC):
         )
         full_evicted = len(node.value)
         swa_evicted = torch.count_nonzero(swa_device_indices).item()
+        draft_swa_evicted = 0
+        if self.cache_controller.draft_independent_swa:
+            # Count BEFORE free: the allocator cascades draft frees.
+            draft_swa_evicted = int(
+                torch.count_nonzero(
+                    self.cache_controller.mem_pool_device_allocator.translate_loc_from_full_to_draft_swa(
+                        node.value
+                    )
+                ).item()
+            )
         self._on_tree_value_removed(node)
         self.cache_controller.mem_pool_device_allocator.free(node.value)
         self._delete_leaf(node)
-        return full_evicted, swa_evicted
+        return full_evicted, swa_evicted, draft_swa_evicted
 
     def _get_valid_load_back_swa_tail_start(self, host_indices: torch.Tensor) -> int:
         tail_start = max(0, len(host_indices) - self.sliding_window_size)
@@ -1393,7 +1459,12 @@ class BaseHiRadixCache(abc.ABC):
         )
         return tail_start
 
-    def evict_host(self, full_num_tokens: int, swa_num_tokens: int = 0):
+    def evict_host(
+        self,
+        full_num_tokens: int,
+        swa_num_tokens: int = 0,
+        draft_swa_num_tokens: int = 0,
+    ):
         leaves = list(self.evictable_host_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -1402,9 +1473,12 @@ class BaseHiRadixCache(abc.ABC):
 
         full_evicted = 0
         swa_evicted = 0
-        while (full_evicted < full_num_tokens or swa_evicted < swa_num_tokens) and len(
-            eviction_heap
-        ):
+        draft_swa_evicted = 0
+        while (
+            full_evicted < full_num_tokens
+            or swa_evicted < swa_num_tokens
+            or draft_swa_evicted < draft_swa_num_tokens
+        ) and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
                 break
@@ -1433,9 +1507,12 @@ class BaseHiRadixCache(abc.ABC):
                         f"age_ms={self._prefetch_evicted_age_ms_by_reqid[evicted_prefetch_req_id]:.1f}, "
                         f"host_tokens={len(x.host_value)}"
                     )
-            freed_full, freed_swa = self.cache_controller.evict_host(x.host_value)
+            freed_full, freed_swa, freed_draft_swa = self.cache_controller.evict_host(
+                x.host_value
+            )
             full_evicted += freed_full
             swa_evicted += freed_swa
+            draft_swa_evicted += freed_draft_swa
 
             key = self.get_child_key_fn(x.key)
             v = x.parent.children.pop(key, None)
@@ -1450,7 +1527,7 @@ class BaseHiRadixCache(abc.ABC):
 
     def estimate_load_back(self, node: TreeNode, host_hit_length: int):
         if host_hit_length <= 0 or not node.evicted:
-            return 0, 0
+            return 0, 0, 0
 
         nodes_to_load = []
         while node.evicted:
@@ -1464,10 +1541,21 @@ class BaseHiRadixCache(abc.ABC):
         # TODO(yingchun): torch.cat + count_nonzero().item() 开销大，可在 node 上维护 SWA 数量
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
         if not self.is_hybrid_swa:
-            return len(host_indices), 0
+            return len(host_indices), 0, 0
 
         tail_start = self._get_valid_load_back_swa_tail_start(host_indices)
-        return len(host_indices), len(host_indices) - tail_start
+        draft_swa_load_back = 0
+        if self.cache_controller.draft_independent_swa:
+            # Everything with a live draft host slot gets loaded back (see
+            # cache_controller.alloc_device's draft mask derivation).
+            draft_swa_load_back = int(
+                torch.count_nonzero(
+                    self.cache_controller.mem_pool_host_draft.gather_swa_mapping(
+                        host_indices
+                    )
+                ).item()
+            )
+        return len(host_indices), len(host_indices) - tail_start, draft_swa_load_back
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
@@ -1507,14 +1595,14 @@ class BaseHiRadixCache(abc.ABC):
             swa_valid_mask[tail_start:] = True
             alloc_kwargs["swa_valid_mask"] = swa_valid_mask
 
-        full_device_indices, lack_full_size, lack_swa_size = (
+        full_device_indices, lack_full_size, lack_swa_size, lack_draft_swa_size = (
             self.cache_controller.alloc_device(
                 host_indices=host_indices,
                 **alloc_kwargs,
             )
         )
         if full_device_indices is None:
-            assert lack_full_size > 0 or lack_swa_size > 0
+            assert lack_full_size > 0 or lack_swa_size > 0 or lack_draft_swa_size > 0
             if self.enable_hicache_metrics:
                 self._log_alloc_retry(
                     scenario="load_back",
@@ -1524,17 +1612,21 @@ class BaseHiRadixCache(abc.ABC):
             if self.debug_mode:
                 self.cache_controller.assert_host_indices(
                     host_indices=host_indices,
-                    host_hit_length=self.sliding_window_size,
+                    host_hit_length=len(host_indices),
                 )
             self.evict(
-                EvictParams(num_tokens=lack_full_size, swa_num_tokens=lack_swa_size)
+                EvictParams(
+                    num_tokens=lack_full_size,
+                    swa_num_tokens=lack_swa_size,
+                    draft_swa_num_tokens=lack_draft_swa_size,
+                )
             )
             if self.debug_mode:
                 self.cache_controller.assert_host_indices(
                     host_indices=host_indices,
-                    host_hit_length=self.sliding_window_size,
+                    host_hit_length=len(host_indices),
                 )
-            full_device_indices, lack_full_size, lack_swa_size = (
+            full_device_indices, lack_full_size, lack_swa_size, lack_draft_swa_size = (
                 self.cache_controller.alloc_device(
                     host_indices=host_indices,
                     **alloc_kwargs,
@@ -1656,17 +1748,22 @@ class BaseHiRadixCache(abc.ABC):
         cc.raise_if_storage_thread_dead()
 
         if cc.is_hybrid_swa:
-            qsizes = torch.tensor(
-                [
-                    cc.prefetch_revoke_queue.qsize(),
-                    cc.ack_backup_queue.qsize(),
-                    cc.host_mem_release_queue.qsize(),
-                    cc.swa_only_host_mem_release_queue.qsize(),
-                    cc.mem_pool_host.full_pool_host.available_size(),
-                    cc.mem_pool_host.swa_pool_host.available_size(),
-                ],
-                dtype=torch.int,
-            )
+            qsizes_list = [
+                cc.prefetch_revoke_queue.qsize(),
+                cc.ack_backup_queue.qsize(),
+                cc.host_mem_release_queue.qsize(),
+                cc.swa_only_host_mem_release_queue.qsize(),
+                cc.mem_pool_host.full_pool_host.available_size(),
+                cc.mem_pool_host.swa_pool_host.available_size(),
+            ]
+            if cc.draft_independent_swa:
+                qsizes_list.append(
+                    cc.dflash_only_host_mem_release_queue.qsize()
+                )
+                qsizes_list.append(
+                    cc.mem_pool_host_draft.swa_pool_host.available_size()
+                )
+            qsizes = torch.tensor(qsizes_list, dtype=torch.int)
         else:
             qsizes = torch.tensor(
                 [
@@ -1683,7 +1780,9 @@ class BaseHiRadixCache(abc.ABC):
             )
 
         n_swa_only_release = None
+        n_dflash_only_release = None
         if cc.is_hybrid_swa:
+            values = list(map(int, qsizes.tolist()))
             (
                 n_revoke,
                 n_backup,
@@ -1691,7 +1790,7 @@ class BaseHiRadixCache(abc.ABC):
                 n_swa_only_release,
                 n_host_full_available_size,
                 n_host_swa_available_size,
-            ) = map(int, qsizes.tolist())
+            ) = values[:6]
             assert (
                 n_host_full_available_size
                 == cc.mem_pool_host.full_pool_host.available_size()
@@ -1700,6 +1799,12 @@ class BaseHiRadixCache(abc.ABC):
                 n_host_swa_available_size
                 == cc.mem_pool_host.swa_pool_host.available_size()
             )
+            if cc.draft_independent_swa:
+                n_dflash_only_release = values[6]
+                assert (
+                    values[7]
+                    == cc.mem_pool_host_draft.swa_pool_host.available_size()
+                ), "draft host swa availability diverged across TP ranks"
         else:
             n_revoke, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
@@ -1708,6 +1813,7 @@ class BaseHiRadixCache(abc.ABC):
             n_release=n_release,
             log_metrics=True,
             n_swa_only_release=n_swa_only_release,
+            n_dflash_only_release=n_dflash_only_release,
         )
 
     # Timeout is linearly increasing with the number of pages
@@ -1733,7 +1839,8 @@ class BaseHiRadixCache(abc.ABC):
             )
         if completed:
             self.cache_controller.assert_host_indices(
-                operation.host_indices, self.sliding_window_size
+                operation.host_indices,
+                len(operation.host_indices),
             )
 
         if self.prefetch_stop_policy == "wait_complete":
@@ -1804,6 +1911,7 @@ class BaseHiRadixCache(abc.ABC):
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
         min_completed_tokens = completed_tokens
+        draft_completed_pages = operation.draft_completed_pages
         if self.tp_world_size > 1:
             # synchronize TP workers to make the same update to hiradix cache
             cc = self.cache_controller
@@ -1813,6 +1921,7 @@ class BaseHiRadixCache(abc.ABC):
                     # TODO(yingchun): Defensive programming only, maybe can be removed
                     cc.mem_pool_host.full_pool_host.available_size(),
                     cc.mem_pool_host.swa_pool_host.available_size(),
+                    draft_completed_pages,
                 ],
                 dtype=torch.int,
             )
@@ -1825,6 +1934,7 @@ class BaseHiRadixCache(abc.ABC):
                 min_completed_tokens,
                 n_host_full_available_size,
                 n_host_swa_available_size,
+                draft_completed_pages,
             ) = states.tolist()
             assert (
                 n_host_full_available_size
@@ -1889,6 +1999,7 @@ class BaseHiRadixCache(abc.ABC):
         )
         self.storage_full_hit_by_reqid[req_id] = operation.full_hit_count
         self.storage_swa_hit_by_reqid[req_id] = operation.swa_hit_count
+        self.storage_draft_swa_hit_by_reqid[req_id] = operation.draft_swa_hit_count
         del self.ongoing_prefetch[req_id]
         # Match the += at prefetch time which used len(aligned_key).
         self.cache_controller.prefetch_tokens_occupied -= len(key)
@@ -1971,6 +2082,9 @@ class BaseHiRadixCache(abc.ABC):
     def pop_storage_swa_hit(self, req_id: str) -> int:
         return self.storage_swa_hit_by_reqid.pop(req_id, 0)
 
+    def pop_storage_draft_swa_hit(self, req_id: str) -> int:
+        return self.storage_draft_swa_hit_by_reqid.pop(req_id, 0)
+
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -2017,21 +2131,48 @@ class BaseHiRadixCache(abc.ABC):
         """Allocate host indices for a prefetch operation.
 
         Returns ``(full_host_indices, swa_host_indices, lack_full, lack_swa,
-        host_indices_ready_event)``. For non-SWA HiCache, swa_host_indices / lack_swa /
-        host_indices_ready_event are always None / 0 / None. host_indices_ready_event (SWA
-        only) records the async index clones so the prefetch thread can wait on
-        them before reading the indices on its own stream.
+        host_indices_ready_event, draft_swa_host_indices)``. For non-SWA
+        HiCache, swa_host_indices / lack_swa / host_indices_ready_event are
+        always None / 0 / None. host_indices_ready_event (SWA only) records the
+        async index clones so the prefetch thread can wait on them before
+        reading the indices on its own stream.
+
+        draft_swa_host_indices is non-None only under DFLASH two-window, and is
+        best-effort: if the draft swa ring lacks capacity it stays None. The
+        draft L3 reservation is additive (a miss just means the draft
+        recomputes those positions), so it must never block or fail the target
+        prefetch — hence no lack signal / eviction for it here.
         """
-        # TODO(yingchun): 尽量通过 cache_controller 访问 pool
-        mem_pool_host = self.cache_controller.mem_pool_host
-        if self.cache_controller.is_hybrid_swa:
-            return mem_pool_host.alloc_unmapped_host_by_len(prefetch_length)
+        cc = self.cache_controller
+        mem_pool_host = cc.mem_pool_host
+        if cc.is_hybrid_swa:
+            full_host_indices, swa_host_indices, lack_full, lack_swa, event = (
+                mem_pool_host.alloc_unmapped_host_by_len(prefetch_length)
+            )
+            draft_swa_host_indices = None
+            if full_host_indices is not None and cc.draft_independent_swa:
+                # Reserve raw draft-swa slots mirroring the target reserve
+                # (min(prefetch_length, draft reserve_swa_size)); left unmapped
+                # until the load side resolves the draft-safe prefix.
+                draft_pool = cc.mem_pool_host_draft
+                draft_swa_need = min(prefetch_length, draft_pool.reserve_swa_size)
+                draft_swa_host_indices, _ = draft_pool.alloc_swa_only_unmapped(
+                    draft_swa_need
+                )
+            return (
+                full_host_indices,
+                swa_host_indices,
+                lack_full,
+                lack_swa,
+                event,
+                draft_swa_host_indices,
+            )
 
         full_host_indices = mem_pool_host.alloc(prefetch_length)
         if full_host_indices is None:
             lack_full = prefetch_length - mem_pool_host.available_size()
-            return None, None, max(0, lack_full), 0, None
-        return full_host_indices, None, 0, 0, None
+            return None, None, max(0, lack_full), 0, None, None
+        return full_host_indices, None, 0, 0, None, None
 
     def prefetch_from_storage(
         self,
@@ -2053,12 +2194,14 @@ class BaseHiRadixCache(abc.ABC):
             return PrefetchStatus.RATE_LIMITED
 
         last_host_node.protect_host()
-        full_host_indices, swa_host_indices, lack_full_size, lack_swa_size, host_indices_ready_event = (
+        full_host_indices, swa_host_indices, lack_full_size, lack_swa_size, host_indices_ready_event, draft_swa_host_indices = (
             self._alloc_prefetch_host_indices(prefetch_length)
         )
         if full_host_indices is None:
             assert swa_host_indices is None
+            assert draft_swa_host_indices is None
             assert lack_full_size > 0 or lack_swa_size > 0
+            # TODO(yingchun): 增加 draft swa 的 lack
             if self.enable_hicache_metrics:
                 self._log_alloc_retry(
                     scenario="prefetch",
@@ -2066,11 +2209,14 @@ class BaseHiRadixCache(abc.ABC):
                     lack_swa=lack_swa_size > 0,
                 )
             self.evict_host(lack_full_size, lack_swa_size)
-            full_host_indices, swa_host_indices, lack_full_size, lack_swa_size, host_indices_ready_event = (
+            full_host_indices, swa_host_indices, lack_full_size, lack_swa_size, host_indices_ready_event, draft_swa_host_indices = (
                 self._alloc_prefetch_host_indices(prefetch_length)
             )
         if full_host_indices is None:
             assert swa_host_indices is None
+            assert draft_swa_host_indices is None
+            assert lack_full_size > 0 or lack_swa_size > 0
+            # TODO(yingchun): 增加 draft swa 的 lack
             if self.enable_hicache_metrics:
                 self._log_alloc_failure(
                     scenario="prefetch",
@@ -2089,6 +2235,7 @@ class BaseHiRadixCache(abc.ABC):
             last_hash,
             prefix_keys,
             host_indices_ready_event=host_indices_ready_event,
+            draft_swa_host_indices=draft_swa_host_indices,
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
@@ -2325,12 +2472,14 @@ class BaseHiRadixCache(abc.ABC):
             else:
                 if self.is_hybrid_swa:
                     # deal with if new device page have swa and the old device page DO NOT
-                    num_transferred = (
+                    num_transferred, draft_num_transferred = (
                         self.token_to_kv_pool_allocator.splice_swa_mapping(
                             node.value, value[:prefix_len]
                         )
                     )
-                    self._on_node_swa_mapping_increased(node, num_transferred)
+                    self._on_node_swa_mapping_increased(
+                        node, num_transferred, draft_num_transferred
+                    )
                     # if new device page have swa but the host page DO NOT
                     # It seems quite possible
                     if num_transferred > 0 and node.backuped:
@@ -2437,15 +2586,31 @@ class BaseHiRadixCache(abc.ABC):
             stack.extend(cur_node.children.values())
 
         dev_mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+        # DFLASH two-window: draft SWA lives in a separate device/host mapping
+        # keyed by the same full indices; count it only when registered.
+        dev_draft_mapping = getattr(
+            self.token_to_kv_pool_allocator, "full_to_draft_swa_index_mapping", None
+        )
+        host_draft_pool = getattr(
+            self.cache_controller, "mem_pool_host_draft", None
+        )
 
         if dev_values:
             cat_dev = torch.cat(dev_values)
             ret.dev.full_tokens = len(cat_dev)
             ret.dev.swa_tokens = int(dev_mapping[cat_dev].count_nonzero())
+            if dev_draft_mapping is not None:
+                ret.dev.draft_swa_tokens = int(
+                    dev_draft_mapping[cat_dev].count_nonzero()
+                )
         if dev_values_locked:
             cat_dev_locked = torch.cat(dev_values_locked)
             ret.dev.full_tokens_locked = len(cat_dev_locked)
             ret.dev.swa_tokens_locked = int(dev_mapping[cat_dev_locked].count_nonzero())
+            if dev_draft_mapping is not None:
+                ret.dev.draft_swa_tokens_locked = int(
+                    dev_draft_mapping[cat_dev_locked].count_nonzero()
+                )
         if host_values:
             cat_host = torch.cat(host_values)
             ret.host.full_tokens = len(cat_host)
@@ -2454,6 +2619,10 @@ class BaseHiRadixCache(abc.ABC):
                     cat_host
                 ).count_nonzero()
             )
+            if host_draft_pool is not None:
+                ret.host.draft_swa_tokens = int(
+                    host_draft_pool.gather_swa_mapping(cat_host).count_nonzero()
+                )
         if host_values_locked:
             cat_host_locked = torch.cat(host_values_locked)
             ret.host.full_tokens_locked = len(cat_host_locked)
@@ -2462,6 +2631,12 @@ class BaseHiRadixCache(abc.ABC):
                     cat_host_locked
                 ).count_nonzero()
             )
+            if host_draft_pool is not None:
+                ret.host.draft_swa_tokens_locked = int(
+                    host_draft_pool.gather_swa_mapping(
+                        cat_host_locked
+                    ).count_nonzero()
+                )
         return ret
 
     def release_aborted_request(self, rid: str):
@@ -2470,6 +2645,7 @@ class BaseHiRadixCache(abc.ABC):
         self.prefetch_stage_durations_by_reqid.pop(rid, None)
         self.storage_full_hit_by_reqid.pop(rid, None)
         self.storage_swa_hit_by_reqid.pop(rid, None)
+        self.storage_draft_swa_hit_by_reqid.pop(rid, None)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self.prefetch_trace_attrs_by_reqid.pop(rid, None)
         self._prefetch_insert_ts_by_reqid.pop(rid, None)
@@ -2595,52 +2771,75 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
         )
 
     def _compute_safe_prefix_len(
-        self, full_matched_result: MatchResult
-    ) -> tuple[int, int]:
+        self, full_matched_result: MatchResult, total_len: int
+    ) -> tuple[int, int, int, int]:
         """Compute the SWA-safe prefix length for both device and host portions.
 
         The full matched prefix consists of two contiguous parts:
           [device_indices (on GPU)] [host-only evicted nodes (to be loaded back)]
 
-        For the combined prefix of length ``total_len = device_len + host_len``,
-        the tail window ``[max(0, total_len - sliding_window_size), total_len)``
-        must have valid SWA mappings. Delegates to ``compute_swa_safe_len()``
-        for the core sliding-window validity check.
+        For the combined prefix of length ``device_len + host_len``, the tail
+        window ``[max(0, L - sliding_window_size), L)`` must have valid SWA
+        mappings. Delegates to ``compute_swa_safe_len()`` (target only) or, in
+        DFLASH two-window mode, to ``compute_target_and_joint_safe_len()`` which
+        also enforces the (weaker, extend-gated) draft window constraint against
+        the combined device+host draft mappings.
+
+        Args:
+            total_len: Full request length (``len(key.token_ids)``), used by
+                the draft_free gate: a prefix leaving more than draft_window
+                tokens to extend does not need live draft slots.
 
         Returns:
-            A tuple ``(swa_safe_device_len, swa_safe_host_len)`` where:
+            ``(swa_safe_device_len, swa_safe_host_len, target_safe_device_len,
+            draft_safe_device_len)``:
 
             - **swa_safe_device_len** (int): Number of leading device_indices
-              that are SWA-safe.  Always ``<= device_len``.
-            - **swa_safe_host_len** (int):
-              - ``int >= 0`` — the number of host tokens (counted from the
-                device/host boundary toward the leaf) that are SWA-safe.
-                ``0`` means no host portion is usable.  Note that when
-                ``swa_safe_device_len < device_len``, ``swa_safe_host_len``
-                will always be ``0`` because trimming the device portion
-                invalidates the host portion as well.
+              that are jointly SWA-safe.  Always ``<= device_len``.
+            - **swa_safe_host_len** (int): host tokens (from the device/host
+              boundary) that are jointly SWA-safe; always ``0`` when the device
+              portion was trimmed.
+            - **target_safe_device_len** (int): device-safe length considering
+              ONLY the target window. Used to gate target-swa refill: a trim
+              caused purely by the draft window cannot be fixed by refilling
+              target swa.
+            - **draft_safe_device_len** (int): device-safe length considering
+              ONLY the draft window (with draft_free), assuming target is
+              refilled. Used to gate target-swa refill: it must cover the full
+              device match because there is no draft refill path. Equals
+              ``device_len`` outside two-window mode.
         """
         device_indices = full_matched_result.device_indices
         device_len = len(device_indices)
         host_hit_length = full_matched_result.host_hit_length
-        total_len = device_len + host_hit_length
+        matched_len = device_len + host_hit_length
 
         # 1. Fast path: nothing matched, return immediately without any SWA checks
-        if total_len == 0:
+        if matched_len == 0:
             assert (
                 device_len == 0 and host_hit_length == 0
             ), f"{device_len=}, {host_hit_length=}"
-            return 0, 0
+            return 0, 0, 0, 0
 
         # 2. Build the combined SWA index vector for the full matched prefix.
         swa_parts = []
+        draft_independent_swa = self.cache_controller.draft_independent_swa
+        draft_parts = [] if draft_independent_swa else None
 
         # 2.1 Device portion: lookup from device allocator's mapping.
+        device_draft = None
         if device_len > 0:
             device_swa = self.token_to_kv_pool_allocator.full_to_swa_index_mapping[
                 device_indices
             ]
             swa_parts.append(device_swa)
+            if draft_independent_swa:
+                device_draft = (
+                    self.token_to_kv_pool_allocator.full_to_draft_swa_index_mapping[
+                        device_indices
+                    ]
+                )
+                draft_parts.append(device_draft)
 
         # 2.2 Host portion: lookup from host pool's mapping (keyed by host_value indices).
         if host_hit_length > 0:
@@ -2658,25 +2857,82 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
             ), f"{host_hit_length=}, {host_indices.numel()=}"
             host_swa = self.cache_controller.get_swa_host_indices(host_indices)
             swa_parts.append(host_swa)
+            if draft_independent_swa:
+                draft_parts.append(
+                    self.cache_controller.mem_pool_host_draft.gather_swa_mapping(
+                        host_indices
+                    )
+                )
 
-        if len(swa_parts) > 1:
-            # Device portion (allocator mapping) is on CUDA; host portion (host
-            # pool mapping) is on CPU. Align to the first part's device before
-            # concatenating for compute_swa_safe_len.
-            target_device = swa_parts[0].device
-            swa_indices = torch.cat([p.to(target_device) for p in swa_parts])
-        else:
-            swa_indices = swa_parts[0]
-        assert len(swa_indices) == total_len, f"{len(swa_indices)=}, {total_len=}"
+        def _cat_parts(parts):
+            if len(parts) > 1:
+                # Device portion (allocator mapping) is on CUDA; host portion
+                # (host pool mapping) is on CPU. Align to the first part's
+                # device before concatenating.
+                target_device = parts[0].device
+                return torch.cat([p.to(target_device) for p in parts])
+            return parts[0]
+
+        swa_indices = _cat_parts(swa_parts)
+        assert len(swa_indices) == matched_len, f"{len(swa_indices)=}, {matched_len=}"
 
         # 3. Delegate to the shared SWA safety check algorithm.
-        safe_total_len = compute_swa_safe_len(swa_indices, self.sliding_window_size)
-        assert safe_total_len <= total_len, f"{safe_total_len=}, {total_len=}"
+        draft_window_size = 0
+        if draft_independent_swa:
+            draft_window_size = int(
+                self.token_to_kv_pool_allocator.draft_swa_window_size
+            )
+            draft_indices = _cat_parts(draft_parts)
+            target_safe_len, safe_total_len = compute_target_and_joint_safe_len(
+                swa_indices,
+                self.sliding_window_size,
+                draft_indices,
+                draft_window_size,
+                total_len,
+            )
+        else:
+            target_safe_len = compute_swa_safe_len(
+                swa_indices, self.sliding_window_size
+            )
+            safe_total_len = target_safe_len
+        assert safe_total_len <= matched_len, f"{safe_total_len=}, {matched_len=}"
+        if self.page_size > 1:
+            safe_total_len = floor_align(safe_total_len, self.page_size)
+
+        # Observability: how many matched prefix tokens the draft-swa window
+        # constraint drops beyond what target-swa alone would (joint <= target).
+        # Zero when not two-window or when the draft window does not bind.
+        # TODO(yingchun): this path uses the strict shrink target_safe_len -
+        #  safe_total_len, but SimpleSWARadixCache._compute_safe_prefix_len feeds
+        #  the SAME counter with the cheaper draft_safe - safe_len. The two paths
+        #  therefore measure slightly different quantities; unify them.
+        if draft_independent_swa and target_safe_len > safe_total_len:
+            self.draft_swa_prefix_shrink_tokens += target_safe_len - safe_total_len
 
         # 4. Split the safe length back into device and host portions.
         safe_device_len = min(safe_total_len, device_len)
         safe_host_len = max(0, safe_total_len - device_len)
-        return safe_device_len, safe_host_len
+        target_safe_device_len = min(target_safe_len, device_len)
+
+        # 5. Draft-only safe DEVICE length (assumes target refilled). Target-SWA
+        #    refill requires this to cover the full device match because it
+        #    cannot restore draft KV. Non-two-window: device_len (no-op).
+        if draft_independent_swa and device_draft is not None:
+            draft_safe_device_len = compute_draft_safe_len(
+                device_draft, draft_window_size, total_len
+            )
+            if self.page_size > 1:
+                draft_safe_device_len = floor_align(
+                    draft_safe_device_len, self.page_size
+                )
+        else:
+            draft_safe_device_len = device_len
+        return (
+            safe_device_len,
+            safe_host_len,
+            target_safe_device_len,
+            draft_safe_device_len,
+        )
 
     def _collect_backed_host_tail_indices(
         self, node: TreeNode, prefix_len: int, host_tail_start: int
@@ -2845,8 +3101,13 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
 
         # Apply SWA safety checks and trim the matched prefix if needed, before re-matching to get the
         # final safe match result.
-        swa_matched_device_len, swa_matched_host_len = self._compute_safe_prefix_len(
-            full_matched_result
+        (
+            swa_matched_device_len,
+            swa_matched_host_len,
+            target_safe_device_len,
+            draft_safe_device_len,
+        ) = self._compute_safe_prefix_len(
+            full_matched_result, len(params.key.token_ids)
         )
         swa_refill_node = None
         swa_refill_len = 0
@@ -2854,9 +3115,13 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
         # prefix, expose refill metadata through MatchResult. The actual
         # SWA-only load still happens later in init_swa_refill(), after the
         # scheduler admits the request and holds the cache lock.
+        # A target-only refill cannot restore draft KV. Only allow refill when
+        # draft safety permits the original full-match endpoint.
+        # FIXME(yingchun): Support draft-capped refill after resolving its node
+        #  endpoint and revalidating the host tail at the capped length.
         if (
-            swa_matched_device_len < full_matched_device_len
-            and full_matched_result.last_host_node
+            target_safe_device_len < full_matched_device_len <= draft_safe_device_len
+                and full_matched_result.last_host_node
             is full_matched_result.last_device_node
         ):
             tail_start = max(0, full_matched_device_len - self.sliding_window_size)
@@ -2871,6 +3136,7 @@ class HiSimpleSWARadixCache(BaseHiRadixCache, SimpleSWARadixCache):
                 # backup for the SWA tail; earlier tokens are already full-KV
                 # device hits and do not need host SWA for refill.
                 swa_refill_node = full_matched_result.last_device_node
+                # Keep the refill length at the node's full-match endpoint.
                 swa_refill_len = full_matched_device_len
         logger.debug(
             f"{full_matched_device_len=}, {full_matched_host_len=}, {swa_matched_device_len=}, {swa_matched_host_len=}"

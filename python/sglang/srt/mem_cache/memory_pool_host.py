@@ -3161,6 +3161,33 @@ class SWATokenToKVPoolHost:
         # mapping call.
         self._page_offsets = torch.arange(self.page_size, device=device)
         self._token_stride_sizes, self._page_element_sizes = self._compute_page_meta()
+        # DFLASH two-window: an independent draft host pool keyed by THIS
+        # pool's full host index space. Registered via register_draft_swa_host.
+        self._draft_swa_host_pool: Optional["SWATokenToKVPoolHost"] = None
+
+    def maybe_bump_reserve_swa_size(self, window_size: Optional[int]) -> None:
+        """Raise reserve_swa_size to at least the SWA window (page-aligned).
+        """
+        if not window_size or window_size <= 0:
+            return
+        assert window_size % self.page_size == 0
+        self.reserve_swa_size = max(self.reserve_swa_size, window_size)
+
+    def register_draft_swa_host(
+        self,
+        draft_host_pool: "SWATokenToKVPoolHost",
+        draft_swa_window_size: Optional[int] = None,
+    ) -> None:
+        assert self._draft_swa_host_pool is None, (
+            "DFLASH draft swa host pool is already registered."
+        )
+        assert draft_host_pool.full_pool_host.size == self.full_pool_host.size, (
+            "draft host pool must share this pool's full host index space "
+            f"(draft={draft_host_pool.full_pool_host.size}, "
+            f"target={self.full_pool_host.size})"
+        )
+        self._draft_swa_host_pool = draft_host_pool
+        draft_host_pool.maybe_bump_reserve_swa_size(draft_swa_window_size)
 
     def _validate_host_pool_sizes(
         self,
@@ -3380,18 +3407,22 @@ class SWATokenToKVPoolHost:
 
         return full_host_indices, 0, 0
 
-    def free(self, full_host_indices: torch.Tensor) -> tuple[int, int]:
+    def free(self, full_host_indices: torch.Tensor) -> tuple[int, int, int]:
         if full_host_indices.numel() == 0:
-            return 0, 0
+            return 0, 0, 0
 
-        # Detach the SWA mapping BEFORE returning the full indices to the free
-        # ring: once freed, another allocator call may re-alloc the same full
-        # indices and zero their mapping entries, so gathering afterwards
-        # would read 0 and leak the SWA slots.
+        # Detach BOTH the target-SWA and draft-SWA mappings BEFORE returning the
+        # full indices to the free ring: once freed, another allocator call may
+        # re-alloc the same full indices and write NEW mapping entries.
         with self._mapping_section:
             swa_host_indices = self.full_to_swa_index_mapping[full_host_indices]
             self.full_to_swa_index_mapping[full_host_indices] = 0
-        self.full_pool_host.free(full_host_indices)
+        draft_swa_freed = 0
+        if self._draft_swa_host_pool is not None:
+            draft_swa_freed = self._draft_swa_host_pool.free_swa_by_full_indices(
+                full_host_indices
+            )
+        full_freed = self.full_pool_host.free(full_host_indices)
         swa_valid = swa_host_indices.bool()
         # Earliest possible detection of mixed mapping pages: without this,
         # the .bool() filter below silently frees the valid half of a mixed
@@ -3409,7 +3440,7 @@ class SWATokenToKVPoolHost:
         if swa_freed > 0:
             self.swa_pool_host.free(swa_host_indices[swa_valid])
 
-        return int(full_host_indices.numel()), swa_freed
+        return full_freed, swa_freed, draft_swa_freed
 
     def mapping_full_and_swa_indices(
         self,
@@ -3429,26 +3460,28 @@ class SWATokenToKVPoolHost:
         num_pages = len(swa_valid_mask)
         assert len(full_host_indices) == num_pages * ps
 
-        swa_available_tokens = len(swa_host_indices)
-        assert swa_available_tokens % ps == 0
-        swa_available_pages = swa_available_tokens // ps
+        reserved_swa_tokens = len(swa_host_indices)
+        assert reserved_swa_tokens % ps == 0
+        reserved_swa_pages = reserved_swa_tokens // ps
 
         nonzero_idx = swa_valid_mask.nonzero(as_tuple=False).view(-1)
-        num_needed_pages = len(nonzero_idx)
-        assert num_needed_pages > 0
-        assert swa_available_pages > 0
+        swa_valid_pages = len(nonzero_idx)
+        assert swa_valid_pages > 0
+        assert reserved_swa_pages > 0
 
         updated_mask = swa_valid_mask.clone()
         surplus_swa = None
 
-        if swa_available_pages >= num_needed_pages:
+        if reserved_swa_pages >= swa_valid_pages:
             pages_to_bind = nonzero_idx
-            surplus_swa_tokens = (swa_available_pages - num_needed_pages) * ps
+            surplus_swa_tokens = (reserved_swa_pages - swa_valid_pages) * ps
             swa_to_bind = swa_host_indices[surplus_swa_tokens:]
             if surplus_swa_tokens > 0:
                 surplus_swa = swa_host_indices[:surplus_swa_tokens]
         else:
-            trim_count = num_needed_pages - swa_available_pages
+            # Reservation smaller than the valid pages: keep the trailing
+            # (most-recent) pages and drop the frontmost (oldest) from the mask.
+            trim_count = swa_valid_pages - reserved_swa_pages
             trimmed_indices = nonzero_idx[:trim_count]
             updated_mask[trimmed_indices] = False
             pages_to_bind = nonzero_idx[trim_count:]
@@ -3563,6 +3596,12 @@ class SWATokenToKVPoolHost:
                     self.page_size,
                     "SWATokenToKVPoolHost.splice_swa_mapping(post_src_mapping)",
                 )
+        # DFLASH two-window: mirror the ownership transfer on the draft host
+        # pool's own mapping (same full host index space).
+        if self._draft_swa_host_pool is not None:
+            self._draft_swa_host_pool.splice_swa_mapping(
+                tgt_full_indices, src_full_indices
+            )
         return num_transferred
 
     def free_swa_only(self, swa_indices: torch.Tensor) -> int:
@@ -3572,6 +3611,109 @@ class SWATokenToKVPoolHost:
 
         self.swa_pool_host.free(swa_indices)
         return int(swa_indices.numel())
+
+    # ------------------------------------------------------------------
+    # DFLASH two-window draft host pool helpers.
+    #
+    # In two-window mode the draft host pool is an independent
+    # SWATokenToKVPoolHost instance whose full host index space is SHARED with
+    # the target host pool (the same full_host_indices key both mappings); only
+    # its swa ring and full_to_swa_index_mapping are its own. Its full ring is
+    # therefore never allocated from — use these helpers instead of
+    # alloc_host()/free() so the shared full ring is not double-managed.
+    # ------------------------------------------------------------------
+
+    def alloc_swa_for_full_indices(
+        self,
+        full_host_indices: torch.Tensor,
+        swa_valid_mask: torch.Tensor,
+    ) -> tuple[bool, int]:
+        """Allocate own swa host slots for the valid positions of externally
+        owned full host indices and record them in the own mapping.
+
+        Returns ``(ok, lack_swa_size)``; on failure nothing is allocated and
+        the mapping entries are zeroed.
+        """
+        assert len(full_host_indices) == len(swa_valid_mask)
+        swa_need_size = int(swa_valid_mask.sum())
+        assert swa_need_size % self.page_size == 0
+
+        lack_swa_size = swa_need_size - self.swa_pool_host.available_size()
+        if lack_swa_size > 0:
+            return False, lack_swa_size
+
+        swa_mapping = torch.zeros(
+            len(full_host_indices), dtype=torch.int64, device=self.device
+        )
+        if swa_need_size > 0:
+            swa_host_indices = self.swa_pool_host.alloc(swa_need_size)
+            assert swa_host_indices is not None, (
+                f"race: swa ring drained between availability check and alloc "
+                f"(need={swa_need_size}, avail_now={self.swa_pool_host.available_size()})"
+            )
+            assert_indices_in_bounds(
+                swa_host_indices,
+                self.page_size,
+                self.swa_pool_host.size + self.page_size,
+                "SWATokenToKVPoolHost.alloc_swa_for_full_indices(swa)",
+                hot=True,
+            )
+            swa_mapping[swa_valid_mask.to(swa_mapping.device)] = swa_host_indices
+        with self._mapping_section:
+            self.full_to_swa_index_mapping[full_host_indices] = swa_mapping
+        return True, 0
+
+    def alloc_swa_only_unmapped(
+        self, swa_need_size: int
+    ) -> tuple[Optional[torch.Tensor], int]:
+        """Allocate raw own swa host slots WITHOUT recording any full->swa mapping.
+
+        Prefetch-path counterpart of alloc_swa_for_full_indices: the mapping is
+        deferred until the storage hit-length is resolved (draft existence
+        query -> joint safe-len). The returned slots are pristine (all valid,
+        page-uniform) and must be freed via free_swa_only (all-surplus) or
+        first mapped, then the surplus freed. Does NOT touch the full ring.
+
+        Returns ``(swa_host_indices, lack_swa_size)``; on lack nothing is
+        allocated (best-effort caller may simply skip the draft reservation).
+        """
+        assert swa_need_size % self.page_size == 0
+        if swa_need_size == 0:
+            return None, 0
+        lack_swa_size = swa_need_size - self.swa_pool_host.available_size()
+        if lack_swa_size > 0:
+            return None, lack_swa_size
+        swa_host_indices = self.swa_pool_host.alloc(swa_need_size)
+        assert swa_host_indices is not None, (
+            f"race: draft swa ring drained between availability check and alloc "
+            f"(need={swa_need_size}, avail_now={self.swa_pool_host.available_size()})"
+        )
+        assert_indices_in_bounds(
+            swa_host_indices,
+            self.page_size,
+            self.swa_pool_host.size + self.page_size,
+            "SWATokenToKVPoolHost.alloc_swa_only_unmapped(swa)",
+            hot=True,
+        )
+        return swa_host_indices, 0
+
+    def free_swa_by_full_indices(self, full_host_indices: torch.Tensor) -> int:
+        """Free own swa host slots keyed by externally owned full host indices.
+
+        Does NOT touch the full ring (owned by the target host pool). Freed
+        positions are detected via the own mapping (0 = absent), so calling
+        this on indices that never had draft swa is a safe no-op.
+        """
+        if full_host_indices.numel() == 0:
+            return 0
+        with self._mapping_section:
+            swa_host_indices = self.full_to_swa_index_mapping[full_host_indices]
+            self.full_to_swa_index_mapping[full_host_indices] = 0
+        swa_valid = swa_host_indices.bool()
+        swa_freed = int(swa_valid.sum())
+        if swa_freed > 0:
+            self.swa_pool_host.free(swa_host_indices[swa_valid])
+        return swa_freed
 
     def gather_swa_mapping(self, full_host_indices: torch.Tensor) -> torch.Tensor:
         # full_to_swa_index_mapping lives on the host pool device (CPU). Index
@@ -3595,6 +3737,8 @@ class SWATokenToKVPoolHost:
         # Note: the last item is -1, we don't clear it, see the comment in __init__
         with self._mapping_section:
             self.full_to_swa_index_mapping[:-1].fill_(0)
+        if self._draft_swa_host_pool is not None:
+            self._draft_swa_host_pool.clear()
 
     def load_to_device_per_layer(
         self,

@@ -1009,6 +1009,7 @@ class SchedulerOutputProcessorMixin:
         raw_cached_tokens = []
         storage_full_hit_tokens = []
         storage_swa_hit_tokens = []
+        storage_draft_swa_hit_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
         image_tokens_list = []
         audio_tokens_list = []
@@ -1124,6 +1125,7 @@ class SchedulerOutputProcessorMixin:
                 raw_cached_tokens.append(req.raw_cached_tokens)
                 storage_full_hit_tokens.append(req.storage_full_hit_tokens)
                 storage_swa_hit_tokens.append(req.storage_swa_hit_tokens)
+                storage_draft_swa_hit_tokens.append(req.storage_draft_swa_hit_tokens)
 
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self._get_cached_tokens_details(req))
@@ -1280,6 +1282,7 @@ class SchedulerOutputProcessorMixin:
                     raw_cached_tokens=raw_cached_tokens,
                     storage_full_hit_tokens=storage_full_hit_tokens,
                     storage_swa_hit_tokens=storage_swa_hit_tokens,
+                    storage_draft_swa_hit_tokens=storage_draft_swa_hit_tokens,
                     cached_tokens_details=cached_tokens_details,
                     image_tokens=image_tokens_list,
                     audio_tokens=audio_tokens_list,
@@ -1319,6 +1322,7 @@ class SchedulerOutputProcessorMixin:
         raw_cached_tokens = []
         storage_full_hit_tokens = []
         storage_swa_hit_tokens = []
+        storage_draft_swa_hit_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
         time_stats = []
         retraction_counts = []
@@ -1333,6 +1337,7 @@ class SchedulerOutputProcessorMixin:
                 raw_cached_tokens.append(req.raw_cached_tokens)
                 storage_full_hit_tokens.append(req.storage_full_hit_tokens)
                 storage_swa_hit_tokens.append(req.storage_swa_hit_tokens)
+                storage_draft_swa_hit_tokens.append(req.storage_draft_swa_hit_tokens)
 
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self._get_cached_tokens_details(req))
@@ -1350,6 +1355,7 @@ class SchedulerOutputProcessorMixin:
                 raw_cached_tokens=raw_cached_tokens,
                 storage_full_hit_tokens=storage_full_hit_tokens,
                 storage_swa_hit_tokens=storage_swa_hit_tokens,
+                storage_draft_swa_hit_tokens=storage_draft_swa_hit_tokens,
                 cached_tokens_details=cached_tokens_details,
                 placeholder_tokens_idx=None,
                 placeholder_tokens_val=None,

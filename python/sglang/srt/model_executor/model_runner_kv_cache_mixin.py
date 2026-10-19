@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.utils.common import (
+    floor_align,
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
     is_hip,
@@ -49,6 +50,7 @@ class MemoryPoolConfig:
     max_running_requests: int
     full_max_total_num_tokens: Optional[int] = None
     swa_max_total_num_tokens: Optional[int] = None
+    draft_swa_max_total_num_tokens: Optional[int] = None
 
     mem_fraction_static: Optional[float] = None
 
@@ -250,8 +252,8 @@ class ModelRunnerKVCacheMixin:
         r = self.server_args.swa_full_tokens_ratio
         ct = full_per_token * n_full + swa_per_token * n_swa
         denom = full_per_token * n_full + r * swa_per_token * n_swa
-        k = (ct * r / denom) if denom > 0 else 1.0
-        kf = (ct / denom) if denom > 0 else 1.0
+        k = (ct * r / denom) if denom > 0 else 1.0  # swa_tokens / token_capacity
+        kf = (ct / denom) if denom > 0 else 1.0  # full_tokens / token_capacity
 
         # Single-window (draft_window == target_window) reuses the target SWA
         # pool (ratio 1); a smaller draft window needs proportionally fewer rows.
@@ -783,9 +785,14 @@ class ModelRunnerKVCacheMixin:
                         "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.hf_text_config.v_head_dim,
                     }
+                size_swa = self.swa_max_total_num_tokens
+                if self.is_draft_worker and getattr(
+                    self, "draft_swa_max_total_num_tokens", None
+                ):
+                    size_swa = self.draft_swa_max_total_num_tokens
                 swa_pool_kwargs = dict(
                     size=self.full_max_total_num_tokens,
-                    size_swa=self.swa_max_total_num_tokens,
+                    size_swa=size_swa,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(
@@ -1048,6 +1055,9 @@ class ModelRunnerKVCacheMixin:
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = config.full_max_total_num_tokens
             self.swa_max_total_num_tokens = config.swa_max_total_num_tokens
+            self.draft_swa_max_total_num_tokens = (
+                config.draft_swa_max_total_num_tokens
+            )
 
         self._init_pools()
 
@@ -1060,18 +1070,63 @@ class ModelRunnerKVCacheMixin:
 
         full_tokens = None
         swa_tokens = None
+        draft_swa_tokens = None
         if self.is_hybrid_swa:
             token_capacity, full_tokens, swa_tokens = self._resolve_hybrid_swa_tokens(
                 token_capacity
             )
+            draft_swa_tokens = self._resolve_draft_swa_tokens(swa_tokens, full_tokens)
 
         return MemoryPoolConfig(
             max_total_num_tokens=token_capacity,
             max_running_requests=self._resolve_max_num_reqs(token_capacity),
             full_max_total_num_tokens=full_tokens,
             swa_max_total_num_tokens=swa_tokens,
+            draft_swa_max_total_num_tokens=draft_swa_tokens,
             mem_fraction_static=self.server_args.mem_fraction_static,
         )
+
+    def _resolve_draft_swa_tokens(
+        self: ModelRunner, swa_tokens: int, full_tokens: int
+    ) -> Optional[int]:
+        """DFLASH two-window: physical size of the draft's own SWA pool.
+
+        When --draft-swa-full-tokens-ratio is set, size the pool as
+        full_tokens * ratio. Otherwise scale the target SWA pool by
+        draft_window / target_window (the draft keeps a larger window). Either
+        way cap at full_tokens so the draft pool cannot exceed the full pool.
+        Returns None unless DFLASH is active with a distinct draft window
+        (single-window mode reuses the target SWA pool and needs no separate
+        draft pool).
+        """
+        if not (self.spec_algorithm.is_dflash() and not self.is_draft_worker):
+            return None
+        draft_cfg = getattr(self, "dflash_draft_model_config", None)
+        if draft_cfg is None:
+            return None
+        dflash_config = getattr(draft_cfg.hf_text_config, "dflash_config", None) or {}
+        if not dflash_config.get("use_swa", False):
+            return None
+        draft_window = dflash_config.get("swa_window_size", None)
+        target_window = self.sliding_window_size
+        if not draft_window or not target_window or draft_window == target_window:
+            return None
+        page_size = self.server_args.page_size
+        ratio = self.server_args.draft_swa_full_tokens_ratio
+        if ratio is not None:
+            scaled = int(full_tokens * ratio)
+        else:
+            scaled = int(swa_tokens * draft_window / target_window)
+        assert full_tokens > 0
+        scaled = min(scaled, full_tokens)
+        draft_swa_tokens = floor_align(scaled, page_size)
+        logger.info(
+            f"Use DFLASH draft swa memory pool. draft_window={draft_window}, "
+            f"target_window={target_window}, draft_swa_full_tokens_ratio={ratio}, "
+            f"full_layer_tokens={full_tokens}, swa_layer_tokens={swa_tokens}, "
+            f"draft_swa_layer_tokens={draft_swa_tokens}"
+        )
+        return draft_swa_tokens
 
     def init_memory_pool(self: ModelRunner, pre_model_load_memory: int):
         if not self.spec_algorithm.is_none() and self.is_draft_worker:

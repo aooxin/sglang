@@ -472,12 +472,22 @@ class PrefillAdder:
         self.swa_rem_total_token_offset = mixed_with_decode_tokens
         self.cur_swa_rem_token_offset = mixed_with_decode_tokens
 
+        self._draft_independent_swa = self.token_to_kv_pool_allocator.has_draft_swa
+        self.draft_swa_window = (
+            int(getattr(self.token_to_kv_pool_allocator, "draft_swa_window_size", 0) or 0)
+            if self._draft_independent_swa
+            else 0
+        )
+        self.draft_swa_rem_total_token_offset = mixed_with_decode_tokens
+        self.cur_draft_swa_rem_token_offset = mixed_with_decode_tokens
+
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
         self.log_hit_tokens = 0
         self.log_host_hit_tokens = 0
+        self.log_storage_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
 
@@ -492,6 +502,11 @@ class PrefillAdder:
             # sliding_window_size tokens in the SWA pool.
             self.swa_rem_total_token_offset += (
                 len(running_batch.reqs) * self.sliding_window_size
+            )
+            # Each running request occupies at most draft_swa_window tokens in
+            # the draft swa pool (DFLASH two-window).
+            self.draft_swa_rem_total_token_offset += (
+                len(running_batch.reqs) * self.draft_swa_window
             )
 
         self.is_hybrid_swa = isinstance(
@@ -602,6 +617,25 @@ class PrefillAdder:
 
         return available_and_evictable - self.cur_swa_rem_token_offset
 
+    @property
+    def rem_draft_swa_total_tokens(self):
+        # DFLASH two-window draft swa budget (independent, larger window).
+        draft_evictable = getattr(self.tree_cache, "draft_swa_evictable_size", None)
+        available_and_evictable = (
+            self.token_to_kv_pool_allocator.draft_swa_available_size()
+            + (draft_evictable() if draft_evictable is not None else 0)
+        )
+        return available_and_evictable - self.draft_swa_rem_total_token_offset
+
+    @property
+    def cur_draft_swa_rem_tokens(self):
+        draft_evictable = getattr(self.tree_cache, "draft_swa_evictable_size", None)
+        available_and_evictable = (
+            self.token_to_kv_pool_allocator.draft_swa_available_size()
+            + (draft_evictable() if draft_evictable is not None else 0)
+        )
+        return available_and_evictable - self.cur_draft_swa_rem_token_offset
+
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
@@ -624,6 +658,13 @@ class PrefillAdder:
         if self.is_hybrid_swa and self.sliding_window_size > 0:
             if self.rem_swa_total_tokens <= 0 or self.cur_swa_rem_tokens <= 0:
                 return AddReqResult.NO_TOKEN
+            # DFLASH two-window: draft swa pool is a separate constraint.
+            if self._draft_independent_swa and self.draft_swa_window > 0:
+                if (
+                    self.rem_draft_swa_total_tokens <= 0
+                    or self.cur_draft_swa_rem_tokens <= 0
+                ):
+                    return AddReqResult.NO_TOKEN
 
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
@@ -644,6 +685,7 @@ class PrefillAdder:
         host_hit_length: int,
         extend_input_len: int,
         max_new_tokens: int,
+        storage_hit_length: int = 0,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -660,6 +702,16 @@ class PrefillAdder:
         )
         self.cur_swa_rem_token_offset += extend_input_len + self.sliding_window_size
 
+        # Update draft-swa budget offsets (DFLASH two-window).
+        # draft_swa_window is 0 when draft-swa is off.
+        if self.draft_swa_window > 0:
+            self.draft_swa_rem_total_token_offset += (
+                extend_input_len + max_new_tokens + self.draft_swa_window
+            )
+            self.cur_draft_swa_rem_token_offset += (
+                extend_input_len + self.draft_swa_window
+            )
+
         self.rem_input_tokens -= extend_input_len
 
         if self.dllm_config is not None:
@@ -669,6 +721,9 @@ class PrefillAdder:
 
         self.log_hit_tokens += prefix_len
         self.log_host_hit_tokens += host_hit_length
+        # L3 storage hits are a subset of the host-loaded tokens (prefetched
+        # into L2 host first); clamp to keep the host/storage split consistent.
+        self.log_storage_hit_tokens += min(host_hit_length, storage_hit_length)
         self.log_input_tokens += extend_input_len
 
     def _get_dllm_remain_tokens(self) -> int:
@@ -959,6 +1014,7 @@ class PrefillAdder:
         )
 
         swa_total_tokens = 0
+        draft_swa_total_tokens = 0
         if self.is_hybrid_swa:
             # Chunk limit should only constrain the extend portion (which can be
             # chunked), not the load_back portion (which must be loaded in full).
@@ -971,12 +1027,13 @@ class PrefillAdder:
 
             # SWA needs: swa_load_back_tokens + swa_extend_tokens
             swa_load_back_tokens = 0
+            draft_swa_load_back_tokens = 0
             estimate_load_back = getattr(
                 self.tree_cache, "estimate_load_back", None
             )
             if estimate_load_back is not None:
-                _, swa_load_back_tokens = estimate_load_back(
-                    req.last_host_node, req.host_hit_length
+                _, swa_load_back_tokens, draft_swa_load_back_tokens = (
+                    estimate_load_back(req.last_host_node, req.host_hit_length)
                 )
 
             swa_refill_tokens = self._estimate_swa_refill_tokens(req)
@@ -984,6 +1041,10 @@ class PrefillAdder:
             swa_total_tokens = (
                 swa_load_back_tokens + swa_refill_tokens + swa_extend_tokens
             )
+            # Draft pool demand this round: the extend portion plus the draft
+            # host->device load_back. The target refill term has no draft
+            # counterpart (there is no draft swa refill path).
+            draft_swa_total_tokens = swa_extend_tokens + draft_swa_load_back_tokens
 
         real_input_tokens = req.extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
@@ -993,7 +1054,16 @@ class PrefillAdder:
         swa_over_budget = (
             self.is_hybrid_swa and swa_total_tokens > self.rem_swa_total_tokens
         )
-        if total_tokens >= self.rem_total_tokens or swa_over_budget:
+        draft_swa_over_budget = (
+            self._draft_independent_swa
+            and self.draft_swa_window > 0
+            and draft_swa_total_tokens > self.rem_draft_swa_total_tokens
+        )
+        if (
+            total_tokens >= self.rem_total_tokens
+            or swa_over_budget
+            or draft_swa_over_budget
+        ):
             if swa_over_budget:
                 swa_available = (
                     self.token_to_kv_pool_allocator.swa_available_size()
@@ -1013,6 +1083,14 @@ class PrefillAdder:
                     f"req.prefix_indices_len={len(req.prefix_indices)}, "
                     f"req.swa_refill_len={req.swa_refill_len}, "
                     f"req.fill_ids_len={len(req.fill_ids)}"
+                )
+            if draft_swa_over_budget:
+                logger.warning(
+                    "draft swa mem not enough (DFLASH two-window)!!! "
+                    f"draft_swa_total_tokens_needed={draft_swa_total_tokens}, "
+                    f"rem_draft_swa_total_tokens={self.rem_draft_swa_total_tokens}, "
+                    f"draft_swa_available_size={self.token_to_kv_pool_allocator.draft_swa_available_size()}, "
+                    f"draft_swa_rem_total_token_offset={self.draft_swa_rem_total_token_offset}"
                 )
             return AddReqResult.NO_TOKEN
 
@@ -1035,7 +1113,16 @@ class PrefillAdder:
             swa_over_budget = (
                 self.is_hybrid_swa and swa_total_tokens > self.rem_swa_total_tokens
             )
-            if total_tokens >= self.rem_total_tokens or swa_over_budget:
+            draft_swa_over_budget = (
+                self._draft_independent_swa
+                and self.draft_swa_window > 0
+                and draft_swa_total_tokens > self.rem_draft_swa_total_tokens
+            )
+            if (
+                total_tokens >= self.rem_total_tokens
+                or swa_over_budget
+                or draft_swa_over_budget
+            ):
                 if swa_over_budget:
                     swa_available = (
                         self.token_to_kv_pool_allocator.swa_available_size()
@@ -1148,6 +1235,7 @@ class PrefillAdder:
                         req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKENS,
                     ),
+                    storage_hit_length=getattr(req, "storage_hit_length", 0),
                 )
             else:
                 # Make sure at least one page is available
@@ -1186,7 +1274,11 @@ class PrefillAdder:
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
-                    prefix_len, req.host_hit_length, trunc_len, 0
+                    prefix_len,
+                    req.host_hit_length,
+                    trunc_len,
+                    0,
+                    storage_hit_length=getattr(req, "storage_hit_length", 0),
                 )
 
         return self.budget_state()
@@ -1254,6 +1346,8 @@ class PrefillAdder:
                 )
                 # Release the SWA budget reserved for this running request
                 self.swa_rem_total_token_offset -= self.sliding_window_size
+                # Release the draft-swa budget reserved for this running request
+                self.draft_swa_rem_total_token_offset -= self.draft_swa_window
                 release_counter += 1
                 self.running_batch.release_req(
                     i, len(self.running_batch.reqs) - release_counter, server_args

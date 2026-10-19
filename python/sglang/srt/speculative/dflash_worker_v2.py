@@ -64,6 +64,10 @@ _is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
+# Debug switch: dump a slice of the draft prefix KV before each draft forward.
+_DFLASH_KV_DEBUG = os.environ.get("SGLANG_DFLASH_KV_DEBUG", "0") == "1"
+
+
 _FusedKVMaterializeHelper = None
 
 
@@ -334,6 +338,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # _append_target_hidden_to_draft_kv_by_loc and spec_draft_block).
         draft_pool = self.draft_model_runner.token_to_kv_pool
         self._draft_pool_is_swa = isinstance(draft_pool, SWAKVPool)
+        self._draft_independent_swa = False
         if self._draft_pool_is_swa:
             draft_alloc = self.draft_model_runner.token_to_kv_pool_allocator
             assert isinstance(draft_alloc, SWATokenToKVPoolAllocator), (
@@ -341,16 +346,43 @@ class DFlashWorkerV2(BaseSpecWorker):
                 f"{type(draft_alloc).__name__}; full->swa loc translation is "
                 "unavailable."
             )
-            # The allocator only registers the mapping on the pool it was
-            # constructed with (the target's). Register the same mapping on the
-            # draft pool so its own translate/debug helpers work too.
-            if draft_pool.full_to_swa_index_mapping is None:
-                draft_pool.register_mapping(draft_alloc.full_to_swa_index_mapping)
-            if self.tp_rank == 0:
-                logger.info(
-                    "DFLASH draft pool is SWAKVPool; full->swa loc translation "
-                    "enabled for draft KV writes."
+            target_swa_window_size = getattr(
+                self.model_runner, "sliding_window_size", None
+            )
+            use_independent = (
+                self.draft_swa_window_size is not None
+                and self.draft_swa_window_size > 0
+                and target_swa_window_size is not None
+                and target_swa_window_size != self.draft_swa_window_size
+            )
+            if use_independent:
+                self._draft_independent_swa = True
+                draft_mapping = draft_alloc.register_draft_swa(
+                    draft_pool.swa_kv_pool,
+                    target_swa_window_size,
+                    self.draft_swa_window_size,
                 )
+                draft_pool.register_mapping(draft_mapping)
+                if self.tp_rank == 0:
+                    logger.info(
+                        "DFLASH draft SWA: independent mapping (draft window=%s, "
+                        "target window=%s).",
+                        self.draft_swa_window_size,
+                        target_swa_window_size,
+                    )
+            else:
+                # Fallback: share the target's mapping (unified window) when the
+                # draft window is unset.
+                if draft_pool.full_to_swa_index_mapping is None:
+                    draft_pool.register_mapping(
+                        draft_alloc.full_to_swa_index_mapping
+                    )
+                if self.tp_rank == 0:
+                    logger.info(
+                        "DFLASH draft SWA: shared mapping (unified window; "
+                        "draft_swa_window_size=%s).",
+                        self.draft_swa_window_size,
+                    )
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -1128,17 +1160,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens = commit_lens.to(torch.int32)
 
         if self._draft_pool_is_swa:
-            # The incoming cache locs are in the FULL index space, but the
-            # (all-SWA) draft KV lives in the swa sub-pool. Translate before
-            # writing so the READ path (attention backend translates
-            # kv_indices the same way) sees the data we wrote.
             _alloc = self.draft_model_runner.token_to_kv_pool_allocator
-            cache_loc = _alloc.translate_loc_from_full_to_swa(cache_loc).to(
-                torch.int64
+            _translate = (
+                _alloc.translate_loc_from_full_to_draft_swa
+                if self._draft_independent_swa
+                else _alloc.translate_loc_from_full_to_swa
             )
+            cache_loc = _translate(cache_loc).to(torch.int64)
             if cache_loc_2d is not None:
                 cache_loc_2d = (
-                    _alloc.translate_loc_from_full_to_swa(cache_loc_2d.reshape(-1))
+                    _translate(cache_loc_2d.reshape(-1))
                     .to(torch.int64)
                     .view_as(cache_loc_2d)
                 )
@@ -1747,9 +1778,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         # translated locs so the block KV lands in the correct swa slots.
         out_cache_loc_swa = None
         if self._draft_pool_is_swa:
-            out_cache_loc_swa = self.draft_model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                verify_out_cache_loc
+            _alloc = self.draft_model_runner.token_to_kv_pool_allocator
+            _translate = (
+                _alloc.translate_loc_from_full_to_draft_swa
+                if self._draft_independent_swa
+                else _alloc.translate_loc_from_full_to_swa
             )
+            out_cache_loc_swa = _translate(verify_out_cache_loc)
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
@@ -1770,6 +1805,64 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+
+        # DEBUG: dump a slice of the draft prefix KV right before the draft
+        # forward reads it. Enable with SGLANG_DFLASH_KV_DEBUG=1. Used to
+        # verify hicache L2 backfill actually restores draft KV (a corrupted /
+        # never-backfilled prefix shows up as zeros or mismatched values).
+        if _DFLASH_KV_DEBUG and self.tp_rank == 0 and bs > 0:
+            _plen = int(prefix_lens[0].item())
+            if _plen > 0:
+                _r2t = self.draft_model_runner.req_to_token_pool.req_to_token
+                _req_idx = int(model_worker_batch.req_pool_indices[0].item())
+                _locs = _r2t[_req_idx, :_plen]
+                _probe = (
+                    torch.cat([_locs[:4], _locs[-4:]]) if _plen > 8 else _locs
+                ).long()
+                _kv = self.draft_model_runner.token_to_kv_pool
+                # SWAKVPool (all-SWA draft): req_to_token holds full-space locs
+                # but get_key_buffer(0) returns the swa sub-pool buffer, whose
+                # rows are swa slots. Translate before indexing; unmapped locs
+                # (outside the sliding window, or never allocated) map to -1.
+                _mapping = getattr(_kv, "full_to_swa_index_mapping", None)
+                if _mapping is None:
+                    _alloc = self.draft_model_runner.token_to_kv_pool_allocator
+                    _mapping = getattr(_alloc, "full_to_swa_index_mapping", None)
+                if _mapping is not None:
+                    _swa_probe = _mapping[_probe].long()
+                    _valid_swa = _mapping[_locs].count_nonzero().item()
+                else:
+                    _swa_probe = _probe
+                    _valid_swa = -1
+                # target-window valid count for side-by-side comparison
+                _alloc_shared = self.draft_model_runner.token_to_kv_pool_allocator
+                _t_map = getattr(_alloc_shared, "full_to_swa_index_mapping", None)
+                _target_valid_swa = (
+                    int(_t_map[_locs].count_nonzero().item())
+                    if _t_map is not None
+                    else -1
+                )
+                _n_unmapped = int((_swa_probe < 0).sum().item())
+                _k0 = _kv.get_key_buffer(0)[_swa_probe.clamp(min=0)].float()
+                logger.info(
+                    "[DFLASH-KV-DEBUG] req_pool_idx=%d prefix_len=%d full_locs=%s "
+                    "swa_locs=%s n_unmapped=%d "
+                    "k0_absmean=%.6f k0_absmax=%.4f k0_zero_frac=%.3f "
+                    "tok_head0_first4=%s locs_len=%s draft_valid_swa=%s "
+                    "target_valid_swa=%s",
+                    _req_idx,
+                    _plen,
+                    _probe.tolist(),
+                    _swa_probe.tolist(),
+                    _n_unmapped,
+                    _k0.abs().mean().item(),
+                    _k0.abs().max().item(),
+                    (_k0 == 0).float().mean().item(),
+                    _k0[:, 0, :4].tolist(),
+                    len(_locs),
+                    _valid_swa,
+                    _target_valid_swa,
+                )
 
         with torch.inference_mode(), self.draft_tp_context(
             self.draft_model_runner.tp_group

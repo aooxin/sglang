@@ -21,7 +21,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.common import ceil_align, floor_align, is_pin_memory_available
 
 _OVERLAP_PLAN_STREAMS: dict[str, torch.cuda.Stream] = {}
 
@@ -141,6 +141,39 @@ class DFlashDraftInputV2(SpecInput):
             verify_done=None,
         )
 
+    def _maybe_evict_draft_swa(self, batch: ScheduleBatch) -> None:
+        """Evict the DFLASH draft's own swa slots at the draft window.
+
+        Independent of the target-window eviction in batch.maybe_evict_swa().
+        Only runs in two-window mode (allocator has a draft-swa mapping). The free
+        range is page-aligned so only complete pages are freed (page_size > 1).
+        """
+        alloc = batch.token_to_kv_pool_allocator
+        if not alloc.has_draft_swa:
+            return
+        draft_swa_window_size = alloc.draft_swa_window_size
+        assert draft_swa_window_size > 0
+        page_size = alloc.page_size
+        # Batched eviction trigger (mirrors ScheduleBatch.maybe_evict_swa):
+        # accumulate up to evict_len_per_step of slack beyond the draft window
+        # before freeing.
+        evict_len_per_step = envs.SGLANG_SWA_EVICT_LENGTH_PER_STEP.get()
+        req_to_token = batch.req_to_token_pool.req_to_token
+        for req in batch.reqs:
+            pre_len = req.seqlen - 1
+            live_len = pre_len - int(req.draft_swa_evicted_seqlen)
+            if (
+                req.decode_batch_idx <= 0
+                or live_len < draft_swa_window_size + evict_len_per_step
+            ):
+                continue
+            free_end = floor_align(max(0, pre_len - draft_swa_window_size), page_size)
+            evicted = ceil_align(int(req.draft_swa_evicted_seqlen), page_size)
+            if free_end > evicted:
+                free_slots = req_to_token[req.req_pool_idx, evicted:free_end]
+                alloc.free_draft_swa(free_slots)
+                req.draft_swa_evicted_seqlen = free_end
+
     def prepare_for_decode(self, batch: ScheduleBatch):
         """Allocate headroom in the shared req_to_token pool for the next DFLASH step.
 
@@ -151,6 +184,7 @@ class DFlashDraftInputV2(SpecInput):
         the overallocated mapping.
         """
         batch.maybe_evict_swa()
+        self._maybe_evict_draft_swa(batch)
 
         plan_stream, plan_stream_ctx = _get_overlap_plan_stream(batch.device)
         if plan_stream is None and self.verify_done is not None:

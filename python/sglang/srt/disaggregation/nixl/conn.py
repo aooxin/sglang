@@ -911,6 +911,7 @@ class NixlKVSender(CommonKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
+        draft_state_indices: Optional[List[int]] = None,
     ):
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
@@ -981,6 +982,7 @@ class NixlKVReceiver(CommonKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        draft_state_indices: Optional[List[int]] = None,
     ):
         if self.bootstrap_infos is None:
             logger.error(

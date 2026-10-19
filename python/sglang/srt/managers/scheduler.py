@@ -758,32 +758,16 @@ class Scheduler(
             or self.tp_worker.model_runner.mamba2_config is not None
         )
 
+        # Target model's own SWA attention window size.
         self.sliding_window_size = None
-        self.swa_retention_window = None
+        # The independent SWA window size for the draft worker.
+        self.draft_swa_window_size = None
         if self.is_hybrid_swa:
             self.sliding_window_size = self.tp_worker.sliding_window_size
+            self.draft_swa_window_size = getattr(self.draft_worker, "draft_swa_window_size", None)
             self.full_tokens_per_layer, self.swa_tokens_per_layer = (
                 self.tp_worker.get_tokens_per_layer_info()
             )
-            self.swa_retention_window = self.sliding_window_size
-            draft_window = getattr(self.draft_worker, "draft_swa_window_size", None)
-            if self.sliding_window_size is not None and draft_window:
-                self.swa_retention_window = max(
-                    int(self.sliding_window_size), int(draft_window)
-                )
-                if (
-                    self.swa_retention_window != self.sliding_window_size
-                    and self.tp_rank == 0
-                ):
-                    logger.info(
-                        "SWA retention window set to %d = max(target=%d, "
-                        "dflash_draft=%d); attention masks stay per-model. Ensure "
-                        "--swa-full-tokens-ratio leaves headroom for the larger "
-                        "swa pool retention.",
-                        self.swa_retention_window,
-                        self.sliding_window_size,
-                        int(draft_window),
-                    )
             if self.enable_hierarchical_cache:
                 if server_args.disaggregation_mode != DisaggregationMode.PREFILL.value:
                     if self.tp_rank == 0:
@@ -831,7 +815,8 @@ class Scheduler(
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
             chunked_prefill_size=effective_chunked_prefill_size,
-            sliding_window_size=self.swa_retention_window,
+            sliding_window_size=self.sliding_window_size,
+            draft_swa_window_size=self.draft_swa_window_size
         )
 
         if effective_chunked_prefill_size is not None and self.disable_radix_cache:
@@ -1154,9 +1139,23 @@ class Scheduler(
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
-            host_kv_pool.full_to_swa_index_mapping = (
-                self.tree_cache.token_to_kv_pool_host.full_to_swa_index_mapping
-            )
+            target_host_pool = self.tree_cache.token_to_kv_pool_host
+            if self.token_to_kv_pool_allocator.has_draft_swa:
+                # DFLASH two-window: the draft host pool keeps its OWN mapping
+                # + swa ring (draft window differs from the target's), keyed by
+                # the target host pool's full index space. Registration asserts
+                # the full host sizes match and makes the target's free()/clear()
+                # cascade into the draft pool.
+                target_host_pool.register_draft_swa_host(
+                    host_kv_pool,
+                    draft_swa_window_size=self.draft_swa_window_size,
+                )
+            else:
+                # Single-window: draft swa shares the target's slot space, so
+                # share the host mapping object too.
+                host_kv_pool.full_to_swa_index_mapping = (
+                    target_host_pool.full_to_swa_index_mapping
+                )
         else:
             logger.warning(
                 f"Draft KV pool type {type(kv_pool).__name__} not supported for HiCache, "
@@ -1269,7 +1268,8 @@ class Scheduler(
                         req_to_token_pool=self.req_to_token_pool,
                         token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                         server_args=self.server_args,
-                        sliding_window_size=self.swa_retention_window,
+                        sliding_window_size=self.sliding_window_size,
+                        draft_swa_window_size=self.draft_swa_window_size,
                         draft_token_to_kv_pool=draft_token_to_kv_pool,
                         draft_token_to_kv_pool_list=draft_token_to_kv_pool_list,
                     )
@@ -1606,7 +1606,6 @@ class Scheduler(
             "page_size_tokens": self.page_size,
             "page_element_sizes_bytes": page_element_sizes_bytes,
             "sliding_window_size": self.sliding_window_size,
-            "swa_retention_window": self.swa_retention_window,
         }
 
     def run_event_loop(self) -> None:
@@ -2986,7 +2985,7 @@ class Scheduler(
             prefill_max_requests=self.server_args.prefill_max_requests,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
-            sliding_window_size=self.swa_retention_window if self.is_hybrid_swa else 0,
+            sliding_window_size=self.sliding_window_size if self.is_hybrid_swa else 0,
         )
 
         if self.chunked_req is not None:
@@ -3092,6 +3091,9 @@ class Scheduler(
                 )
                 req.storage_swa_hit_tokens = self.tree_cache.pop_storage_swa_hit(
                     req.rid
+                )
+                req.storage_draft_swa_hit_tokens = (
+                    self.tree_cache.pop_storage_draft_swa_hit(req.rid)
                 )
                 prefetch_trace_attrs = self.tree_cache.pop_prefetch_trace_attrs(
                     req.rid

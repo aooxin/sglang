@@ -112,6 +112,7 @@ class EvictParams:
     num_tokens: int
     swa_num_tokens: int = 0
     mamba_num: int = 0
+    draft_swa_num_tokens: int = 0
 
 
 @dataclasses.dataclass
@@ -121,6 +122,7 @@ class EvictResult:
     num_tokens_evicted: int = 0
     swa_num_tokens_evicted: int = 0
     mamba_num_evicted: int = 0
+    draft_swa_num_tokens_evicted: int = 0
 
 
 @dataclasses.dataclass

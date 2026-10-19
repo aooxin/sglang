@@ -558,6 +558,18 @@ class Envs:
     SGLANG_SIMPLE_SWA_RESERVED_CHUNK = EnvInt(14 * 1024)
     SGLANG_SIMPLE_SWA_RESERVED_MAX_POINT = EnvInt(128 * 1024)
 
+    SGLANG_DFLASH_DRAFT_SWA_RESERVED_POINTS = EnvStr("")
+    SGLANG_DFLASH_DRAFT_SWA_RESERVED_CHUNK = EnvInt(0)
+    SGLANG_DFLASH_DRAFT_SWA_RESERVED_MAX_POINT = EnvInt(0)
+
+    # Emit gcache storage backend logs (check/set/get/probe page counts) at
+    # INFO level.
+    SGLANG_GCACHE_LOG = EnvBool(False)
+    # Additionally emit verbose per-call detail (concrete keys / sizes / result
+    # masks) alongside the count logs. Noisy; no effect unless SGLANG_GCACHE_LOG
+    # is also set.
+    SGLANG_GCACHE_LOG_DETAILS = EnvBool(False)
+
     # Per-request SWA branch-window protection at Full-KV branch points.
     # Default off; gate rollout. When enabled,
     # each request's evict_swa() protects the SWA window ending at its own

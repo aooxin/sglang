@@ -2319,6 +2319,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 and i < len(recv_obj.storage_swa_hit_tokens)
                 else 0
             )
+            storage_draft_swa_hit = (
+                recv_obj.storage_draft_swa_hit_tokens[i]
+                if getattr(recv_obj, "storage_draft_swa_hit_tokens", None)
+                and i < len(recv_obj.storage_draft_swa_hit_tokens)
+                else 0
+            )
             # Determine if this request was aborted
             finished_reason = recv_obj.finished_reasons[i]
             is_abort = (
@@ -2334,6 +2340,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 raw_cached,
                 storage_full_hit,
                 storage_swa_hit,
+                storage_draft_swa_hit,
                 state.time_stats.get_e2e_latency(),
                 self._request_has_grammar(state.obj),
                 retraction_count,

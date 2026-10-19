@@ -19,11 +19,16 @@ Coverage targets:
     - Large tensors
 """
 
+import random
 import unittest
 
 import torch
 
-from sglang.srt.mem_cache.simple_swa_radix_cache import compute_swa_safe_len
+from sglang.srt.mem_cache.simple_swa_radix_cache import (
+    compute_draft_safe_len,
+    compute_swa_safe_len,
+    compute_target_and_joint_safe_len,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -466,6 +471,177 @@ class TestComputeSwaSafeLen(CustomTestCase):
         """
         swa = torch.tensor([0, 0, 1], dtype=torch.int64)
         self.assertEqual(compute_swa_safe_len(swa, sliding_window_size=1), 3)
+
+
+class TestComputeTargetAndJointSafeLen(CustomTestCase):
+    """compute_target_and_joint_safe_len must match an independent brute-force
+    oracle. Target uses the strict per-candidate sliding window; draft uses the
+    fixed-left-edge frame anchored at s = max(0, total_len - draft_window_size)
+    (holes before s are irrelevant; the first dead slot at or after s truncates
+    the monotone draft-safe prefix)."""
+
+    @staticmethod
+    def _reference(swa, sliding_window_size, draft, draft_window_size, total_len):
+        # Independent brute-force oracle (does not reuse the code under test).
+        # target_safe_len: longest L whose target window [max(0,L-sw), L) is live.
+        # draft_safe: fixed-left-edge frame -> first dead slot at or after
+        # s = max(0, total_len - dw) within [s, n), else n.
+        # joint: longest target-safe L capped at draft_safe.
+        def target_live(idx, window, L):
+            return all(int(idx[i]) != 0 for i in range(max(0, L - window), L))
+
+        n = len(swa)
+        s = max(0, total_len - draft_window_size)
+        draft_safe = n
+        for i in range(s, n):
+            if int(draft[i]) == 0:
+                draft_safe = i
+                break
+
+        target_safe_len = 0
+        joint = 0
+        for L in range(1, n + 1):
+            if target_live(swa, sliding_window_size, L):
+                target_safe_len = L
+                if L <= draft_safe:
+                    joint = L
+        return target_safe_len, joint
+
+    def _assert_equiv(self, swa, sw, draft, dw, total_len):
+        expected = self._reference(swa, sw, draft, dw, total_len)
+        got = compute_target_and_joint_safe_len(swa, sw, draft, dw, total_len)
+        self.assertEqual(got, expected)
+
+    def test_empty(self):
+        empty = torch.empty(0, dtype=torch.int64)
+        self.assertEqual(
+            compute_target_and_joint_safe_len(empty, 4, empty, 8, 0), (0, 0)
+        )
+
+    def test_all_valid_fast_path(self):
+        swa = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+        draft = torch.tensor([1, 2, 3, 4], dtype=torch.int64)
+        self._assert_equiv(swa, 2, draft, 3, total_len=4)
+
+    def test_draft_free_exemption(self):
+        # draft has a hole but total_len - L > draft_window exempts it.
+        swa = torch.tensor([1, 1, 1, 1, 1, 1], dtype=torch.int64)
+        draft = torch.tensor([1, 1, 0, 1, 1, 1], dtype=torch.int64)
+        self._assert_equiv(swa, 3, draft, 2, total_len=20)
+
+    def test_target_hole_binds(self):
+        swa = torch.tensor([1, 0, 1, 1], dtype=torch.int64)
+        draft = torch.tensor([1, 1, 1, 1], dtype=torch.int64)
+        self._assert_equiv(swa, 2, draft, 2, total_len=4)
+
+    def test_draft_binds_within_window(self):
+        swa = torch.tensor([1, 1, 1, 1], dtype=torch.int64)
+        draft = torch.tensor([1, 1, 0, 1], dtype=torch.int64)
+        self._assert_equiv(swa, 2, draft, 3, total_len=4)
+
+    def test_draft_free_region_ignores_draft_holes(self):
+        # s = total_len - dw = 20 - 3 = 17 >= n = 6, so the whole matched prefix
+        # is below the materialization edge: draft imposes no constraint and
+        # joint must equal target_safe_len regardless of draft holes.
+        swa = torch.tensor([1, 1, 0, 1, 1, 1], dtype=torch.int64)
+        draft = torch.tensor([0, 0, 0, 0, 0, 0], dtype=torch.int64)
+        self._assert_equiv(swa, 3, draft, 3, total_len=20)
+        target_safe, joint = compute_target_and_joint_safe_len(
+            swa, 3, draft, 3, total_len=20
+        )
+        self.assertEqual(joint, target_safe)
+
+    def test_fixed_edge_hole_before_s_irrelevant(self):
+        # Fixed-edge regression: hole at index 5 is BEFORE s = total_len - dw =
+        # 10 - 3 = 7, so it must NOT shrink the draft frame. A sliding-window
+        # implementation would wrongly reject L=8 (window [5,8) hits the hole).
+        swa = torch.tensor([1] * 10, dtype=torch.int64)
+        draft = torch.tensor([1, 1, 1, 1, 1, 0, 1, 1, 1, 1], dtype=torch.int64)
+        _, joint = compute_target_and_joint_safe_len(swa, 3, draft, 3, total_len=10)
+        self.assertEqual(joint, 10)
+        self._assert_equiv(swa, 3, draft, 3, total_len=10)
+
+    def test_fixed_edge_hole_at_or_after_s_truncates(self):
+        # Fixed-edge regression: hole at index 7 is AT/AFTER s = 10 - 3 = 7, so
+        # it truncates the draft frame to 7 (and joint follows). This is the
+        # discriminating case where sliding-window returned 6 (wrong).
+        swa = torch.tensor([1] * 10, dtype=torch.int64)
+        draft = torch.tensor([1, 1, 1, 1, 1, 0, 1, 0, 1, 1], dtype=torch.int64)
+        _, joint = compute_target_and_joint_safe_len(swa, 3, draft, 3, total_len=10)
+        self.assertEqual(joint, 7)
+        self._assert_equiv(swa, 3, draft, 3, total_len=10)
+
+    def test_randomized_equivalence(self):
+        rng = random.Random(1234)
+        for _ in range(4000):
+            n = rng.randint(0, 16)
+            swa = torch.tensor(
+                [rng.choice([0, 0, 1, 2, 5]) for _ in range(n)], dtype=torch.int64
+            )
+            draft = torch.tensor(
+                [rng.choice([0, 0, 1, 2, 5]) for _ in range(n)], dtype=torch.int64
+            )
+            sw = rng.randint(1, 8)
+            dw = rng.randint(1, 14)
+            # Wide extend range exercises both s >= n (whole prefix below the
+            # materialization edge) and s < n (fixed-edge frame binds).
+            total_len = rng.randint(n, n + 40)
+            self._assert_equiv(swa, sw, draft, dw, total_len)
+
+
+class TestComputeDraftSafeLen(CustomTestCase):
+    """compute_draft_safe_len must match a fixed-left-edge brute-force oracle:
+    the first dead slot at or after s = max(0, total_len - dw) within [s, n)
+    truncates the monotone draft-safe prefix (else n). Holes before s are
+    irrelevant (re-materialized from target hidden states)."""
+
+    @staticmethod
+    def _reference(draft, draft_window_size, total_len):
+        n = len(draft)
+        s = max(0, total_len - draft_window_size)
+        for i in range(s, n):
+            if int(draft[i]) == 0:
+                return i
+        return n
+
+    def _assert_equiv(self, draft, dw, total_len):
+        expected = self._reference(draft, dw, total_len)
+        got = compute_draft_safe_len(draft, dw, total_len)
+        self.assertEqual(got, expected)
+
+    def test_empty(self):
+        empty = torch.empty(0, dtype=torch.int64)
+        self.assertEqual(compute_draft_safe_len(empty, 4, 0), 0)
+
+    def test_below_materialization_edge(self):
+        # s = 20 - 3 = 17 >= n = 5 → whole prefix below edge, safe despite holes.
+        draft = torch.tensor([0, 0, 0, 0, 0], dtype=torch.int64)
+        self.assertEqual(compute_draft_safe_len(draft, 3, total_len=20), 5)
+
+    def test_hole_before_s_irrelevant(self):
+        # s = 10 - 3 = 7; hole at index 5 is before s → draft_safe = n = 8.
+        draft = torch.tensor([1, 1, 1, 1, 1, 0, 1, 1], dtype=torch.int64)
+        self.assertEqual(compute_draft_safe_len(draft, 3, total_len=10), 8)
+
+    def test_hole_at_or_after_s_truncates(self):
+        # s = 10 - 3 = 7; first hole at index 7 (>= s) → draft_safe = 7.
+        draft = torch.tensor([1, 1, 1, 1, 1, 0, 1, 0, 1, 1], dtype=torch.int64)
+        self.assertEqual(compute_draft_safe_len(draft, 3, total_len=10), 7)
+
+    def test_binding_tail_hole(self):
+        draft = torch.tensor([1, 1, 1, 1, 0], dtype=torch.int64)
+        self._assert_equiv(draft, 2, total_len=5)
+
+    def test_randomized_equivalence(self):
+        rng = random.Random(4321)
+        for _ in range(4000):
+            n = rng.randint(0, 16)
+            draft = torch.tensor(
+                [rng.choice([0, 0, 1, 2, 5]) for _ in range(n)], dtype=torch.int64
+            )
+            dw = rng.randint(1, 14)
+            total_len = rng.randint(n, n + 40)
+            self._assert_equiv(draft, dw, total_len)
 
 
 if __name__ == "__main__":

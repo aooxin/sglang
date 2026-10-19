@@ -151,7 +151,9 @@ class TestSimpleSWAComputeSafePrefixLen(CustomTestCase):
         kv = self.allocator.alloc(8)
         self.assertIsNotNone(kv)
         result = self._make_match_result(kv)
-        safe_len, host_len = self.cache._compute_safe_prefix_len(result)
+        safe_len, host_len = self.cache._compute_safe_prefix_len(
+            result, len(result.device_indices) + result.host_hit_length
+        )
         self.assertEqual(safe_len, 8)
         self.assertIsNone(host_len)
 
@@ -162,7 +164,9 @@ class TestSimpleSWAComputeSafePrefixLen(CustomTestCase):
         # Free SWA of the last token
         self.allocator.free_swa(kv[-1:])
         result = self._make_match_result(kv)
-        safe_len, host_len = self.cache._compute_safe_prefix_len(result)
+        safe_len, host_len = self.cache._compute_safe_prefix_len(
+            result, len(result.device_indices) + result.host_hit_length
+        )
         # The last token is in the window, so safe_len should be 7
         self.assertEqual(safe_len, 7)
         self.assertIsNone(host_len)
@@ -174,7 +178,9 @@ class TestSimpleSWAComputeSafePrefixLen(CustomTestCase):
         # Free SWA of the first token (outside window for L>=5)
         self.allocator.free_swa(kv[:1])
         result = self._make_match_result(kv)
-        safe_len, host_len = self.cache._compute_safe_prefix_len(result)
+        safe_len, host_len = self.cache._compute_safe_prefix_len(
+            result, len(result.device_indices) + result.host_hit_length
+        )
         # window=4, len=10. For L=10, window=[6,10), first token outside.
         self.assertEqual(safe_len, 10)
         self.assertIsNone(host_len)
@@ -185,7 +191,9 @@ class TestSimpleSWAComputeSafePrefixLen(CustomTestCase):
         self.assertIsNotNone(kv)
         self.allocator.free_swa(kv)
         result = self._make_match_result(kv)
-        safe_len, host_len = self.cache._compute_safe_prefix_len(result)
+        safe_len, host_len = self.cache._compute_safe_prefix_len(
+            result, len(result.device_indices) + result.host_hit_length
+        )
         self.assertEqual(safe_len, 0)
         self.assertIsNone(host_len)
 
@@ -204,7 +212,9 @@ class TestSimpleSWAComputeSafePrefixLen(CustomTestCase):
         self.assertIsNotNone(kv)
         self.allocator.free_swa(kv[2:3])
         result = self._make_match_result(kv)
-        safe_len, host_len = self.cache._compute_safe_prefix_len(result)
+        safe_len, host_len = self.cache._compute_safe_prefix_len(
+            result, len(result.device_indices) + result.host_hit_length
+        )
         self.assertEqual(safe_len, 2)
         self.assertIsNone(host_len)
 
@@ -219,7 +229,9 @@ class TestSimpleSWAComputeSafePrefixLen(CustomTestCase):
         self.assertIsNotNone(kv)
         self.allocator.free_swa(kv[:1])
         result = self._make_match_result(kv)
-        safe_len, host_len = self.cache._compute_safe_prefix_len(result)
+        safe_len, host_len = self.cache._compute_safe_prefix_len(
+            result, len(result.device_indices) + result.host_hit_length
+        )
         self.assertEqual(safe_len, 6)
         self.assertIsNone(host_len)
 
@@ -228,7 +240,9 @@ class TestSimpleSWAComputeSafePrefixLen(CustomTestCase):
         kv = self.allocator.alloc(1)
         self.assertIsNotNone(kv)
         result = self._make_match_result(kv)
-        safe_len, host_len = self.cache._compute_safe_prefix_len(result)
+        safe_len, host_len = self.cache._compute_safe_prefix_len(
+            result, len(result.device_indices) + result.host_hit_length
+        )
         self.assertEqual(safe_len, 1)
         self.assertIsNone(host_len)
 
@@ -238,7 +252,9 @@ class TestSimpleSWAComputeSafePrefixLen(CustomTestCase):
         self.assertIsNotNone(kv)
         self.allocator.free_swa(kv)
         result = self._make_match_result(kv)
-        safe_len, host_len = self.cache._compute_safe_prefix_len(result)
+        safe_len, host_len = self.cache._compute_safe_prefix_len(
+            result, len(result.device_indices) + result.host_hit_length
+        )
         self.assertEqual(safe_len, 0)
         self.assertIsNone(host_len)
 
@@ -444,11 +460,13 @@ class TestHiSimpleSWAComputeSafePrefixLen(CustomTestCase):
         mock.sliding_window_size = sliding_window_size
         mock.device = self.device
         mock.root_node = TreeNode()
+        mock.page_size = 1
 
         # Use the real _compute_safe_prefix_len method
         mock._compute_safe_prefix_len = (
             HiSimpleSWARadixCache._compute_safe_prefix_len.__get__(mock)
         )
+        mock.cache_controller = SimpleNamespace(draft_independent_swa=False)
         return mock
 
     def _make_evicted_node_chain(
@@ -496,7 +514,9 @@ class TestHiSimpleSWAComputeSafePrefixLen(CustomTestCase):
             last_host_node=mock.root_node,
             host_hit_length=0,
         )
-        safe_dev, safe_host = mock._compute_safe_prefix_len(result)
+        safe_dev, safe_host, _target_safe, _draft_safe = mock._compute_safe_prefix_len(
+            result, len(result.device_indices) + result.host_hit_length
+        )
         self.assertEqual(safe_dev, 8)
         self.assertEqual(safe_host, 0)
 
@@ -519,7 +539,9 @@ class TestHiSimpleSWAComputeSafePrefixLen(CustomTestCase):
             last_host_node=mock.root_node,
             host_hit_length=0,
         )
-        safe_dev, safe_host = mock._compute_safe_prefix_len(result)
+        safe_dev, safe_host, _target_safe, _draft_safe = mock._compute_safe_prefix_len(
+            result, len(result.device_indices) + result.host_hit_length
+        )
         self.assertEqual(safe_dev, 7)
         self.assertEqual(safe_host, 0)
 
@@ -547,6 +569,7 @@ class TestHiSimpleSWAComputeSafePrefixLen(CustomTestCase):
         host_swa_mapping[10] = 200
         host_swa_mapping[11] = 201
         mock.cache_controller = MagicMock()
+        mock.cache_controller.draft_independent_swa = False
         mock.cache_controller.get_swa_host_indices = lambda x: host_swa_mapping[x]
 
         result = MatchResult(
@@ -555,7 +578,9 @@ class TestHiSimpleSWAComputeSafePrefixLen(CustomTestCase):
             last_host_node=deepest,
             host_hit_length=2,
         )
-        safe_dev, safe_host = mock._compute_safe_prefix_len(result)
+        safe_dev, safe_host, _target_safe, _draft_safe = mock._compute_safe_prefix_len(
+            result, len(result.device_indices) + result.host_hit_length
+        )
         self.assertEqual(safe_dev, 4)
         self.assertEqual(safe_host, 2)  # entire match is safe, all 2 host tokens usable
 
@@ -584,6 +609,7 @@ class TestHiSimpleSWAComputeSafePrefixLen(CustomTestCase):
         host_swa_mapping[11] = 201
         host_swa_mapping[12] = 0
         mock.cache_controller = MagicMock()
+        mock.cache_controller.draft_independent_swa = False
         mock.cache_controller.get_swa_host_indices = lambda x: host_swa_mapping[x]
 
         result = MatchResult(
@@ -596,7 +622,9 @@ class TestHiSimpleSWAComputeSafePrefixLen(CustomTestCase):
         # Combined SWA: [100,101,102,103, 200,201,0]
         # L=7: w=[4,7) → [200,201,0] → bad
         # L=6: w=[3,6) → [103,200,201] → ok
-        safe_dev, safe_host = mock._compute_safe_prefix_len(result)
+        safe_dev, safe_host, _target_safe, _draft_safe = mock._compute_safe_prefix_len(
+            result, len(result.device_indices) + result.host_hit_length
+        )
         self.assertEqual(safe_dev, 4)  # all device tokens safe
         self.assertEqual(safe_host, 2)  # 2 host tokens safe
 
@@ -611,7 +639,9 @@ class TestHiSimpleSWAComputeSafePrefixLen(CustomTestCase):
             last_host_node=mock.root_node,
             host_hit_length=0,
         )
-        safe_dev, safe_host = mock._compute_safe_prefix_len(result)
+        safe_dev, safe_host, _target_safe, _draft_safe = mock._compute_safe_prefix_len(
+            result, len(result.device_indices) + result.host_hit_length
+        )
         self.assertEqual(safe_dev, 0)
         self.assertEqual(safe_host, 0)
 
@@ -643,6 +673,7 @@ class TestHiSimpleSWAComputeSafePrefixLen(CustomTestCase):
         host_swa_mapping[10] = 200
         host_swa_mapping[11] = 201
         mock.cache_controller = MagicMock()
+        mock.cache_controller.draft_independent_swa = False
         mock.cache_controller.get_swa_host_indices = lambda x: host_swa_mapping[x]
 
         result = MatchResult(
@@ -658,7 +689,9 @@ class TestHiSimpleSWAComputeSafePrefixLen(CustomTestCase):
         # L=4: w=[1,4) → [101,0,0] bad
         # L=3: w=[0,3) → [100,101,0] bad
         # L=2: w=[0,2) → [100,101] ok
-        safe_dev, safe_host = mock._compute_safe_prefix_len(result)
+        safe_dev, safe_host, _target_safe, _draft_safe = mock._compute_safe_prefix_len(
+            result, len(result.device_indices) + result.host_hit_length
+        )
         self.assertEqual(safe_dev, 2)  # trimmed device
         self.assertEqual(safe_host, 0)  # host must be 0 when device is trimmed
 
@@ -867,9 +900,9 @@ class _RecordingDeviceAllocator:
         self.calls = []
         self.device = torch.device("cpu")
 
-    def alloc_device(self, host_indices, swa_valid_mask):
+    def alloc_device(self, host_indices, swa_valid_mask, draft_swa_valid_mask=None):
         self.calls.append((host_indices, swa_valid_mask))
-        return torch.arange(len(host_indices), dtype=torch.int64), 0, 0
+        return torch.arange(len(host_indices), dtype=torch.int64), 0, 0, 0
 
 
 class _RecordingCacheController:
@@ -877,14 +910,16 @@ class _RecordingCacheController:
         self.alloc_calls = []
         self.load_calls = []
 
+        self.draft_independent_swa = False
+
     def alloc_device(self, host_indices, swa_valid_mask=None):
         self.alloc_calls.append((host_indices, swa_valid_mask))
-        return torch.arange(len(host_indices), dtype=torch.int64), 0, 0
+        return torch.arange(len(host_indices), dtype=torch.int64), 0, 0, 0
 
     def load(self, host_indices, device_indices, priority=None, node_id=-1):
         self.load_calls.append((host_indices, device_indices, priority, node_id))
 
-    def assert_host_indices(self, host_indices, host_hit_length):
+    def assert_host_indices(self, host_indices, host_hit_length, swa_valid_mask=None):
         pass
 
 
@@ -914,7 +949,7 @@ def _prepare_hicache_load_back(cache):
     cache.evictable_size_ = 0
     cache.inc_lock_ref = lambda node: IncLockRefResult(delta=0)
     cache.dec_lock_ref = lambda node: None
-    cache.evict = lambda lack_full_size, lack_swa_size: None
+    cache.evict = lambda params=None: None
     cache._on_tree_value_added = lambda node: None
     return cache.cache_controller
 
@@ -1009,18 +1044,21 @@ class TestHiCacheLoadBackSwaMask(unittest.TestCase):
             host_indices, swa_host_indices, sliding_window_size=4
         )
 
+        cache.cache_controller = SimpleNamespace(draft_independent_swa=False)
+
         root = TreeNode()
         root.value = torch.empty(0, dtype=torch.int64)
         root.host_value = torch.empty(0, dtype=torch.int64)
         parent = _make_hicache_evicted_node(root, host_indices[:4])
         leaf = _make_hicache_evicted_node(parent, host_indices[4:])
 
-        full_tokens, swa_tokens = cache.estimate_load_back(
+        full_tokens, swa_tokens, draft_swa_tokens = cache.estimate_load_back(
             leaf, host_hit_length=len(host_indices)
         )
 
         self.assertEqual(full_tokens, 8)
         self.assertEqual(swa_tokens, 4)
+        self.assertEqual(draft_swa_tokens, 0)
 
     def test_alloc_device_uses_explicit_swa_mask_when_provided(self):
         host_indices = torch.arange(10, 18, dtype=torch.int64)
@@ -1030,15 +1068,17 @@ class TestHiCacheLoadBackSwaMask(unittest.TestCase):
         allocator = _RecordingDeviceAllocator()
         controller = HiCacheController.__new__(HiCacheController)
         controller.is_hybrid_swa = True
+        controller._draft_independent_swa = False
         controller.mem_pool_device_allocator = allocator
 
-        device_indices, lack_full, lack_swa = controller.alloc_device(
+        device_indices, lack_full, lack_swa, lack_draft_swa = controller.alloc_device(
             host_indices, swa_valid_mask=explicit_mask
         )
 
         self.assertEqual(device_indices.tolist(), list(range(8)))
         self.assertEqual(lack_full, 0)
         self.assertEqual(lack_swa, 0)
+        self.assertEqual(lack_draft_swa, 0)
         called_host_indices, called_mask = allocator.calls[0]
         self.assertIs(called_host_indices, host_indices)
         self.assertIs(called_mask, explicit_mask)
@@ -1048,6 +1088,7 @@ class TestHiCacheLoadBackSwaMask(unittest.TestCase):
         allocator = _RecordingDeviceAllocator()
         controller = HiCacheController.__new__(HiCacheController)
         controller.is_hybrid_swa = True
+        controller._draft_independent_swa = False
         controller.mem_pool_device_allocator = allocator
         mapping = torch.zeros(14, dtype=torch.int64)
         mapping[host_indices] = torch.tensor([0, 201, 0, 203])

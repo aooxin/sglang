@@ -23,6 +23,11 @@ from sglang.srt.observability.startup_func_log_and_timer import startup_timer
 
 logger = logging.getLogger(__name__)
 
+# Cached once at import: gates for INFO-level gcache backend logs.
+_GCACHE_LOG = envs.SGLANG_GCACHE_LOG.get()
+_GCACHE_LOG_DETAILS = envs.SGLANG_GCACHE_LOG_DETAILS.get()
+
+
 GCACHE_CONFIG_FILE = "/sgl-workspace/gcache.flags"
 
 
@@ -351,11 +356,24 @@ class GcacheStorage(HiCacheStorage):
         size_per_token = mem_pool_host.get_size_per_token()
         self.gb_per_page = size_per_token * mem_pool_host.page_size / (1 << 30)
 
+    def _log(self, is_draft: bool, msg: str) -> None:
+        """Emit a gcache backend log at INFO iff SGLANG_GCACHE_LOG is set."""
+        if not _GCACHE_LOG:
+            return
+        logger.info(msg)
+
+    def _log_details(self, is_draft: bool, msg: str) -> None:
+        """Like _log but also requires SGLANG_GCACHE_LOG_DETAILS (verbose
+        key/size/result dumps)."""
+        if not _GCACHE_LOG_DETAILS:
+            return
+        self._log(is_draft, msg)
+
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
         query_keys, size_list = self._convert_hybrid_keys(keys, with_size=True)
-        logger.debug(f"gcache: begin check {len(query_keys)} keys")
+        self._log(False, f"gcache: begin check {len(query_keys)} keys")
         key_multiplier = 4
         assert len(query_keys) == len(keys) * key_multiplier
         exist_mask = self.gcache_client.batch_exists(
@@ -371,8 +389,8 @@ class GcacheStorage(HiCacheStorage):
             else:
                 break
 
-        logger.debug(
-            f"gcache: end check {len(query_keys)} keys, {prefix_success} exist"
+        self._log(
+            False, f"gcache: end check {len(query_keys)} keys, {prefix_success} exist"
         )
         prefix_success = prefix_success // key_multiplier
         return prefix_success
@@ -381,7 +399,7 @@ class GcacheStorage(HiCacheStorage):
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> tuple[int, list[bool]]:
         query_keys, size_list = self._convert_hybrid_keys(keys, with_size=True)
-        logger.debug(f"gcache: begin hybrid check {len(query_keys)} keys")
+        self._log(False, f"gcache: begin hybrid check {len(query_keys)} keys")
         key_multiplier = 4
         assert len(query_keys) == len(keys) * key_multiplier
         exist_mask: List[bool] = self.gcache_client.batch_exists(
@@ -402,9 +420,10 @@ class GcacheStorage(HiCacheStorage):
             for ii in range(0, full_prefix_success * key_multiplier, key_multiplier)
         ]
 
-        logger.debug(
+        self._log(
+            False,
             f"gcache: end hybrid check {len(query_keys)} keys, "
-            f"{full_prefix_success=}, swa_valid={sum(valid_swa_mask)}/{len(valid_swa_mask)}"
+            f"{full_prefix_success=}, swa_valid={sum(valid_swa_mask)}/{len(valid_swa_mask)}",
         )
         return full_prefix_success, valid_swa_mask
 
@@ -441,7 +460,12 @@ class GcacheStorage(HiCacheStorage):
         gcache_keys, value_ptr_list, value_size_list, swa_valid_list, has_full = (
             self._batch_preprocess(keys, host_indices, is_draft=is_draft)
         )
-        logger.debug(f"gcache: begin set {len(gcache_keys)} keys")
+        self._log(is_draft, f"gcache: begin set {len(gcache_keys)} keys, {is_draft=}")
+        self._log_details(
+            is_draft,
+            f"gcache: begin set details, "
+            f"gcache_keys={gcache_keys}, value_size_list={value_size_list}",
+        )
 
         exist_result = self.gcache_client.batch_exists(
             gcache_keys, for_read=False, size_list=value_size_list
@@ -487,11 +511,15 @@ class GcacheStorage(HiCacheStorage):
 
         ret = self._batch_postprocess(set_results, swa_valid_list, has_full)
         if len(gcache_keys) == success_count:
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    f"gcache: end set {len(gcache_keys)} keys, success count: {success_count}, API results: {set_results}, "
-                    f"ret: {ret}, cost time: {execution_time:.2f} us"
-                )
+            self._log(
+                is_draft,
+                f"gcache: end set {len(gcache_keys)} keys, {is_draft=}, "
+                f"success count: {success_count}, cost time: {execution_time:.2f} us",
+            )
+            self._log_details(
+                is_draft,
+                f"gcache: end set details, API results: {set_results}, ret: {ret}",
+            )
         else:
             logger.error(
                 f"gcache: batch set failed: {len(gcache_keys)} keys, success count: {success_count}"
@@ -517,6 +545,51 @@ class GcacheStorage(HiCacheStorage):
         `register_draft_mem_pool_host`."""
         return self._batch_get_v1_impl(keys, host_indices, extra_info, is_draft=True)
 
+    def batch_exists_draft(
+        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> List[bool]:
+        if len(keys) == 0:
+            return []
+        has_full = self.draft_mem_pool_host.has_full_layers
+        is_swa = self._draft_is_swa
+        # swa_valid_list=None: we have no host slots yet at query time, so probe
+        # every page. draft=True selects the `d:` namespace; has_full/is_swa make
+        # the key set identical to the write path.
+        query_keys, size_list = self._convert_hybrid_keys(
+            keys,
+            swa_valid_list=None,
+            with_size=True,
+            is_swa=is_swa,
+            draft=True,
+            has_full=has_full,
+        )
+        per_page = (2 if has_full else 0) + (2 if is_swa else 0)
+        assert per_page > 0, "draft pool has neither full nor swa layers"
+        assert len(query_keys) == len(keys) * per_page
+        exist_mask: List[bool] = self.gcache_client.batch_exists(
+            query_keys, for_read=True, size_list=size_list
+        )
+        assert len(exist_mask) == len(query_keys)
+        # Vectorized per-page AND-reduce instead of a Python comprehension over
+        # (hundreds of) pages on the prefetch hot path.
+        per_page_exists = (
+            torch.tensor(exist_mask, dtype=torch.bool)
+            .view(len(keys), per_page)
+            .all(dim=1)
+            .tolist()
+        )
+        self._log(
+            True,
+            f"draft L3 probe: probed_pages={len(keys)} "
+            f"exist_pages={sum(1 for x in per_page_exists if x)}",
+        )
+        self._log_details(
+            True,
+            f"draft L3 probe details, query_keys={query_keys}, "
+            f"size_list={size_list}, exist_mask={exist_mask}",
+        )
+        return per_page_exists
+
     def _batch_get_v1_impl(
         self,
         keys: List[str],
@@ -527,9 +600,12 @@ class GcacheStorage(HiCacheStorage):
         if len(keys) == 0:
             return [True] * len(keys)
 
-        swa_needed_per_page = (
-            extra_info.swa_needed_per_page if extra_info is not None else None
-        )
+        if is_draft:
+            swa_needed_per_page = None
+        else:
+            swa_needed_per_page = (
+                extra_info.swa_needed_per_page if extra_info is not None else None
+            )
 
         t0 = time.perf_counter()
         gcache_keys, value_ptr_list, value_size_list, swa_valid_list, has_full = (
@@ -538,7 +614,12 @@ class GcacheStorage(HiCacheStorage):
             )
         )
         assert len(gcache_keys) == len(value_ptr_list) == len(value_size_list)
-        logger.debug(f"gcache: begin get {len(gcache_keys)} keys")
+        self._log(is_draft, f"gcache: begin get {len(gcache_keys)} keys, {is_draft=}")
+        self._log_details(
+            is_draft,
+            f"gcache: begin get details, "
+            f"gcache_keys={gcache_keys}, value_size_list={value_size_list}",
+        )
 
         t1 = time.perf_counter()
         results = self.gcache_client.batch_get(
@@ -573,9 +654,10 @@ class GcacheStorage(HiCacheStorage):
                     self._prefetch_idle_seconds.labels(**labels).observe(idle)
             self._last_batch_get_end_ts = t3
 
-        logger.debug(
-            f"gcache: end get {len(gcache_keys)} keys, success count: {success_count}, "
-            f"cost time: {execution_time:.2f} us"
+        self._log(
+            is_draft,
+            f"gcache: end get {len(gcache_keys)} keys, {is_draft=}, success count: {success_count}, "
+            f"cost time: {execution_time:.2f} us",
         )
 
         return ret
@@ -660,7 +742,8 @@ class GcacheStorage(HiCacheStorage):
 
         size_list = []
         if with_size:
-            full_and_swa = self.mem_pool_host.get_page_element_sizes()
+            size_pool = self.draft_mem_pool_host if draft else self.mem_pool_host
+            full_and_swa = size_pool.get_page_element_sizes()
             full_only = full_and_swa[:2]
             swa_only = full_and_swa[2:]
             if swa_valid_list is None:

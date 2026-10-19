@@ -10,6 +10,7 @@ import psutil
 import torch
 
 from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
@@ -110,9 +111,16 @@ def synchronized(func):
     return wrapper
 
 
+def block_quota_kwargs(block_quota: Optional[int]) -> dict[str, int]:
+    # Omit when unset: kernel defaults differ by platform and by kernel family.
+    return {} if block_quota is None else {"block_quota": block_quota}
+
+
 class HostKVCache(abc.ABC):
     dcp_size = 1
     dcp_rank = 0
+    h2d_block_quota: Optional[int] = None
+    d2h_block_quota: Optional[int] = None
 
     def __init__(
         self,
@@ -145,6 +153,8 @@ class HostKVCache(abc.ABC):
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
         self.can_use_write_back_jit = False
+        self.h2d_block_quota = envs.SGLANG_HICACHE_H2D_BLOCK_QUOTA.get()
+        self.d2h_block_quota = envs.SGLANG_HICACHE_D2H_BLOCK_QUOTA.get()
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()

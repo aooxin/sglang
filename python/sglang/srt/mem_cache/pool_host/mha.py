@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKOnlyPool, MHATokenToKVPo
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
+    block_quota_kwargs,
     host_memory_budget_bytes,
 )
 from sglang.srt.mem_cache.pool_host.common import (
@@ -274,6 +275,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.element_dim,
+                        **block_quota_kwargs(self.h2d_block_quota),
                     )
                 else:
                     transfer_kv_per_layer(
@@ -284,6 +286,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         item_size=self.token_stride_size,
+                        **block_quota_kwargs(self.h2d_block_quota),
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
@@ -298,6 +301,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.element_dim,
+                        **block_quota_kwargs(self.h2d_block_quota),
                     )
                 else:
                     transfer_kv_per_layer_pf_lf(
@@ -310,6 +314,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         layer_id=host_layer_id,
                         item_size=self.token_stride_size,
                         src_layout_dim=self.layout_dim,
+                        **block_quota_kwargs(self.h2d_block_quota),
                     )
             elif self.layout == "page_head":
                 transfer_kv_per_layer_ph_lf(
@@ -324,6 +329,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     src_layout_dim=self.layout_dim,
                     page_size=self.page_size,
                     head_num=self.head_num,
+                    **block_quota_kwargs(self.h2d_block_quota),
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -424,6 +430,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         kv_cache_dst_stride_bytes=self.token_stride_size,
                         kv_cache_src_stride_bytes=self.token_stride_size,
                         element_size=self.element_dim * self.dtype.itemsize,
+                        **block_quota_kwargs(self.d2h_block_quota),
                     )
                 else:
                     transfer_kv_all_layer(
@@ -435,6 +442,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         dst_indices=host_indices,
                         item_size=self.token_stride_size,
                         num_layers=self.layer_num,
+                        **block_quota_kwargs(self.d2h_block_quota),
                     )
             elif self.layout == "page_first":
                 if self.can_use_write_back_jit:
@@ -460,6 +468,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         item_size=self.token_stride_size,
                         dst_layout_dim=self.layout_dim,
                         num_layers=self.layer_num,
+                        **block_quota_kwargs(self.d2h_block_quota),
                     )
             elif self.layout == "page_head":
                 transfer_kv_all_layer_lf_ph(
@@ -474,6 +483,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                     num_layers=self.layer_num,
                     page_size=self.page_size,
                     head_num=self.head_num,
+                    **block_quota_kwargs(self.d2h_block_quota),
                 )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -1202,6 +1212,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                 layer_id=host_layer_id,
                 item_size=self._k_token_stride_size(),
                 src_layout_dim=self._k_layout_dim(),
+                **block_quota_kwargs(self.h2d_block_quota),
             )
             transfer_kv_per_layer_mla_pf_lf(
                 src=self.v_buffer,
@@ -1211,6 +1222,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                 layer_id=host_layer_id,
                 item_size=self._v_token_stride_size(),
                 src_layout_dim=self._v_layout_dim(),
+                **block_quota_kwargs(self.h2d_block_quota),
             )
         elif io_backend == "direct":
             if self.layout != "page_first_direct":
@@ -1282,6 +1294,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                     item_size=self._k_token_stride_size(),
                     dst_layout_dim=self._k_layout_dim(),
                     num_layers=self.layer_num,
+                    **block_quota_kwargs(self.d2h_block_quota),
                 )
                 transfer_kv_all_layer_mla_lf_pf(
                     src_layers=device_v_data_ptrs,
@@ -1291,6 +1304,7 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
                     item_size=self._v_token_stride_size(),
                     dst_layout_dim=self._v_layout_dim(),
                     num_layers=self.layer_num,
+                    **block_quota_kwargs(self.d2h_block_quota),
                 )
         elif io_backend == "direct":
             if self.layout != "page_first_direct":

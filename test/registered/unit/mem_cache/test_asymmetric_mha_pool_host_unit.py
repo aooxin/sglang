@@ -174,6 +174,49 @@ class TestAsymmetricMHATokenToKVPoolHost(CustomTestCase):
         self.assertEqual(v_call.kwargs["item_size"], 24)
         self.assertEqual(v_call.kwargs["dst_layout_dim"], 72)
 
+    def test_block_quota_reaches_transfer_kernels_only_when_set(self):
+        # Unset quotas must be omitted: some AOT wrappers accept only int, and the
+        # per-layer MLA wrapper falls back to SGLANG_HICACHE_BLOCK_QUOTA.
+        host_indices = torch.tensor([0, 1, 2, 3], dtype=torch.int64)
+        device_indices = torch.tensor([4, 5, 6, 7], dtype=torch.int64)
+        for h2d, d2h in ((None, None), (8, 4)):
+            with self.subTest(h2d=h2d, d2h=d2h):
+                host = _make_host("page_first")
+                host.h2d_block_quota = h2d
+                host.d2h_block_quota = d2h
+                device_pool = _make_device_pool(host)
+
+                with (
+                    mock.patch(
+                        "sglang.srt.mem_cache.pool_host.mha.transfer_kv_per_layer_mla_pf_lf",
+                        create=True,
+                    ) as load,
+                    mock.patch(
+                        "sglang.srt.mem_cache.pool_host.mha.transfer_kv_all_layer_mla_lf_pf",
+                        create=True,
+                    ) as backup,
+                ):
+                    host.load_to_device_per_layer(
+                        device_pool,
+                        host_indices,
+                        device_indices,
+                        layer_id=0,
+                        io_backend="kernel",
+                    )
+                    host.backup_from_device_all_layer(
+                        device_pool, host_indices, device_indices, io_backend="kernel"
+                    )
+
+                for transfer, quota in ((load, h2d), (backup, d2h)):
+                    expected = "omitted" if quota is None else quota
+                    self.assertEqual(
+                        [
+                            call.kwargs.get("block_quota", "omitted")
+                            for call in transfer.call_args_list
+                        ],
+                        [expected, expected],
+                    )
+
     def test_kernel_backup_uses_staged_kernel_for_each_kv_buffer(self):
         host = _make_host("page_first")
         host.can_use_write_back_jit = True

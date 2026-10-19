@@ -745,6 +745,10 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # CTA quota of the host<->device KV copy kernels; unset keeps each kernel's
+    # platform default. The staged page_first write-back is not quota-limited.
+    SGLANG_HICACHE_H2D_BLOCK_QUOTA = EnvInt(None)
+    SGLANG_HICACHE_D2H_BLOCK_QUOTA = EnvInt(None)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)

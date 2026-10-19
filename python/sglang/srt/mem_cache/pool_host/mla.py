@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
+    block_quota_kwargs,
     sync_fixed_hicache_size,
 )
 from sglang.srt.mem_cache.pool_host.common import (
@@ -673,6 +674,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.kv_cache_dim,
+                        **block_quota_kwargs(self.h2d_block_quota),
                     )
                 else:
                     transfer_kv_per_layer_mla(
@@ -681,6 +683,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         item_size=self.token_stride_size,
+                        **block_quota_kwargs(self.h2d_block_quota),
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
@@ -690,6 +693,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.kv_cache_dim,
+                        **block_quota_kwargs(self.h2d_block_quota),
                     )
                 else:
                     transfer_kv_per_layer_mla_pf_lf(
@@ -700,6 +704,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         layer_id=host_layer_id,
                         item_size=self.token_stride_size,
                         src_layout_dim=self.layout_dim,
+                        **block_quota_kwargs(self.h2d_block_quota),
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -799,6 +804,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         indices_dst=host_indices,
                         indices_src=device_indices,
                         element_dim=self.kv_cache_dim,
+                        **block_quota_kwargs(self.d2h_block_quota),
                     )
                 else:
                     transfer_kv_per_layer_mla(
@@ -807,6 +813,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         src_indices=device_indices,
                         dst_indices=host_indices,
                         item_size=self.token_stride_size,
+                        **block_quota_kwargs(self.d2h_block_quota),
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
@@ -816,6 +823,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         indices_dst=host_indices,
                         indices_src=device_indices,
                         element_dim=self.kv_cache_dim,
+                        **block_quota_kwargs(self.d2h_block_quota),
                     )
                 else:
                     raise ValueError(
@@ -900,6 +908,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         cache_dst_stride_bytes=self.token_stride_size,
                         cache_src_stride_bytes=self.token_stride_size,
                         element_size=self.kv_cache_dim * self.dtype.itemsize,
+                        **block_quota_kwargs(self.d2h_block_quota),
                     )
                 else:
                     transfer_kv_all_layer_mla(
@@ -909,6 +918,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         dst_indices=host_indices,
                         item_size=self.token_stride_size,
                         num_layers=self.layer_num,
+                        **block_quota_kwargs(self.d2h_block_quota),
                     )
             elif self.layout == "page_first":
                 if self.can_use_write_back_jit:
@@ -929,6 +939,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         item_size=self.token_stride_size,
                         dst_layout_dim=self.layout_dim,
                         num_layers=self.layer_num,
+                        **block_quota_kwargs(self.d2h_block_quota),
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")

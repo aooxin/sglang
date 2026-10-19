@@ -40,7 +40,8 @@ limitations under the License.
   }
 
 /*
- * From flash-attention
+ * From the pinned 0510 flash-attention backend. The two additional 0520
+ * operator arguments are handled by make_fa3_0510_pytorch_shim at registration.
  */
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     at::Tensor q,  // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
@@ -82,9 +83,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_fwd(
     int64_t num_splits,
     std::optional<bool> pack_gqa_,
     int64_t sm_margin,
-    std::optional<const at::Tensor>& sinks_,      // (h)
-    std::optional<at::Tensor> sparse_mask_fine_,  // [total_q, max_k_blocks, num_int32_per_block]
-    bool only_qv);
+    std::optional<const at::Tensor>& sinks_);  // (h)
 
 /*
  * From flash-attention: get_scheduler_metadata

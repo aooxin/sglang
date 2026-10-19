@@ -1,4 +1,14 @@
 cmake_minimum_required(VERSION 3.26 FATAL_ERROR)
+
+# Enter the migrated FA3 build before the full project's CUDA/Torch setup.
+# The child owns the 0510 source pin, 0520 binding and CUDA 12.9 toolchain.
+option(BUILD_FA_ONLY "Build only the migrated 0510 FA3 flash_ops target" OFF)
+if(BUILD_FA_ONLY)
+    project(sglang_fa3_only LANGUAGES NONE)
+    add_subdirectory(cmake/fa3)
+    return()
+endif()
+
 project(sgl-kernel LANGUAGES CXX CUDA)
 
 # utils
@@ -79,11 +89,11 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flashinfer)
 
-# flash-attention
+# 0510 FA3 kernels; flash_extension.cc adapts the 0520 operator schema.
 FetchContent_Declare(
     repo-flash-attention
-    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/sgl-attn/archive/f89bc2306632d1ec5f97b014dded4254f5b4a907.tar.gz
-    URL_HASH SHA256=418b5681584dc3efff496a1cab5ffd58d2728d89dcfe0ea16e6985d6ef35c68c
+    URL      https://${GITHUB_ARTIFACTORY}/sgl-project/sgl-attn/archive/bcf72ccc6816b36a5fae2c5a3c027604629785e0.tar.gz
+    URL_HASH SHA256=2110d8ca1ed9b330b9f99c1d4088be12a37e44152c39fdf90dfb6526f532ba96
 )
 FetchContent_Populate(repo-flash-attention)
 
@@ -178,6 +188,10 @@ option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              ${DEFAULT_SG
 option(SGL_KERNEL_ENABLE_FA3_SPARSE_MASK  "Enable FA3 sparse mask kernels" OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
+
+if(SGL_KERNEL_ENABLE_FA3 AND SGL_KERNEL_ENABLE_FA3_SPARSE_MASK)
+    message(FATAL_ERROR "0510 FA3 does not support sparse mask kernels")
+endif()
 
 if (SGL_KERNEL_ENABLE_BF16)
     list(APPEND SGL_KERNEL_CUDA_FLAGS

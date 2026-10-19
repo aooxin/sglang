@@ -1,26 +1,41 @@
-# Standalone equivalent of 0510's BUILD_FA_ONLY, using 0520 sources and flags.
+# Standalone FA3 build: 0510 kernel sources with the 0520 operator interface.
 # Keep the normal full-kernel build independent of this local compiler override.
 cmake_minimum_required(VERSION 3.26)
 set(CMAKE_CUDA_ARCHITECTURES OFF)
-project(sglang_fa3_cu129 LANGUAGES CXX CUDA)
+project(sglang_fa3 LANGUAGES CXX CUDA)
 
 find_package(Python 3.10 COMPONENTS Interpreter Development.SABIModule REQUIRED)
 find_package(CUDAToolkit REQUIRED)
-if(CUDAToolkit_VERSION VERSION_LESS "12.9" OR NOT CUDAToolkit_VERSION VERSION_LESS "13.0")
-    message(FATAL_ERROR "FA3 requires CUDA 12.9, got ${CUDAToolkit_VERSION}")
+string(REGEX MATCH "^[0-9]+\\.[0-9]+" FA3_CUDA_RELEASE "${CUDAToolkit_VERSION}")
+if(NOT FA3_CUDA_RELEASE STREQUAL "12.9"
+   AND NOT FA3_CUDA_RELEASE STREQUAL "13.0"
+   AND NOT FA3_CUDA_RELEASE STREQUAL "13.2")
+    message(FATAL_ERROR "FA3 accepts CUDA 12.9, 13.0 or experimental 13.2, got ${CUDAToolkit_VERSION}")
 endif()
 if(NOT CMAKE_CUDA_COMPILER_VERSION VERSION_EQUAL CUDAToolkit_VERSION)
     message(FATAL_ERROR "FA3 nvcc and CUDA toolkit versions differ")
+endif()
+if(FA3_CUDA_RELEASE STREQUAL "13.2")
+    message(STATUS "FA3: experimental CUDA 13.2 toolchain selected")
 endif()
 
 # Do not call find_package(Torch): its CUDA-major check rejects this deliberate
 # nvcc 12.9 + Torch cu13 combination. Query the selected interpreter instead.
 execute_process(
-    COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/package_fa.py" --describe
+    COMMAND "${Python_EXECUTABLE}" -c [=[
+import json
+from pathlib import Path
+import torch
+if not str(torch.__version__).startswith("2.13.") or not torch.version.cuda:
+    raise RuntimeError(f"0520 FA3 requires CUDA-enabled Torch 2.13; got {torch.__version__}")
+print(json.dumps(dict(torch_root=str(Path(torch.__file__).resolve().parent),
+                      torch_version=str(torch.__version__), torch_cuda=torch.version.cuda,
+                      cxx11_abi=int(torch.compiled_with_cxx11_abi()))))
+]=]
     RESULT_VARIABLE TORCH_STATUS OUTPUT_VARIABLE TORCH_INFO OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 if(NOT TORCH_STATUS EQUAL 0)
-    message(FATAL_ERROR "FA3 needs Python >=3.10 with Torch 2.13 and wheel installed")
+    message(FATAL_ERROR "FA3 needs Python >=3.10 with CUDA-enabled Torch 2.13")
 endif()
 string(JSON TORCH_ROOT GET "${TORCH_INFO}" torch_root)
 string(JSON TORCH_ABI GET "${TORCH_INFO}" cxx11_abi)
@@ -33,12 +48,15 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Match CMake's default in the 0510/0520 full build: static CUDA runtime for
-# this extension, avoiding an extra dynamic libcudart.so.12 dependency.
+# this extension. The runtime comes from the selected toolkit.
 set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
-set(FA3_CUTLASS_URL "https://github.com/NVIDIA/cutlass/archive/57e3cfb47a2d9e0d46eb6335c3dc411498efa198.tar.gz"
+# Match the GitHub mirror used by the 0510 Feishu build instructions.
+set(GITHUB_ARTIFACTORY "pkgs.d.xiaomi.net/artifactory/github"
+    CACHE STRING "GitHub mirror host/path")
+set(FA3_CUTLASS_URL "https://${GITHUB_ARTIFACTORY}/NVIDIA/cutlass/archive/57e3cfb47a2d9e0d46eb6335c3dc411498efa198.tar.gz"
     CACHE STRING "Pinned CUTLASS archive URL (may be a local file)")
-set(FA3_ATTENTION_URL "https://github.com/sgl-project/sgl-attn/archive/f89bc2306632d1ec5f97b014dded4254f5b4a907.tar.gz"
+set(FA3_ATTENTION_URL "https://${GITHUB_ARTIFACTORY}/sgl-project/sgl-attn/archive/bcf72ccc6816b36a5fae2c5a3c027604629785e0.tar.gz"
     CACHE STRING "Pinned sgl-attn archive URL (may be a local file)")
 set(FETCHCONTENT_QUIET OFF)
 include(FetchContent)
@@ -53,11 +71,11 @@ FetchContent_Declare(fa3_cutlass
 )
 FetchContent_Declare(fa3_attention
     URL "${FA3_ATTENTION_URL}"
-    URL_HASH SHA256=418b5681584dc3efff496a1cab5ffd58d2728d89dcfe0ea16e6985d6ef35c68c
+    URL_HASH SHA256=2110d8ca1ed9b330b9f99c1d4088be12a37e44152c39fdf90dfb6526f532ba96
     SOURCE_SUBDIR _fa3_source_only
     DOWNLOAD_NO_PROGRESS FALSE TIMEOUT 600 INACTIVITY_TIMEOUT 60
 )
-message(STATUS "FA3: preparing pinned CUTLASS and sgl-attn sources")
+message(STATUS "FA3: preparing pinned CUTLASS and 0510 sgl-attn sources (bcf72ccc)")
 FetchContent_MakeAvailable(fa3_cutlass fa3_attention)
 
 set(FA3_HOPPER "${fa3_attention_SOURCE_DIR}/hopper")
@@ -135,9 +153,7 @@ foreach(name torch torch_cpu torch_cuda c10 c10_cuda)
     target_link_libraries(flash_ops PRIVATE "${FA3_${name}}")
 endforeach()
 target_link_libraries(flash_ops PRIVATE CUDA::cudart_static CUDA::cuda_driver)
+install(TARGETS flash_ops LIBRARY DESTINATION sgl_kernel)
 
-string(JSON BUILD_INFO SET "${TORCH_INFO}" nvcc "\"${CMAKE_CUDA_COMPILER_VERSION}\"")
-string(JSON BUILD_INFO SET "${BUILD_INFO}" gpu_arch "\"${FA3_ARCHES}\"")
-file(WRITE "${CMAKE_BINARY_DIR}/fa3-build-info.json" "${BUILD_INFO}\n")
 list(LENGTH FA3_INSTANTIATIONS FA3_INSTANTIATION_COUNT)
 message(STATUS "FA3: ${FA3_INSTANTIATION_COUNT} instantiations for ${FA3_ARCHES}; configuration complete")

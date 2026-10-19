@@ -9,6 +9,9 @@ export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
 # Compile actual shapes on demand instead of sweeping all M values in a request.
 export SGLANG_JIT_DEEPGEMM_PRECOMPILE=0
 
+# Install the mounted FA3 on every node before model processes start.
+python3 /opt/sglang/fa3/install.py || exit 1
+
 python3 -m sglang.launch_server \
               --model-path /preset-models/ \
               --served-model-name mimo-v2.6-pro-0520 \

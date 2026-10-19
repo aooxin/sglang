@@ -5,6 +5,9 @@ export SGLANG_JIT_DEEPGEMM_FAST_WARMUP=1
 # DFLASH verify: 96 requests * 8 tokens / (TP 8 / DP 2) = 192 tokens per rank.
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256
 
+# Install the mounted FA3 on every node before model processes start.
+python3 /opt/sglang/fa3/install.py || exit 1
+
 python3 -m sglang.launch_server \
               --model-path /preset-models/ \
               --served-model-name mimo-v2-pro-0520 \

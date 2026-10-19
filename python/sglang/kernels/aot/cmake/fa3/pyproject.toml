@@ -1,0 +1,18 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "torch==2.13.0", "wheel"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "sglang-kernel-fa3"
+version = "0.4.7"
+description = "FA3-only extension for the 0520 sglang-kernel"
+requires-python = ">=3.10"
+dependencies = ["torch==2.13.0"]
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.build-type = "Release"
+build.targets = ["flash_ops"]
+wheel.py-api = "cp310"
+wheel.packages = []
+wheel.license-files = []

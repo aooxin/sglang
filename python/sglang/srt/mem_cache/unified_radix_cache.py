@@ -387,6 +387,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
         self.prefetch_loaded_storage_start_by_reqid: dict[CacheRequestHandle, int] = {}
+        # Absolute end of the Full-KV prefix each request's L3 query found,
+        # regardless of SWA; consumed by the re-match that picks the SWA fork.
+        self.storage_full_kv_end_by_reqid: dict[CacheRequestHandle, int] = {}
         self.ongoing_prefetch: dict[CacheRequestHandle, _OngoingPrefetch] = {}
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
@@ -2441,6 +2444,9 @@ class UnifiedRadixCache(BasePrefixCache):
             self.prefetch_loaded_storage_start_by_reqid.pop(request, None),
         )
 
+    def pop_storage_full_kv_end(self, request: CacheRequestHandle) -> Optional[int]:
+        return self.storage_full_kv_end_by_reqid.pop(request, None)
+
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
@@ -2448,6 +2454,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.linker.release_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(rid, None)
+        self.storage_full_kv_end_by_reqid.pop(request, None)
         self.storage_prefetch_retries.cancel(rid)
         if (
             self.buffer_pipeline is not None
@@ -2816,6 +2823,11 @@ class UnifiedRadixCache(BasePrefixCache):
                     if hit_tokens > 0:
                         self.discard_storage_prefetch_accounting(request)
                     continue
+                if operation.full_kv_hit_pages > 0:
+                    self.storage_full_kv_end_by_reqid[request] = (
+                        operation.storage_start
+                        + operation.full_kv_hit_pages * self.page_size
+                    )
                 if hit_tokens > 0:
                     self._record_storage_prefetch_hit(request, hit_tokens)
                 if operation.is_terminated():

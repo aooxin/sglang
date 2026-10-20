@@ -385,6 +385,33 @@ class SWAComponent(TreeComponent):
             swa_branching_seqlen=branching_seqlen,
         )
 
+    def finalize_match_result_in_cache(
+        self, params: MatchPrefixParams, result: MatchResult
+    ) -> MatchResult:
+        if params.storage_full_kv_end is None:
+            return result
+        return result._replace(
+            swa_branching_seqlen=self._branching_seqlen_with_storage(
+                result, params.storage_full_kv_end
+            )
+        )
+
+    def _branching_seqlen_with_storage(
+        self, result: MatchResult, storage_full_kv_end: int
+    ) -> Optional[int]:
+        page_size = self.cache.page_size
+        swa_boundary_len = len(result.device_indices) + result.host_hit_length
+        tree_full_len = result.full_kv_hit_length // page_size * page_size
+        # A tree fork is where cached siblings diverge, so it wins until restorable;
+        # a match that ran off the tree is no fork, and the longer L3 hit is.
+        if tree_full_len > swa_boundary_len and not result.full_kv_hit_tree_exhausted:
+            branching_seqlen = tree_full_len
+        else:
+            branching_seqlen = max(
+                tree_full_len, storage_full_kv_end // page_size * page_size
+            )
+        return branching_seqlen if branching_seqlen > swa_boundary_len else None
+
     def update_component_on_insert_overlap(
         self,
         node: UnifiedTreeNode,

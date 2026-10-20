@@ -6686,6 +6686,206 @@ class UnifiedRadixCacheSuite:
             forward_len - expected_evicted,
         )
 
+    # ---------- SWA branching point with an L3 Full-KV hit ----------
+
+    def _skip_unless_full_swa(self):
+        if not self.cfg.has_swa or self.cfg.has_mamba:
+            self.skipTest("requires Full+SWA without Mamba")
+
+    def _swa_window_pages(self) -> int:
+        ps = self.cfg.page_size
+        return (self.cfg.sliding_window_size + ps - 1) // ps
+
+    def _insert_two_window_prefix(
+        self, cache, allocator, req_to_token_pool, *, head_swa, tail_swa, sibling
+    ):
+        """Insert shared = head + tail, one SWA window each, as two nodes, plus an
+        optional sibling branch that diverges right after shared. Returns
+        (head, shared, sibling leaf or None)."""
+        wp = self._swa_window_pages()
+        head = self._make_seq(1, wp)
+        shared = head + self._make_seq(10_000, wp)
+        self._insert(cache, allocator, req_to_token_pool, head)
+        self._insert(cache, allocator, req_to_token_pool, shared)
+        sibling_leaf = None
+        if sibling:
+            sibling_tokens = shared + self._make_seq(20_000, 1)
+            self._insert(cache, allocator, req_to_token_pool, sibling_tokens)
+            # Resolve the leaf while every SWA window is still live.
+            sibling_leaf = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", sibling_tokens)))
+            ).last_device_node
+        for tokens, keep_swa in ((head, head_swa), (shared, tail_swa)):
+            if keep_swa:
+                continue
+            node = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            ).last_device_node
+            evicted = cache.tree_core.evict_component(
+                node, ComponentType.SWA, EvictLayer.DEVICE
+            )
+            cache._free_values(evicted.device_frees, evicted.host_frees)
+        return head, shared, sibling_leaf
+
+    def _match_with_storage_end(self, cache, tokens, storage_full_kv_end):
+        return cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", tokens)),
+                storage_full_kv_end=storage_full_kv_end,
+            )
+        )
+
+    def test_swa_branching_prefers_tree_fork_over_deeper_storage_hit(self):
+        """A fork the tree shows is where siblings diverge; a deeper Full-KV hit
+        known only to L3 must not displace it as the SWA checkpoint."""
+        self._skip_unless_full_swa()
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        _, shared, _ = self._insert_two_window_prefix(
+            cache,
+            allocator,
+            req_to_token_pool,
+            head_swa=True,
+            tail_swa=False,
+            sibling=True,
+        )
+        tokens = shared + self._make_seq(30_000, 2)
+
+        result = self._match_with_storage_end(
+            cache, tokens, len(shared) + self.cfg.page_size
+        )
+
+        self.assertEqual(result.swa_branching_seqlen, len(shared))
+
+    def test_swa_branching_uses_storage_full_kv_end_on_empty_tree(self):
+        """Pure-L3 reuse: with nothing in the tree, only the L3 Full-KV hit can
+        mark the fork, else the shared prefix never gets an SWA checkpoint."""
+        self._skip_unless_full_swa()
+        cache, _, _ = build_fixture(self.cfg)
+        shared = self._make_seq(1, 2 * self._swa_window_pages())
+        tokens = shared + self._make_seq(30_000, 1)
+
+        result = self._match_with_storage_end(cache, tokens, len(shared))
+
+        self.assertEqual(result.swa_branching_seqlen, len(shared))
+
+    def test_swa_branching_extends_past_tree_leaf_end_to_storage_hit(self):
+        """A tree match that stops at a leaf end (e.g. an evicted tail) is not a
+        fork; the longer L3 Full-KV hit is the checkpoint."""
+        self._skip_unless_full_swa()
+        if _selected_tree_core_test_backend() == "rust":
+            self.skipTest("Rust tree core does not report an exhausted match")
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        _, shared, _ = self._insert_two_window_prefix(
+            cache,
+            allocator,
+            req_to_token_pool,
+            head_swa=True,
+            tail_swa=False,
+            sibling=False,
+        )
+        tokens = shared + self._make_seq(30_000, 2)
+        storage_end = len(shared) + self.cfg.page_size
+
+        result = self._match_with_storage_end(cache, tokens, storage_end)
+
+        self.assertEqual(result.swa_branching_seqlen, storage_end)
+
+    def test_swa_branching_uses_storage_hit_once_tree_fork_is_restorable(self):
+        """A tree fork that already has an SWA window needs no checkpoint, so the
+        deeper L3 Full-KV hit becomes the next one."""
+        self._skip_unless_full_swa()
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        _, shared, _ = self._insert_two_window_prefix(
+            cache,
+            allocator,
+            req_to_token_pool,
+            head_swa=True,
+            tail_swa=True,
+            sibling=True,
+        )
+        tokens = shared + self._make_seq(30_000, 2)
+        storage_end = len(shared) + self.cfg.page_size
+
+        result = self._match_with_storage_end(cache, tokens, storage_end)
+
+        self.assertEqual(result.swa_branching_seqlen, storage_end)
+
+    def test_swa_branching_unset_when_storage_hit_is_restorable(self):
+        self._skip_unless_full_swa()
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        _, shared, _ = self._insert_two_window_prefix(
+            cache,
+            allocator,
+            req_to_token_pool,
+            head_swa=True,
+            tail_swa=True,
+            sibling=True,
+        )
+        tokens = shared + self._make_seq(30_000, 1)
+
+        result = self._match_with_storage_end(cache, tokens, len(shared))
+
+        self.assertIsNone(result.swa_branching_seqlen)
+
+    def _check_l3_prefetch_reports_full_kv_end(self, *, head_swa: bool):
+        if self._skip_unsupported_hicache_test():
+            return
+        self._skip_unless_full_swa()
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+
+        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            prod,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+        head, shared, sibling_leaf = self._insert_two_window_prefix(
+            prod,
+            prod_alloc,
+            prod_rtp,
+            head_swa=head_swa,
+            tail_swa=False,
+            sibling=True,
+        )
+        self._backup_node(prod, sibling_leaf)
+        self._write_path_to_l3(prod, sibling_leaf)
+        self._flush_l3_backups(prod)
+
+        cons, _, _ = build_fixture(self.cfg)
+        self._init_hicache(
+            cons,
+            storage_backend="file",
+            storage_dir=storage_dir,
+            prefetch_threshold=1,
+        )
+        tokens = shared + self._make_seq(30_000, 1)
+        req_id = CacheRequestHandle("fork-req", 0)
+        cons.prefetch_from_storage(
+            req_id, cons.root_node_handle(), array("q", tokens), None, None
+        )
+        self._run_prefetch_to_completion(cons, req_id)
+
+        storage_end = cons.pop_storage_full_kv_end(req_id)
+        result = self._match_with_storage_end(cons, tokens, storage_end)
+
+        self.assertEqual(result.host_hit_length, len(head) if head_swa else 0)
+        self.assertEqual(storage_end, len(shared))
+        self.assertEqual(result.swa_branching_seqlen, len(shared))
+        self.assertIsNone(cons.pop_storage_full_kv_end(req_id))
+
+    def test_l3_prefetch_reports_full_kv_end_beyond_swa_hit(self):
+        """L3 holds a shared prefix's Full KV with an SWA window only partway in:
+        the prefetch loads up to that window but must still report how far Full
+        KV matches, so the re-match marks the prefix end as the SWA checkpoint."""
+        self._check_l3_prefetch_reports_full_kv_end(head_swa=True)
+
+    def test_l3_prefetch_reports_full_kv_end_without_swa_hit(self):
+        """Same, with no SWA window inside the prefix: nothing is loaded and the
+        prefetch is dropped, yet the Full-KV end must still be reported."""
+        self._check_l3_prefetch_reports_full_kv_end(head_swa=False)
+
     def test_mamba_branching_seqlen_disabled_under_hicache(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")

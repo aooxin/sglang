@@ -587,6 +587,9 @@ class StreamingSession(BasePrefixCache):
     ) -> tuple[int, Optional[int]]:
         return self.inner.pop_prefetch_loaded_span(handle)
 
+    def pop_storage_full_kv_end(self, handle: CacheRequestHandle) -> Optional[int]:
+        return self.inner.pop_storage_full_kv_end(handle)
+
     def finish_storage_prefetch_admission(
         self, handle: CacheRequestHandle, fulfilled_tokens: int, reason: Optional[str]
     ) -> None:

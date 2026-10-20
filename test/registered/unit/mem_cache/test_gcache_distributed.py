@@ -76,7 +76,12 @@ def _run_rank(rank, rendezvous, address, config_dir, scenario):
         fill_pool(swa, seed=91 + rank * 17)
         tokens = list(range(12))
         hashes = get_storage_hash_str(tokens, None, page_size=2)
-        assert backend.batch_set_v1(hashes, torch.arange(12)) == [True] * 6
+        # In "kv_prefix", rank 1 lacks the last Full page.
+        kv_pages = 5 if scenario == "kv_prefix" and rank == 1 else 6
+        assert (
+            backend.batch_set_v1(hashes[:kv_pages], torch.arange(2 * kv_pages))
+            == [True] * kv_pages
+        )
         mask = [1, 1, 0, 1, 1, 1] if rank == 0 else [1, 1, 1, 1, 0, 0]
         selected = [i for i, exists in enumerate(mask) if exists]
         assert backend.batch_set_v2(
@@ -130,10 +135,16 @@ def _run_rank(rank, rendezvous, address, config_dir, scenario):
         assert not worker.is_alive()
         if scenario == "cancel":
             assert operation.storage_hit_count == 0
+            assert operation.full_kv_hit_pages == 0
             return
         # Rank maxima are 6 and 4, but rank 0 cannot restore endpoint 4.
         assert operation.storage_hit_count == 4
         assert operation.hash_value == hashes[:2]
+        if scenario == "kv_prefix":
+            # Full KV alone reaches 6 and 5 pages; every rank must agree on 5.
+            assert operation.full_kv_hit_pages == 5
+            return
+        assert operation.full_kv_hit_pages == 6
 
         operation.host_indices = cc.mem_pool_host.alloc(4)
         transfer.host_indices = cc.mem_pool_host.alloc(4, pool=PoolName.SWA)
@@ -215,7 +226,7 @@ def _run_rank(rank, rendezvous, address, config_dir, scenario):
 
 
 @pytest.mark.parametrize(
-    "scenario", ["restore", "swa_failure", "full_failure", "cancel"]
+    "scenario", ["restore", "swa_failure", "full_failure", "cancel", "kv_prefix"]
 )
 def test_two_rank_prefetch_and_failure_reclamation(tmp_path, scenario):
     with GCacheMockServer() as server:

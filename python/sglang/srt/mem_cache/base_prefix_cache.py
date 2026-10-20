@@ -70,6 +70,10 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    # SWA specific: absolute end of the Full-KV prefix the request last found
+    # in L3 storage, regardless of SWA. None when no storage query reported it.
+    storage_full_kv_end: Optional[int] = None
+
 
 @dataclasses.dataclass
 class InsertParams:
@@ -245,6 +249,9 @@ class MatchResult(NamedTuple):
                                 exists a mamba state.
         full_kv_hit_length: Longest Full-KV prefix available on either device or
                             host, independent of other components.
+        full_kv_hit_tree_exhausted: True when the Full-KV match stopped because the
+                            tree holds nothing further on this path (a leaf end or a
+                            dead node) rather than at a sibling divergence.
     """
 
     device_indices: torch.Tensor
@@ -258,6 +265,7 @@ class MatchResult(NamedTuple):
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
     full_kv_hit_length: int = 0
+    full_kv_hit_tree_exhausted: bool = False
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
 
@@ -532,6 +540,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     ) -> tuple[int, Optional[int]]:
         """Pop L3-loaded tokens and their absolute prefix start, if known."""
         return self.pop_prefetch_loaded_tokens(handle), None
+
+    def pop_storage_full_kv_end(self, handle: CacheRequestHandle) -> Optional[int]:
+        """Pop the absolute end of the Full-KV prefix found in L3, if reported."""
+        return None
 
     def ready_to_load_host_cache(self) -> Any:
         """

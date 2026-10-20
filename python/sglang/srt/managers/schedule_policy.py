@@ -182,6 +182,7 @@ def match_prefix_for_req(
             ),
             cow_mamba=cow_mamba,
             req=req if include_req else None,
+            storage_full_kv_end=req.storage_full_kv_end,
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():

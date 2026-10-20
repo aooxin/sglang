@@ -3915,6 +3915,13 @@ class Scheduler(
                     # Cache-mode host memory is a resident L2 tier. Buffer mode
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
+                storage_full_kv_end = self.tree_cache.pop_storage_full_kv_end(
+                    req.cache_request_handle
+                )
+                if storage_full_kv_end is not None:
+                    req.storage_full_kv_end = max(
+                        req.storage_full_kv_end or 0, storage_full_kv_end
+                    )
 
             req.init_next_round_input(self.tree_cache)
             if self.enable_hicache_storage and (

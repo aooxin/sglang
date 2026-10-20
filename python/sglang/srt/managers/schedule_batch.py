@@ -1014,6 +1014,9 @@ class Req(ReqDllmMixin):
         # Full-KV-derived boundary whose SWA window should be inserted after
         # the current prefill pass.
         self.swa_branching_seqlen: Optional[int] = None
+        # Absolute end of the Full-KV prefix an L3 query found, regardless of
+        # SWA; lets the re-match place the SWA fork past what the tree holds.
+        self.storage_full_kv_end: Optional[int] = None
 
         # for cross-encoder model
         self.token_type_ids = token_type_ids
@@ -1578,6 +1581,7 @@ class Req(ReqDllmMixin):
                     ),
                     req=self,
                     cow_mamba=cow_mamba,
+                    storage_full_kv_end=self.storage_full_kv_end,
                 )
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
@@ -1897,6 +1901,7 @@ class Req(ReqDllmMixin):
         self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False
         self.swa_branching_seqlen = None
+        self.storage_full_kv_end = None
         self.extend_range = None
         self.dllm_initialized = False
         self.is_retracted = True

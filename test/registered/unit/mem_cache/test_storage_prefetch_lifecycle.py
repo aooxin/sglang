@@ -151,6 +151,7 @@ def _terminated_query(cache, rid, hit_tokens):
         request_id=rid,
         handle=handle,
         storage_hit_count=hit_tokens,
+        full_kv_hit_pages=0,
         stats_requested_tokens=8,
         is_terminated=lambda: True,
     )

@@ -94,6 +94,9 @@ class PrefetchOperation(StorageOperation):
         # query. Trailing sidecars still use the untrimmed hit endpoint.
         self.sidecar_hash_values: Optional[list[str]] = None
         self.sidecar_hit_pages = 0
+        # Leading pages whose Full KV is in storage, ignoring sidecar pools and
+        # agreed across ranks; marks how far the prefix matches for SWA forks.
+        self.full_kv_hit_pages = 0
 
     def mark_terminate(self):
         with self._lock:
@@ -617,6 +620,7 @@ class HybridCacheController(BaseHiCacheController):
             # A prior hit on a suffix of this span proved it stored, and writes
             # are prefix-covered, so re-querying only adds a round trip.
             kv_hit_pages = len(hash_value)
+            operation.full_kv_hit_pages = kv_hit_pages
             operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
             operation.pool_storage_result.restorable_prefix_pages = list(
                 range(1, kv_hit_pages + 1)
@@ -630,11 +634,15 @@ class HybridCacheController(BaseHiCacheController):
             hit_result = self.storage_backend.batch_exists_v2(
                 hash_value, operation.pool_transfers, extra_info
             )
+            operation.full_kv_hit_pages = hit_result.extra_pool_hit_pages.get(
+                PoolName.KV, 0
+            )
         else:
             kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
             hit_result = PoolTransferResult(
                 kv_hit_pages=kv_hit_count, extra_pool_hit_pages={}
             )
+            operation.full_kv_hit_pages = kv_hit_count
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
@@ -652,19 +660,34 @@ class HybridCacheController(BaseHiCacheController):
             transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
             for transfer in operation.pool_transfers or []
         )
+        if not has_trailing_pool:
+            # Every page is restorable, so the Full-KV hit is the hit itself.
+            hit_count = super()._sync_storage_hit_count(operation, storage_hit_count)
+            operation.full_kv_hit_pages = hit_count // self.page_size
+            return hit_count
         if (
-            not has_trailing_pool
-            or getattr(self.storage_backend, "supports_restorable_prefixes", False)
+            getattr(self.storage_backend, "supports_restorable_prefixes", False)
             is not True
         ):
-            return super()._sync_storage_hit_count(operation, storage_hit_count)
+            counts = torch.tensor(
+                [storage_hit_count, operation.full_kv_hit_pages], dtype=torch.int
+            )
+            self._all_reduce(
+                counts,
+                torch.distributed.ReduceOp.MIN,
+                self.prefetch_hits_sync_groups,
+            )
+            operation.full_kv_hit_pages = int(counts[1].item())
+            return int(counts[0].item())
 
         # A trailing window can be present at 6 pages and absent at 4. MIN of
         # per-rank maxima is therefore insufficient. Every rank, including one
-        # that cancelled before querying, reduces the same fixed-size bitmap.
+        # that cancelled before querying, reduces the same fixed-size bitmap;
+        # its extra last slot carries the Full-KV page count.
         num_pages = len(operation.token_ids) // self.page_size
-        valid = torch.zeros(num_pages + 1, dtype=torch.int)
+        valid = torch.zeros(num_pages + 2, dtype=torch.int)
         valid[0] = 1
+        valid[-1] = operation.full_kv_hit_pages
         for pages in operation.pool_storage_result.restorable_prefix_pages or []:
             if 0 < pages <= min(num_pages, storage_hit_count // self.page_size):
                 valid[pages] = 1
@@ -673,7 +696,8 @@ class HybridCacheController(BaseHiCacheController):
             torch.distributed.ReduceOp.MIN,
             self.prefetch_hits_sync_groups,
         )
-        hit_pages = int(valid.nonzero()[-1].item())
+        operation.full_kv_hit_pages = int(valid[-1].item())
+        hit_pages = int(valid[:-1].nonzero()[-1].item())
         operation.pool_storage_result.kv_hit_pages = hit_pages
         return hit_pages * self.page_size
 

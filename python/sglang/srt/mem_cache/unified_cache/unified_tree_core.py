@@ -786,6 +786,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_node,
             best_match_device_value_len,
             full_kv_hit_length,
+            full_kv_hit_tree_exhausted,
             action,
         ) = self._match_prefix_helper(key)
         return self._match_post_processor(
@@ -796,6 +797,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
+            full_kv_hit_tree_exhausted=full_kv_hit_tree_exhausted,
         )
 
     def _match_prefix_helper(
@@ -806,6 +808,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         UnifiedTreeNode,
         int,
         int,
+        bool,
         Optional[CacheAction | ComponentAction],
     ]:
         # Non-HiCache mode has only device-resident matches, so the scheduler
@@ -820,6 +823,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_device_node = node
         best_match_device_value_len = 0
         full_kv_hit_length = 0
+        full_kv_hit_tree_exhausted = False
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
         if separate_device_match:
@@ -860,6 +864,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
             # HiCache: dead node (evicted + not backuped) — stop traversal
             if child.evicted and not child.backuped:
+                full_kv_hit_tree_exhausted = True
                 break
 
             prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
@@ -878,6 +883,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             key_offset += prefix_len
             if key_offset < len(key):
                 child_key = key.child_key_at(key_offset, self.page_size)
+        else:
+            # Stopped at a node boundary: a leaf has no data past it, while
+            # remaining children are siblings that diverge here.
+            full_kv_hit_tree_exhausted = key_offset < len(key) and not node.children
 
         return (
             value,
@@ -885,6 +894,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_node,
             best_match_device_value_len,
             full_kv_hit_length,
+            full_kv_hit_tree_exhausted,
             action,
         )
 
@@ -923,6 +933,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_device_value_len: int,
         full_kv_hit_length: int,
         action: Optional[CacheAction | ComponentAction],
+        *,
+        full_kv_hit_tree_exhausted: bool = False,
     ) -> MatchResult:
         node_update = best_match_node
         for comp in self.components:
@@ -955,6 +967,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_node=best_match_node,
             host_hit_length=0,
             full_kv_hit_length=full_kv_hit_length,
+            full_kv_hit_tree_exhausted=full_kv_hit_tree_exhausted,
         )
 
         for component in self.components:

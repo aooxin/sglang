@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
@@ -25,6 +26,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 class _StubReq:
@@ -40,6 +42,7 @@ class _StubReq:
         self.host_hit_length = None
         self.num_matched_prefix_tokens = 0
         self.swa_branching_seqlen = None
+        self.storage_full_kv_end = None
         self.kv = SimpleNamespace(cache_protected_len=None)
 
     def _compute_max_prefix_len(self, input_len):
@@ -125,6 +128,56 @@ class TestMatchPrefixForReqForceMiss(unittest.TestCase):
         self.assertIs(forced_req.last_node, tree.root_node)
         self.assertIs(forced_req.last_host_node, tree.root_node)
         self.assertEqual(forced_req.host_hit_length, 0)
+
+
+class _CapturingTreeCache:
+    def __init__(self):
+        self.match_params = []
+
+    def swa_reprefill_tail_tokens(self):
+        return 0
+
+    def supports_mamba(self):
+        return False
+
+    def match_prefix(self, params):
+        self.match_params.append(params)
+        return MatchResult(
+            device_indices=torch.empty((0,), dtype=torch.int64),
+            last_device_node=None,
+            last_host_node=None,
+            best_match_node=None,
+            host_hit_length=0,
+        )
+
+
+class TestRematchForwardsStorageFullKVEnd(unittest.TestCase):
+    """Every scheduler re-match must pass the request's L3 Full-KV end to
+    match_prefix; a path that drops it silently loses the SWA fork for
+    prefixes reused only through L3."""
+
+    def test_match_prefix_for_req(self):
+        tree = _CapturingTreeCache()
+        req = _StubReq([1, 2, 3, 4])
+        req.storage_full_kv_end = 256
+
+        match_prefix_for_req(tree, req)
+
+        self.assertEqual(tree.match_params[-1].storage_full_kv_end, 256)
+
+    def test_init_next_round_input(self):
+        tree = _CapturingTreeCache()
+        req = Req(
+            rid="rematch",
+            origin_input_text="",
+            origin_input_ids=array("q", range(8)),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req.storage_full_kv_end = 256
+
+        req.init_next_round_input(tree)
+
+        self.assertEqual(tree.match_params[-1].storage_full_kv_end, 256)
 
 
 if __name__ == "__main__":

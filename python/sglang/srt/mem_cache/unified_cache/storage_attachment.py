@@ -421,4 +421,5 @@ class StorageAttachment:
         cache.prefetch_loaded_tokens_by_reqid.clear()
         cache.prefetch_loaded_storage_start_by_reqid.clear()
         cache.storage_full_kv_end_by_reqid.clear()
+        cache.prefetch_timing_by_reqid.clear()
         cache.storage_prefetch_retries.clear()

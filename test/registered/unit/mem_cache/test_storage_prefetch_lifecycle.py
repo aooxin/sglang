@@ -24,7 +24,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.mem_cache.storage_prefetch import (
+    PrefetchTiming,
+    StoragePrefetchRetries,
+)
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
     _OngoingPrefetch,
@@ -152,6 +155,7 @@ def _terminated_query(cache, rid, hit_tokens):
         handle=handle,
         storage_hit_count=hit_tokens,
         full_kv_hit_pages=0,
+        timing=PrefetchTiming(),
         stats_requested_tokens=8,
         is_terminated=lambda: True,
     )
@@ -493,6 +497,57 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         retries = cache.storage_prefetch_retries
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [])
         self.assertEqual(retries.pop_ready([head, req], 1, 8), [(req, None)])
+
+
+class TestPrefetchTiming(unittest.TestCase):
+    def test_stages_partition_a_committed_prefetch(self):
+        """The per-stage metrics must cover the whole wait without gaps or overlap,
+        so their sum reconciles with commit - start like 0510's stages do."""
+        timing = PrefetchTiming(
+            start=10.0,
+            query_start=10.5,
+            query_finish=10.75,
+            resolve_finish=11.0,
+            hit_drained=11.5,
+            io_enqueued=11.625,
+            io_start=12.0,
+            kv_finish=12.5,
+            io_finish=13.0,
+            ack_reduced=13.25,
+            commit=14.0,
+        )
+
+        stages = timing.stage_durations()
+
+        self.assertEqual(
+            stages,
+            {
+                "queue": 0.5,
+                "query": 0.25,
+                "resolve": 0.25,
+                "io_queue": 1.0,
+                "io": 1.0,
+                "commit": 1.0,
+            },
+        )
+        self.assertEqual(sum(stages.values()), timing.commit - timing.start)
+
+    def test_revoked_prefetch_reports_no_io_stages(self):
+        """A prefetch revoked before IO has no io stages; commit runs from the
+        last stamp it reached, not from an unset IO stamp."""
+        timing = PrefetchTiming(
+            start=10.0,
+            query_start=10.5,
+            query_finish=10.75,
+            resolve_finish=11.0,
+            hit_drained=11.5,
+            commit=12.0,
+        )
+
+        self.assertEqual(
+            timing.stage_durations(),
+            {"queue": 0.5, "query": 0.25, "resolve": 0.25, "commit": 1.0},
+        )
 
 
 if __name__ == "__main__":

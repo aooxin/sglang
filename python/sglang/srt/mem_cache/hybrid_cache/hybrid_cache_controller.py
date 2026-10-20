@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.storage_prefetch import PrefetchTiming
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -76,6 +77,7 @@ class PrefetchOperation(StorageOperation):
         self._terminated_flag = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
+        self.timing = PrefetchTiming.started()
         # Take the whole span as present instead of querying for it; the read
         # itself is fail-soft, so a wrong guess shortens the fetch.
         self.assume_stored = assume_stored

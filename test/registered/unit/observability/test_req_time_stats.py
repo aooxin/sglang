@@ -126,5 +126,45 @@ class TestSetFinishedTimeSpanAttrs(CustomTestCase):
         self.assertEqual(caller_attrs, {"gen_ai.request.id": "rid-1"})
 
 
+class TestObserveHicachePrefetchStages(CustomTestCase):
+    def test_emits_0510_stage_names(self):
+        """Dashboards compare 0510 and 0520 through these per-stage label values,
+        so they must stay identical to 0510's."""
+        from sglang.srt.mem_cache.storage_prefetch import PrefetchTiming
+
+        stats = rts.SchedulerReqTimeStats()
+        stats.enable_metrics = True
+        stats.metrics_collector = mock.Mock()
+        timing = PrefetchTiming(
+            start=10.0,
+            query_start=10.5,
+            query_finish=10.75,
+            resolve_finish=11.0,
+            io_start=12.0,
+            io_finish=13.0,
+            commit=14.0,
+        )
+
+        with mock.patch.object(rts.time, "monotonic", return_value=14.5):
+            stats.observe_hicache_prefetch_stages(timing)
+
+        observed = {
+            call.args[0]: call.args[1]
+            for call in stats.metrics_collector.observe_per_stage_req_latency.call_args_list
+        }
+        self.assertEqual(
+            observed,
+            {
+                "hicache_prefetch_wait_total": 4.5,
+                "hicache_prefetch_queue": 0.5,
+                "hicache_prefetch_query": 0.25,
+                "hicache_prefetch_resolve": 0.25,
+                "hicache_prefetch_io_queue": 1.0,
+                "hicache_prefetch_io": 1.0,
+                "hicache_prefetch_commit": 1.0,
+            },
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

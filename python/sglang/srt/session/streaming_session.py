@@ -25,7 +25,10 @@ from sglang.srt.utils.common import ceil_align, is_npu
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
-    from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+    from sglang.srt.mem_cache.storage_prefetch import (
+        PrefetchTiming,
+        StoragePrefetchRetries,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -589,6 +592,11 @@ class StreamingSession(BasePrefixCache):
 
     def pop_storage_full_kv_end(self, handle: CacheRequestHandle) -> Optional[int]:
         return self.inner.pop_storage_full_kv_end(handle)
+
+    def pop_prefetch_timing(
+        self, handle: CacheRequestHandle
+    ) -> Optional[PrefetchTiming]:
+        return self.inner.pop_prefetch_timing(handle)
 
     def finish_storage_prefetch_admission(
         self, handle: CacheRequestHandle, fulfilled_tokens: int, reason: Optional[str]

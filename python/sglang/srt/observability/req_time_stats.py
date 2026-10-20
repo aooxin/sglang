@@ -46,6 +46,7 @@ from sglang.srt.utils import get_bool_env_var
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVTransferMetric
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.mem_cache.storage_prefetch import PrefetchTiming
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
@@ -147,6 +148,43 @@ class RequestStage:
     PREFILL_CHUNKED_FORWARD = RequestStageConfig(
         "chunked_prefill",
         level=3,
+        metrics_is_observed=True,
+    )
+
+    # HiCache storage prefetch; names shared with 0510 so dashboards compare.
+    HICACHE_PREFETCH_WAIT_TOTAL = RequestStageConfig(
+        "hicache_prefetch_wait_total",
+        level=1,
+        metrics_is_observed=True,
+    )
+    HICACHE_PREFETCH_QUEUE = RequestStageConfig(
+        "hicache_prefetch_queue",
+        level=1,
+        metrics_is_observed=True,
+    )
+    HICACHE_PREFETCH_QUERY = RequestStageConfig(
+        "hicache_prefetch_query",
+        level=1,
+        metrics_is_observed=True,
+    )
+    HICACHE_PREFETCH_RESOLVE = RequestStageConfig(
+        "hicache_prefetch_resolve",
+        level=1,
+        metrics_is_observed=True,
+    )
+    HICACHE_PREFETCH_IO_QUEUE = RequestStageConfig(
+        "hicache_prefetch_io_queue",
+        level=1,
+        metrics_is_observed=True,
+    )
+    HICACHE_PREFETCH_IO = RequestStageConfig(
+        "hicache_prefetch_io",
+        level=1,
+        metrics_is_observed=True,
+    )
+    HICACHE_PREFETCH_COMMIT = RequestStageConfig(
+        "hicache_prefetch_commit",
+        level=1,
         metrics_is_observed=True,
     )
 
@@ -283,6 +321,25 @@ class ReqTimeStatsBase:
             self.metrics_collector.observe_per_stage_req_latency(
                 stage.stage_name, latency
             )
+
+    def observe_hicache_prefetch_stages(self, timing: PrefetchTiming) -> None:
+        """Report how long one L3 prefetch spent in each stage."""
+        if not self.enable_metrics:
+            return
+        self.observe_per_stage_req_latency(
+            RequestStage.HICACHE_PREFETCH_WAIT_TOTAL,
+            time.monotonic() - timing.start,
+        )
+        mapping = {
+            "queue": RequestStage.HICACHE_PREFETCH_QUEUE,
+            "query": RequestStage.HICACHE_PREFETCH_QUERY,
+            "resolve": RequestStage.HICACHE_PREFETCH_RESOLVE,
+            "io_queue": RequestStage.HICACHE_PREFETCH_IO_QUEUE,
+            "io": RequestStage.HICACHE_PREFETCH_IO,
+            "commit": RequestStage.HICACHE_PREFETCH_COMMIT,
+        }
+        for name, seconds in timing.stage_durations().items():
+            self.observe_per_stage_req_latency(mapping[name], seconds)
 
     def init_trace_ctx(
         self,

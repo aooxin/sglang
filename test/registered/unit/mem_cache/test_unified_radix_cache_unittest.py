@@ -6886,6 +6886,106 @@ class UnifiedRadixCacheSuite:
         prefetch is dropped, yet the Full-KV end must still be reported."""
         self._check_l3_prefetch_reports_full_kv_end(head_swa=False)
 
+    def test_l3_prefetch_reports_timing_of_every_stage(self):
+        """Each thread of a completed L3 prefetch must stamp its hand-off, else a
+        per-stage metric silently absorbs another stage's time."""
+        if self._skip_unsupported_hicache_test():
+            return
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        num_pages = 4
+        if self.cfg.has_swa:
+            num_pages = max(num_pages, self._swa_window_pages() + 1)
+        seq = self._make_seq(1, num_pages)
+
+        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            prod, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
+        )
+        self._insert(prod, prod_alloc, prod_rtp, seq)
+        leaf = prod.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", seq)))
+        ).last_device_node
+        self._backup_node(prod, leaf)
+        self._write_path_to_l3(prod, leaf)
+        self._flush_l3_backups(prod)
+
+        cons, _, _ = build_fixture(self.cfg)
+        self._init_hicache(
+            cons, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
+        )
+        req_id = CacheRequestHandle("timing-req", 0)
+        cons.prefetch_from_storage(
+            req_id, cons.root_node_handle(), array("q", seq), None, None
+        )
+        self._run_prefetch_to_completion(cons, req_id)
+
+        timing = cons.pop_prefetch_timing(req_id)
+
+        stamps = [
+            timing.start,
+            timing.query_start,
+            timing.query_finish,
+            timing.resolve_finish,
+            timing.hit_drained,
+            timing.io_enqueued,
+            timing.io_start,
+            timing.kv_finish,
+            timing.io_finish,
+            timing.ack_reduced,
+            timing.commit,
+        ]
+        self.assertTrue(all(stamp > 0.0 for stamp in stamps), stamps)
+        self.assertEqual(stamps, sorted(stamps))
+        self.assertEqual(
+            list(timing.stage_durations()),
+            ["queue", "query", "resolve", "io_queue", "io", "commit"],
+        )
+        self.assertIsNone(cons.pop_prefetch_timing(req_id))
+
+    def test_decode_prefetch_pop_releases_all_per_request_state(self):
+        """Decode consumes an L3 prefetch only via pop_prefetch_loaded_tokens; it
+        must drop every per-request entry, or each L3 request leaks on decode."""
+        if self._skip_unsupported_hicache_test():
+            return
+        self._skip_unless_full_swa()
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            prod, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
+        )
+        _, shared, sibling_leaf = self._insert_two_window_prefix(
+            prod,
+            prod_alloc,
+            prod_rtp,
+            head_swa=True,
+            tail_swa=False,
+            sibling=True,
+        )
+        self._backup_node(prod, sibling_leaf)
+        self._write_path_to_l3(prod, sibling_leaf)
+        self._flush_l3_backups(prod)
+
+        cons, _, _ = build_fixture(self.cfg)
+        self._init_hicache(
+            cons, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
+        )
+        req_id = CacheRequestHandle("decode-req", 0)
+        cons.prefetch_from_storage(
+            req_id,
+            cons.root_node_handle(),
+            array("q", shared + self._make_seq(30_000, 1)),
+            None,
+            None,
+        )
+        self._run_prefetch_to_completion(cons, req_id)
+
+        cons.pop_prefetch_loaded_tokens(req_id)
+
+        self.assertIsNone(cons.pop_storage_full_kv_end(req_id))
+        self.assertIsNone(cons.pop_prefetch_timing(req_id))
+
     def test_mamba_branching_seqlen_disabled_under_hicache(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")

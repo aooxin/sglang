@@ -42,6 +42,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.storage_prefetch import PrefetchTiming
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
@@ -269,6 +270,7 @@ class PrefetchOperation(StorageOperation):
         self._terminated_flag = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
+        self.timing = PrefetchTiming.started()
 
         super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
 
@@ -1110,6 +1112,7 @@ class HiCacheController:
                 operation=operation,
             )
             self.prefetch_sync_queue.put(ack)
+        operation.timing.kv_finish = time.monotonic()
         return completed_pages
 
     def _page_transfer_kv_batch(
@@ -1160,7 +1163,9 @@ class HiCacheController:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                operation.timing.io_start = time.monotonic()
                 self._page_transfer(operation)
+                operation.timing.io_finish = time.monotonic()
 
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
@@ -1239,10 +1244,13 @@ class HiCacheController:
                 if operation.is_terminated():
                     hash_value, storage_hit_count = [], 0
                 else:
+                    operation.timing.query_start = time.monotonic()
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
+                    operation.timing.query_finish = time.monotonic()
                 storage_hit_count = self._sync_storage_hit_count(
                     operation, storage_hit_count
                 )
+                operation.timing.resolve_finish = time.monotonic()
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.
@@ -1332,6 +1340,8 @@ class HiCacheController:
                 if ack is None:
                     continue
                 self._reduce_prefetch_ack(ack)
+                if ack.completed_req:
+                    ack.operation.timing.ack_reduced = time.monotonic()
                 self.ack_prefetch_queue.put(ack)
             except Empty:
                 continue

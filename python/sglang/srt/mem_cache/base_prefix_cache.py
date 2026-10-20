@@ -34,7 +34,10 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.radix_cache import RadixKey
-    from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+    from sglang.srt.mem_cache.storage_prefetch import (
+        PrefetchTiming,
+        StoragePrefetchRetries,
+    )
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
@@ -543,6 +546,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def pop_storage_full_kv_end(self, handle: CacheRequestHandle) -> Optional[int]:
         """Pop the absolute end of the Full-KV prefix found in L3, if reported."""
+        return None
+
+    def pop_prefetch_timing(
+        self, handle: CacheRequestHandle
+    ) -> Optional[PrefetchTiming]:
+        """Pop the per-stage timings of the request's last L3 prefetch."""
         return None
 
     def ready_to_load_host_cache(self) -> Any:

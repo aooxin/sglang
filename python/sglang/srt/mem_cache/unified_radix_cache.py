@@ -45,7 +45,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.mem_cache.storage_prefetch import (
+    PrefetchTiming,
+    StoragePrefetchRetries,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
@@ -390,6 +393,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Absolute end of the Full-KV prefix each request's L3 query found,
         # regardless of SWA; consumed by the re-match that picks the SWA fork.
         self.storage_full_kv_end_by_reqid: dict[CacheRequestHandle, int] = {}
+        # Per-stage timings of each request's last L3 prefetch, for the
+        # scheduler thread to report once the request is admitted.
+        self.prefetch_timing_by_reqid: dict[CacheRequestHandle, PrefetchTiming] = {}
         self.ongoing_prefetch: dict[CacheRequestHandle, _OngoingPrefetch] = {}
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
@@ -2121,6 +2127,7 @@ class UnifiedRadixCache(BasePrefixCache):
         request = operation.handle
         completed_tokens = operation.completed_tokens
         hash_value = operation.hash_value
+        self._close_prefetch_timing(request, operation)
 
         (
             last_host_node_id,
@@ -2221,15 +2228,26 @@ class UnifiedRadixCache(BasePrefixCache):
         else:
             self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
         logger.info(
-            "HiCache prefetch %s req=%s completed=%d matched=%d loaded=%d occupied=%d",
+            "HiCache prefetch %s req=%s completed=%d matched=%d loaded=%d occupied=%d "
+            "issued_at=%.3f timeline_ms: %s",
             "dropped" if insert_result.host_insert_dropped else "success",
             request.rid,
             completed_tokens,
             insert_result.prefix_len,
             loaded_from_storage,
             self.cache_controller.prefetch_tokens_occupied,
+            operation.timing.start_wall,
+            operation.timing.timeline_ms(),
         )
         return
+
+    def _close_prefetch_timing(
+        self, request: CacheRequestHandle, operation: PrefetchOperation
+    ) -> None:
+        # First terminal event wins: a revoke can follow a committed result.
+        if operation.timing.commit == 0.0:
+            operation.timing.commit = time.monotonic()
+        self.prefetch_timing_by_reqid[request] = operation.timing
 
     def _check_hybrid_prefetch_result(
         self,
@@ -2432,6 +2450,10 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
     def pop_prefetch_loaded_tokens(self, request: CacheRequestHandle) -> int:
+        # Decode consumes a prefetch only through this call; it has no SWA fork
+        # or prefetch-stage metrics, so drop their entries here too.
+        self.storage_full_kv_end_by_reqid.pop(request, None)
+        self.prefetch_timing_by_reqid.pop(request, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
         return self.prefetch_loaded_tokens_by_reqid.pop(request, 0)
 
@@ -2447,6 +2469,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def pop_storage_full_kv_end(self, request: CacheRequestHandle) -> Optional[int]:
         return self.storage_full_kv_end_by_reqid.pop(request, None)
 
+    def pop_prefetch_timing(
+        self, request: CacheRequestHandle
+    ) -> Optional[PrefetchTiming]:
+        return self.prefetch_timing_by_reqid.pop(request, None)
+
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
@@ -2455,6 +2482,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(rid, None)
         self.storage_full_kv_end_by_reqid.pop(request, None)
+        self.prefetch_timing_by_reqid.pop(request, None)
         self.storage_prefetch_retries.cancel(rid)
         if (
             self.buffer_pipeline is not None
@@ -2476,6 +2504,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if operation.host_indices is None:
             self.cache_controller.terminate_prefetch(operation)
             self.revoke_pending_prefetch(request)
+            # The revoke recorded timing for a request that is never admitted.
+            self.prefetch_timing_by_reqid.pop(request, None)
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
@@ -2635,6 +2665,7 @@ class UnifiedRadixCache(BasePrefixCache):
             anchor_lock_params,
             comp_xfers,
         ) = info
+        self._close_prefetch_timing(request, operation)
         self._invalidate_absent_from_hit_query(operation)
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.pop_prefix_ctx(request)
@@ -2802,6 +2833,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if buffer_mode:
                 cc.prefetch_tokens_occupied += alloc_len
             cc.prefetch_buffer.put(operation)
+            operation.timing.io_enqueued = time.monotonic()
             return True
 
         def _drain_and_alloc_storage_hit():
@@ -2814,6 +2846,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     parked.popleft()
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
                 request = operation.handle
+                operation.timing.hit_drained = time.monotonic()
                 hit_tokens = operation.storage_hit_count
                 info = self.ongoing_prefetch.get(request)
                 if info is None:

@@ -3922,6 +3922,11 @@ class Scheduler(
                     req.storage_full_kv_end = max(
                         req.storage_full_kv_end or 0, storage_full_kv_end
                     )
+                prefetch_timing = self.tree_cache.pop_prefetch_timing(
+                    req.cache_request_handle
+                )
+                if prefetch_timing is not None:
+                    req.time_stats.observe_hicache_prefetch_stages(prefetch_timing)
 
             req.init_next_round_input(self.tree_cache)
             if self.enable_hicache_storage and (

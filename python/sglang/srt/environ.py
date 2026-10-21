@@ -1238,6 +1238,9 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    # Route MiMo-V2 Pro (384 experts, one group) through the dedicated CUDA gate
+    # instead of the Triton router. Name kept from 0510 so deployments carry over.
+    SGLANG_USE_FUSED_MOE_GATE = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends

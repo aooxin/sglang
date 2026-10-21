@@ -133,6 +133,12 @@ _is_xpu = is_xpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
+_use_mimo_pro_fused_gate = _is_cuda and envs.SGLANG_USE_FUSED_MOE_GATE.get()
+if _use_mimo_pro_fused_gate:
+    from sglang.kernels.ops.moe.mimo_pro_moe_fused_gate import (
+        MIMO_PRO_NUM_EXPERTS,
+        mimo_pro_moe_fused_gate,
+    )
 
 # Epsilon added to the top-k weight sum before renormalization, matching the
 # DeepSeek reference gate (modeling_deepseek.py: `topk_weight.sum(...) + 1e-20`)
@@ -1801,6 +1807,24 @@ def biased_grouped_topk_gpu(
             apply_routed_scaling_factor_on_output,
         )
         return topk_weights, topk_ids
+    elif (
+        _use_mimo_pro_fused_gate
+        and num_experts == MIMO_PRO_NUM_EXPERTS
+        and num_expert_group == 1
+        and num_fused_shared_experts == 0
+    ):
+        return mimo_pro_moe_fused_gate(
+            gating_output,
+            correction_bias.to(dtype=torch.float32),
+            topk,
+            renormalize=renormalize,
+            routed_scaling_factor=(
+                routed_scaling_factor if routed_scaling_factor is not None else 1.0
+            ),
+            apply_routed_scaling_factor_on_output=bool(
+                apply_routed_scaling_factor_on_output
+            ),
+        )
     else:
         num_experts = gating_output.shape[1]
         # The JIT triton router (single fused kernel: scoring + bias + topk +
@@ -2174,6 +2198,10 @@ def _post_process_topk_ids(
             # Per-rank shared-slot remap later adds shared slots to the topk ID
             # space, so keep the routed physical ids separately for statistics.
             recorder_topk_ids = routed_cols
+        elif expert_location_dispatch_info is None:
+            # No dispatch map, so the remap is identity: mask padded rows eagerly.
+            # The compiled wrapper costs per-call guards and splits at mask_topk_ids.
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
         else:
             topk_ids = _biased_grouped_topk_postprocess(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded

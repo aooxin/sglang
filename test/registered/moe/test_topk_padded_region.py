@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import torch
 
@@ -246,6 +247,37 @@ class TestSelectExpertsCustomRoutingPadMask(CustomTestCase):
         # ...and real rows untouched (in-range, no -1 leakage).
         self.assertTrue(torch.all(out.topk_ids[:n_valid] >= 0))
         self.assertTrue(torch.all(out.topk_ids[:n_valid] < num_experts))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "padded-region masking needs a GPU")
+@unittest.skipIf(_IS_HIP, "HIP has its own padded-region path")
+class TestPostProcessWithoutDispatchMapCuda(CustomTestCase):
+    """Without an expert-location dispatch map the remap is identity, so the
+    post-process must mask padded rows eagerly instead of entering the
+    torch.compile wrapper, whose per-call guards dominate eager prefill."""
+
+    DEVICE = "cuda"
+
+    def test_masks_eagerly_without_compiled_wrapper(self):
+        n, k, n_valid = 16, 8, 5
+        topk_ids = torch.randint(0, 64, (n, k), device=self.DEVICE, dtype=torch.int32)
+        compiled = mock.Mock(side_effect=lambda ids, info, pad_count: ids)
+        with mock.patch.object(topk_mod, "_biased_grouped_topk_postprocess", compiled):
+            out_ids, _, _ = _post_process_topk_ids(
+                topk_ids.clone(),
+                torch.rand((n, k), device=self.DEVICE, dtype=torch.float32),
+                TopKConfig(top_k=k, num_fused_shared_experts=0),
+                torch.rand((n, 64), device=self.DEVICE, dtype=torch.float32),
+                layer_id=0,
+                num_token_non_padded=torch.tensor(
+                    n_valid, device=self.DEVICE, dtype=torch.int32
+                ),
+                expert_location_dispatch_info=None,
+            )
+
+        compiled.assert_not_called()
+        self.assertTrue(torch.equal(out_ids[:n_valid], topk_ids[:n_valid]))
+        self.assertTrue(torch.all(out_ids[n_valid:] == -1))
 
 
 if __name__ == "__main__":

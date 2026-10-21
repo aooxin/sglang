@@ -850,9 +850,12 @@ class MiMoProcessor:
             else:
                 kwargs[k] = self.default_video_processor_kwargs[k]
 
-        for k in ["total_max_pixels", "min_pixels"]:
-            limit = self.default_video_processor_kwargs[k]
-            if limit is not None and kwargs[k] is not None:
+        limits = {
+            "total_max_pixels": envs.SGLANG_MIMO_VIDEO_TOTAL_MAX_PIXELS.get(),
+            "max_pixels": envs.SGLANG_MIMO_VIDEO_MAX_PIXELS.get(),
+        }
+        for k, limit in limits.items():
+            if kwargs[k] is not None:
                 kwargs[k] = min(kwargs[k], limit)
 
         if video.max_frame_token is not None:

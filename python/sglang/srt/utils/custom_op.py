@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import inspect
 from typing import Any, Callable, List, Optional, TypeVar, Union, overload
 
@@ -7,6 +8,7 @@ import torch
 import torch.library
 
 from sglang.kernels.kernel_api_logging import debug_torch_op
+from sglang.srt.environ import envs
 
 F = TypeVar("F", bound=Callable)
 
@@ -130,6 +132,17 @@ def register_custom_op(
     return decorator
 
 
+def _eager_direct_call(op_func: Callable, op: Callable) -> Callable:
+    @functools.wraps(op_func)
+    def call(*args, **kwargs):
+        # Dynamo must still record the opaque torch.ops node.
+        if torch.compiler.is_compiling():
+            return op(*args, **kwargs)
+        return op_func(*args, **kwargs)
+
+    return call
+
+
 class CustomOpWrapper:
     def __init__(
         self,
@@ -161,7 +174,13 @@ class CustomOpWrapper:
                     mutates_args=self.mutates_args,
                     fake_impl=self.fake_impl,
                 )
-            self._impl = debug_torch_op(self.op_func, self.op_name)
+            impl = debug_torch_op(self.op_func, self.op_name)
+            # Identity holds only when kernel API logging is off; keep logged ops on torch.ops.
+            if envs.SGLANG_OPT_CUSTOM_OP_EAGER_DIRECT_CALL.get() and impl is getattr(
+                torch.ops.sglang, self.op_name
+            ):
+                impl = _eager_direct_call(self.op_func, impl)
+            self._impl = impl
             assert self._impl is not None
         return self._impl
 

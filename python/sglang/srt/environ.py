@@ -1256,6 +1256,9 @@ class Envs:
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
+    # Outside torch.compile tracing, call register_custom_op functions directly
+    # instead of through the torch.ops dispatcher (2-4 us per call on H20).
+    SGLANG_OPT_CUSTOM_OP_EAGER_DIRECT_CALL = EnvBool(False)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
 

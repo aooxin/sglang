@@ -257,24 +257,25 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        all_tools = request.get_all_tools()
         if (
             isinstance(request.tool_choice, str)
             and request.tool_choice.lower() == "required"
-            and not request.tools
+            and not all_tools
         ):
             return "Tools cannot be empty if tool choice is set to required."
 
         if request.tool_choice is not None and not isinstance(request.tool_choice, str):
-            if not request.tools:
+            if not all_tools:
                 return "Tools cannot be empty if tool choice is set to a specific tool."
             tool_name = request.tool_choice.function.name
-            tool_exists = any(tool.function.name == tool_name for tool in request.tools)
+            tool_exists = any(tool.function.name == tool_name for tool in all_tools)
             if not tool_exists:
                 return f"Tool '{tool_name}' not found in tools list."
 
         # Validate tool definitions
         if not request.return_tokens_only:
-            for i, tool in enumerate(request.tools or []):
+            for i, tool in enumerate(all_tools or []):
                 if tool.function.parameters is None:
                     continue
                 try:
@@ -425,18 +426,22 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Apply chat template and its stop strings
         tools = None
-        if request.tools and request.tool_choice != "none":
+        # Message-level tools are rendered inline by the template, so only
+        # request-level tools go to its `tools` argument; parsing and
+        # constraints see both.
+        all_tools = request.get_all_tools()
+        if all_tools and request.tool_choice != "none":
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
                 tools = [
                     item.model_dump()
-                    for item in request.tools
+                    for item in request.tools or []
                     if item.function.name == request.tool_choice.function.name
-                ]
-            else:
+                ] or None
+            elif request.tools:
                 tools = [item.model_dump() for item in request.tools]
             if self.tool_call_parser:
-                parser = FunctionCallParser(request.tools, self.tool_call_parser)
+                parser = FunctionCallParser(all_tools, self.tool_call_parser)
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
@@ -446,7 +451,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.tool_choice, ToolChoice
             ):
                 json_schema = get_json_schema_constraint(
-                    request.tools,
+                    all_tools,
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
@@ -941,7 +946,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             should_parse_tool_calls = bool(
                 request.tool_choice != "none"
-                and request.tools
+                and request.get_all_tools()
                 and self.tool_call_parser
             )
             history_tool_calls_cnt = (
@@ -1371,6 +1376,7 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> Union[ChatCompletionResponse, ORJSONResponse]:
         """Build chat completion response from generation results"""
         choices = []
+        all_tools = request.get_all_tools()
 
         # Build sglext at response level (from first ret_item, as these are per-request)
         first_ret = ret[0]
@@ -1425,7 +1431,7 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_calls = None
             if (
                 request.tool_choice != "none"
-                and request.tools
+                and all_tools
                 and self.tool_call_parser
                 and not self._toolcall_gate_blocks(ret_item.get("output_ids"))
             ):
@@ -1438,7 +1444,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ) = self._process_tool_calls_with_reasoning_fallback(
                     text,
                     reasoning_text,
-                    request.tools,
+                    all_tools,
                     finish_reason,
                     request.tool_choice,
                     history_tool_calls_cnt,
@@ -1866,7 +1872,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 parser_dict[index] = JsonArrayParser()
             else:
                 parser_dict[index] = FunctionCallParser(
-                    tools=request.tools,
+                    tools=request.get_all_tools(),
                     tool_call_parser=self.tool_call_parser,
                 )
 
@@ -1874,7 +1880,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Handle both FunctionCallParser and JsonArrayParser
         if isinstance(parser, JsonArrayParser):
-            result = parser.parse_streaming_increment(delta, request.tools)
+            result = parser.parse_streaming_increment(delta, request.get_all_tools())
             normal_text, calls = result.normal_text, result.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)

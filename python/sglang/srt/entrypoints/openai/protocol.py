@@ -28,10 +28,10 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response import ToolChoice
-from openai.types.responses.tool import Tool
 from pydantic import (
     BaseModel,
     Field,
+    PrivateAttr,
     field_validator,
     model_serializer,
     model_validator,
@@ -498,6 +498,74 @@ RerankContentPart = Union[
 RerankContent = Union[str, List[RerankContentPart]]
 
 
+class _VerbatimJSONModel(BaseModel):
+    """Serializes back to the exact JSON object it was validated from: same
+    keys in the same order, unknown keys kept, unset defaults not injected.
+
+    Chat templates render tool definitions with `tojson`, so this keeps the
+    prompt identical to what the client sent. Instances not validated from a
+    dict serialize normally.
+    """
+
+    _raw_json: Optional[Dict[str, Any]] = PrivateAttr(default=None)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _keep_raw_json(cls, data, handler):
+        if not isinstance(data, dict):
+            return handler(data)
+        model = handler(cls._normalize_json(data))
+        model._raw_json = data
+        return model
+
+    @classmethod
+    def _normalize_json(cls, data: Dict[str, Any]) -> Dict[str, Any]:
+        return data
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        if self._raw_json is None:
+            return handler(self)
+        return self._raw_json
+
+
+class Function(_VerbatimJSONModel):
+    """Function descriptions."""
+
+    description: Optional[str] = Field(default=None, examples=[None])
+    name: str
+    parameters: Optional[object] = None
+    strict: bool = False
+
+
+class Tool(_VerbatimJSONModel):
+    """Function wrapper.
+
+    Also accepts custom (freeform) tools, `{"type": "custom", "custom": {...}}`:
+    their name and description are exposed through `function` (without
+    `parameters`) so tool-call parsers can match them, while serialization
+    keeps the original custom shape.
+    """
+
+    type: str = Field(default="function", examples=["function"])
+    function: Function
+
+    @classmethod
+    def _normalize_json(cls, data: Dict[str, Any]) -> Dict[str, Any]:
+        custom = data.get("custom")
+        if (
+            data.get("type") == "custom"
+            and "function" not in data
+            and isinstance(custom, dict)
+        ):
+            function = {
+                "name": custom.get("name"),
+                "description": custom.get("description"),
+            }
+            return {**data, "function": function}
+        return data
+
+
 class FunctionResponse(BaseModel):
     """Function response."""
 
@@ -541,6 +609,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
+    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
 
 
 ChatCompletionMessageParam = Union[
@@ -548,20 +617,17 @@ ChatCompletionMessageParam = Union[
 ]
 
 
-class Function(BaseModel):
-    """Function descriptions."""
-
-    description: Optional[str] = Field(default=None, examples=[None])
-    name: str
-    parameters: Optional[object] = None
-    strict: bool = False
-
-
-class Tool(BaseModel):
-    """Function wrapper."""
-
-    type: str = Field(default="function", examples=["function"])
-    function: Function
+def _has_message_level_tools(messages: Any) -> bool:
+    if not isinstance(messages, list):
+        return False
+    for msg in messages:
+        if isinstance(msg, dict):
+            role, tools = msg.get("role"), msg.get("tools")
+        else:
+            role, tools = getattr(msg, "role", None), getattr(msg, "tools", None)
+        if role != "assistant" and tools:
+            return True
+    return False
 
 
 class ToolChoiceFuncName(BaseModel):
@@ -702,11 +768,35 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def set_tool_choice_default(cls, values):
         if values.get("tool_choice") is None:
-            if values.get("tools") is None:
+            if values.get("tools") is None and not _has_message_level_tools(
+                values.get("messages")
+            ):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
         return values
+
+    def get_all_tools(self) -> Optional[List[Tool]]:
+        """Request-level tools plus tools attached to non-assistant messages.
+
+        Some chat templates (e.g. MiMo-V2) render a message's own `tools`
+        inline, so the model may call tools that are absent from the
+        request-level list. Use this for tool-call parsing, validation and
+        constraints; only request-level `tools` go to the template's `tools`
+        argument. A later definition of the same function name overrides an
+        earlier one.
+        """
+        if not _has_message_level_tools(self.messages):
+            return self.tools
+        merged: Dict[str, Tool] = {}
+        for tool in self.tools or []:
+            merged[tool.function.name] = tool
+        for msg in self.messages:
+            if msg.role == "assistant" or not msg.tools:
+                continue
+            for tool in msg.tools:
+                merged[tool.function.name] = tool
+        return list(merged.values())
 
     @model_validator(mode="before")
     @classmethod

@@ -39,7 +39,8 @@ def _get_param_type(func_name: str, param_name: str, tools: List[Tool]) -> str:
     """Get parameter type from tool schema."""
     for tool in tools:
         if tool.function.name == func_name:
-            props = tool.function.parameters.get("properties", {})
+            # Custom (freeform) tools carry no parameters schema.
+            props = (tool.function.parameters or {}).get("properties", {})
             if param_name in props:
                 return props[param_name].get("type", "string")
     return "string"

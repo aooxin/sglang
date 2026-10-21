@@ -188,8 +188,15 @@ class DFlashDraftInputV2(SpecInput):
 
         plan_stream, plan_stream_ctx = _get_overlap_plan_stream(batch.device)
         if plan_stream is None and self.verify_done is not None:
-            # Ensure previous forward is completed before mutating shared buffers.
-            self.verify_done.synchronize()
+            if (
+                torch.device(batch.device).type == "cuda"
+                and self._prepare_cur_kv_lens_cpu_buf is None
+            ):
+                torch.get_device_module(batch.device).current_stream().wait_event(
+                    self.verify_done
+                )
+            else:
+                self.verify_done.synchronize()
 
         bs = batch.batch_size()
         if bs == 0:

@@ -2857,6 +2857,11 @@ def launch_server(
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
 
+    if get_parallel().node_rank >= 1:
+        # Worker-only nodes have already waited for their schedulers to exit
+        # inside _launch_subprocesses and have no tokenizer/HTTP server to run.
+        return
+
     if envs.SGLANG_RUST_SERVER.get():
         # The Rust server serves api-server, tokenizer, and detokenizer, so the
         # main process has no Python HTTP server / tokenizer manager to run.

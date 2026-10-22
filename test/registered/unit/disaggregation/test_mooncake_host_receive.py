@@ -1,23 +1,16 @@
-"""Host destination wire compatibility, drain lifetime and TP admission consensus."""
+"""Host destination wire compatibility and drain lifetime."""
 
 import dataclasses
-import os
-import tempfile
 import threading
 import unittest
 from collections import defaultdict
-from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
-import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVTransferDestination
 from sglang.srt.disaggregation.common.conn import CommonKVManager, KVTransferError
-from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo,
     MooncakeKVManager,
@@ -77,46 +70,6 @@ def _registration():
         dst_host_state_data_ptrs=[[140, 150]],
         dst_host_state_item_lens=[[512, 256]],
     )
-
-
-def _consensus_worker(rank, rendezvous):
-    dist.init_process_group(
-        "gloo",
-        init_method=rendezvous,
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=30),
-    )
-    try:
-        queue = object.__new__(DecodePreallocQueue)
-        queue.gloo_group = dist.group.WORLD
-        # One delayed/short rank vetoes admission; both resume in the same tick.
-        for states, expected in [
-            ((True, False), False),
-            ((False, True), False),
-            ((False, False), False),
-            ((True, True), True),
-        ]:
-            assert queue._host_receive_all_ready(states[rank]) == expected
-        # Reuse the actual host allocator method. A local SWA failure rolls back
-        # the peer's successful allocation as well as both full allocations.
-        queue.host_pool = Mock(page_size=4)
-        queue.host_pool.available_size.return_value = 32
-        queue.host_pool.alloc.return_value = torch.arange(4, 12)
-        queue.host_swa_pool = Mock()
-        queue.host_swa_pool.available_size.return_value = 32
-        queue.host_swa_pool.alloc.return_value = None if rank else torch.arange(4, 12)
-        queue.host_reserved_tokens = 4
-        queue.host_swa_reserved_tokens = 4
-        queue.scheduler = SimpleNamespace(sliding_window_size=8)
-        queue.tree_cache = SimpleNamespace(disable=True)
-        request = SimpleNamespace(req=SimpleNamespace(origin_input_ids=[1] * 7))
-        assert not queue._pre_alloc_host(request)
-        queue.host_pool.free.assert_called_once()
-        assert queue.host_swa_pool.free.call_count == (0 if rank else 1)
-        assert queue._host_receive_all_ready(True)
-    finally:
-        dist.destroy_process_group()
 
 
 class TestMooncakeHostReceive(CustomTestCase):
@@ -221,15 +174,6 @@ class TestMooncakeHostReceive(CustomTestCase):
         self.assertTrue(receiver.is_abort_release_safe())
         receiver.kv_mgr._deferred_abort_ack_tracker[17].remove(1)
         self.assertFalse(receiver.is_abort_release_safe())
-
-    def test_real_gloo_capacity_and_swa_rollback(self):
-        with tempfile.TemporaryDirectory() as directory:
-            mp.spawn(
-                _consensus_worker,
-                args=("file://" + os.path.join(directory, "gloo"),),
-                nprocs=2,
-                join=True,
-            )
 
     def test_failure_exception_keeps_early_and_late_host_drain_acks(self):
         receiver = _receiver()

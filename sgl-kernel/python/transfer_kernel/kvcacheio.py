@@ -318,6 +318,34 @@ def transfer_kv_direct(
     )
 
 
+def transfer_kv_direct_mode(
+    src_layers: List[torch.Tensor],
+    dst_layers: List[torch.Tensor],
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    page_size: int,
+    mode: str,
+):
+    """Benchmark-only forced backend selection: plain, batch, or 3d."""
+    api_calls, segments, groups, reason = (
+        torch.ops.transfer_kernel.transfer_kv_direct_mode.default(
+            src_layers,
+            dst_layers,
+            src_indices,
+            dst_indices,
+            page_size,
+            mode,
+        )
+    )
+    return {
+        "mode": mode,
+        "api_calls": api_calls,
+        "copy_segments": segments,
+        "layer_groups": groups,
+        "reason": reason,
+    }
+
+
 def transfer_kv_per_layer_direct_mla(
     src: torch.Tensor,
     dst: torch.Tensor,

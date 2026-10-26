@@ -7,6 +7,8 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1068,6 +1070,106 @@ inline void transfer_page_direct(
           /* non_blocking= */ true);
 }
 
+struct H2DLayerInfo {
+  size_t row_bytes;
+  char* src;
+  char* dst;
+};
+
+struct DirectCopyRun {
+  int64_t src_index;
+  int64_t dst_index;
+  int64_t length;
+};
+
+// Both the experiment-only backends and the production fallback need the same
+// H2D layout checks. Keep them in one place so a backend cannot silently copy
+// a tensor that another backend rejected.
+bool describe_h2d_layers(
+    const std::vector<at::Tensor>& src_layers,
+    const std::vector<at::Tensor>& dst_layers,
+    int device_id,
+    std::vector<H2DLayerInfo>& layers) {
+  if (src_layers.size() != dst_layers.size()) {
+    return false;
+  }
+  layers.clear();
+  layers.reserve(src_layers.size());
+  for (size_t j = 0; j < src_layers.size(); ++j) {
+    const auto& src = src_layers[j];
+    const auto& dst = dst_layers[j];
+    if (!src.is_cpu() || !dst.is_cuda() || dst.get_device() != device_id || !src.is_pinned() || !src.is_contiguous() ||
+        !dst.is_contiguous() || src.scalar_type() != dst.scalar_type() || src.dim() == 0 || dst.dim() == 0 ||
+        src.sizes().slice(1) != dst.sizes().slice(1) || src.size(0) == 0 || dst.size(0) == 0) {
+      return false;
+    }
+    const auto row_bytes = src.numel() / src.size(0) * src.element_size();
+    if (row_bytes == 0) {
+      return false;
+    }
+    layers.push_back(
+        {static_cast<size_t>(row_bytes), static_cast<char*>(src.data_ptr()), static_cast<char*>(dst.data_ptr())});
+  }
+  return true;
+}
+
+std::vector<DirectCopyRun>
+merge_direct_copy_runs(const at::Tensor& src_indices_cpu, const at::Tensor& dst_indices_cpu) {
+  const auto* src_indices = src_indices_cpu.data_ptr<int64_t>();
+  const auto* dst_indices = dst_indices_cpu.data_ptr<int64_t>();
+  const auto count = src_indices_cpu.numel();
+  std::vector<DirectCopyRun> runs;
+  for (int64_t begin = 0; begin < count;) {
+    int64_t end = begin + 1;
+    while (end < count && src_indices[end] == src_indices[end - 1] + 1 &&
+           dst_indices[end] == dst_indices[end - 1] + 1) {
+      ++end;
+    }
+    runs.push_back({src_indices[begin], dst_indices[begin], end - begin});
+    begin = end;
+  }
+  return runs;
+}
+
+bool validate_direct_copy_runs(
+    const std::vector<DirectCopyRun>& runs,
+    const std::vector<H2DLayerInfo>& layers,
+    const std::vector<at::Tensor>& src_layers,
+    const std::vector<at::Tensor>& dst_layers,
+    bool check_destination_overlap) {
+  std::vector<std::pair<uintptr_t, uintptr_t>> dst_ranges;
+  if (check_destination_overlap) {
+    dst_ranges.reserve(runs.size() * layers.size());
+  }
+  for (const auto& run : runs) {
+    for (size_t j = 0; j < layers.size(); ++j) {
+      const auto row_bytes = static_cast<int64_t>(layers[j].row_bytes);
+      if (run.src_index < 0 || run.dst_index < 0 || run.length > src_layers[j].size(0) ||
+          run.length > dst_layers[j].size(0) || run.src_index > src_layers[j].size(0) - run.length ||
+          run.dst_index > dst_layers[j].size(0) - run.length) {
+        return false;
+      }
+      if (check_destination_overlap) {
+        const auto bytes = run.length * row_bytes;
+        const auto address = reinterpret_cast<uintptr_t>(layers[j].dst + run.dst_index * row_bytes);
+        dst_ranges.emplace_back(address, address + bytes);
+      }
+    }
+  }
+  if (!check_destination_overlap) {
+    return true;
+  }
+  // Copy APIs are unordered. Preserve ATen copy_'s sequential semantics for
+  // repeated destination indices or aliasing destination tensors.
+  std::sort(dst_ranges.begin(), dst_ranges.end());
+  for (size_t i = 1; i < dst_ranges.size(); ++i) {
+    if (dst_ranges[i].first < dst_ranges[i - 1].second) {
+      return false;
+    }
+  }
+  return true;
+}
+
 #if !defined(USE_ROCM) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
 // CUDA headers may provide C++ overloads of cudaMemcpyBatchAsync, so taking
 // its address with decltype is ambiguous. Describe the runtime symbol's ABI
@@ -1131,70 +1233,31 @@ bool try_transfer_kv_batch_h2d(
   if (stream == at::cuda::getDefaultCUDAStream(device_id)) {
     return false;
   }
-  std::vector<size_t> row_bytes;
-  row_bytes.reserve(src_layers.size());
-  for (size_t j = 0; j < src_layers.size(); ++j) {
-    const auto& src = src_layers[j];
-    const auto& dst = dst_layers[j];
-    if (!src.is_cpu() || !dst.is_cuda() || dst.get_device() != device_id || !src.is_pinned() || !src.is_contiguous() ||
-        !dst.is_contiguous() || src.scalar_type() != dst.scalar_type() || src.dim() == 0 || dst.dim() == 0 ||
-        src.sizes().slice(1) != dst.sizes().slice(1) || src.size(0) == 0 || dst.size(0) == 0) {
-      return false;
-    }
-    const auto bytes = src.numel() / src.size(0) * src.element_size();
-    if (bytes == 0) {
-      return false;
-    }
-    row_bytes.push_back(bytes);
+  std::vector<H2DLayerInfo> layers;
+  if (!describe_h2d_layers(src_layers, dst_layers, device_id, layers)) {
+    return false;
   }
-
-  const auto* src_indices = src_indices_cpu.data_ptr<int64_t>();
-  const auto* dst_indices = dst_indices_cpu.data_ptr<int64_t>();
-  const auto count = src_indices_cpu.numel();
   // Merge runs contiguous on BOTH sides before building the CUDA batch.
-  std::vector<std::array<int64_t, 3>> runs;
-  for (int64_t begin = 0; begin < count;) {
-    int64_t end = begin + 1;
-    while (end < count && src_indices[end] == src_indices[end - 1] + 1 &&
-           dst_indices[end] == dst_indices[end - 1] + 1) {
-      ++end;
-    }
-    runs.push_back({src_indices[begin], dst_indices[begin], end - begin});
-    begin = end;
+  const auto runs = merge_direct_copy_runs(src_indices_cpu, dst_indices_cpu);
+  if (!validate_direct_copy_runs(runs, layers, src_layers, dst_layers, true)) {
+    return false;
   }
 
   std::vector<MemcpyBatchSrcPointer> srcs;
   std::vector<void*> dsts;
   std::vector<size_t> sizes;
-  std::vector<std::pair<uintptr_t, uintptr_t>> dst_ranges;
   const auto num_copies = runs.size() * src_layers.size();
   srcs.reserve(num_copies);
   dsts.reserve(num_copies);
   sizes.reserve(num_copies);
-  dst_ranges.reserve(num_copies);
   for (const auto& run : runs) {
-    const auto [src_index, dst_index, length] = run;
     for (size_t j = 0; j < src_layers.size(); ++j) {
-      if (src_index < 0 || dst_index < 0 || length > src_layers[j].size(0) || length > dst_layers[j].size(0) ||
-          src_index > src_layers[j].size(0) - length || dst_index > dst_layers[j].size(0) - length) {
-        return false;
-      }
-      auto* src = static_cast<char*>(src_layers[j].data_ptr()) + src_index * row_bytes[j];
-      auto* dst = static_cast<char*>(dst_layers[j].data_ptr()) + dst_index * row_bytes[j];
-      const auto bytes = length * row_bytes[j];
+      const auto bytes = run.length * static_cast<int64_t>(layers[j].row_bytes);
+      auto* src = layers[j].src + run.src_index * layers[j].row_bytes;
+      auto* dst = layers[j].dst + run.dst_index * layers[j].row_bytes;
       srcs.push_back(src);
       dsts.push_back(dst);
       sizes.push_back(bytes);
-      const auto address = reinterpret_cast<uintptr_t>(dst);
-      dst_ranges.emplace_back(address, address + bytes);
-    }
-  }
-  // Batch copies are unordered. Preserve copy_'s sequential semantics for
-  // repeated destination indices or aliasing destination tensors.
-  std::sort(dst_ranges.begin(), dst_ranges.end());
-  for (size_t i = 1; i < dst_ranges.size(); ++i) {
-    if (dst_ranges[i].first < dst_ranges[i - 1].second) {
-      return false;
     }
   }
 
@@ -1218,6 +1281,96 @@ bool try_transfer_kv_batch_h2d(
   }
   TORCH_CHECK(
       err == cudaSuccess, "cudaMemcpyBatchAsync H2D failed. failIdx=", fail_idx, " error=", cudaGetErrorString(err));
+  return true;
+}
+#endif
+
+// Experimental cudaMemcpy3D backend for layer-first pools. A fixed layer
+// stride lets one volume describe the same token run across all layers:
+// pitch is the layer stride, height is one, and depth is the layer count.
+// This is deliberately rejected unless every layer group has at least two
+// members and a constant positive stride on both sides.
+#if !defined(USE_ROCM)
+bool try_transfer_kv_3d_h2d(
+    const std::vector<at::Tensor>& src_layers,
+    const std::vector<at::Tensor>& dst_layers,
+    const at::Tensor& src_indices_cpu,
+    const at::Tensor& dst_indices_cpu,
+    int64_t* api_calls,
+    int64_t* layer_groups,
+    std::string* reason) {
+  if (src_layers.empty() || src_indices_cpu.numel() == 0) {
+    return false;
+  }
+  const int device_id = at::cuda::current_device();
+  std::vector<H2DLayerInfo> layers;
+  if (!describe_h2d_layers(src_layers, dst_layers, device_id, layers)) {
+    *reason = "unsupported_layer_layout";
+    return false;
+  }
+  const auto runs = merge_direct_copy_runs(src_indices_cpu, dst_indices_cpu);
+  if (!validate_direct_copy_runs(runs, layers, src_layers, dst_layers, true)) {
+    *reason = "invalid_or_overlapping_destination";
+    return false;
+  }
+
+  std::vector<std::pair<size_t, size_t>> groups;
+  for (size_t begin = 0; begin < layers.size();) {
+    size_t end = begin + 1;
+    if (end < layers.size() && layers[end].row_bytes == layers[begin].row_bytes) {
+      const auto src_stride = layers[end].src - layers[begin].src;
+      const auto dst_stride = layers[end].dst - layers[begin].dst;
+      if (src_stride <= 0 || dst_stride <= 0 || static_cast<size_t>(src_stride) < layers[begin].row_bytes ||
+          static_cast<size_t>(dst_stride) < layers[begin].row_bytes) {
+        *reason = "invalid_layer_stride";
+        return false;
+      }
+      while (end < layers.size() && layers[end].row_bytes == layers[begin].row_bytes &&
+             layers[end].src - layers[end - 1].src == src_stride &&
+             layers[end].dst - layers[end - 1].dst == dst_stride) {
+        ++end;
+      }
+    }
+    if (end - begin < 2) {
+      *reason = end == layers.size() ? "no_multi_layer_group" : "nonuniform_layer_stride";
+      return false;
+    }
+    groups.emplace_back(begin, end);
+    begin = end;
+  }
+
+  const auto stream = at::cuda::getCurrentCUDAStream(device_id);
+  for (const auto& src : src_layers) {
+    at::cuda::CachingHostAllocator_recordEvent(src.data_ptr(), src.storage().data_ptr().get_context(), stream);
+  }
+
+  for (const auto& run : runs) {
+    for (const auto& [begin, end] : groups) {
+      const auto row_bytes = layers[begin].row_bytes;
+      const auto run_bytes = static_cast<size_t>(run.length) * row_bytes;
+      cudaMemcpy3DParms params{};
+      params.srcPtr = {
+          layers[begin].src + run.src_index * row_bytes,
+          static_cast<size_t>(layers[begin + 1].src - layers[begin].src),
+          run_bytes,
+          1};
+      params.dstPtr = {
+          layers[begin].dst + run.dst_index * row_bytes,
+          static_cast<size_t>(layers[begin + 1].dst - layers[begin].dst),
+          run_bytes,
+          1};
+      params.extent = {run_bytes, 1, end - begin};
+      params.kind = cudaMemcpyHostToDevice;
+      const auto err = cudaMemcpy3DAsync(&params, stream);
+      if (err != cudaSuccess) {
+        cudaGetLastError();
+        TORCH_CHECK(false, "cudaMemcpy3DAsync H2D failed: ", cudaGetErrorString(err));
+      }
+      ++*api_calls;
+    }
+  }
+  *layer_groups = static_cast<int64_t>(groups.size());
+  *reason = "3d";
   return true;
 }
 #endif
@@ -1272,6 +1425,60 @@ void transfer_kv_direct(
     }
     start_index = end_index;
   }
+}
+
+// Benchmark-only entry point. It keeps production dispatch unchanged while
+// forcing each backend from one binary so comparisons do not mix wheels.
+std::tuple<int64_t, int64_t, int64_t, std::string> transfer_kv_direct_mode(
+    const std::vector<at::Tensor>& src_layers,
+    std::vector<at::Tensor> dst_layers,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t page_size,
+    std::string mode) {
+  TORCH_CHECK(
+      src_layers.size() == dst_layers.size(), "Source and destination layers must have the same number of layers");
+  TORCH_CHECK(src_indices.numel() == dst_indices.numel(), "Source and destination indices must have the same length");
+  TORCH_CHECK(page_size > 0, "Page size must be positive");
+  TORCH_CHECK(src_indices.numel() % page_size == 0, "Source indices size must be divisible by page size");
+
+  auto src_indices_cpu = src_indices.cpu().contiguous();
+  auto dst_indices_cpu = dst_indices.cpu().contiguous();
+  const auto runs = merge_direct_copy_runs(src_indices_cpu, dst_indices_cpu);
+  const auto segments = static_cast<int64_t>(runs.size() * src_layers.size());
+  int64_t api_calls = 0;
+  int64_t groups = 0;
+
+  if (mode == "plain") {
+    for (const auto& run : runs) {
+      for (size_t j = 0; j < src_layers.size(); ++j) {
+        transfer_page_direct(src_layers[j], dst_layers[j], run.src_index, run.dst_index, run.length);
+      }
+    }
+    api_calls = segments;
+  } else if (mode == "batch") {
+#if !defined(USE_ROCM) && defined(CUDART_VERSION) && CUDART_VERSION >= 12080
+    TORCH_CHECK(
+        try_transfer_kv_batch_h2d(src_layers, dst_layers, src_indices_cpu, dst_indices_cpu),
+        "cudaMemcpyBatchAsync H2D is not available for this input");
+    api_calls = segments == 0 ? 0 : 1;
+#else
+    TORCH_CHECK(false, "cudaMemcpyBatchAsync H2D requires CUDA 12.8 or newer");
+#endif
+  } else if (mode == "3d") {
+#if !defined(USE_ROCM)
+    std::string reason;
+    TORCH_CHECK(
+        try_transfer_kv_3d_h2d(src_layers, dst_layers, src_indices_cpu, dst_indices_cpu, &api_calls, &groups, &reason),
+        "cudaMemcpy3D H2D is not applicable: ",
+        reason);
+#else
+    TORCH_CHECK(false, "cudaMemcpy3D H2D experiment requires CUDA");
+#endif
+  } else {
+    TORCH_CHECK(false, "Unknown transfer mode: ", mode);
+  }
+  return {api_calls, segments, groups, mode};
 }
 
 // Direct (cudaMemcpy-based) single-buffer transfer for one layer of an

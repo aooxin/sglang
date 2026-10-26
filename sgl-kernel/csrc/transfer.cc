@@ -1,6 +1,10 @@
 /* PyTorch 扩展注册 - 只注册 transfer_kernel_impl (transfer.cu) */
 #include <torch/extension.h>
 #include <torch/library.h>
+
+#include <string>
+#include <tuple>
+#include <vector>
 void transfer_kv_per_layer(
     const at::Tensor src_k,
     at::Tensor dst_k,
@@ -186,6 +190,14 @@ void transfer_kv_direct(
     const at::Tensor dst_indices,
     int64_t page_size);
 
+std::tuple<int64_t, int64_t, int64_t, std::string> transfer_kv_direct_mode(
+    const std::vector<at::Tensor>& src_layers,
+    std::vector<at::Tensor> dst_layers,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t page_size,
+    std::string mode);
+
 void transfer_kv_per_layer_direct_mla(
     const at::Tensor src, at::Tensor dst, const at::Tensor src_indices, const at::Tensor dst_indices);
 
@@ -278,6 +290,10 @@ TORCH_LIBRARY(transfer_kernel, m) {
       "transfer_kv_direct(Tensor[] src_layers, Tensor[] dst_layers, Tensor src_indices, Tensor dst_indices, int "
       "page_size) -> ()");
   m.impl("transfer_kv_direct", torch::kCUDA, &transfer_kv_direct);
+  m.def(
+      "transfer_kv_direct_mode(Tensor[] src_layers, Tensor[] dst_layers, Tensor src_indices, Tensor dst_indices, int "
+      "page_size, str mode) -> (int, int, int, str)");
+  m.impl("transfer_kv_direct_mode", torch::kCUDA, &transfer_kv_direct_mode);
   m.def("transfer_kv_per_layer_direct_mla(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices) -> ()");
   m.impl("transfer_kv_per_layer_direct_mla", torch::kCUDA, &transfer_kv_per_layer_direct_mla);
   m.def(
